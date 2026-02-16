@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-10 complete on 2026-02-16)  
+Status: Draft (Phases 0-11 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -272,12 +272,20 @@ Exit criteria:
 
 ## Phase 11: Diagnostics, profiling, and debugging
 
-- [ ] Add tracing spans analogous to existing renderer instrumentation.
-- [ ] Add optional Vulkan debug markers and validation hooks in debug builds.
-- [ ] Add runtime stats for cache hit/miss and command submission timing.
+- [x] Add tracing spans analogous to existing renderer instrumentation.
+- [x] Add optional Vulkan debug markers and validation hooks in debug builds.
+- [x] Add runtime stats for cache hit/miss and command submission timing.
 
 Exit criteria:
 - Debug output is actionable and profiling data can isolate performance bottlenecks.
+- Verified on 2026-02-16 with:
+  - `cargo check --no-default-features --features renderer_vulkan`
+  - `cargo check --no-default-features --features renderer_vulkan,renderer_multi`
+  - `cargo check --no-default-features --features renderer_vulkan,wayland_frontend,backend_gbm`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::frame::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::readback::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::dmabuf::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan,wayland_frontend,backend_gbm compositor_ -- --nocapture`
 
 ## Phase 12: Documentation and examples
 
@@ -388,6 +396,6 @@ Minimum matrix before production recommendation:
 - [x] Export/offscreen/readback complete.
 - [x] Blit and multigpu compatibility complete.
 - [x] `DrmCompositor` hardening complete.
-- [ ] Diagnostics and profiling complete.
+- [x] Diagnostics and profiling complete.
 - [ ] Documentation complete.
 - [ ] Test matrix and release gates complete.

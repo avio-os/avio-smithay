@@ -1,9 +1,9 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module currently includes phase-9 device, dma-buf import/bind, descriptor,
+//! This module currently includes phase-11 device, dma-buf import/bind, descriptor,
 //! pipeline, frame-recording infrastructure, explicit sync bridge support, memory
 //! upload support for shared-memory client paths, readback/offscreen support, and
-//! framebuffer blit support.
+//! framebuffer blit support with diagnostics instrumentation.
 
 #![allow(dead_code)]
 
@@ -35,12 +35,55 @@ use crate::backend::{
 
 use self::blit::BlitState;
 use self::descriptor::DescriptorState;
-use self::device::DeviceState;
+use self::device::{DeviceDiagnostics, DeviceState};
 use self::dmabuf::DmabufState;
 use self::format::FormatCapabilities;
 use self::pipeline::PipelineState;
 use self::readback::ReadbackState;
 use self::upload::UploadState;
+
+/// Cache diagnostics for renderer-internal resource caches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VulkanCacheStats {
+    /// Number of successful cache lookups.
+    pub hits: u64,
+    /// Number of cache misses requiring allocation or import work.
+    pub misses: u64,
+    /// Number of entries evicted from the cache.
+    pub evictions: u64,
+}
+
+/// Submission and timing diagnostics for renderer command dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VulkanSubmissionStats {
+    /// Number of queue submissions (asynchronous and blocking).
+    pub total_submissions: u64,
+    /// Number of blocking submissions.
+    pub blocking_submissions: u64,
+    /// Number of asynchronously submitted command buffers reclaimed after completion.
+    pub reclaimed_submissions: u64,
+    /// Average host-side CPU time spent in `vkQueueSubmit` for async submissions (nanoseconds).
+    pub avg_submit_cpu_ns: u64,
+    /// Maximum host-side CPU time spent in `vkQueueSubmit` for async submissions (nanoseconds).
+    pub max_submit_cpu_ns: u64,
+    /// Average async submission completion latency from submit to reclaim (nanoseconds).
+    pub avg_completion_ns: u64,
+    /// Maximum async submission completion latency from submit to reclaim (nanoseconds).
+    pub max_completion_ns: u64,
+}
+
+/// Aggregated runtime diagnostics for the Vulkan renderer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VulkanRendererDiagnostics {
+    /// dma-buf import/bind cache diagnostics.
+    pub dmabuf_cache: VulkanCacheStats,
+    /// Texture descriptor cache diagnostics.
+    pub descriptor_cache: VulkanCacheStats,
+    /// Submission and completion timing diagnostics.
+    pub submissions: VulkanSubmissionStats,
+    /// Whether Vulkan debug markers are active for command-buffer labels.
+    pub debug_markers_enabled: bool,
+}
 
 /// Vulkan renderer implementation under active phased development.
 #[derive(Debug)]
@@ -210,6 +253,35 @@ impl VulkanRenderer {
     pub fn not_yet_implemented(operation: &'static str) -> VulkanRendererError {
         VulkanRendererError::not_implemented(operation)
     }
+
+    /// Returns live diagnostics for cache behavior and command submission timing.
+    pub fn diagnostics(&self) -> VulkanRendererDiagnostics {
+        let submissions: DeviceDiagnostics = self.device.diagnostics();
+        VulkanRendererDiagnostics {
+            dmabuf_cache: self.dmabuf.cache_stats(),
+            descriptor_cache: self.descriptors.cache_stats(),
+            submissions: VulkanSubmissionStats {
+                total_submissions: submissions.total_submissions,
+                blocking_submissions: submissions.blocking_submissions,
+                reclaimed_submissions: submissions.reclaimed_submissions,
+                avg_submit_cpu_ns: avg_nanos(submissions.total_submit_cpu_ns, submissions.total_submissions),
+                max_submit_cpu_ns: submissions.max_submit_cpu_ns,
+                avg_completion_ns: avg_nanos(
+                    submissions.total_completion_ns,
+                    submissions.reclaimed_submissions,
+                ),
+                max_completion_ns: submissions.max_completion_ns,
+            },
+            debug_markers_enabled: submissions.debug_markers_enabled,
+        }
+    }
+}
+
+fn avg_nanos(total_ns: u64, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    total_ns / count
 }
 
 #[cfg(test)]

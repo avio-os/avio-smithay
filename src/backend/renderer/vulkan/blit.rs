@@ -1,5 +1,6 @@
 use ash::vk;
 use indexmap::IndexMap;
+use tracing::{instrument, trace};
 
 use crate::{
     backend::renderer::{sync::SyncPoint, Blit, TextureFilter},
@@ -16,6 +17,8 @@ pub(crate) struct BlitState {
 }
 
 impl BlitState {
+    #[instrument(level = "trace", skip(self, device, from, to))]
+    #[profiling::function]
     fn blit_images(
         &mut self,
         device: &mut DeviceState,
@@ -25,6 +28,7 @@ impl BlitState {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<SyncPoint, VulkanRendererError> {
+        trace!(?src, ?dst, ?filter, "recording vulkan blit");
         if from.id() == to.id() {
             return Err(VulkanRendererError::TemporaryFailure(
                 "blit source and destination must be different images",
@@ -93,6 +97,7 @@ impl BlitState {
             let _ = device.discard_command_buffer(command_buffer);
             return Err(err.into());
         }
+        device.insert_debug_label(command_buffer, c"vulkan.blit", [0.92, 0.74, 0.13, 1.0]);
 
         transition_image_layout(
             vk_device,
@@ -267,6 +272,8 @@ impl BlitState {
 }
 
 impl Blit for VulkanRenderer {
+    #[instrument(level = "trace", skip(self, from, to))]
+    #[profiling::function]
     fn blit(
         &mut self,
         from: &VulkanTarget,

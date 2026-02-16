@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use indexmap::IndexMap;
-use tracing::warn;
+use tracing::{instrument, trace, warn};
 
 use crate::{
     backend::{
@@ -90,6 +90,8 @@ impl Renderer for VulkanRenderer {
         self.debug_flags
     }
 
+    #[instrument(level = "trace", skip(self, target))]
+    #[profiling::function]
     fn render<'frame, 'buffer>(
         &'frame mut self,
         target: &'frame mut Self::Framebuffer<'buffer>,
@@ -99,6 +101,11 @@ impl Renderer for VulkanRenderer {
     where
         'buffer: 'frame,
     {
+        trace!(
+            ?output_size,
+            ?dst_transform,
+            "starting vulkan render pass recording"
+        );
         self.device.reclaim_completed_submissions()?;
 
         if output_size.w <= 0 || output_size.h <= 0 {
@@ -138,6 +145,8 @@ impl Renderer for VulkanRenderer {
                 .device_handle()
                 .begin_command_buffer(command_buffer, &begin_info)
         }?;
+        self.device
+            .insert_debug_label(command_buffer, c"vulkan.render.begin", [0.17, 0.42, 0.86, 1.0]);
 
         let framebuffer = create_framebuffer(
             self.device.device_handle(),
@@ -187,6 +196,11 @@ impl Renderer for VulkanRenderer {
 
         // SAFETY: All render pass/framebuffer handles are valid for this command buffer.
         unsafe {
+            frame.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.render.begin_pass",
+                [0.20, 0.58, 0.95, 1.0],
+            );
             frame.renderer.device.device_handle().cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_begin_info,
@@ -197,6 +211,8 @@ impl Renderer for VulkanRenderer {
         Ok(frame)
     }
 
+    #[instrument(level = "trace", skip(self, sync))]
+    #[profiling::function]
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
             return vulkan_fence
@@ -226,6 +242,8 @@ impl Renderer for VulkanRenderer {
             .map_err(|_| VulkanRendererError::TemporaryFailure("sync wait was interrupted"))
     }
 
+    #[instrument(level = "trace", skip(self))]
+    #[profiling::function]
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
         self.dmabuf.cleanup();
         self.descriptors.clear_texture_cache()?;
@@ -266,6 +284,8 @@ impl Frame for VulkanFrame<'_> {
         self.renderer.context_id.clone()
     }
 
+    #[instrument(level = "trace", skip(self, at))]
+    #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
         let (command_buffer, transform, size) = {
             let recording = self.recording()?;
@@ -298,6 +318,11 @@ impl Frame for VulkanFrame<'_> {
 
         // SAFETY: Command buffer recording is active and clear regions are inside the current render area.
         unsafe {
+            self.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.frame.clear",
+                [0.26, 0.73, 0.31, 1.0],
+            );
             self.renderer.device.device_handle().cmd_clear_attachments(
                 command_buffer,
                 &clear_attachments,
@@ -308,6 +333,8 @@ impl Frame for VulkanFrame<'_> {
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self, damage))]
+    #[profiling::function]
     fn draw_solid(
         &mut self,
         dst: Rectangle<i32, Physical>,
@@ -350,6 +377,11 @@ impl Frame for VulkanFrame<'_> {
 
         // SAFETY: Command buffer recording is active and all pipeline/layout handles are valid.
         unsafe {
+            self.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.frame.draw_solid",
+                [0.90, 0.56, 0.22, 1.0],
+            );
             self.renderer.device.device_handle().cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -385,6 +417,8 @@ impl Frame for VulkanFrame<'_> {
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
+    #[profiling::function]
     fn render_texture_from_to(
         &mut self,
         texture: &Self::TextureId,
@@ -503,6 +537,11 @@ impl Frame for VulkanFrame<'_> {
 
         // SAFETY: Command buffer recording is active and all handles belong to this renderer device.
         unsafe {
+            self.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.frame.render_texture",
+                [0.74, 0.34, 0.89, 1.0],
+            );
             self.renderer.device.device_handle().cmd_set_viewport(
                 command_buffer,
                 0,
@@ -590,10 +629,14 @@ impl Frame for VulkanFrame<'_> {
             .unwrap_or(Transform::Normal)
     }
 
+    #[instrument(level = "trace", skip(self, sync))]
+    #[profiling::function]
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         self.renderer.wait(sync)
     }
 
+    #[instrument(level = "trace", skip(self))]
+    #[profiling::function]
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
         self.finish_internal()
     }
@@ -717,6 +760,8 @@ impl VulkanFrame<'_> {
             .collect()
     }
 
+    #[instrument(level = "trace", skip(self))]
+    #[profiling::function]
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanRendererError> {
         if self.state != VulkanFrameState::Recording {
             return Ok(SyncPoint::signaled());
@@ -731,6 +776,11 @@ impl VulkanFrame<'_> {
 
         // SAFETY: Render pass was begun when entering frame recording.
         unsafe {
+            self.renderer.device.insert_debug_label(
+                recording.command_buffer,
+                c"vulkan.frame.finish",
+                [0.95, 0.25, 0.35, 1.0],
+            );
             self.renderer
                 .device
                 .device_handle()
@@ -1183,6 +1233,96 @@ mod tests {
             .device
             .wait_for_all_submissions()
             .expect("all transform submissions should complete");
+    }
+
+    #[test]
+    fn renderer_diagnostics_track_cache_and_submission_metrics() {
+        let Some((mut renderer, mut allocator)) = init_renderer_and_allocator() else {
+            return;
+        };
+
+        let Some(format) = renderer
+            .dmabuf_render_formats()
+            .iter()
+            .copied()
+            .find(|format| renderer.has_dmabuf_import_format(*format))
+        else {
+            return;
+        };
+
+        let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+        let texture_dmabuf = match texture_buffer.export() {
+            Ok(dmabuf) => dmabuf,
+            Err(_) => return,
+        };
+        let texture: VulkanTexture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+
+        let target_buffer = match allocator.create_buffer(96, 64, format.code, &[format.modifier]) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+        let target_dmabuf = match target_buffer.export() {
+            Ok(dmabuf) => dmabuf,
+            Err(_) => return,
+        };
+        let mut target = match renderer.bind_dmabuf_target(&target_dmabuf) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+
+        for _ in 0..2 {
+            let mut frame = match renderer.render(&mut target, Size::from((96, 64)), Transform::Normal) {
+                Ok(frame) => frame,
+                Err(_) => return,
+            };
+
+            frame
+                .render_texture_from_to(
+                    &texture,
+                    Rectangle::new((0.0, 0.0).into(), texture.size().to_f64()),
+                    Rectangle::new((12, 10).into(), Size::from((36, 24))),
+                    &[Rectangle::new((0, 0).into(), Size::from((96, 64)))],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                )
+                .expect("texture rendering should succeed");
+            let sync = frame.finish().expect("finish should submit the frame");
+            let _ = sync.wait();
+        }
+
+        renderer
+            .device
+            .wait_for_all_submissions()
+            .expect("submissions should complete");
+
+        let diagnostics = renderer.diagnostics();
+        assert!(
+            diagnostics.dmabuf_cache.misses >= 2,
+            "importing texture and binding target should populate dmabuf cache misses"
+        );
+        assert!(
+            diagnostics.descriptor_cache.misses >= 1,
+            "first textured draw should allocate a descriptor"
+        );
+        assert!(
+            diagnostics.descriptor_cache.hits >= 1,
+            "second textured draw should reuse descriptor cache entry"
+        );
+        assert!(
+            diagnostics.submissions.total_submissions >= 2,
+            "two finished frames should record at least two submissions"
+        );
+        assert!(
+            diagnostics.submissions.reclaimed_submissions >= 1,
+            "completed submissions should be reclaimed into diagnostics"
+        );
     }
 
     #[test]
