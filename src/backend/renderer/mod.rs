@@ -6,6 +6,8 @@
 //! Supported rendering apis:
 //!
 //! - Raw OpenGL ES 2
+//! - Pixman software rendering
+//! - Vulkan (feature: `renderer_vulkan`, phase-0 scaffolding)
 
 use crate::utils::{ids::id_gen, Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
 use cgmath::Matrix3;
@@ -32,6 +34,9 @@ pub mod glow;
 
 #[cfg(feature = "renderer_pixman")]
 pub mod pixman;
+
+#[cfg(feature = "renderer_vulkan")]
+pub mod vulkan;
 
 mod color;
 pub use color::Color32F;
