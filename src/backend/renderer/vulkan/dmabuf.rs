@@ -485,6 +485,10 @@ impl ImportedDmabufImage {
         self.vk_format
     }
 
+    pub(crate) fn format(&self) -> Format {
+        self.format
+    }
+
     pub(crate) fn size(&self) -> Size<i32, BufferCoord> {
         self.size
     }

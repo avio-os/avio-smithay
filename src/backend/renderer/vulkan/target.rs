@@ -29,6 +29,14 @@ impl VulkanTarget {
         size: Size<i32, BufferCoord>,
         format: Option<Fourcc>,
     ) -> Self {
+        Self::from_imported_image(imported, size, format)
+    }
+
+    pub(crate) fn from_imported_image(
+        imported: Arc<ImportedDmabufImage>,
+        size: Size<i32, BufferCoord>,
+        format: Option<Fourcc>,
+    ) -> Self {
         Self {
             size,
             format,

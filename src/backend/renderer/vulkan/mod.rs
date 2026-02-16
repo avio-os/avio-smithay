@@ -1,9 +1,8 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module currently includes phase-7 device, dma-buf import/bind, descriptor,
-//! pipeline, frame-recording infrastructure, explicit sync bridge support, and
-//! memory upload support for shared-memory client paths.
-//! Readback paths are implemented in later phases.
+//! This module currently includes phase-8 device, dma-buf import/bind, descriptor,
+//! pipeline, frame-recording infrastructure, explicit sync bridge support, memory
+//! upload support for shared-memory client paths, and readback/offscreen support.
 
 #![allow(dead_code)]
 
@@ -38,6 +37,7 @@ use self::device::DeviceState;
 use self::dmabuf::DmabufState;
 use self::format::FormatCapabilities;
 use self::pipeline::PipelineState;
+use self::readback::ReadbackState;
 use self::upload::UploadState;
 
 /// Vulkan renderer implementation under active phased development.
@@ -51,6 +51,7 @@ pub struct VulkanRenderer {
     formats: FormatCapabilities,
     dmabuf: DmabufState,
     upload: UploadState,
+    readback: ReadbackState,
     descriptors: DescriptorState,
     pipelines: PipelineState,
 }
@@ -76,6 +77,7 @@ impl VulkanRenderer {
             formats: FormatCapabilities::new(physical_device)?,
             dmabuf: DmabufState::default(),
             upload: UploadState::default(),
+            readback: ReadbackState::default(),
             descriptors,
             pipelines,
         })
