@@ -52,6 +52,8 @@ pub(crate) struct TexturePushConstants {
     pub(crate) transform: u32,
     pub(crate) y_inverted: u32,
     pub(crate) _pad0: u32,
+    pub(crate) src_offset: [f32; 2],
+    pub(crate) src_scale: [f32; 2],
 }
 
 impl Default for TexturePushConstants {
@@ -61,6 +63,8 @@ impl Default for TexturePushConstants {
             transform: TextureTransform::Normal as u32,
             y_inverted: 0,
             _pad0: 0,
+            src_offset: [0.0, 0.0],
+            src_scale: [1.0, 1.0],
         }
     }
 }
@@ -72,7 +76,15 @@ impl TexturePushConstants {
             transform: transform as u32,
             y_inverted: u32::from(y_inverted),
             _pad0: 0,
+            src_offset: [0.0, 0.0],
+            src_scale: [1.0, 1.0],
         }
+    }
+
+    pub(crate) fn with_src_rect(mut self, offset: [f32; 2], scale: [f32; 2]) -> Self {
+        self.src_offset = offset;
+        self.src_scale = scale;
+        self
     }
 }
 
@@ -80,7 +92,9 @@ impl TexturePushConstants {
 pub(crate) struct PipelineHandles {
     pub(crate) render_pass: vk::RenderPass,
     pub(crate) solid_pipeline: vk::Pipeline,
+    pub(crate) solid_opaque_pipeline: vk::Pipeline,
     pub(crate) textured_pipeline: vk::Pipeline,
+    pub(crate) textured_opaque_pipeline: vk::Pipeline,
     pub(crate) solid_layout: vk::PipelineLayout,
     pub(crate) textured_layout: vk::PipelineLayout,
 }
@@ -89,7 +103,9 @@ pub(crate) struct PipelineHandles {
 struct FormatPipelineSet {
     render_pass: vk::RenderPass,
     solid_pipeline: vk::Pipeline,
+    solid_opaque_pipeline: vk::Pipeline,
     textured_pipeline: vk::Pipeline,
+    textured_opaque_pipeline: vk::Pipeline,
 }
 
 #[derive(Debug)]
@@ -279,7 +295,9 @@ impl PipelineState {
         Ok(PipelineHandles {
             render_pass: set.render_pass,
             solid_pipeline: set.solid_pipeline,
+            solid_opaque_pipeline: set.solid_opaque_pipeline,
             textured_pipeline: set.textured_pipeline,
+            textured_opaque_pipeline: set.textured_opaque_pipeline,
             solid_layout: self.solid_layout,
             textured_layout: self.textured_layout,
         })
@@ -297,6 +315,7 @@ impl PipelineState {
             self.solid_layout,
             self.solid_vertex_module,
             self.solid_fragment_module,
+            true,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -305,11 +324,12 @@ impl PipelineState {
             }
         };
 
-        let textured_pipeline = match self.create_graphics_pipeline(
+        let solid_opaque_pipeline = match self.create_graphics_pipeline(
             render_pass,
-            self.textured_layout,
-            self.texture_vertex_module,
-            self.texture_fragment_module,
+            self.solid_layout,
+            self.solid_vertex_module,
+            self.solid_fragment_module,
+            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -321,10 +341,49 @@ impl PipelineState {
             }
         };
 
+        let textured_pipeline = match self.create_graphics_pipeline(
+            render_pass,
+            self.textured_layout,
+            self.texture_vertex_module,
+            self.texture_fragment_module,
+            true,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                unsafe {
+                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
+                    vk_device.destroy_pipeline(solid_pipeline, None);
+                    vk_device.destroy_render_pass(render_pass, None);
+                }
+                return Err(err);
+            }
+        };
+
+        let textured_opaque_pipeline = match self.create_graphics_pipeline(
+            render_pass,
+            self.textured_layout,
+            self.texture_vertex_module,
+            self.texture_fragment_module,
+            false,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                unsafe {
+                    vk_device.destroy_pipeline(textured_pipeline, None);
+                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
+                    vk_device.destroy_pipeline(solid_pipeline, None);
+                    vk_device.destroy_render_pass(render_pass, None);
+                }
+                return Err(err);
+            }
+        };
+
         Ok(FormatPipelineSet {
             render_pass,
             solid_pipeline,
+            solid_opaque_pipeline,
             textured_pipeline,
+            textured_opaque_pipeline,
         })
     }
 
@@ -334,6 +393,7 @@ impl PipelineState {
         layout: vk::PipelineLayout,
         vertex_shader_module: vk::ShaderModule,
         fragment_shader_module: vk::ShaderModule,
+        blend_enabled: bool,
     ) -> Result<vk::Pipeline, VulkanRendererError> {
         let vk_device = self.device.handle();
 
@@ -363,7 +423,7 @@ impl PipelineState {
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(true)
+            .blend_enable(blend_enabled)
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
@@ -415,7 +475,9 @@ impl Drop for PipelineState {
 
         for (_, set) in self.per_format.drain(..) {
             unsafe {
+                device.destroy_pipeline(set.textured_opaque_pipeline, None);
                 device.destroy_pipeline(set.textured_pipeline, None);
+                device.destroy_pipeline(set.solid_opaque_pipeline, None);
                 device.destroy_pipeline(set.solid_pipeline, None);
                 device.destroy_render_pass(set.render_pass, None);
             }
@@ -445,7 +507,7 @@ fn create_render_pass(
     let attachments = [vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(vk::AttachmentLoadOp::LOAD)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -708,10 +770,32 @@ mod tests {
                 command_buffer,
                 target.image,
                 vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+
+            vk_device.cmd_clear_color_image(
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue {
+                    float32: [0.0, 0.0, 1.0, 1.0],
+                },
+                &[full_range],
+            );
+
+            transition_image_layout(
+                vk_device,
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             );
 

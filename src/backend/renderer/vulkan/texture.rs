@@ -48,6 +48,10 @@ impl VulkanTexture {
     pub(crate) fn imported_image_id(&self) -> Option<u64> {
         self.imported.as_ref().map(|image| image.id())
     }
+
+    pub(crate) fn imported_image(&self) -> Option<&Arc<ImportedDmabufImage>> {
+        self.imported.as_ref()
+    }
 }
 
 impl Texture for VulkanTexture {
