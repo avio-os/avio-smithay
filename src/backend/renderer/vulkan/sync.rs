@@ -52,8 +52,8 @@ impl VulkanFence {
         let mut create_info = vk::FenceCreateInfo::default();
 
         if exportable_sync_file && external_fence_fd.is_some() {
-            export_info = vk::ExportFenceCreateInfo::default()
-                .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+            export_info =
+                vk::ExportFenceCreateInfo::default().handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
             create_info = create_info.push_next(&mut export_info);
         }
 

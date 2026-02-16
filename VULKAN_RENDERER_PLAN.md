@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-8 complete on 2026-02-16)  
+Status: Draft (Phases 0-9 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -243,12 +243,17 @@ Exit criteria:
 
 ## Phase 9: Blit and multigpu requirements
 
-- [ ] Implement `Blit` trait with Vulkan transfer/blit operations.
-- [ ] Ensure compatibility with `renderer::multigpu` trait constraints.
-- [ ] Validate import/export interactions across GPUs where supported.
+- [x] Implement `Blit` trait with Vulkan transfer/blit operations.
+- [x] Ensure compatibility with `renderer::multigpu` trait constraints.
+- [x] Validate import/export interactions across GPUs where supported.
 
 Exit criteria:
 - `renderer::multigpu` compiles and runtime smoke tests pass for Vulkan renderer paths.
+- Verified on 2026-02-16 with:
+  - `cargo check --no-default-features --features renderer_vulkan`
+  - `cargo check --no-default-features --features renderer_vulkan,renderer_multi`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::blit::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::readback::tests -- --nocapture`
 
 ## Phase 10: DrmCompositor integration hardening
 
@@ -376,7 +381,7 @@ Minimum matrix before production recommendation:
 - [x] Explicit sync integration complete.
 - [x] Memory upload path complete.
 - [x] Export/offscreen/readback complete.
-- [ ] Blit and multigpu compatibility complete.
+- [x] Blit and multigpu compatibility complete.
 - [ ] `DrmCompositor` hardening complete.
 - [ ] Diagnostics and profiling complete.
 - [ ] Documentation complete.
