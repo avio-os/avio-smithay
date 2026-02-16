@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use ash::vk;
 use indexmap::IndexMap;
+use tracing::trace;
 
-use super::{device::DeviceHandle, VulkanRendererError};
+use super::{device::DeviceHandle, VulkanCacheStats, VulkanRendererError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TextureDescriptorKey {
@@ -18,6 +19,7 @@ pub(crate) struct DescriptorState {
     pool: vk::DescriptorPool,
     texture_sets: IndexMap<TextureDescriptorKey, vk::DescriptorSet>,
     max_texture_sets: usize,
+    cache_stats: VulkanCacheStats,
 }
 
 impl DescriptorState {
@@ -95,6 +97,7 @@ impl DescriptorState {
             pool,
             texture_sets: IndexMap::new(),
             max_texture_sets,
+            cache_stats: VulkanCacheStats::default(),
         })
     }
 
@@ -115,9 +118,17 @@ impl DescriptorState {
         if let Some(existing) = self.texture_sets.shift_remove(&key) {
             // Keep hot entries toward the end of insertion order so old entries are evicted first.
             self.texture_sets.insert(key, existing);
+            self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
+            trace!(
+                hits = self.cache_stats.hits,
+                misses = self.cache_stats.misses,
+                evictions = self.cache_stats.evictions,
+                "vulkan descriptor cache hit"
+            );
             return Ok(existing);
         }
 
+        self.cache_stats.misses = self.cache_stats.misses.saturating_add(1);
         self.evict_if_needed()?;
 
         let layouts = [self.texture_layout];
@@ -135,8 +146,18 @@ impl DescriptorState {
 
         self.write_texture_descriptor(descriptor_set, image_view);
         self.texture_sets.insert(key, descriptor_set);
+        trace!(
+            hits = self.cache_stats.hits,
+            misses = self.cache_stats.misses,
+            evictions = self.cache_stats.evictions,
+            "vulkan descriptor cache miss"
+        );
 
         Ok(descriptor_set)
+    }
+
+    pub(crate) fn cache_stats(&self) -> VulkanCacheStats {
+        self.cache_stats
     }
 
     pub(crate) fn clear_texture_cache(&mut self) -> Result<(), VulkanRendererError> {
@@ -145,6 +166,7 @@ impl DescriptorState {
         }
 
         let sets = self.texture_sets.values().copied().collect::<Vec<_>>();
+        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(sets.len() as u64);
         self.texture_sets.clear();
 
         // SAFETY: All descriptor sets originate from this pool and are no longer referenced after cache clear.
@@ -161,6 +183,7 @@ impl DescriptorState {
         let Some((_, descriptor_set)) = self.texture_sets.shift_remove_index(0) else {
             return Ok(());
         };
+        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
 
         // SAFETY: Descriptor set originates from this pool and has been removed from the cache.
         unsafe {

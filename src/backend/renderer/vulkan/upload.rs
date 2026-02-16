@@ -1,4 +1,5 @@
 use ash::vk;
+use tracing::{instrument, trace};
 
 use crate::{
     backend::{
@@ -50,6 +51,8 @@ impl UploadState {
         id
     }
 
+    #[instrument(level = "trace", skip(self, device, data))]
+    #[profiling::function]
     pub(crate) fn import_memory(
         &mut self,
         device: &mut DeviceState,
@@ -58,6 +61,7 @@ impl UploadState {
         size: Size<i32, BufferCoord>,
         flipped: bool,
     ) -> Result<VulkanTexture, VulkanRendererError> {
+        trace!(?format, ?size, flipped, "importing memory into vulkan texture");
         let _ = validate_memory_format(format)?;
         let expected_len = expected_len_for_size(format, size)?;
         if data.len() < expected_len {
@@ -72,6 +76,8 @@ impl UploadState {
         Ok(VulkanTexture::from_memory_import(image, size, format, flipped))
     }
 
+    #[instrument(level = "trace", skip(self, device, texture, data))]
+    #[profiling::function]
     pub(crate) fn update_memory(
         &mut self,
         device: &mut DeviceState,
@@ -79,6 +85,7 @@ impl UploadState {
         data: &[u8],
         region: Rectangle<i32, BufferCoord>,
     ) -> Result<(), VulkanRendererError> {
+        trace!(?region, "updating vulkan texture memory region");
         if !texture.memory_writable() {
             return Err(VulkanRendererError::InvalidMemoryUpload(
                 "texture is not writable through ImportMem::update_memory",
@@ -239,6 +246,7 @@ fn upload_region_to_image(
     data: &[u8],
     region: Rectangle<i32, BufferCoord>,
 ) -> Result<(), VulkanRendererError> {
+    trace!(?region, ?format, "recording upload-to-image copy");
     if region.is_empty() {
         return Ok(());
     }
@@ -291,6 +299,7 @@ fn upload_region_to_image(
         let _ = device.discard_command_buffer(command_buffer);
         return Err(err.into());
     }
+    device.insert_debug_label(command_buffer, c"vulkan.upload", [0.11, 0.78, 0.86, 1.0]);
 
     let old_layout = image.current_layout();
     transition_image_layout(

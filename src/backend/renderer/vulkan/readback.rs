@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ash::vk;
+use tracing::{instrument, trace};
 
 use crate::{
     backend::{
@@ -35,12 +36,15 @@ impl ReadbackState {
         id
     }
 
+    #[instrument(level = "trace", skip(self, device))]
+    #[profiling::function]
     pub(crate) fn create_offscreen_texture(
         &mut self,
         device: &DeviceState,
         format: Fourcc,
         size: Size<i32, BufferCoord>,
     ) -> Result<VulkanTexture, VulkanRendererError> {
+        trace!(?format, ?size, "creating vulkan offscreen texture");
         if size.w <= 0 || size.h <= 0 {
             return Err(VulkanRendererError::TemporaryFailure(
                 "offscreen buffer dimensions must be positive",
@@ -156,6 +160,8 @@ impl ReadbackState {
         ))
     }
 
+    #[instrument(level = "trace", skip(self, device, image))]
+    #[profiling::function]
     fn copy_image_to_mapping(
         &mut self,
         device: &mut DeviceState,
@@ -163,6 +169,7 @@ impl ReadbackState {
         region: Rectangle<i32, BufferCoord>,
         dst_format: Fourcc,
     ) -> Result<VulkanMapping, VulkanRendererError> {
+        trace!(?region, src = ?image.format().code, dst = ?dst_format, "copying image to cpu mapping");
         validate_region(image.size(), region)?;
 
         let src_format = image.format().code;
@@ -207,6 +214,7 @@ impl ReadbackState {
             let _ = device.discard_command_buffer(command_buffer);
             return Err(err.into());
         }
+        device.insert_debug_label(command_buffer, c"vulkan.readback", [0.52, 0.47, 0.91, 1.0]);
 
         let old_layout = image.current_layout();
         transition_image_layout(

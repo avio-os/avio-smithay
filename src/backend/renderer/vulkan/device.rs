@@ -1,7 +1,7 @@
-use std::{collections::VecDeque, ffi::CStr, fmt, os::fd::OwnedFd, sync::Arc};
+use std::{collections::VecDeque, ffi::CStr, fmt, os::fd::OwnedFd, sync::Arc, time::Instant};
 
 use ash::{ext, khr, vk};
-use tracing::warn;
+use tracing::{instrument, trace, warn};
 
 use crate::backend::vulkan::{version::Version, PhysicalDevice};
 
@@ -19,6 +19,7 @@ struct InFlightSubmission {
     fence: VulkanFence,
     command_buffer: vk::CommandBuffer,
     framebuffers: Vec<vk::Framebuffer>,
+    submitted_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,6 +43,18 @@ impl DeviceCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DeviceDiagnostics {
+    pub(crate) total_submissions: u64,
+    pub(crate) blocking_submissions: u64,
+    pub(crate) reclaimed_submissions: u64,
+    pub(crate) total_submit_cpu_ns: u64,
+    pub(crate) max_submit_cpu_ns: u64,
+    pub(crate) total_completion_ns: u64,
+    pub(crate) max_completion_ns: u64,
+    pub(crate) debug_markers_enabled: bool,
+}
+
 pub(crate) struct DeviceState {
     physical_device: PhysicalDevice,
     enabled_extensions: Vec<&'static CStr>,
@@ -54,6 +67,8 @@ pub(crate) struct DeviceState {
     next_submission_id: u64,
     device: Arc<DeviceHandle>,
     external_fence_fd: Option<Arc<khr::external_fence_fd::Device>>,
+    debug_utils: Option<Arc<ext::debug_utils::Device>>,
+    diagnostics: DeviceDiagnostics,
 }
 
 impl fmt::Debug for DeviceState {
@@ -71,6 +86,10 @@ impl fmt::Debug for DeviceState {
             .field("device", &self.device.handle().handle())
             .field("supports_sync_file_import", &self.capabilities.sync_file_import())
             .field("supports_sync_file_export", &self.capabilities.sync_file_export())
+            .field("debug_markers_enabled", &self.diagnostics.debug_markers_enabled)
+            .field("total_submissions", &self.diagnostics.total_submissions)
+            .field("blocking_submissions", &self.diagnostics.blocking_submissions)
+            .field("reclaimed_submissions", &self.diagnostics.reclaimed_submissions)
             .finish()
     }
 }
@@ -156,6 +175,21 @@ impl DeviceState {
         let external_fence_fd = enabled_extensions
             .contains(&khr::external_fence_fd::NAME)
             .then(|| Arc::new(khr::external_fence_fd::Device::new(instance, device.handle())));
+        let debug_utils = if cfg!(debug_assertions)
+            && physical_device
+                .instance()
+                .enabled_extensions()
+                .any(|name| name == ext::debug_utils::NAME)
+        {
+            Some(Arc::new(ext::debug_utils::Device::new(instance, device.handle())))
+        } else {
+            None
+        };
+
+        if cfg!(debug_assertions) && debug_utils.is_none() {
+            trace!("vulkan debug markers are unavailable (VK_EXT_debug_utils not enabled)");
+        }
+        let debug_markers_enabled = debug_utils.is_some();
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -181,6 +215,11 @@ impl DeviceState {
             next_submission_id: 0,
             device,
             external_fence_fd,
+            debug_utils,
+            diagnostics: DeviceDiagnostics {
+                debug_markers_enabled,
+                ..DeviceDiagnostics::default()
+            },
         })
     }
 
@@ -216,6 +255,32 @@ impl DeviceState {
         self.capabilities.sync_file_export() && self.external_fence_fd.is_some()
     }
 
+    pub(crate) fn debug_markers_enabled(&self) -> bool {
+        self.diagnostics.debug_markers_enabled
+    }
+
+    pub(crate) fn diagnostics(&self) -> DeviceDiagnostics {
+        self.diagnostics
+    }
+
+    pub(crate) fn insert_debug_label(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        label_name: &'static CStr,
+        color: [f32; 4],
+    ) {
+        let Some(debug_utils) = self.debug_utils.as_ref() else {
+            return;
+        };
+
+        let label_info = vk::DebugUtilsLabelEXT::default()
+            .label_name(label_name)
+            .color(color);
+
+        // SAFETY: Command buffer belongs to this device; debug label data points to static/living memory.
+        unsafe { debug_utils.cmd_insert_debug_utils_label(command_buffer, &label_info) };
+    }
+
     pub(crate) fn wait_on_sync_file(&self, sync_file: OwnedFd) -> Result<(), VulkanRendererError> {
         if !self.supports_sync_file_import() {
             return Err(VulkanRendererError::NotImplemented(
@@ -238,6 +303,8 @@ impl DeviceState {
         wait_result.map_err(Into::into)
     }
 
+    #[instrument(level = "trace", skip(self))]
+    #[profiling::function]
     pub(crate) fn acquire_command_buffer(&mut self) -> Result<vk::CommandBuffer, VulkanRendererError> {
         self.reclaim_completed_submissions()?;
 
@@ -276,11 +343,14 @@ impl DeviceState {
         Ok(id)
     }
 
+    #[instrument(level = "trace", skip(self, command_buffer, framebuffers))]
+    #[profiling::function]
     pub(crate) fn submit_with_framebuffers_and_fence(
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
     ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
+        let submit_started_at = Instant::now();
         let fence = VulkanFence::create(
             self.shared_device(),
             self.external_fence_fd.clone(),
@@ -304,6 +374,12 @@ impl DeviceState {
             return Err(err.into());
         }
 
+        let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
+        self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
+        self.diagnostics.total_submit_cpu_ns =
+            self.diagnostics.total_submit_cpu_ns.saturating_add(submit_cpu_ns);
+        self.diagnostics.max_submit_cpu_ns = self.diagnostics.max_submit_cpu_ns.max(submit_cpu_ns);
+
         let id = SubmissionId(self.next_submission_id);
         self.next_submission_id = self.next_submission_id.wrapping_add(1);
         self.in_flight_submissions.push_back(InFlightSubmission {
@@ -311,15 +387,25 @@ impl DeviceState {
             fence: fence.clone(),
             command_buffer,
             framebuffers,
+            submitted_at: submit_started_at,
         });
+        trace!(
+            submission = ?id,
+            submit_cpu_ns,
+            in_flight = self.in_flight_submissions.len(),
+            "submitted vulkan command buffer"
+        );
 
         Ok((id, fence))
     }
 
+    #[instrument(level = "trace", skip(self, command_buffer))]
+    #[profiling::function]
     pub(crate) fn submit_blocking(
         &mut self,
         command_buffer: vk::CommandBuffer,
     ) -> Result<(), VulkanRendererError> {
+        let submit_started_at = Instant::now();
         let fence_info = vk::FenceCreateInfo::default();
         // SAFETY: Device is valid and create info references no borrowed resources.
         let fence = unsafe { self.device.handle().create_fence(&fence_info, None) }?;
@@ -348,6 +434,12 @@ impl DeviceState {
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
         }?;
         self.reusable_command_buffers.push(command_buffer);
+        let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
+        self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
+        self.diagnostics.blocking_submissions = self.diagnostics.blocking_submissions.saturating_add(1);
+        self.diagnostics.total_submit_cpu_ns =
+            self.diagnostics.total_submit_cpu_ns.saturating_add(submit_cpu_ns);
+        self.diagnostics.max_submit_cpu_ns = self.diagnostics.max_submit_cpu_ns.max(submit_cpu_ns);
         Ok(())
     }
 
@@ -370,6 +462,8 @@ impl DeviceState {
         self.in_flight_submissions.len()
     }
 
+    #[instrument(level = "trace", skip(self))]
+    #[profiling::function]
     pub(crate) fn reclaim_completed_submissions(&mut self) -> Result<(), VulkanRendererError> {
         loop {
             let Some(front) = self.in_flight_submissions.front() else {
@@ -392,6 +486,8 @@ impl DeviceState {
         Ok(())
     }
 
+    #[instrument(level = "trace", skip(self))]
+    #[profiling::function]
     pub(crate) fn wait_for_all_submissions(&mut self) -> Result<(), VulkanRendererError> {
         while let Some(submission) = self.in_flight_submissions.pop_front() {
             // SAFETY: Fence was created by this device and remains valid while tracked.
@@ -408,11 +504,25 @@ impl DeviceState {
 
     fn recycle_submission(&mut self, submission: InFlightSubmission) -> Result<(), VulkanRendererError> {
         let InFlightSubmission {
+            id,
             fence: _fence,
             command_buffer,
             framebuffers,
+            submitted_at,
             ..
         } = submission;
+
+        let completion_ns = duration_to_ns(submitted_at.elapsed());
+        self.diagnostics.reclaimed_submissions = self.diagnostics.reclaimed_submissions.saturating_add(1);
+        self.diagnostics.total_completion_ns =
+            self.diagnostics.total_completion_ns.saturating_add(completion_ns);
+        self.diagnostics.max_completion_ns = self.diagnostics.max_completion_ns.max(completion_ns);
+        trace!(
+            submission = ?id,
+            completion_ns,
+            reclaimed = self.diagnostics.reclaimed_submissions,
+            "reclaimed completed vulkan submission"
+        );
 
         for framebuffer in framebuffers {
             // SAFETY: The submission fence is already signaled when this method is called,
@@ -528,6 +638,10 @@ impl DeviceState {
             sync_file_export,
         }
     }
+}
+
+fn duration_to_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 impl Drop for DeviceState {

@@ -9,6 +9,7 @@ use std::{
 
 use ash::vk;
 use scopeguard::ScopeGuard;
+use tracing::trace;
 
 use crate::{
     backend::allocator::{
@@ -21,7 +22,7 @@ use crate::{
 use super::{
     device::{DeviceHandle, DeviceState},
     format::FormatCapabilities,
-    VulkanRendererError, VulkanTarget, VulkanTexture,
+    VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,7 @@ struct DmabufImportDescriptor {
 pub(crate) struct DmabufState {
     cache: HashMap<WeakDmabuf, CachedDmabuf>,
     next_import_id: u64,
+    cache_stats: VulkanCacheStats,
 }
 
 impl DmabufState {
@@ -117,8 +119,15 @@ impl DmabufState {
     }
 
     pub(crate) fn cleanup(&mut self) {
+        let before = self.cache.len();
         self.cache
             .retain(|_, cached| !cached.handle.is_gone() || Arc::strong_count(&cached.imported) > 1);
+        let removed = before.saturating_sub(self.cache.len()) as u64;
+        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(removed);
+    }
+
+    pub(crate) fn cache_stats(&self) -> VulkanCacheStats {
+        self.cache_stats
     }
 
     fn import_or_reuse(
@@ -136,10 +145,18 @@ impl DmabufState {
 
         if let Some(cached) = self.cache.get(&key) {
             if cached.signature == descriptor.signature && cached.imported.usage().contains(requested_usage) {
+                self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
+                trace!(
+                    hits = self.cache_stats.hits,
+                    misses = self.cache_stats.misses,
+                    evictions = self.cache_stats.evictions,
+                    "vulkan dmabuf cache hit"
+                );
                 return Ok(cached.imported.clone());
             }
         }
 
+        self.cache_stats.misses = self.cache_stats.misses.saturating_add(1);
         let usage = self
             .cache
             .get(&key)
@@ -155,6 +172,12 @@ impl DmabufState {
                 signature: descriptor.signature,
                 imported: imported.clone(),
             },
+        );
+        trace!(
+            hits = self.cache_stats.hits,
+            misses = self.cache_stats.misses,
+            evictions = self.cache_stats.evictions,
+            "vulkan dmabuf cache miss"
         );
 
         Ok(imported)
