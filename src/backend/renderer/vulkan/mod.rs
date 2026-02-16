@@ -1,8 +1,9 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module currently includes phase-6 device, dma-buf import/bind, descriptor,
-//! pipeline, frame-recording infrastructure, and explicit sync bridge support.
-//! Memory upload/readback paths are implemented in later phases.
+//! This module currently includes phase-7 device, dma-buf import/bind, descriptor,
+//! pipeline, frame-recording infrastructure, explicit sync bridge support, and
+//! memory upload support for shared-memory client paths.
+//! Readback paths are implemented in later phases.
 
 #![allow(dead_code)]
 
@@ -37,6 +38,7 @@ use self::device::DeviceState;
 use self::dmabuf::DmabufState;
 use self::format::FormatCapabilities;
 use self::pipeline::PipelineState;
+use self::upload::UploadState;
 
 /// Vulkan renderer implementation under active phased development.
 #[derive(Debug)]
@@ -48,6 +50,7 @@ pub struct VulkanRenderer {
     device: DeviceState,
     formats: FormatCapabilities,
     dmabuf: DmabufState,
+    upload: UploadState,
     descriptors: DescriptorState,
     pipelines: PipelineState,
 }
@@ -72,6 +75,7 @@ impl VulkanRenderer {
             device,
             formats: FormatCapabilities::new(physical_device)?,
             dmabuf: DmabufState::default(),
+            upload: UploadState::default(),
             descriptors,
             pipelines,
         })
@@ -108,6 +112,11 @@ impl VulkanRenderer {
     /// Returns whether submitted frame fences can be exported as native sync-file fds.
     pub fn supports_explicit_sync_export(&self) -> bool {
         self.device.supports_sync_file_export()
+    }
+
+    /// Returns formats accepted by [`crate::backend::renderer::ImportMem`] uploads.
+    pub fn memory_upload_formats(&self) -> &[Fourcc] {
+        self.upload.supported_formats()
     }
 
     /// Returns the enabled Vulkan device extensions.

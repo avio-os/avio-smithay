@@ -322,6 +322,41 @@ impl DeviceState {
         Ok((id, fence))
     }
 
+    pub(crate) fn submit_blocking(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), VulkanRendererError> {
+        let fence_info = vk::FenceCreateInfo::default();
+        // SAFETY: Device is valid and create info references no borrowed resources.
+        let fence = unsafe { self.device.handle().create_fence(&fence_info, None) }?;
+
+        let command_buffers = [command_buffer];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+
+        // SAFETY: Queue, fence, and command buffers are valid; queue access is serialized by `&mut self`.
+        if let Err(err) = unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) } {
+            // SAFETY: Fence belongs to this device and is not in-flight after failed submission.
+            unsafe { self.device.handle().destroy_fence(fence, None) };
+            let _ = self.discard_command_buffer(command_buffer);
+            return Err(err.into());
+        }
+
+        // SAFETY: Fence belongs to this device and was submitted by the queue_submit call above.
+        let wait_result = unsafe { self.device.handle().wait_for_fences(&[fence], true, u64::MAX) };
+        // SAFETY: Fence belongs to this device and is no longer needed after wait completes/errors.
+        unsafe { self.device.handle().destroy_fence(fence, None) };
+        wait_result?;
+
+        // SAFETY: Command buffer belongs to this command pool and execution completed after host wait.
+        unsafe {
+            self.device
+                .handle()
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+        }?;
+        self.reusable_command_buffers.push(command_buffer);
+        Ok(())
+    }
+
     pub(crate) fn discard_command_buffer(
         &mut self,
         command_buffer: vk::CommandBuffer,

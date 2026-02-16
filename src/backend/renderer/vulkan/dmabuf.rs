@@ -380,19 +380,19 @@ impl DmabufState {
         let import_id = self.next_import_id;
         self.next_import_id = self.next_import_id.wrapping_add(1);
 
-        Ok(Arc::new(ImportedDmabufImage {
+        Ok(Arc::new(ImportedDmabufImage::new(
             import_id,
             image,
             memory,
             view,
             size,
             format,
-            vk_format: descriptor.vk_format,
+            descriptor.vk_format,
             usage,
-            y_inverted: descriptor.signature.y_inverted,
-            layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
-            device: device_handle,
-        }))
+            descriptor.signature.y_inverted,
+            vk::ImageLayout::UNDEFINED,
+            device_handle,
+        )))
     }
 
     fn pick_memory_type(memory_type_bits: u32) -> Result<u32, VulkanRendererError> {
@@ -440,6 +440,35 @@ impl std::fmt::Debug for ImportedDmabufImage {
 }
 
 impl ImportedDmabufImage {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        import_id: u64,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        view: vk::ImageView,
+        size: Size<i32, BufferCoord>,
+        format: Format,
+        vk_format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        y_inverted: bool,
+        initial_layout: vk::ImageLayout,
+        device: Arc<DeviceHandle>,
+    ) -> Self {
+        Self {
+            import_id,
+            image,
+            memory,
+            view,
+            size,
+            format,
+            vk_format,
+            usage,
+            y_inverted,
+            layout: AtomicI32::new(initial_layout.as_raw()),
+            device,
+        }
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.import_id
     }
