@@ -66,6 +66,14 @@ pub enum VulkanRendererError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// Unsupported memory-upload format.
+    #[error("unsupported memory-upload format for Vulkan import: {0:?}")]
+    UnsupportedMemoryFormat(crate::backend::allocator::Fourcc),
+
+    /// Memory upload metadata did not pass validation.
+    #[error("invalid memory upload metadata: {0}")]
+    InvalidMemoryUpload(&'static str),
+
     /// The Vulkan renderer context has been lost and must be recreated.
     #[error("vulkan renderer context lost: {0}")]
     ContextLost(&'static str),
@@ -94,6 +102,8 @@ impl VulkanRendererError {
             | VulkanRendererError::DmabufPlaneCountMismatch { .. }
             | VulkanRendererError::NoCompatibleMemoryType
             | VulkanRendererError::Io(_)
+            | VulkanRendererError::UnsupportedMemoryFormat(_)
+            | VulkanRendererError::InvalidMemoryUpload(_)
             | VulkanRendererError::TemporaryFailure(_)
             | VulkanRendererError::NotImplemented(_) => VulkanRendererErrorKind::TemporaryFailure,
         }

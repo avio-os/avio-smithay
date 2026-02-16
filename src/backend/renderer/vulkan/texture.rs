@@ -13,6 +13,7 @@ pub struct VulkanTexture {
     format: Option<Fourcc>,
     y_inverted: bool,
     imported: Option<Arc<ImportedDmabufImage>>,
+    memory_writable: bool,
 }
 
 impl VulkanTexture {
@@ -23,6 +24,7 @@ impl VulkanTexture {
             format,
             y_inverted: false,
             imported: None,
+            memory_writable: false,
         }
     }
 
@@ -37,6 +39,22 @@ impl VulkanTexture {
             format,
             y_inverted,
             imported: Some(imported),
+            memory_writable: false,
+        }
+    }
+
+    pub(crate) fn from_memory_import(
+        imported: Arc<ImportedDmabufImage>,
+        size: Size<i32, BufferCoord>,
+        format: Fourcc,
+        y_inverted: bool,
+    ) -> Self {
+        Self {
+            size,
+            format: Some(format),
+            y_inverted,
+            imported: Some(imported),
+            memory_writable: true,
         }
     }
 
@@ -51,6 +69,10 @@ impl VulkanTexture {
 
     pub(crate) fn imported_image(&self) -> Option<&Arc<ImportedDmabufImage>> {
         self.imported.as_ref()
+    }
+
+    pub(crate) fn memory_writable(&self) -> bool {
+        self.memory_writable
     }
 }
 
