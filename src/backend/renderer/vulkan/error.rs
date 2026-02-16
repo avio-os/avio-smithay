@@ -13,7 +13,7 @@ pub enum VulkanRendererErrorKind {
     TemporaryFailure,
 }
 
-/// Error type for phase-1 Vulkan renderer scaffolding.
+/// Error type for phase-3 Vulkan renderer scaffolding.
 #[derive(Debug, thiserror::Error)]
 pub enum VulkanRendererError {
     /// Required Vulkan device extensions are unavailable.
@@ -34,6 +34,37 @@ pub enum VulkanRendererError {
     /// Vulkan API error.
     #[error(transparent)]
     Vk(#[from] vk::Result),
+
+    /// Unsupported dma-buf format/modifier for the requested usage.
+    #[error("unsupported dma-buf format for Vulkan import/bind: {0:?}")]
+    UnsupportedDmabufFormat(crate::backend::allocator::Format),
+
+    /// dma-buf metadata did not pass strict validation.
+    #[error("invalid dma-buf metadata: {0}")]
+    InvalidDmabuf(&'static str),
+
+    /// dma-buf multi-fd/disjoint imports are currently unsupported.
+    #[error("dma-buf disjoint/multi-fd imports are currently unsupported")]
+    UnsupportedDmabufDisjoint,
+
+    /// dma-buf plane count does not match modifier requirements.
+    #[error("dma-buf plane count mismatch for modifier {modifier:?}: expected {expected}, got {actual}")]
+    DmabufPlaneCountMismatch {
+        /// Modifier that was validated.
+        modifier: crate::backend::allocator::Modifier,
+        /// Expected number of planes.
+        expected: u32,
+        /// Actual number of planes.
+        actual: usize,
+    },
+
+    /// No compatible memory type for an imported image.
+    #[error("no compatible Vulkan memory type for dma-buf import")]
+    NoCompatibleMemoryType,
+
+    /// Operating system I/O error during dma-buf import.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 
     /// The Vulkan renderer context has been lost and must be recreated.
     #[error("vulkan renderer context lost: {0}")]
@@ -57,9 +88,14 @@ impl VulkanRendererError {
             | VulkanRendererError::MissingQueueFamily { .. }
             | VulkanRendererError::Vk(_)
             | VulkanRendererError::ContextLost(_) => VulkanRendererErrorKind::ContextLost,
-            VulkanRendererError::TemporaryFailure(_) | VulkanRendererError::NotImplemented(_) => {
-                VulkanRendererErrorKind::TemporaryFailure
-            }
+            VulkanRendererError::UnsupportedDmabufFormat(_)
+            | VulkanRendererError::InvalidDmabuf(_)
+            | VulkanRendererError::UnsupportedDmabufDisjoint
+            | VulkanRendererError::DmabufPlaneCountMismatch { .. }
+            | VulkanRendererError::NoCompatibleMemoryType
+            | VulkanRendererError::Io(_)
+            | VulkanRendererError::TemporaryFailure(_)
+            | VulkanRendererError::NotImplemented(_) => VulkanRendererErrorKind::TemporaryFailure,
         }
     }
 
