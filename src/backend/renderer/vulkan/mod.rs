@@ -1,8 +1,8 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module currently includes phase-5 device, dma-buf import/bind, descriptor,
-//! pipeline, and frame-recording infrastructure. Sync bridges and memory upload/
-//! readback paths are implemented in later phases.
+//! This module currently includes phase-6 device, dma-buf import/bind, descriptor,
+//! pipeline, frame-recording infrastructure, and explicit sync bridge support.
+//! Memory upload/readback paths are implemented in later phases.
 
 #![allow(dead_code)]
 
@@ -95,6 +95,19 @@ impl VulkanRenderer {
     /// Returns whether timeline semaphore support was detected.
     pub fn supports_timeline_semaphore(&self) -> bool {
         self.device.capabilities().timeline_semaphore()
+    }
+
+    /// Returns whether importing native sync-file fds into Vulkan wait paths is supported.
+    ///
+    /// When this is `false`, `Renderer::wait` and `Frame::wait` fall back to blocking on
+    /// the provided `SyncPoint` at the host level.
+    pub fn supports_explicit_sync_import(&self) -> bool {
+        self.device.supports_sync_file_import()
+    }
+
+    /// Returns whether submitted frame fences can be exported as native sync-file fds.
+    pub fn supports_explicit_sync_export(&self) -> bool {
+        self.device.supports_sync_file_export()
     }
 
     /// Returns the enabled Vulkan device extensions.

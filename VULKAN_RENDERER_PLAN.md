@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-5 complete on 2026-02-16)  
+Status: Draft (Phases 0-6 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -198,14 +198,18 @@ Exit criteria:
 
 ## Phase 6: SyncPoint bridge and explicit sync
 
-- [ ] Add Vulkan fence wrapper implementing Smithay `Fence`.
-- [ ] Export sync fd from submitted work where supported.
-- [ ] Import `SyncPoint` fd into Vulkan wait path for `Renderer::wait` and `Frame::wait`.
-- [ ] Fallback to blocking wait when import/export is unavailable.
-- [ ] Document sync guarantees and limitations by driver capability.
+- [x] Add Vulkan fence wrapper implementing Smithay `Fence`.
+- [x] Export sync fd from submitted work where supported.
+- [x] Import `SyncPoint` fd into Vulkan wait path for `Renderer::wait` and `Frame::wait`.
+- [x] Fallback to blocking wait when import/export is unavailable.
+- [x] Document sync guarantees and limitations by driver capability.
 
 Exit criteria:
 - Explicit sync tests pass and no deadlock or missed-wait regressions appear under stress.
+- Verified on 2026-02-16 with:
+  - `cargo check --no-default-features --features renderer_vulkan`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::frame::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan renderer_create_drop_loop -- --nocapture`
 
 ## Phase 7: Memory import path (shm / CPU upload)
 
@@ -358,7 +362,7 @@ Minimum matrix before production recommendation:
 - [x] Format/modifier negotiation complete.
 - [x] dmabuf import/bind robust under stress.
 - [x] Frame lifecycle and submission semantics complete.
-- [ ] Explicit sync integration complete.
+- [x] Explicit sync integration complete.
 - [ ] Memory upload path complete.
 - [ ] Export/offscreen/readback complete.
 - [ ] Blit and multigpu compatibility complete.

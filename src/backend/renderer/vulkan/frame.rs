@@ -23,7 +23,8 @@ use super::{
     pipeline::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
     },
-    VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
+    sync::VulkanFence,
+    VulkanRenderer, VulkanRendererError, VulkanRendererErrorKind, VulkanTarget, VulkanTexture,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -197,6 +198,30 @@ impl Renderer for VulkanRenderer {
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+        if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
+            return vulkan_fence
+                .wait_vk()
+                .map_err(|_| VulkanRendererError::TemporaryFailure("sync wait was interrupted"));
+        }
+
+        if self.device.supports_sync_file_import() {
+            if let Some(sync_file) = sync.export() {
+                match self.device.wait_on_sync_file(sync_file) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        if err.kind() == VulkanRendererErrorKind::ContextLost {
+                            return Err(err);
+                        }
+
+                        warn!(
+                            ?err,
+                            "failed to import SyncPoint fd into Vulkan wait path; falling back to blocking wait"
+                        );
+                    }
+                }
+            }
+        }
+
         sync.wait()
             .map_err(|_| VulkanRendererError::TemporaryFailure("sync wait was interrupted"))
     }
@@ -734,25 +759,28 @@ impl VulkanFrame<'_> {
             return Err(err.into());
         }
 
-        if let Err(err) = self
+        let (_, submission_fence) = match self
             .renderer
             .device
-            .submit_with_framebuffers(recording.command_buffer, vec![recording.framebuffer])
+            .submit_with_framebuffers_and_fence(recording.command_buffer, vec![recording.framebuffer])
         {
-            let _ = self
-                .renderer
-                .device
-                .discard_command_buffer(recording.command_buffer);
-            self.state = VulkanFrameState::Aborted;
-            return Err(err);
-        }
+            Ok(submission) => submission,
+            Err(err) => {
+                let _ = self
+                    .renderer
+                    .device
+                    .discard_command_buffer(recording.command_buffer);
+                self.state = VulkanFrameState::Aborted;
+                return Err(err);
+            }
+        };
 
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
             image.set_layout(layout);
         }
 
         self.state = VulkanFrameState::Finished;
-        Ok(SyncPoint::signaled())
+        Ok(SyncPoint::from(submission_fence))
     }
 }
 
@@ -1026,6 +1054,18 @@ mod tests {
         let sync = frame
             .finish()
             .expect("finishing frame should submit work successfully");
+        assert!(
+            sync.contains_fence(),
+            "finished Vulkan frame should return a fence-backed sync point",
+        );
+        assert_eq!(
+            sync.is_exportable(),
+            renderer.supports_explicit_sync_export(),
+            "sync point exportability should match device explicit-sync export capability",
+        );
+        renderer
+            .wait(&sync)
+            .expect("renderer wait should accept Vulkan fence-backed sync points");
         let _ = sync.wait();
 
         assert_eq!(
