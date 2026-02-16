@@ -1,8 +1,8 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module currently includes the phase-4 device, dma-buf import, descriptor,
-//! and graphics pipeline infrastructure. Full trait-backed frame rendering is
-//! deferred to later phases.
+//! This module currently includes phase-5 device, dma-buf import/bind, descriptor,
+//! pipeline, and frame-recording infrastructure. Sync bridges and memory upload/
+//! readback paths are implemented in later phases.
 
 #![allow(dead_code)]
 
@@ -28,7 +28,7 @@ use std::ffi::CStr;
 
 use crate::backend::{
     allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc, Modifier},
-    renderer::DebugFlags,
+    renderer::{ContextId, DebugFlags, TextureFilter},
     vulkan::PhysicalDevice,
 };
 
@@ -38,9 +38,12 @@ use self::dmabuf::DmabufState;
 use self::format::FormatCapabilities;
 use self::pipeline::PipelineState;
 
-/// Compile-only placeholder for the upcoming Vulkan renderer implementation.
+/// Vulkan renderer implementation under active phased development.
 #[derive(Debug)]
 pub struct VulkanRenderer {
+    context_id: ContextId<VulkanTexture>,
+    downscale_filter: TextureFilter,
+    upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
     device: DeviceState,
     formats: FormatCapabilities,
@@ -62,6 +65,9 @@ impl VulkanRenderer {
         let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout())?;
 
         Ok(Self {
+            context_id: ContextId::new(),
+            downscale_filter: TextureFilter::Linear,
+            upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
             device,
             formats: FormatCapabilities::new(physical_device)?,

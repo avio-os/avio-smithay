@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     os::fd::{AsRawFd, IntoRawFd},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
 };
 
 use ash::vk;
@@ -387,6 +390,7 @@ impl DmabufState {
             vk_format: descriptor.vk_format,
             usage,
             y_inverted: descriptor.signature.y_inverted,
+            layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
             device: device_handle,
         }))
     }
@@ -415,6 +419,7 @@ pub(crate) struct ImportedDmabufImage {
     vk_format: vk::Format,
     usage: vk::ImageUsageFlags,
     y_inverted: bool,
+    layout: AtomicI32,
     device: Arc<DeviceHandle>,
 }
 
@@ -439,8 +444,36 @@ impl ImportedDmabufImage {
         self.import_id
     }
 
+    pub(crate) fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub(crate) fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    pub(crate) fn vk_format(&self) -> vk::Format {
+        self.vk_format
+    }
+
+    pub(crate) fn size(&self) -> Size<i32, BufferCoord> {
+        self.size
+    }
+
     pub(crate) fn usage(&self) -> vk::ImageUsageFlags {
         self.usage
+    }
+
+    pub(crate) fn y_inverted(&self) -> bool {
+        self.y_inverted
+    }
+
+    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
+        vk::ImageLayout::from_raw(self.layout.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_layout(&self, layout: vk::ImageLayout) {
+        self.layout.store(layout.as_raw(), Ordering::Relaxed);
     }
 }
 

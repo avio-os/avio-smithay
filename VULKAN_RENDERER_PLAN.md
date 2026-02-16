@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-4 complete on 2026-02-16)  
+Status: Draft (Phases 0-5 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -186,14 +186,15 @@ Exit criteria:
 
 ## Phase 5: Frame implementation
 
-- [ ] Implement `Renderer::render`.
-- [ ] Implement `Frame` methods and shared draw internals.
-- [ ] Correctly handle output transform and projection mapping.
-- [ ] Implement damage-scissoring and opaque-region optimizations.
-- [ ] Implement robust `finish` semantics with exactly-once submission behavior.
+- [x] Implement `Renderer::render`.
+- [x] Implement `Frame` methods and shared draw internals.
+- [x] Correctly handle output transform and projection mapping.
+- [x] Implement damage-scissoring and opaque-region optimizations.
+- [x] Implement robust `finish` semantics with exactly-once submission behavior.
 
 Exit criteria:
 - Rendering operations behave correctly for all transforms and damage scenarios in tests.
+- Verified on 2026-02-16 with `cargo test --no-default-features --features renderer_vulkan vulkan::frame::tests -- --nocapture`.
 
 ## Phase 6: SyncPoint bridge and explicit sync
 
@@ -356,7 +357,7 @@ Minimum matrix before production recommendation:
 - [ ] Extended traits implemented and validated.
 - [x] Format/modifier negotiation complete.
 - [x] dmabuf import/bind robust under stress.
-- [ ] Frame lifecycle and submission semantics complete.
+- [x] Frame lifecycle and submission semantics complete.
 - [ ] Explicit sync integration complete.
 - [ ] Memory upload path complete.
 - [ ] Export/offscreen/readback complete.

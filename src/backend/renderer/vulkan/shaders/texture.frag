@@ -7,6 +7,8 @@ layout(push_constant) uniform TexturePushConstants {
     uint transform;
     uint y_inverted;
     uint _pad0;
+    vec2 src_offset;
+    vec2 src_scale;
 } constants;
 
 layout(location = 0) in vec2 in_uv;
@@ -47,6 +49,8 @@ void main() {
     if (constants.y_inverted != 0u) {
         uv.y = 1.0 - uv.y;
     }
+
+    uv = constants.src_offset + (uv * constants.src_scale);
 
     vec4 sampled = texture(texture_sampler, uv);
     out_color = vec4(sampled.rgb, sampled.a * constants.alpha);

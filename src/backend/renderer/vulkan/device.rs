@@ -15,6 +15,7 @@ struct InFlightSubmission {
     id: SubmissionId,
     fence: vk::Fence,
     command_buffer: vk::CommandBuffer,
+    framebuffers: Vec<vk::Framebuffer>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -213,6 +214,14 @@ impl DeviceState {
         &mut self,
         command_buffer: vk::CommandBuffer,
     ) -> Result<SubmissionId, VulkanRendererError> {
+        self.submit_with_framebuffers(command_buffer, Vec::new())
+    }
+
+    pub(crate) fn submit_with_framebuffers(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        framebuffers: Vec<vk::Framebuffer>,
+    ) -> Result<SubmissionId, VulkanRendererError> {
         let fence_info = vk::FenceCreateInfo::default();
         // SAFETY: Device is valid, create info references no borrowed resources.
         let fence = unsafe { self.device.handle().create_fence(&fence_info, None) }?;
@@ -225,6 +234,10 @@ impl DeviceState {
         if let Err(err) = unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) } {
             // SAFETY: Fence was created by this device and has not been submitted on failure path.
             unsafe { self.device.handle().destroy_fence(fence, None) };
+            for framebuffer in framebuffers {
+                // SAFETY: Framebuffer belongs to this device and is not referenced by a failed submission.
+                unsafe { self.device.handle().destroy_framebuffer(framebuffer, None) };
+            }
             return Err(err.into());
         }
 
@@ -234,9 +247,29 @@ impl DeviceState {
             id,
             fence,
             command_buffer,
+            framebuffers,
         });
 
         Ok(id)
+    }
+
+    pub(crate) fn discard_command_buffer(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), VulkanRendererError> {
+        // SAFETY: Command buffer belongs to `self.command_pool` and is not in-flight because
+        // it was never submitted.
+        unsafe {
+            self.device
+                .handle()
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+        }?;
+        self.reusable_command_buffers.push(command_buffer);
+        Ok(())
+    }
+
+    pub(crate) fn in_flight_submission_count(&self) -> usize {
+        self.in_flight_submissions.len()
     }
 
     pub(crate) fn reclaim_completed_submissions(&mut self) -> Result<(), VulkanRendererError> {
@@ -276,17 +309,30 @@ impl DeviceState {
     }
 
     fn recycle_submission(&mut self, submission: InFlightSubmission) -> Result<(), VulkanRendererError> {
+        let InFlightSubmission {
+            fence,
+            command_buffer,
+            framebuffers,
+            ..
+        } = submission;
+
+        for framebuffer in framebuffers {
+            // SAFETY: The submission fence is already signaled when this method is called,
+            // so command buffer execution is complete and framebuffer handles may be destroyed.
+            unsafe { self.device.handle().destroy_framebuffer(framebuffer, None) };
+        }
+
         // SAFETY: Command buffer belongs to `self.command_pool` and can be reset because the associated fence
         // is known to be signaled before this method is called.
         unsafe {
             self.device
                 .handle()
-                .reset_command_buffer(submission.command_buffer, vk::CommandBufferResetFlags::empty())
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
         }?;
 
         // SAFETY: Fence was created by this device and is no longer needed after completion.
-        unsafe { self.device.handle().destroy_fence(submission.fence, None) };
-        self.reusable_command_buffers.push(submission.command_buffer);
+        unsafe { self.device.handle().destroy_fence(fence, None) };
+        self.reusable_command_buffers.push(command_buffer);
         Ok(())
     }
 
