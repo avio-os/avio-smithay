@@ -1,8 +1,9 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module currently includes phase-8 device, dma-buf import/bind, descriptor,
+//! This module currently includes phase-9 device, dma-buf import/bind, descriptor,
 //! pipeline, frame-recording infrastructure, explicit sync bridge support, memory
-//! upload support for shared-memory client paths, and readback/offscreen support.
+//! upload support for shared-memory client paths, readback/offscreen support, and
+//! framebuffer blit support.
 
 #![allow(dead_code)]
 
@@ -32,6 +33,7 @@ use crate::backend::{
     vulkan::PhysicalDevice,
 };
 
+use self::blit::BlitState;
 use self::descriptor::DescriptorState;
 use self::device::DeviceState;
 use self::dmabuf::DmabufState;
@@ -52,6 +54,7 @@ pub struct VulkanRenderer {
     dmabuf: DmabufState,
     upload: UploadState,
     readback: ReadbackState,
+    blit: BlitState,
     descriptors: DescriptorState,
     pipelines: PipelineState,
 }
@@ -78,6 +81,7 @@ impl VulkanRenderer {
             dmabuf: DmabufState::default(),
             upload: UploadState::default(),
             readback: ReadbackState::default(),
+            blit: BlitState::default(),
             descriptors,
             pipelines,
         })

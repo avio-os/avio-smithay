@@ -69,14 +69,8 @@ impl fmt::Debug for DeviceState {
             .field("in_flight_submissions", &self.in_flight_submissions.len())
             .field("next_submission_id", &self.next_submission_id)
             .field("device", &self.device.handle().handle())
-            .field(
-                "supports_sync_file_import",
-                &self.capabilities.sync_file_import(),
-            )
-            .field(
-                "supports_sync_file_export",
-                &self.capabilities.sync_file_export(),
-            )
+            .field("supports_sync_file_import", &self.capabilities.sync_file_import())
+            .field("supports_sync_file_export", &self.capabilities.sync_file_export())
             .finish()
     }
 }
@@ -501,32 +495,32 @@ impl DeviceState {
         // SAFETY: `features2` points to valid writable memory and the physical device belongs to this instance.
         unsafe { instance.get_physical_device_features2(physical_device.handle(), &mut features2) };
 
-        let (sync_file_import, sync_file_export) = if enabled_extensions.contains(&khr::external_fence_fd::NAME)
-        {
-            let fence_info = vk::PhysicalDeviceExternalFenceInfo::default()
-                .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-            let mut fence_properties = vk::ExternalFenceProperties::default();
+        let (sync_file_import, sync_file_export) =
+            if enabled_extensions.contains(&khr::external_fence_fd::NAME) {
+                let fence_info = vk::PhysicalDeviceExternalFenceInfo::default()
+                    .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+                let mut fence_properties = vk::ExternalFenceProperties::default();
 
-            // SAFETY: `fence_properties` points to valid writable memory and `fence_info` outlives the call.
-            unsafe {
-                instance.get_physical_device_external_fence_properties(
-                    physical_device.handle(),
-                    &fence_info,
-                    &mut fence_properties,
+                // SAFETY: `fence_properties` points to valid writable memory and `fence_info` outlives the call.
+                unsafe {
+                    instance.get_physical_device_external_fence_properties(
+                        physical_device.handle(),
+                        &fence_info,
+                        &mut fence_properties,
+                    )
+                };
+
+                (
+                    fence_properties
+                        .external_fence_features
+                        .contains(vk::ExternalFenceFeatureFlags::IMPORTABLE),
+                    fence_properties
+                        .external_fence_features
+                        .contains(vk::ExternalFenceFeatureFlags::EXPORTABLE),
                 )
+            } else {
+                (false, false)
             };
-
-            (
-                fence_properties
-                    .external_fence_features
-                    .contains(vk::ExternalFenceFeatureFlags::IMPORTABLE),
-                fence_properties
-                    .external_fence_features
-                    .contains(vk::ExternalFenceFeatureFlags::EXPORTABLE),
-            )
-        } else {
-            (false, false)
-        };
 
         DeviceCapabilities {
             timeline_semaphore: timeline.timeline_semaphore == vk::TRUE,

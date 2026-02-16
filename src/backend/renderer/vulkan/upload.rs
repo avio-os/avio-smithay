@@ -133,8 +133,7 @@ impl ImportMem for VulkanRenderer {
         data: &[u8],
         region: Rectangle<i32, BufferCoord>,
     ) -> Result<(), Self::Error> {
-        self.upload
-            .update_memory(&mut self.device, texture, data, region)
+        self.upload.update_memory(&mut self.device, texture, data, region)
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -167,11 +166,9 @@ impl ImportMemWl for VulkanRenderer {
                 ));
             }
 
-            let row_bytes = (data.width as usize)
-                .checked_mul(bytes_per_pixel)
-                .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                    "wl_shm row byte count overflowed",
-                ))?;
+            let row_bytes = (data.width as usize).checked_mul(bytes_per_pixel).ok_or(
+                VulkanRendererError::InvalidMemoryUpload("wl_shm row byte count overflowed"),
+            )?;
             if (data.stride as usize) < row_bytes {
                 return Err(VulkanRendererError::InvalidMemoryUpload(
                     "wl_shm stride is smaller than width * bytes_per_pixel",
@@ -189,13 +186,9 @@ impl ImportMemWl for VulkanRenderer {
             })?;
 
             let expected_len = src_offset
-                .checked_add(
-                    (height - 1)
-                        .checked_mul(src_stride)
-                        .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                            "wl_shm payload size overflowed",
-                        ))?,
-                )
+                .checked_add((height - 1).checked_mul(src_stride).ok_or(
+                    VulkanRendererError::InvalidMemoryUpload("wl_shm payload size overflowed"),
+                )?)
                 .and_then(|base| base.checked_add(row_bytes))
                 .ok_or(VulkanRendererError::InvalidMemoryUpload(
                     "wl_shm payload size overflowed",
@@ -210,9 +203,7 @@ impl ImportMemWl for VulkanRenderer {
             let mut packed = vec![
                 0u8;
                 row_bytes.checked_mul(height).ok_or(
-                    VulkanRendererError::InvalidMemoryUpload(
-                        "packed wl_shm upload size overflowed",
-                    ),
+                    VulkanRendererError::InvalidMemoryUpload("packed wl_shm upload size overflowed",),
                 )?
             ];
 
@@ -257,11 +248,12 @@ fn upload_region_to_image(
         .map_err(|_| VulkanRendererError::InvalidMemoryUpload("upload width could not be represented"))?;
     let upload_height = usize::try_from(region.size.h)
         .map_err(|_| VulkanRendererError::InvalidMemoryUpload("upload height could not be represented"))?;
-    let upload_row_bytes = upload_width
-        .checked_mul(bytes_per_pixel)
-        .ok_or(VulkanRendererError::InvalidMemoryUpload(
-            "upload row byte count overflowed",
-        ))?;
+    let upload_row_bytes =
+        upload_width
+            .checked_mul(bytes_per_pixel)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "upload row byte count overflowed",
+            ))?;
     let upload_len = upload_row_bytes
         .checked_mul(upload_height)
         .ok_or(VulkanRendererError::InvalidMemoryUpload("upload size overflowed"))?;
@@ -388,16 +380,19 @@ fn write_region_to_staging_memory(
     let upload_height = usize::try_from(region.size.h)
         .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region height conversion failed"))?;
 
-    let src_stride = texture_width
-        .checked_mul(bytes_per_pixel)
-        .ok_or(VulkanRendererError::InvalidMemoryUpload(
-            "source stride overflowed",
-        ))?;
+    let src_stride =
+        texture_width
+            .checked_mul(bytes_per_pixel)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "source stride overflowed",
+            ))?;
 
-    let map_size = (upload_row_bytes
-        .checked_mul(upload_height)
-        .ok_or(VulkanRendererError::InvalidMemoryUpload("mapped upload size overflowed"))?)
-        as vk::DeviceSize;
+    let map_size =
+        (upload_row_bytes
+            .checked_mul(upload_height)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "mapped upload size overflowed",
+            ))?) as vk::DeviceSize;
 
     let vk_device = device.device_handle();
     // SAFETY: Memory was allocated by this device and mapped range is bounded to the staging allocation size.
@@ -411,14 +406,17 @@ fn write_region_to_staging_memory(
             .ok_or(VulkanRendererError::InvalidMemoryUpload(
                 "source row offset overflowed",
             ))?;
-        let src_row_end = src_row_start
-            .checked_add(upload_row_bytes)
-            .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                "source row range overflowed",
-            ))?;
-        let src_row = data.get(src_row_start..src_row_end).ok_or(
-            VulkanRendererError::InvalidMemoryUpload("source data slice is out of bounds"),
-        )?;
+        let src_row_end =
+            src_row_start
+                .checked_add(upload_row_bytes)
+                .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                    "source row range overflowed",
+                ))?;
+        let src_row =
+            data.get(src_row_start..src_row_end)
+                .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                    "source data slice is out of bounds",
+                ))?;
 
         // SAFETY: Mapped pointer is valid for `map_size` bytes and destination offsets are range-checked above.
         unsafe {
@@ -536,10 +534,7 @@ fn bytes_per_pixel(format: Fourcc) -> Result<usize, VulkanRendererError> {
     Ok(bytes)
 }
 
-fn expected_len_for_size(
-    format: Fourcc,
-    size: Size<i32, BufferCoord>,
-) -> Result<usize, VulkanRendererError> {
+fn expected_len_for_size(format: Fourcc, size: Size<i32, BufferCoord>) -> Result<usize, VulkanRendererError> {
     if size.w <= 0 || size.h <= 0 {
         return Err(VulkanRendererError::InvalidMemoryUpload(
             "texture dimensions must be positive",
@@ -849,7 +844,10 @@ mod tests {
             return;
         };
 
-        let format = renderer.mem_formats().next().expect("phase-7 must expose mem formats");
+        let format = renderer
+            .mem_formats()
+            .next()
+            .expect("phase-7 must expose mem formats");
         let size: Size<i32, BufferCoord> = Size::from((16, 16));
         let data = vec![255u8; (size.w * size.h * 4) as usize];
 

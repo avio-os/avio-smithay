@@ -718,7 +718,12 @@ mod tests {
     }
 
     fn first_working_offscreen_format(renderer: &mut VulkanRenderer) -> Option<Fourcc> {
-        for format in [Fourcc::Argb8888, Fourcc::Abgr8888, Fourcc::Xrgb8888, Fourcc::Xbgr8888] {
+        for format in [
+            Fourcc::Argb8888,
+            Fourcc::Abgr8888,
+            Fourcc::Xrgb8888,
+            Fourcc::Xbgr8888,
+        ] {
             if renderer.create_buffer(format, Size::from((4, 4))).is_ok() {
                 return Some(format);
             }
