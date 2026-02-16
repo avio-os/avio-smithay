@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, ffi::CStr, fmt};
+use std::{collections::VecDeque, ffi::CStr, fmt, sync::Arc};
 
 use ash::{ext, khr, vk};
 use tracing::warn;
@@ -38,7 +38,7 @@ pub(crate) struct DeviceState {
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
     next_submission_id: u64,
-    device: ash::Device,
+    device: Arc<DeviceHandle>,
 }
 
 impl fmt::Debug for DeviceState {
@@ -53,8 +53,33 @@ impl fmt::Debug for DeviceState {
             .field("reusable_command_buffers", &self.reusable_command_buffers.len())
             .field("in_flight_submissions", &self.in_flight_submissions.len())
             .field("next_submission_id", &self.next_submission_id)
+            .field("device", &self.device.handle().handle())
+            .finish()
+    }
+}
+
+pub(super) struct DeviceHandle {
+    device: ash::Device,
+}
+
+impl fmt::Debug for DeviceHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceHandle")
             .field("device", &self.device.handle())
             .finish()
+    }
+}
+
+impl DeviceHandle {
+    pub(super) fn handle(&self) -> &ash::Device {
+        &self.device
+    }
+}
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        // SAFETY: Device destruction happens once, after all dependent resources are dropped.
+        unsafe { self.device.destroy_device(None) };
     }
 }
 
@@ -103,23 +128,23 @@ impl DeviceState {
         let instance = physical_device.instance().handle();
         // SAFETY: The physical device belongs to this instance and all pointers in create_info
         // are valid for the duration of this call.
-        let device = unsafe { instance.create_device(physical_device.handle(), &create_info, None) }?;
+        let raw_device = unsafe { instance.create_device(physical_device.handle(), &create_info, None) }?;
 
         let queue = {
             // SAFETY: Queue family/index are valid for this device by construction in select_queue_family.
-            unsafe { device.get_device_queue(queue_family_index, 0) }
+            unsafe { raw_device.get_device_queue(queue_family_index, 0) }
         };
+
+        let device = Arc::new(DeviceHandle { device: raw_device });
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
         // SAFETY: Device is valid and create info references live data.
-        let command_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+        let command_pool = match unsafe { device.handle().create_command_pool(&pool_info, None) } {
             Ok(pool) => pool,
             Err(err) => {
-                // SAFETY: Device was created successfully and must be destroyed on this error path.
-                unsafe { device.destroy_device(None) };
                 return Err(err.into());
             }
         };
@@ -150,6 +175,18 @@ impl DeviceState {
         &self.enabled_extensions
     }
 
+    pub(crate) fn physical_device(&self) -> &PhysicalDevice {
+        &self.physical_device
+    }
+
+    pub(crate) fn device_handle(&self) -> &ash::Device {
+        self.device.handle()
+    }
+
+    pub(crate) fn shared_device(&self) -> Arc<DeviceHandle> {
+        self.device.clone()
+    }
+
     pub(crate) fn acquire_command_buffer(&mut self) -> Result<vk::CommandBuffer, VulkanRendererError> {
         self.reclaim_completed_submissions()?;
 
@@ -163,7 +200,7 @@ impl DeviceState {
             .command_buffer_count(1);
 
         // SAFETY: Device and command pool are valid, allocation info references live data.
-        let command_buffers = unsafe { self.device.allocate_command_buffers(&alloc_info) }?;
+        let command_buffers = unsafe { self.device.handle().allocate_command_buffers(&alloc_info) }?;
         command_buffers
             .into_iter()
             .next()
@@ -178,16 +215,16 @@ impl DeviceState {
     ) -> Result<SubmissionId, VulkanRendererError> {
         let fence_info = vk::FenceCreateInfo::default();
         // SAFETY: Device is valid, create info references no borrowed resources.
-        let fence = unsafe { self.device.create_fence(&fence_info, None) }?;
+        let fence = unsafe { self.device.handle().create_fence(&fence_info, None) }?;
 
         let command_buffers = [command_buffer];
         let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
 
         // SAFETY: Queue, fence, and command buffers are valid; host-side synchronization is upheld by
         // requiring &mut self for submissions.
-        if let Err(err) = unsafe { self.device.queue_submit(self.queue, &submit_info, fence) } {
+        if let Err(err) = unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) } {
             // SAFETY: Fence was created by this device and has not been submitted on failure path.
-            unsafe { self.device.destroy_fence(fence, None) };
+            unsafe { self.device.handle().destroy_fence(fence, None) };
             return Err(err.into());
         }
 
@@ -209,7 +246,7 @@ impl DeviceState {
             };
 
             // SAFETY: Fence was created by this device and remains valid while tracked in `in_flight_submissions`.
-            let signaled = unsafe { self.device.get_fence_status(front.fence) }?;
+            let signaled = unsafe { self.device.handle().get_fence_status(front.fence) }?;
             if !signaled {
                 break;
             }
@@ -227,7 +264,11 @@ impl DeviceState {
     pub(crate) fn wait_for_all_submissions(&mut self) -> Result<(), VulkanRendererError> {
         while let Some(submission) = self.in_flight_submissions.pop_front() {
             // SAFETY: Fence was created by this device and remains valid while tracked.
-            unsafe { self.device.wait_for_fences(&[submission.fence], true, u64::MAX) }?;
+            unsafe {
+                self.device
+                    .handle()
+                    .wait_for_fences(&[submission.fence], true, u64::MAX)
+            }?;
             self.recycle_submission(submission)?;
         }
 
@@ -239,11 +280,12 @@ impl DeviceState {
         // is known to be signaled before this method is called.
         unsafe {
             self.device
+                .handle()
                 .reset_command_buffer(submission.command_buffer, vk::CommandBufferResetFlags::empty())
         }?;
 
         // SAFETY: Fence was created by this device and is no longer needed after completion.
-        unsafe { self.device.destroy_fence(submission.fence, None) };
+        unsafe { self.device.handle().destroy_fence(submission.fence, None) };
         self.reusable_command_buffers.push(submission.command_buffer);
         Ok(())
     }
@@ -320,7 +362,7 @@ impl Drop for DeviceState {
         }
 
         // SAFETY: Synchronization for queue operations is handled by `&mut self` in all queue-touching APIs.
-        if let Err(err) = unsafe { self.device.queue_wait_idle(self.queue) } {
+        if let Err(err) = unsafe { self.device.handle().queue_wait_idle(self.queue) } {
             warn!(
                 ?err,
                 "failed to wait for Vulkan queue idle during renderer teardown"
@@ -328,8 +370,6 @@ impl Drop for DeviceState {
         }
 
         // SAFETY: Command pool belongs to this device and may be destroyed after queue idle.
-        unsafe { self.device.destroy_command_pool(self.command_pool, None) };
-        // SAFETY: No owned Vulkan objects depending on the device remain after command pool destruction.
-        unsafe { self.device.destroy_device(None) };
+        unsafe { self.device.handle().destroy_command_pool(self.command_pool, None) };
     }
 }

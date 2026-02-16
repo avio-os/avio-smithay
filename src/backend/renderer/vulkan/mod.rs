@@ -27,12 +27,13 @@ pub use texture::VulkanTexture;
 use std::ffi::CStr;
 
 use crate::backend::{
-    allocator::{format::FormatSet, Format, Fourcc, Modifier},
+    allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc, Modifier},
     renderer::DebugFlags,
     vulkan::PhysicalDevice,
 };
 
 use self::device::DeviceState;
+use self::dmabuf::DmabufState;
 use self::format::FormatCapabilities;
 
 /// Compile-only placeholder for the upcoming Vulkan renderer implementation.
@@ -41,6 +42,7 @@ pub struct VulkanRenderer {
     debug_flags: DebugFlags,
     device: DeviceState,
     formats: FormatCapabilities,
+    dmabuf: DmabufState,
 }
 
 impl VulkanRenderer {
@@ -55,6 +57,7 @@ impl VulkanRenderer {
             debug_flags: DebugFlags::empty(),
             device: DeviceState::new(physical_device)?,
             formats: FormatCapabilities::new(physical_device)?,
+            dmabuf: DmabufState::default(),
         })
     }
 
@@ -131,6 +134,22 @@ impl VulkanRenderer {
     /// Returns whether implicit modifier support (`Modifier::Invalid`) exists for render-target use.
     pub fn supports_implicit_render_modifier(&self, code: Fourcc) -> bool {
         self.formats.supports_implicit_render_modifier(code)
+    }
+
+    /// Import a dma-buf as a sampled texture.
+    pub fn import_dmabuf_texture(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTexture, VulkanRendererError> {
+        self.dmabuf.import_texture(&self.device, &self.formats, dmabuf)
+    }
+
+    /// Bind a dma-buf for render-target usage.
+    pub fn bind_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTarget, VulkanRendererError> {
+        self.dmabuf
+            .bind_render_target(&self.device, &self.formats, dmabuf)
+    }
+
+    /// Drop stale cached dma-buf imports.
+    pub fn cleanup_dmabuf_cache(&mut self) {
+        self.dmabuf.cleanup();
     }
 
     /// Returns a standardized "not implemented" error.

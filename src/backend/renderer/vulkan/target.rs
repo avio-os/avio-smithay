@@ -3,17 +3,41 @@ use crate::{
     utils::{Buffer as BufferCoord, Size},
 };
 
+use super::dmabuf::ImportedDmabufImage;
+use std::sync::Arc;
+
 /// Placeholder Vulkan render target handle for phase-0 scaffolding.
 #[derive(Debug, Clone)]
 pub struct VulkanTarget {
     size: Size<i32, BufferCoord>,
     format: Option<Fourcc>,
+    imported: Option<Arc<ImportedDmabufImage>>,
 }
 
 impl VulkanTarget {
     /// Creates a placeholder render-target description.
     pub fn new(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Self {
-        Self { size, format }
+        Self {
+            size,
+            format,
+            imported: None,
+        }
+    }
+
+    pub(crate) fn from_dmabuf_import(
+        imported: Arc<ImportedDmabufImage>,
+        size: Size<i32, BufferCoord>,
+        format: Option<Fourcc>,
+    ) -> Self {
+        Self {
+            size,
+            format,
+            imported: Some(imported),
+        }
+    }
+
+    pub(crate) fn imported_image_id(&self) -> Option<u64> {
+        self.imported.as_ref().map(|image| image.id())
     }
 }
 

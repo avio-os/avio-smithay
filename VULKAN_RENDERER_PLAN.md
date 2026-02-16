@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-2 complete on 2026-02-16)  
+Status: Draft (Phases 0-3 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -162,14 +162,15 @@ Exit criteria:
 
 ## Phase 3: dmabuf import and bind
 
-- [ ] Implement dmabuf to `VkImage` import for sampled textures.
-- [ ] Implement dmabuf to render-target bind path (image view + framebuffer attachments).
-- [ ] Add cache keys using `WeakDmabuf` plus metadata validation.
-- [ ] Handle re-import, stale cache, and lifetimes correctly.
-- [ ] Include strict validation for plane count, strides, offsets, modifiers, and usage flags.
+- [x] Implement dmabuf to `VkImage` import for sampled textures.
+- [x] Implement dmabuf to render-target bind path (image view + framebuffer attachments).
+- [x] Add cache keys using `WeakDmabuf` plus metadata validation.
+- [x] Handle re-import, stale cache, and lifetimes correctly.
+- [x] Include strict validation for plane count, strides, offsets, modifiers, and usage flags.
 
 Exit criteria:
 - Import/bind passes stress tests for rapid create/destroy and repeated frame usage.
+- Verified on 2026-02-16 with `cargo test --no-default-features --features renderer_vulkan vulkan::dmabuf::tests -- --nocapture`.
 
 ## Phase 4: Pipeline and shader system
 
@@ -353,7 +354,7 @@ Minimum matrix before production recommendation:
 - [ ] Core traits implemented and validated.
 - [ ] Extended traits implemented and validated.
 - [x] Format/modifier negotiation complete.
-- [ ] dmabuf import/bind robust under stress.
+- [x] dmabuf import/bind robust under stress.
 - [ ] Frame lifecycle and submission semantics complete.
 - [ ] Explicit sync integration complete.
 - [ ] Memory upload path complete.
