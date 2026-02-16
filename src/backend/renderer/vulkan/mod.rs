@@ -1,7 +1,7 @@
 //! Vulkan renderer scaffolding.
 //!
-//! This module contains the phase-1 device/command infrastructure for the future
-//! Smithay Vulkan renderer. Rendering trait implementations are intentionally
+//! This module currently includes the phase-4 device, dma-buf import, descriptor,
+//! and graphics pipeline infrastructure. Full trait-backed frame rendering is
 //! deferred to later phases.
 
 #![allow(dead_code)]
@@ -32,9 +32,11 @@ use crate::backend::{
     vulkan::PhysicalDevice,
 };
 
+use self::descriptor::DescriptorState;
 use self::device::DeviceState;
 use self::dmabuf::DmabufState;
 use self::format::FormatCapabilities;
+use self::pipeline::PipelineState;
 
 /// Compile-only placeholder for the upcoming Vulkan renderer implementation.
 #[derive(Debug)]
@@ -43,6 +45,8 @@ pub struct VulkanRenderer {
     device: DeviceState,
     formats: FormatCapabilities,
     dmabuf: DmabufState,
+    descriptors: DescriptorState,
+    pipelines: PipelineState,
 }
 
 impl VulkanRenderer {
@@ -53,11 +57,17 @@ impl VulkanRenderer {
 
     /// Creates a new Vulkan renderer and initializes device/queue infrastructure.
     pub fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
+        let device = DeviceState::new(physical_device)?;
+        let descriptors = DescriptorState::new(device.shared_device())?;
+        let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout())?;
+
         Ok(Self {
             debug_flags: DebugFlags::empty(),
-            device: DeviceState::new(physical_device)?,
+            device,
             formats: FormatCapabilities::new(physical_device)?,
             dmabuf: DmabufState::default(),
+            descriptors,
+            pipelines,
         })
     }
 
@@ -150,6 +160,16 @@ impl VulkanRenderer {
     /// Drop stale cached dma-buf imports.
     pub fn cleanup_dmabuf_cache(&mut self) {
         self.dmabuf.cleanup();
+    }
+
+    /// Exports the current Vulkan pipeline cache blob for persistence by the caller.
+    pub fn pipeline_cache_data(&self) -> Result<Vec<u8>, VulkanRendererError> {
+        self.pipelines.pipeline_cache_data()
+    }
+
+    /// Merges caller-provided cache data into the current Vulkan pipeline cache.
+    pub fn merge_pipeline_cache_data(&mut self, cache_data: &[u8]) -> Result<(), VulkanRendererError> {
+        self.pipelines.merge_pipeline_cache_data(cache_data)
     }
 
     /// Returns a standardized "not implemented" error.

@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-3 complete on 2026-02-16)  
+Status: Draft (Phases 0-4 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -174,14 +174,15 @@ Exit criteria:
 
 ## Phase 4: Pipeline and shader system
 
-- [ ] Add solid-color pipeline.
-- [ ] Add texture sampling pipeline with transform and alpha controls.
-- [ ] Add descriptor set layouts/pools and update model.
-- [ ] Precompile/ship SPIR-V assets or build-time shader compilation path.
-- [ ] Add pipeline cache persistence strategy (optional but recommended).
+- [x] Add solid-color pipeline.
+- [x] Add texture sampling pipeline with transform and alpha controls.
+- [x] Add descriptor set layouts/pools and update model.
+- [x] Precompile/ship SPIR-V assets or build-time shader compilation path.
+- [x] Add pipeline cache persistence strategy (optional but recommended).
 
 Exit criteria:
 - `clear`, `draw_solid`, and textured draw produce expected output in offscreen tests.
+- Verified on 2026-02-16 with `cargo test --no-default-features --features renderer_vulkan vulkan::pipeline::tests -- --nocapture`.
 
 ## Phase 5: Frame implementation
 
