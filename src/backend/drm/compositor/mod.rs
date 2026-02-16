@@ -188,6 +188,60 @@ mod frame_result;
 use elements::*;
 pub use frame_result::*;
 
+fn select_compositor_formats(
+    code: DrmFourcc,
+    plane_formats: &IndexSet<DrmFormat>,
+    renderer_formats: &[DrmFormat],
+) -> Vec<DrmFormat> {
+    let plane_modifiers = plane_formats
+        .iter()
+        .map(|fmt| fmt.modifier)
+        .collect::<IndexSet<_>>();
+    let renderer_modifiers = renderer_formats
+        .iter()
+        .map(|fmt| fmt.modifier)
+        .collect::<IndexSet<_>>();
+
+    // Special case: if one side supports explicit LINEAR (but no implicit modifiers)
+    // and the other side only reports implicit modifiers, force implicit to keep a
+    // working pipeline where possible.
+    if (plane_formats.len() == 1
+        && plane_formats
+            .iter()
+            .next()
+            .map(|fmt| fmt.modifier == DrmModifier::Invalid)
+            .unwrap_or(false)
+        && renderer_formats
+            .iter()
+            .all(|fmt| fmt.modifier != DrmModifier::Invalid)
+        && renderer_formats
+            .iter()
+            .any(|fmt| fmt.modifier == DrmModifier::Linear))
+        || (renderer_formats.len() == 1
+            && renderer_formats
+                .first()
+                .map(|fmt| fmt.modifier == DrmModifier::Invalid)
+                .unwrap_or(false)
+            && plane_formats
+                .iter()
+                .all(|fmt| fmt.modifier != DrmModifier::Invalid)
+            && plane_formats
+                .iter()
+                .any(|fmt| fmt.modifier == DrmModifier::Linear))
+    {
+        return vec![DrmFormat {
+            code,
+            modifier: DrmModifier::Invalid,
+        }];
+    }
+
+    plane_modifiers
+        .intersection(&renderer_modifiers)
+        .cloned()
+        .map(|modifier| DrmFormat { code, modifier })
+        .collect::<Vec<_>>()
+}
+
 impl RenderElementState {
     pub(crate) fn zero_copy(visible_area: usize) -> Self {
         RenderElementState {
@@ -1630,34 +1684,7 @@ where
             return Err((allocator, FrameError::NoSupportedRendererFormat));
         }
 
-        let formats = {
-            // Special case: if a format supports explicit LINEAR (but no implicit Modifiers)
-            // and the other doesn't support any modifier, force Implicit.
-            // This should at least result in a working pipeline possibly with a linear buffer,
-            // but we cannot be sure.
-            if (plane_formats.len() == 1
-                && plane_formats.iter().next().unwrap().modifier == DrmModifier::Invalid
-                && renderer_formats
-                    .iter()
-                    .all(|x| x.modifier != DrmModifier::Invalid)
-                && renderer_formats.iter().any(|x| x.modifier == DrmModifier::Linear))
-                || (renderer_formats.len() == 1
-                    && renderer_formats.first().unwrap().modifier == DrmModifier::Invalid
-                    && plane_formats.iter().all(|x| x.modifier != DrmModifier::Invalid)
-                    && plane_formats.iter().any(|x| x.modifier == DrmModifier::Linear))
-            {
-                vec![DrmFormat {
-                    code,
-                    modifier: DrmModifier::Invalid,
-                }]
-            } else {
-                plane_modifiers
-                    .intersection(&renderer_modifiers)
-                    .cloned()
-                    .map(|modifier| DrmFormat { code, modifier })
-                    .collect::<Vec<_>>()
-            }
-        };
+        let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
 
         debug!("Testing Formats: {:?}", formats);
 
@@ -4433,4 +4460,127 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+#[test]
+fn compositor_format_selection_prefers_implicit_for_linear_bridge() {
+    let code = DrmFourcc::Argb8888;
+
+    let plane_formats = IndexSet::from([DrmFormat {
+        code,
+        modifier: DrmModifier::Invalid,
+    }]);
+    let renderer_formats = vec![DrmFormat {
+        code,
+        modifier: DrmModifier::Linear,
+    }];
+
+    let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
+    assert_eq!(
+        formats,
+        vec![DrmFormat {
+            code,
+            modifier: DrmModifier::Invalid,
+        }]
+    );
+
+    let plane_formats = IndexSet::from([DrmFormat {
+        code,
+        modifier: DrmModifier::Linear,
+    }]);
+    let renderer_formats = vec![DrmFormat {
+        code,
+        modifier: DrmModifier::Invalid,
+    }];
+
+    let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
+    assert_eq!(
+        formats,
+        vec![DrmFormat {
+            code,
+            modifier: DrmModifier::Invalid,
+        }]
+    );
+}
+
+#[test]
+fn compositor_format_selection_intersects_explicit_modifiers() {
+    let code = DrmFourcc::Argb8888;
+    let custom_modifier = DrmModifier::from(0xABCD_u64);
+
+    let plane_formats = IndexSet::from([
+        DrmFormat {
+            code,
+            modifier: DrmModifier::Linear,
+        },
+        DrmFormat {
+            code,
+            modifier: custom_modifier,
+        },
+    ]);
+    let renderer_formats = vec![
+        DrmFormat {
+            code,
+            modifier: custom_modifier,
+        },
+        DrmFormat {
+            code,
+            modifier: DrmModifier::Linear,
+        },
+    ];
+
+    let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
+    assert_eq!(
+        formats,
+        vec![
+            DrmFormat {
+                code,
+                modifier: DrmModifier::Linear,
+            },
+            DrmFormat {
+                code,
+                modifier: custom_modifier,
+            },
+        ]
+    );
+}
+
+#[test]
+fn compositor_format_selection_reports_no_intersection() {
+    let code = DrmFourcc::Argb8888;
+    let plane_formats = IndexSet::from([DrmFormat {
+        code,
+        modifier: DrmModifier::from(0x1111_u64),
+    }]);
+    let renderer_formats = vec![DrmFormat {
+        code,
+        modifier: DrmModifier::from(0x2222_u64),
+    }];
+
+    let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
+    assert!(formats.is_empty());
+}
+
+#[cfg(feature = "renderer_vulkan")]
+#[test]
+fn compositor_bounds_accept_vulkan_renderer() {
+    use crate::backend::{
+        allocator::dmabuf::Dmabuf,
+        renderer::{
+            element::{solid::SolidColorRenderElement, RenderElement},
+            vulkan::VulkanRenderer,
+            Bind, Renderer, Texture,
+        },
+    };
+
+    fn assert_compositor_renderer_bounds<R, E>()
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+    }
+
+    assert_compositor_renderer_bounds::<VulkanRenderer, SolidColorRenderElement>();
 }
