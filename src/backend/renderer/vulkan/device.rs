@@ -1,11 +1,14 @@
-use std::{collections::VecDeque, ffi::CStr, fmt, sync::Arc};
+use std::{collections::VecDeque, ffi::CStr, fmt, os::fd::OwnedFd, sync::Arc};
 
 use ash::{ext, khr, vk};
 use tracing::warn;
 
 use crate::backend::vulkan::{version::Version, PhysicalDevice};
 
-use super::VulkanRendererError;
+use super::{
+    sync::{import_sync_file_to_fence, VulkanFence},
+    VulkanRendererError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SubmissionId(u64);
@@ -13,7 +16,7 @@ pub(crate) struct SubmissionId(u64);
 #[derive(Debug)]
 struct InFlightSubmission {
     id: SubmissionId,
-    fence: vk::Fence,
+    fence: VulkanFence,
     command_buffer: vk::CommandBuffer,
     framebuffers: Vec<vk::Framebuffer>,
 }
@@ -21,11 +24,21 @@ struct InFlightSubmission {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DeviceCapabilities {
     timeline_semaphore: bool,
+    sync_file_import: bool,
+    sync_file_export: bool,
 }
 
 impl DeviceCapabilities {
     pub(crate) fn timeline_semaphore(self) -> bool {
         self.timeline_semaphore
+    }
+
+    pub(crate) fn sync_file_import(self) -> bool {
+        self.sync_file_import
+    }
+
+    pub(crate) fn sync_file_export(self) -> bool {
+        self.sync_file_export
     }
 }
 
@@ -40,6 +53,7 @@ pub(crate) struct DeviceState {
     in_flight_submissions: VecDeque<InFlightSubmission>,
     next_submission_id: u64,
     device: Arc<DeviceHandle>,
+    external_fence_fd: Option<Arc<khr::external_fence_fd::Device>>,
 }
 
 impl fmt::Debug for DeviceState {
@@ -55,6 +69,14 @@ impl fmt::Debug for DeviceState {
             .field("in_flight_submissions", &self.in_flight_submissions.len())
             .field("next_submission_id", &self.next_submission_id)
             .field("device", &self.device.handle().handle())
+            .field(
+                "supports_sync_file_import",
+                &self.capabilities.sync_file_import(),
+            )
+            .field(
+                "supports_sync_file_export",
+                &self.capabilities.sync_file_export(),
+            )
             .finish()
     }
 }
@@ -103,7 +125,7 @@ impl DeviceState {
 
     pub(crate) fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
         let enabled_extensions = Self::validate_required_extensions(physical_device)?;
-        let capabilities = Self::query_capabilities(physical_device);
+        let capabilities = Self::query_capabilities(physical_device, &enabled_extensions);
         Self::validate_required_features(physical_device)?;
 
         let queue_family_index = Self::select_queue_family(physical_device)?;
@@ -137,6 +159,9 @@ impl DeviceState {
         };
 
         let device = Arc::new(DeviceHandle { device: raw_device });
+        let external_fence_fd = enabled_extensions
+            .contains(&khr::external_fence_fd::NAME)
+            .then(|| Arc::new(khr::external_fence_fd::Device::new(instance, device.handle())));
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -161,6 +186,7 @@ impl DeviceState {
             in_flight_submissions: VecDeque::new(),
             next_submission_id: 0,
             device,
+            external_fence_fd,
         })
     }
 
@@ -186,6 +212,36 @@ impl DeviceState {
 
     pub(crate) fn shared_device(&self) -> Arc<DeviceHandle> {
         self.device.clone()
+    }
+
+    pub(crate) fn supports_sync_file_import(&self) -> bool {
+        self.capabilities.sync_file_import() && self.external_fence_fd.is_some()
+    }
+
+    pub(crate) fn supports_sync_file_export(&self) -> bool {
+        self.capabilities.sync_file_export() && self.external_fence_fd.is_some()
+    }
+
+    pub(crate) fn wait_on_sync_file(&self, sync_file: OwnedFd) -> Result<(), VulkanRendererError> {
+        if !self.supports_sync_file_import() {
+            return Err(VulkanRendererError::NotImplemented(
+                "sync_file fence import is not available on this Vulkan device",
+            ));
+        }
+
+        let external_fence_fd = self
+            .external_fence_fd
+            .as_ref()
+            .expect("checked by supports_sync_file_import");
+        let fence = import_sync_file_to_fence(self.device.handle(), external_fence_fd, sync_file)?;
+
+        // SAFETY: Fence was created/imported on this device and is valid until we destroy it below.
+        let wait_result = unsafe { self.device.handle().wait_for_fences(&[fence], true, u64::MAX) };
+
+        // SAFETY: Fence belongs to this device and is no longer needed after the host wait attempt.
+        unsafe { self.device.handle().destroy_fence(fence, None) };
+
+        wait_result.map_err(Into::into)
     }
 
     pub(crate) fn acquire_command_buffer(&mut self) -> Result<vk::CommandBuffer, VulkanRendererError> {
@@ -222,18 +278,31 @@ impl DeviceState {
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
     ) -> Result<SubmissionId, VulkanRendererError> {
-        let fence_info = vk::FenceCreateInfo::default();
-        // SAFETY: Device is valid, create info references no borrowed resources.
-        let fence = unsafe { self.device.handle().create_fence(&fence_info, None) }?;
+        let (id, _) = self.submit_with_framebuffers_and_fence(command_buffer, framebuffers)?;
+        Ok(id)
+    }
+
+    pub(crate) fn submit_with_framebuffers_and_fence(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        framebuffers: Vec<vk::Framebuffer>,
+    ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
+        let fence = VulkanFence::create(
+            self.shared_device(),
+            self.external_fence_fd.clone(),
+            self.supports_sync_file_export(),
+        )?;
 
         let command_buffers = [command_buffer];
         let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
 
         // SAFETY: Queue, fence, and command buffers are valid; host-side synchronization is upheld by
         // requiring &mut self for submissions.
-        if let Err(err) = unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) } {
-            // SAFETY: Fence was created by this device and has not been submitted on failure path.
-            unsafe { self.device.handle().destroy_fence(fence, None) };
+        if let Err(err) = unsafe {
+            self.device
+                .handle()
+                .queue_submit(self.queue, &submit_info, fence.handle())
+        } {
             for framebuffer in framebuffers {
                 // SAFETY: Framebuffer belongs to this device and is not referenced by a failed submission.
                 unsafe { self.device.handle().destroy_framebuffer(framebuffer, None) };
@@ -245,12 +314,12 @@ impl DeviceState {
         self.next_submission_id = self.next_submission_id.wrapping_add(1);
         self.in_flight_submissions.push_back(InFlightSubmission {
             id,
-            fence,
+            fence: fence.clone(),
             command_buffer,
             framebuffers,
         });
 
-        Ok(id)
+        Ok((id, fence))
     }
 
     pub(crate) fn discard_command_buffer(
@@ -279,7 +348,7 @@ impl DeviceState {
             };
 
             // SAFETY: Fence was created by this device and remains valid while tracked in `in_flight_submissions`.
-            let signaled = unsafe { self.device.handle().get_fence_status(front.fence) }?;
+            let signaled = unsafe { self.device.handle().get_fence_status(front.fence.handle()) }?;
             if !signaled {
                 break;
             }
@@ -300,7 +369,7 @@ impl DeviceState {
             unsafe {
                 self.device
                     .handle()
-                    .wait_for_fences(&[submission.fence], true, u64::MAX)
+                    .wait_for_fences(&[submission.fence.handle()], true, u64::MAX)
             }?;
             self.recycle_submission(submission)?;
         }
@@ -310,7 +379,7 @@ impl DeviceState {
 
     fn recycle_submission(&mut self, submission: InFlightSubmission) -> Result<(), VulkanRendererError> {
         let InFlightSubmission {
-            fence,
+            fence: _fence,
             command_buffer,
             framebuffers,
             ..
@@ -330,8 +399,6 @@ impl DeviceState {
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
         }?;
 
-        // SAFETY: Fence was created by this device and is no longer needed after completion.
-        unsafe { self.device.handle().destroy_fence(fence, None) };
         self.reusable_command_buffers.push(command_buffer);
         Ok(())
     }
@@ -347,7 +414,11 @@ impl DeviceState {
             .collect::<Vec<_>>();
 
         if missing.is_empty() {
-            Ok(required)
+            let mut enabled = required;
+            if physical_device.has_device_extension(khr::external_fence_fd::NAME) {
+                enabled.push(khr::external_fence_fd::NAME);
+            }
+            Ok(enabled)
         } else {
             Err(VulkanRendererError::MissingDeviceExtensions(missing))
         }
@@ -384,7 +455,10 @@ impl DeviceState {
             })
     }
 
-    fn query_capabilities(physical_device: &PhysicalDevice) -> DeviceCapabilities {
+    fn query_capabilities(
+        physical_device: &PhysicalDevice,
+        enabled_extensions: &[&'static CStr],
+    ) -> DeviceCapabilities {
         let instance = physical_device.instance().handle();
         let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut timeline);
@@ -392,8 +466,37 @@ impl DeviceState {
         // SAFETY: `features2` points to valid writable memory and the physical device belongs to this instance.
         unsafe { instance.get_physical_device_features2(physical_device.handle(), &mut features2) };
 
+        let (sync_file_import, sync_file_export) = if enabled_extensions.contains(&khr::external_fence_fd::NAME)
+        {
+            let fence_info = vk::PhysicalDeviceExternalFenceInfo::default()
+                .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+            let mut fence_properties = vk::ExternalFenceProperties::default();
+
+            // SAFETY: `fence_properties` points to valid writable memory and `fence_info` outlives the call.
+            unsafe {
+                instance.get_physical_device_external_fence_properties(
+                    physical_device.handle(),
+                    &fence_info,
+                    &mut fence_properties,
+                )
+            };
+
+            (
+                fence_properties
+                    .external_fence_features
+                    .contains(vk::ExternalFenceFeatureFlags::IMPORTABLE),
+                fence_properties
+                    .external_fence_features
+                    .contains(vk::ExternalFenceFeatureFlags::EXPORTABLE),
+            )
+        } else {
+            (false, false)
+        };
+
         DeviceCapabilities {
             timeline_semaphore: timeline.timeline_semaphore == vk::TRUE,
+            sync_file_import,
+            sync_file_export,
         }
     }
 }
