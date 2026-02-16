@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-7 complete on 2026-02-16)  
+Status: Draft (Phases 0-8 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -228,12 +228,18 @@ Exit criteria:
 
 ## Phase 8: Export and offscreen support
 
-- [ ] Implement `Offscreen` buffer creation for Vulkan-backed render targets.
-- [ ] Implement `ExportMem` readback path with format conversion handling.
-- [ ] Implement `TextureMapping` lifetime and map/unmap safety.
+- [x] Implement `Offscreen` buffer creation for Vulkan-backed render targets.
+- [x] Implement `ExportMem` readback path with format conversion handling.
+- [x] Implement `TextureMapping` lifetime and map/unmap safety.
 
 Exit criteria:
 - Offscreen rendering and readback pass deterministic image validation tests.
+- Verified on 2026-02-16 with:
+  - `cargo check --no-default-features --features renderer_vulkan`
+  - `cargo check --no-default-features --features renderer_vulkan,wayland_frontend`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::readback::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::frame::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::upload::tests -- --nocapture`
 
 ## Phase 9: Blit and multigpu requirements
 
@@ -369,7 +375,7 @@ Minimum matrix before production recommendation:
 - [x] Frame lifecycle and submission semantics complete.
 - [x] Explicit sync integration complete.
 - [x] Memory upload path complete.
-- [ ] Export/offscreen/readback complete.
+- [x] Export/offscreen/readback complete.
 - [ ] Blit and multigpu compatibility complete.
 - [ ] `DrmCompositor` hardening complete.
 - [ ] Diagnostics and profiling complete.
