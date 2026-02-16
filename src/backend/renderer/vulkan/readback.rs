@@ -703,10 +703,14 @@ mod tests {
     use crate::{
         backend::{
             allocator::Fourcc,
-            renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture},
+            renderer::{
+                damage::OutputDamageTracker,
+                element::{solid::SolidColorBuffer, solid::SolidColorRenderElement, Kind},
+                Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture,
+            },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
-        utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
+        utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform},
     };
 
     use super::VulkanRenderer;
@@ -738,6 +742,32 @@ mod tests {
             Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [255, 128, 64, 255],
             _ => [255, 128, 64, 255],
         }
+    }
+
+    fn expected_red_pixel(format: Fourcc) -> [u8; 4] {
+        match format {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => [0, 0, 255, 255],
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [255, 0, 0, 255],
+            _ => [255, 0, 0, 255],
+        }
+    }
+
+    fn expected_blue_pixel(format: Fourcc) -> [u8; 4] {
+        match format {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => [255, 0, 0, 255],
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [0, 0, 255, 255],
+            _ => [0, 0, 255, 255],
+        }
+    }
+
+    fn pixel_at(bytes: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let offset = ((y * width) + x) * 4;
+        [
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]
     }
 
     #[test]
@@ -805,5 +835,163 @@ mod tests {
 
         assert_eq!(Texture::format(&converted), Some(fallback_format));
         assert_eq!(converted_bytes[3], 0xFF);
+    }
+
+    #[test]
+    fn damage_tracker_scene_composition_tracks_multi_frame_updates() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let buffer_size: Size<i32, BufferCoord> = Size::from((64, 64));
+        let physical_size: Size<i32, Physical> = Size::from((64, 64));
+        let mut offscreen = match renderer.create_buffer(format, buffer_size) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+        let mut target = match renderer.bind(&mut offscreen) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+
+        let mut damage_tracker = OutputDamageTracker::new(physical_size, 1.0, Transform::Normal);
+        let background = SolidColorBuffer::new((64, 64), Color32F::new(0.0, 0.0, 1.0, 1.0));
+        let foreground = SolidColorBuffer::new((16, 64), Color32F::new(1.0, 0.0, 0.0, 1.0));
+
+        {
+            let foreground_element = SolidColorRenderElement::from_buffer(
+                &foreground,
+                Point::from((8, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+            let background_element = SolidColorRenderElement::from_buffer(
+                &background,
+                Point::from((0, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+            let elements = vec![foreground_element, background_element];
+
+            let result = damage_tracker
+                .render_output(
+                    &mut renderer,
+                    &mut target,
+                    0,
+                    &elements,
+                    Color32F::new(0.0, 0.0, 0.0, 1.0),
+                )
+                .expect("initial scene composition should render");
+            assert!(
+                result.damage.is_some(),
+                "initial frame should include full output damage"
+            );
+            let _ = result.sync.wait();
+        }
+
+        let full_region = Rectangle::from_size(buffer_size);
+        let first_frame = renderer
+            .copy_framebuffer(&target, full_region, format)
+            .expect("first scene readback should succeed");
+        let first_bytes = renderer
+            .map_texture(&first_frame)
+            .expect("first scene bytes should be mappable");
+        let width = buffer_size.w as usize;
+        assert_eq!(
+            pixel_at(first_bytes, width, 4, 10),
+            expected_blue_pixel(format),
+            "background region should stay blue",
+        );
+        assert_eq!(
+            pixel_at(first_bytes, width, 10, 10),
+            expected_red_pixel(format),
+            "foreground stripe should render red",
+        );
+
+        {
+            let foreground_element = SolidColorRenderElement::from_buffer(
+                &foreground,
+                Point::from((8, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+            let background_element = SolidColorRenderElement::from_buffer(
+                &background,
+                Point::from((0, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+            let elements = vec![foreground_element, background_element];
+
+            let result = damage_tracker
+                .render_output(
+                    &mut renderer,
+                    &mut target,
+                    1,
+                    &elements,
+                    Color32F::new(0.0, 0.0, 0.0, 1.0),
+                )
+                .expect("unchanged scene should be accepted");
+            assert!(
+                result.damage.is_none(),
+                "unchanged frame should skip rendering damage",
+            );
+            let _ = result.sync.wait();
+        }
+
+        {
+            let foreground_element = SolidColorRenderElement::from_buffer(
+                &foreground,
+                Point::from((24, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+            let background_element = SolidColorRenderElement::from_buffer(
+                &background,
+                Point::from((0, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            );
+            let elements = vec![foreground_element, background_element];
+
+            let result = damage_tracker
+                .render_output(
+                    &mut renderer,
+                    &mut target,
+                    1,
+                    &elements,
+                    Color32F::new(0.0, 0.0, 0.0, 1.0),
+                )
+                .expect("moved scene should produce incremental damage");
+            assert!(result.damage.is_some(), "moved element should generate damage",);
+            let _ = result.sync.wait();
+        }
+
+        let moved_frame = renderer
+            .copy_framebuffer(&target, full_region, format)
+            .expect("moved scene readback should succeed");
+        let moved_bytes = renderer
+            .map_texture(&moved_frame)
+            .expect("moved scene bytes should be mappable");
+        assert_eq!(
+            pixel_at(moved_bytes, width, 10, 10),
+            expected_blue_pixel(format),
+            "old stripe position should be restored by fallback composition",
+        );
+        assert_eq!(
+            pixel_at(moved_bytes, width, 26, 10),
+            expected_red_pixel(format),
+            "new stripe position should be red after composition update",
+        );
     }
 }

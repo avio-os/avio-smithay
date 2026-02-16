@@ -1,6 +1,6 @@
 # Smithay VulkanRenderer Full Completion Plan (ash-based)
 
-Status: Draft (Phases 0-9 complete on 2026-02-16)  
+Status: Draft (Phases 0-10 complete on 2026-02-16)  
 Scope: Full completion, production readiness, and long-term maintainability  
 Location: `src/backend/renderer/vulkan/`  
 API backend: `ash` only
@@ -257,13 +257,18 @@ Exit criteria:
 
 ## Phase 10: DrmCompositor integration hardening
 
-- [ ] Validate all direct scanout fallback paths with Vulkan renderer bound dmabufs.
-- [ ] Validate compositor behavior with implicit and explicit modifiers.
-- [ ] Verify no regressions in queue/commit timing and state tracking.
-- [ ] Add integration tests for typical compositor scene composition.
+- [x] Validate all direct scanout fallback paths with Vulkan renderer bound dmabufs.
+- [x] Validate compositor behavior with implicit and explicit modifiers.
+- [x] Verify no regressions in queue/commit timing and state tracking.
+- [x] Add integration tests for typical compositor scene composition.
 
 Exit criteria:
 - Stable multi-frame rendering with `DrmCompositor` in real and synthetic tests.
+- Verified on 2026-02-16 with:
+  - `cargo check --no-default-features --features renderer_vulkan`
+  - `cargo check --no-default-features --features renderer_vulkan,wayland_frontend,backend_gbm`
+  - `cargo test --no-default-features --features renderer_vulkan vulkan::readback::tests -- --nocapture`
+  - `cargo test --no-default-features --features renderer_vulkan,wayland_frontend,backend_gbm compositor_ -- --nocapture`
 
 ## Phase 11: Diagnostics, profiling, and debugging
 
@@ -382,7 +387,7 @@ Minimum matrix before production recommendation:
 - [x] Memory upload path complete.
 - [x] Export/offscreen/readback complete.
 - [x] Blit and multigpu compatibility complete.
-- [ ] `DrmCompositor` hardening complete.
+- [x] `DrmCompositor` hardening complete.
 - [ ] Diagnostics and profiling complete.
 - [ ] Documentation complete.
 - [ ] Test matrix and release gates complete.
