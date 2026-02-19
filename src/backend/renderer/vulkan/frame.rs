@@ -11,12 +11,15 @@ use crate::{
             format::{has_alpha, FormatSet},
         },
         renderer::{
-            sync::SyncPoint, Bind, Color32F, ContextId, Frame, ImportDma, Renderer, RendererSuper, Texture,
-            TextureFilter,
+            sync::SyncPoint, Bind, Blit, BlitFrame, Color32F, ContextId, Frame, ImportDma, Renderer,
+            RendererSuper, Texture, TextureFilter,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
 };
+
+#[cfg(feature = "wayland_frontend")]
+use crate::backend::renderer::ImportDmaWl;
 
 use super::{
     dmabuf::ImportedDmabufImage,
@@ -46,6 +49,15 @@ struct FrameRecording {
     output_size: Size<i32, Physical>,
     size: Size<i32, Physical>,
     pending_layouts: IndexMap<u64, (Arc<ImportedDmabufImage>, vk::ImageLayout)>,
+}
+
+#[derive(Debug)]
+struct FrameResumeContext {
+    target: Arc<ImportedDmabufImage>,
+    pipelines: PipelineHandles,
+    transform: Transform,
+    output_size: Size<i32, Physical>,
+    size: Size<i32, Physical>,
 }
 
 /// In-flight Vulkan renderer frame recording context.
@@ -214,32 +226,7 @@ impl Renderer for VulkanRenderer {
     #[instrument(level = "trace", skip(self, sync))]
     #[profiling::function]
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
-            return vulkan_fence
-                .wait_vk()
-                .map_err(|_| VulkanRendererError::TemporaryFailure("sync wait was interrupted"));
-        }
-
-        if self.device.supports_sync_file_import() {
-            if let Some(sync_file) = sync.export() {
-                match self.device.wait_on_sync_file(sync_file) {
-                    Ok(()) => return Ok(()),
-                    Err(err) => {
-                        if err.kind() == VulkanRendererErrorKind::ContextLost {
-                            return Err(err);
-                        }
-
-                        warn!(
-                            ?err,
-                            "failed to import SyncPoint fd into Vulkan wait path; falling back to blocking wait"
-                        );
-                    }
-                }
-            }
-        }
-
-        sync.wait()
-            .map_err(|_| VulkanRendererError::TemporaryFailure("sync wait was interrupted"))
+        wait_on_sync_point(self, sync, vk::PipelineStageFlags::ALL_COMMANDS)
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -275,6 +262,9 @@ impl ImportDma for VulkanRenderer {
         self.import_dmabuf_texture(dmabuf)
     }
 }
+
+#[cfg(feature = "wayland_frontend")]
+impl ImportDmaWl for VulkanRenderer {}
 
 impl Frame for VulkanFrame<'_> {
     type Error = VulkanRendererError;
@@ -632,7 +622,11 @@ impl Frame for VulkanFrame<'_> {
     #[instrument(level = "trace", skip(self, sync))]
     #[profiling::function]
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        self.renderer.wait(sync)
+        wait_on_sync_point(
+            self.renderer,
+            sync,
+            vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::TRANSFER,
+        )
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -642,7 +636,114 @@ impl Frame for VulkanFrame<'_> {
     }
 }
 
+fn wait_on_sync_point(
+    renderer: &mut VulkanRenderer,
+    sync: &SyncPoint,
+    wait_stage_mask: vk::PipelineStageFlags,
+) -> Result<(), VulkanRendererError> {
+    if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
+        return vulkan_fence.wait_vk().map_err(Into::into);
+    }
+
+    if renderer.device.supports_sync_file_import() {
+        if let Some(sync_file) = sync.export() {
+            match renderer
+                .device
+                .queue_wait_on_sync_file_with_stage(sync_file, wait_stage_mask)
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if err.kind() == VulkanRendererErrorKind::ContextLost {
+                        return Err(err);
+                    }
+
+                    warn!(
+                        ?err,
+                        "failed to import SyncPoint fd into Vulkan wait semaphore; falling back to blocking wait"
+                    );
+                }
+            }
+        }
+    }
+
+    if renderer.device.supports_sync_file_fence_import() {
+        if let Some(sync_file) = sync.export() {
+            match renderer.device.wait_on_sync_file(sync_file) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if err.kind() == VulkanRendererErrorKind::ContextLost {
+                        return Err(err);
+                    }
+
+                    warn!(
+                        ?err,
+                        "failed to import SyncPoint fd into Vulkan host wait; falling back to blocking wait"
+                    );
+                }
+            }
+        }
+    }
+
+    sync.wait()
+        .map_err(|_| VulkanRendererError::TemporaryFailure("sync wait was interrupted"))
+}
+
+impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
+    #[instrument(level = "trace", skip(self, to))]
+    #[profiling::function]
+    fn blit_to(
+        &mut self,
+        to: &mut VulkanTarget,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<(), Self::Error> {
+        let resume_context = self.flush_recording_segment()?;
+        let resume_target = Self::frame_target_from_context(&resume_context);
+        let blit_result = self.renderer.blit(&resume_target, to, src, dst, filter);
+        let resume_result = self.begin_recording_segment(resume_context);
+
+        if let Err(err) = resume_result {
+            return Err(err);
+        }
+
+        match blit_result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[instrument(level = "trace", skip(self, from))]
+    #[profiling::function]
+    fn blit_from(
+        &mut self,
+        from: &VulkanTarget,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<(), Self::Error> {
+        let resume_context = self.flush_recording_segment()?;
+        let mut resume_target = Self::frame_target_from_context(&resume_context);
+        let blit_result = self.renderer.blit(from, &mut resume_target, src, dst, filter);
+        let resume_result = self.begin_recording_segment(resume_context);
+
+        if let Err(err) = resume_result {
+            return Err(err);
+        }
+
+        match blit_result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 impl VulkanFrame<'_> {
+    fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
+        let format = Some(context.target.format().code);
+        VulkanTarget::from_imported_image(context.target.clone(), context.target.size(), format)
+    }
+
     fn recording(&self) -> Result<&FrameRecording, VulkanRendererError> {
         if self.state != VulkanFrameState::Recording {
             return Err(VulkanRendererError::TemporaryFailure(
@@ -805,6 +906,7 @@ impl VulkanFrame<'_> {
                 .renderer
                 .device
                 .discard_command_buffer(recording.command_buffer);
+            self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
             return Err(err.into());
         }
@@ -820,6 +922,7 @@ impl VulkanFrame<'_> {
                     .renderer
                     .device
                     .discard_command_buffer(recording.command_buffer);
+                self.renderer.device.clear_pending_wait_semaphores();
                 self.state = VulkanFrameState::Aborted;
                 return Err(err);
             }
@@ -832,16 +935,171 @@ impl VulkanFrame<'_> {
         self.state = VulkanFrameState::Finished;
         Ok(SyncPoint::from(submission_fence))
     }
-}
 
-impl Drop for VulkanFrame<'_> {
-    fn drop(&mut self) {
-        if self.state != VulkanFrameState::Recording {
-            return;
+    fn flush_recording_segment(&mut self) -> Result<FrameResumeContext, VulkanRendererError> {
+        let mut recording = self
+            .recording
+            .take()
+            .ok_or(VulkanRendererError::TemporaryFailure(
+                "frame recording context was already consumed",
+            ))?;
+
+        // SAFETY: Render pass was begun when entering frame recording.
+        unsafe {
+            self.renderer.device.insert_debug_label(
+                recording.command_buffer,
+                c"vulkan.frame.flush_segment",
+                [0.86, 0.49, 0.18, 1.0],
+            );
+            self.renderer
+                .device
+                .device_handle()
+                .cmd_end_render_pass(recording.command_buffer);
         }
 
+        // SAFETY: Command buffer recording is valid and render pass has been ended.
+        if let Err(err) = unsafe {
+            self.renderer
+                .device
+                .device_handle()
+                .end_command_buffer(recording.command_buffer)
+        } {
+            // SAFETY: Framebuffer was created for this device and command buffer will not be submitted.
+            unsafe {
+                self.renderer
+                    .device
+                    .device_handle()
+                    .destroy_framebuffer(recording.framebuffer, None)
+            };
+            let _ = self
+                .renderer
+                .device
+                .discard_command_buffer(recording.command_buffer);
+            self.renderer.device.clear_pending_wait_semaphores();
+            self.state = VulkanFrameState::Aborted;
+            return Err(err.into());
+        }
+
+        if let Err(err) = self
+            .renderer
+            .device
+            .submit_with_framebuffers_and_fence(recording.command_buffer, vec![recording.framebuffer])
+        {
+            let _ = self
+                .renderer
+                .device
+                .discard_command_buffer(recording.command_buffer);
+            self.renderer.device.clear_pending_wait_semaphores();
+            self.state = VulkanFrameState::Aborted;
+            return Err(err);
+        }
+
+        for (_, (image, layout)) in recording.pending_layouts.drain(..) {
+            image.set_layout(layout);
+        }
+
+        self.state = VulkanFrameState::Idle;
+        Ok(FrameResumeContext {
+            target: recording.target,
+            pipelines: recording.pipelines,
+            transform: recording.transform,
+            output_size: recording.output_size,
+            size: recording.size,
+        })
+    }
+
+    fn begin_recording_segment(&mut self, context: FrameResumeContext) -> Result<(), VulkanRendererError> {
+        let command_buffer = self.renderer.device.acquire_command_buffer()?;
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: Command buffer belongs to this device command pool and is not currently in use.
+        if let Err(err) = unsafe {
+            self.renderer
+                .device
+                .device_handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+        } {
+            let _ = self.renderer.device.discard_command_buffer(command_buffer);
+            self.renderer.device.clear_pending_wait_semaphores();
+            self.state = VulkanFrameState::Aborted;
+            return Err(err.into());
+        }
+        self.renderer.device.insert_debug_label(
+            command_buffer,
+            c"vulkan.render.resume",
+            [0.17, 0.42, 0.86, 1.0],
+        );
+
+        let framebuffer = match create_framebuffer(
+            self.renderer.device.device_handle(),
+            context.pipelines.render_pass,
+            context.target.view(),
+            context.size,
+        ) {
+            Ok(framebuffer) => framebuffer,
+            Err(err) => {
+                let _ = self.renderer.device.discard_command_buffer(command_buffer);
+                self.renderer.device.clear_pending_wait_semaphores();
+                self.state = VulkanFrameState::Aborted;
+                return Err(err);
+            }
+        };
+
+        self.recording = Some(FrameRecording {
+            command_buffer,
+            framebuffer,
+            target: context.target.clone(),
+            pipelines: context.pipelines,
+            transform: context.transform,
+            output_size: context.output_size,
+            size: context.size,
+            pending_layouts: IndexMap::new(),
+        });
+        self.state = VulkanFrameState::Recording;
+
+        if let Err(err) =
+            self.transition_image_layout(&context.target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        {
+            self.abort_recording();
+            return Err(err);
+        }
+
+        let render_pass_begin_info = {
+            let recording = self.recording.as_ref().expect("recording initialized");
+            vk::RenderPassBeginInfo::default()
+                .render_pass(recording.pipelines.render_pass)
+                .framebuffer(recording.framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: recording.size.w as u32,
+                        height: recording.size.h as u32,
+                    },
+                })
+        };
+
+        // SAFETY: All render pass/framebuffer handles are valid for this command buffer.
+        unsafe {
+            self.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.render.resume_pass",
+                [0.20, 0.58, 0.95, 1.0],
+            );
+            self.renderer.device.device_handle().cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_begin_info,
+                vk::SubpassContents::INLINE,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn abort_recording(&mut self) {
+        self.renderer.device.clear_pending_wait_semaphores();
+
         if let Some(recording) = self.recording.take() {
-            // SAFETY: Framebuffer was created by this device and command buffer is not submitted on drop.
+            // SAFETY: Framebuffer was created by this device and command buffer is not submitted on abort.
             unsafe {
                 self.renderer
                     .device
@@ -854,11 +1112,22 @@ impl Drop for VulkanFrame<'_> {
                 .device
                 .discard_command_buffer(recording.command_buffer)
             {
-                warn!(?err, "failed to discard Vulkan frame command buffer on drop");
+                warn!(?err, "failed to discard Vulkan frame command buffer during abort");
             }
         }
 
         self.state = VulkanFrameState::Aborted;
+    }
+}
+
+impl Drop for VulkanFrame<'_> {
+    fn drop(&mut self) {
+        if self.state != VulkanFrameState::Recording {
+            self.renderer.device.clear_pending_wait_semaphores();
+            return;
+        }
+
+        self.abort_recording();
     }
 }
 
@@ -1011,9 +1280,12 @@ mod tests {
             allocator::{
                 dmabuf::AsDmabuf,
                 vulkan::{ImageUsageFlags, VulkanAllocator},
-                Allocator,
+                Allocator, Fourcc,
             },
-            renderer::{vulkan::VulkanTexture, Frame, Renderer, Texture},
+            renderer::{
+                vulkan::VulkanTexture, Bind, BlitFrame, Color32F, Frame, Offscreen, Renderer, Texture,
+                TextureFilter,
+            },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Physical, Rectangle, Size, Transform},
@@ -1343,5 +1615,75 @@ mod tests {
             combine_image_transform(Transform::Flipped90, Transform::_270),
             Transform::Flipped180
         );
+    }
+
+    #[test]
+    fn frame_blit_to_and_from_resume_recording() {
+        let Some((mut renderer, _)) = init_renderer_and_allocator() else {
+            return;
+        };
+
+        let Some(format) = [
+            Fourcc::Argb8888,
+            Fourcc::Abgr8888,
+            Fourcc::Xrgb8888,
+            Fourcc::Xbgr8888,
+        ]
+        .into_iter()
+        .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok()) else {
+            return;
+        };
+
+        let size = Size::from((32, 32));
+        let physical_size = Size::<i32, Physical>::from((32, 32));
+        let full_damage = Rectangle::from_size(physical_size);
+
+        let mut frame_tex = match renderer.create_buffer(format, size) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+        let mut aux_tex = match renderer.create_buffer(format, size) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+
+        let mut frame_target = match renderer.bind(&mut frame_tex) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+        let mut aux_target = match renderer.bind(&mut aux_tex) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+
+        let mut frame = match renderer.render(&mut frame_target, physical_size, Transform::Normal) {
+            Ok(frame) => frame,
+            Err(_) => return,
+        };
+
+        frame
+            .clear(Color32F::new(0.1, 0.2, 0.3, 1.0), &[full_damage])
+            .expect("clear should succeed before frame blit operations");
+
+        frame
+            .blit_to(&mut aux_target, full_damage, full_damage, TextureFilter::Nearest)
+            .expect("blit_to should succeed and keep frame usable");
+
+        frame
+            .blit_from(&aux_target, full_damage, full_damage, TextureFilter::Nearest)
+            .expect("blit_from should succeed and keep frame usable");
+
+        frame
+            .draw_solid(
+                Rectangle::new((8, 8).into(), Size::from((8, 8))),
+                &[Rectangle::new((0, 0).into(), Size::from((8, 8)))],
+                Color32F::new(1.0, 0.0, 0.0, 1.0),
+            )
+            .expect("frame should continue recording after blit operations");
+
+        let sync = frame
+            .finish()
+            .expect("finish should submit frame after frame blits");
+        let _ = sync.wait();
     }
 }

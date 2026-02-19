@@ -6,7 +6,7 @@ use tracing::{instrument, trace, warn};
 use crate::backend::vulkan::{version::Version, PhysicalDevice};
 
 use super::{
-    sync::{import_sync_file_to_fence, VulkanFence},
+    sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
     VulkanRendererError,
 };
 
@@ -19,6 +19,7 @@ struct InFlightSubmission {
     fence: VulkanFence,
     command_buffer: vk::CommandBuffer,
     framebuffers: Vec<vk::Framebuffer>,
+    wait_semaphores: Vec<vk::Semaphore>,
     submitted_at: Instant,
 }
 
@@ -27,6 +28,7 @@ pub(crate) struct DeviceCapabilities {
     timeline_semaphore: bool,
     sync_file_import: bool,
     sync_file_export: bool,
+    sync_file_semaphore_import: bool,
 }
 
 impl DeviceCapabilities {
@@ -40,6 +42,10 @@ impl DeviceCapabilities {
 
     pub(crate) fn sync_file_export(self) -> bool {
         self.sync_file_export
+    }
+
+    pub(crate) fn sync_file_semaphore_import(self) -> bool {
+        self.sync_file_semaphore_import
     }
 }
 
@@ -64,9 +70,11 @@ pub(crate) struct DeviceState {
     command_pool: vk::CommandPool,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
+    pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
     device: Arc<DeviceHandle>,
     external_fence_fd: Option<Arc<khr::external_fence_fd::Device>>,
+    external_semaphore_fd: Option<Arc<khr::external_semaphore_fd::Device>>,
     debug_utils: Option<Arc<ext::debug_utils::Device>>,
     diagnostics: DeviceDiagnostics,
 }
@@ -84,8 +92,12 @@ impl fmt::Debug for DeviceState {
             .field("in_flight_submissions", &self.in_flight_submissions.len())
             .field("next_submission_id", &self.next_submission_id)
             .field("device", &self.device.handle().handle())
-            .field("supports_sync_file_import", &self.capabilities.sync_file_import())
-            .field("supports_sync_file_export", &self.capabilities.sync_file_export())
+            .field("supports_sync_file_import", &self.supports_sync_file_import())
+            .field(
+                "supports_sync_file_fence_import",
+                &self.supports_sync_file_fence_import(),
+            )
+            .field("supports_sync_file_export", &self.supports_sync_file_export())
             .field("debug_markers_enabled", &self.diagnostics.debug_markers_enabled)
             .field("total_submissions", &self.diagnostics.total_submissions)
             .field("blocking_submissions", &self.diagnostics.blocking_submissions)
@@ -175,6 +187,9 @@ impl DeviceState {
         let external_fence_fd = enabled_extensions
             .contains(&khr::external_fence_fd::NAME)
             .then(|| Arc::new(khr::external_fence_fd::Device::new(instance, device.handle())));
+        let external_semaphore_fd = enabled_extensions
+            .contains(&khr::external_semaphore_fd::NAME)
+            .then(|| Arc::new(khr::external_semaphore_fd::Device::new(instance, device.handle())));
         let debug_utils = if cfg!(debug_assertions)
             && physical_device
                 .instance()
@@ -212,9 +227,11 @@ impl DeviceState {
             command_pool,
             reusable_command_buffers: Vec::new(),
             in_flight_submissions: VecDeque::new(),
+            pending_waits: Vec::new(),
             next_submission_id: 0,
             device,
             external_fence_fd,
+            external_semaphore_fd,
             debug_utils,
             diagnostics: DeviceDiagnostics {
                 debug_markers_enabled,
@@ -248,6 +265,10 @@ impl DeviceState {
     }
 
     pub(crate) fn supports_sync_file_import(&self) -> bool {
+        self.capabilities.sync_file_semaphore_import() && self.external_semaphore_fd.is_some()
+    }
+
+    pub(crate) fn supports_sync_file_fence_import(&self) -> bool {
         self.capabilities.sync_file_import() && self.external_fence_fd.is_some()
     }
 
@@ -282,7 +303,7 @@ impl DeviceState {
     }
 
     pub(crate) fn wait_on_sync_file(&self, sync_file: OwnedFd) -> Result<(), VulkanRendererError> {
-        if !self.supports_sync_file_import() {
+        if !self.supports_sync_file_fence_import() {
             return Err(VulkanRendererError::NotImplemented(
                 "sync_file fence import is not available on this Vulkan device",
             ));
@@ -291,7 +312,7 @@ impl DeviceState {
         let external_fence_fd = self
             .external_fence_fd
             .as_ref()
-            .expect("checked by supports_sync_file_import");
+            .expect("checked by supports_sync_file_fence_import");
         let fence = import_sync_file_to_fence(self.device.handle(), external_fence_fd, sync_file)?;
 
         // SAFETY: Fence was created/imported on this device and is valid until we destroy it below.
@@ -301,6 +322,46 @@ impl DeviceState {
         unsafe { self.device.handle().destroy_fence(fence, None) };
 
         wait_result.map_err(Into::into)
+    }
+
+    pub(crate) fn queue_wait_on_sync_file(&mut self, sync_file: OwnedFd) -> Result<(), VulkanRendererError> {
+        self.queue_wait_on_sync_file_with_stage(sync_file, vk::PipelineStageFlags::ALL_COMMANDS)
+    }
+
+    pub(crate) fn queue_wait_on_sync_file_with_stage(
+        &mut self,
+        sync_file: OwnedFd,
+        wait_stage_mask: vk::PipelineStageFlags,
+    ) -> Result<(), VulkanRendererError> {
+        if !self.supports_sync_file_import() {
+            return Err(VulkanRendererError::NotImplemented(
+                "sync_file semaphore import is not available on this Vulkan device",
+            ));
+        }
+
+        let external_semaphore_fd = self
+            .external_semaphore_fd
+            .as_ref()
+            .expect("checked by supports_sync_file_import");
+        let semaphore =
+            import_sync_file_to_semaphore(self.device.handle(), external_semaphore_fd, sync_file)?;
+
+        if wait_stage_mask.is_empty() {
+            unsafe { self.device.handle().destroy_semaphore(semaphore, None) };
+            return Err(VulkanRendererError::TemporaryFailure(
+                "sync_file wait stage mask must not be empty",
+            ));
+        }
+
+        self.pending_waits.push((semaphore, wait_stage_mask));
+        Ok(())
+    }
+
+    pub(crate) fn clear_pending_wait_semaphores(&mut self) {
+        for (semaphore, _) in self.pending_waits.drain(..) {
+            // SAFETY: Semaphore belongs to this device and is not in-flight because it was never submitted.
+            unsafe { self.device.handle().destroy_semaphore(semaphore, None) };
+        }
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -357,8 +418,18 @@ impl DeviceState {
             self.supports_sync_file_export(),
         )?;
 
+        let pending_waits = std::mem::take(&mut self.pending_waits);
+        let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
+            pending_waits.into_iter().unzip();
+
         let command_buffers = [command_buffer];
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let mut submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        if !wait_semaphores.is_empty() {
+            submit = submit
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_dst_stage_mask);
+        }
+        let submit_info = [submit];
 
         // SAFETY: Queue, fence, and command buffers are valid; host-side synchronization is upheld by
         // requiring &mut self for submissions.
@@ -367,6 +438,10 @@ impl DeviceState {
                 .handle()
                 .queue_submit(self.queue, &submit_info, fence.handle())
         } {
+            for semaphore in wait_semaphores {
+                // SAFETY: Semaphore belongs to this device and the submission did not succeed.
+                unsafe { self.device.handle().destroy_semaphore(semaphore, None) };
+            }
             for framebuffer in framebuffers {
                 // SAFETY: Framebuffer belongs to this device and is not referenced by a failed submission.
                 unsafe { self.device.handle().destroy_framebuffer(framebuffer, None) };
@@ -387,6 +462,7 @@ impl DeviceState {
             fence: fence.clone(),
             command_buffer,
             framebuffers,
+            wait_semaphores,
             submitted_at: submit_started_at,
         });
         trace!(
@@ -410,11 +486,25 @@ impl DeviceState {
         // SAFETY: Device is valid and create info references no borrowed resources.
         let fence = unsafe { self.device.handle().create_fence(&fence_info, None) }?;
 
+        let pending_waits = std::mem::take(&mut self.pending_waits);
+        let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
+            pending_waits.into_iter().unzip();
+
         let command_buffers = [command_buffer];
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let mut submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        if !wait_semaphores.is_empty() {
+            submit = submit
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_dst_stage_mask);
+        }
+        let submit_info = [submit];
 
         // SAFETY: Queue, fence, and command buffers are valid; queue access is serialized by `&mut self`.
         if let Err(err) = unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) } {
+            for semaphore in wait_semaphores {
+                // SAFETY: Semaphore belongs to this device and the submission did not succeed.
+                unsafe { self.device.handle().destroy_semaphore(semaphore, None) };
+            }
             // SAFETY: Fence belongs to this device and is not in-flight after failed submission.
             unsafe { self.device.handle().destroy_fence(fence, None) };
             let _ = self.discard_command_buffer(command_buffer);
@@ -425,6 +515,10 @@ impl DeviceState {
         let wait_result = unsafe { self.device.handle().wait_for_fences(&[fence], true, u64::MAX) };
         // SAFETY: Fence belongs to this device and is no longer needed after wait completes/errors.
         unsafe { self.device.handle().destroy_fence(fence, None) };
+        for semaphore in wait_semaphores {
+            // SAFETY: Submission completion is determined by the host fence above; semaphore can be released.
+            unsafe { self.device.handle().destroy_semaphore(semaphore, None) };
+        }
         wait_result?;
 
         // SAFETY: Command buffer belongs to this command pool and execution completed after host wait.
@@ -508,6 +602,7 @@ impl DeviceState {
             fence: _fence,
             command_buffer,
             framebuffers,
+            wait_semaphores,
             submitted_at,
             ..
         } = submission;
@@ -528,6 +623,11 @@ impl DeviceState {
             // SAFETY: The submission fence is already signaled when this method is called,
             // so command buffer execution is complete and framebuffer handles may be destroyed.
             unsafe { self.device.handle().destroy_framebuffer(framebuffer, None) };
+        }
+
+        for semaphore in wait_semaphores {
+            // SAFETY: Submission completion implies this semaphore is no longer referenced by the queue.
+            unsafe { self.device.handle().destroy_semaphore(semaphore, None) };
         }
 
         // SAFETY: Command buffer belongs to `self.command_pool` and can be reset because the associated fence
@@ -557,6 +657,9 @@ impl DeviceState {
             if physical_device.has_device_extension(khr::external_fence_fd::NAME) {
                 enabled.push(khr::external_fence_fd::NAME);
             }
+            if physical_device.has_device_extension(khr::external_semaphore_fd::NAME) {
+                enabled.push(khr::external_semaphore_fd::NAME);
+            }
             Ok(enabled)
         } else {
             Err(VulkanRendererError::MissingDeviceExtensions(missing))
@@ -575,6 +678,7 @@ impl DeviceState {
     }
 
     fn select_queue_family(physical_device: &PhysicalDevice) -> Result<u32, VulkanRendererError> {
+        // SAFETY: Physical device belongs to this instance and query only reads driver-provided immutable properties.
         let queue_families = unsafe {
             physical_device
                 .instance()
@@ -632,10 +736,32 @@ impl DeviceState {
                 (false, false)
             };
 
+        let sync_file_semaphore_import = if enabled_extensions.contains(&khr::external_semaphore_fd::NAME) {
+            let semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            let mut semaphore_properties = vk::ExternalSemaphoreProperties::default();
+
+            // SAFETY: `semaphore_properties` points to valid writable memory and `semaphore_info` outlives the call.
+            unsafe {
+                instance.get_physical_device_external_semaphore_properties(
+                    physical_device.handle(),
+                    &semaphore_info,
+                    &mut semaphore_properties,
+                )
+            };
+
+            semaphore_properties
+                .external_semaphore_features
+                .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE)
+        } else {
+            false
+        };
+
         DeviceCapabilities {
             timeline_semaphore: timeline.timeline_semaphore == vk::TRUE,
             sync_file_import,
             sync_file_export,
+            sync_file_semaphore_import,
         }
     }
 }
@@ -646,6 +772,8 @@ fn duration_to_ns(duration: std::time::Duration) -> u64 {
 
 impl Drop for DeviceState {
     fn drop(&mut self) {
+        self.clear_pending_wait_semaphores();
+
         if let Err(err) = self.wait_for_all_submissions() {
             warn!(
                 ?err,
