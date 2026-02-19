@@ -5,7 +5,7 @@ use std::{
 };
 
 use ash::{khr, vk};
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::backend::renderer::sync::{Fence, Interrupted};
 
@@ -108,7 +108,20 @@ impl VulkanFence {
             }
         };
 
-        // SAFETY: Vulkan returns ownership of a valid fd on success.
+        if fd == -1 {
+            trace!("Vulkan fence export returned already-signaled sync_file sentinel");
+            return None;
+        }
+
+        if fd < -1 {
+            warn!(
+                fd,
+                "Vulkan fence export returned invalid negative fd for sync_file handle"
+            );
+            return None;
+        }
+
+        // SAFETY: Vulkan returns ownership of a valid fd on success. `-1` is handled above.
         Some(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
@@ -152,6 +165,7 @@ pub(crate) fn import_sync_file_to_fence(
     };
 
     let sync_file_raw = std::os::fd::IntoRawFd::into_raw_fd(sync_file);
+    // SAFETY: `fd` is owned by this guard and closed exactly once on early-return paths.
     let sync_file_guard = scopeguard::guard(sync_file_raw, |fd| unsafe {
         libc::close(fd);
     });
@@ -172,4 +186,41 @@ pub(crate) fn import_sync_file_to_fence(
     let _ = scopeguard::ScopeGuard::into_inner(sync_file_guard);
 
     Ok(fence)
+}
+
+pub(crate) fn import_sync_file_to_semaphore(
+    device: &ash::Device,
+    external_semaphore_fd: &khr::external_semaphore_fd::Device,
+    sync_file: OwnedFd,
+) -> Result<vk::Semaphore, VulkanRendererError> {
+    let semaphore_info = vk::SemaphoreCreateInfo::default();
+
+    // SAFETY: Device is valid and create info references no borrowed memory.
+    let semaphore = match unsafe { device.create_semaphore(&semaphore_info, None) } {
+        Ok(semaphore) => semaphore,
+        Err(err) => return Err(err.into()),
+    };
+
+    let sync_file_raw = std::os::fd::IntoRawFd::into_raw_fd(sync_file);
+    // SAFETY: `fd` is owned by this guard and closed exactly once on early-return paths.
+    let sync_file_guard = scopeguard::guard(sync_file_raw, |fd| unsafe {
+        libc::close(fd);
+    });
+
+    let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+        .semaphore(semaphore)
+        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .fd(*sync_file_guard);
+
+    // SAFETY: Semaphore and device are valid and import info references live memory.
+    if let Err(err) = unsafe { external_semaphore_fd.import_semaphore_fd(&import_info) } {
+        unsafe { device.destroy_semaphore(semaphore, None) };
+        return Err(err.into());
+    }
+
+    // Ownership moved to Vulkan on successful import.
+    let _ = scopeguard::ScopeGuard::into_inner(sync_file_guard);
+
+    Ok(semaphore)
 }

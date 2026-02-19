@@ -1,9 +1,118 @@
-//! Vulkan renderer scaffolding.
+//! Vulkan renderer implementation for Smithay composition paths.
 //!
-//! This module currently includes phase-11 device, dma-buf import/bind, descriptor,
-//! pipeline, frame-recording infrastructure, explicit sync bridge support, memory
-//! upload support for shared-memory client paths, readback/offscreen support, and
-//! framebuffer blit support with diagnostics instrumentation.
+//! This module exposes [`VulkanRenderer`], [`VulkanTexture`], and [`VulkanTarget`], and
+//! wires them into Smithay renderer traits for dma-buf import, memory upload/readback,
+//! offscreen rendering, framebuffer blit, and explicit sync interop.
+//!
+//! # Renderer Lifecycle
+//!
+//! 1. Probe device extension requirements with [`VulkanRenderer::required_extensions`].
+//! 2. Create the renderer using [`VulkanRenderer::new`].
+//! 3. Inspect supported format/modifier combinations via [`VulkanRenderer::dmabuf_import_formats`]
+//!    and [`VulkanRenderer::dmabuf_render_formats`] before allocator/compositor setup.
+//! 4. Bind targets with [`crate::backend::renderer::Bind::bind`] and record drawing through
+//!    [`crate::backend::renderer::Renderer::render`].
+//! 5. Finalize frames with [`crate::backend::renderer::Frame::finish`] and hand returned
+//!    [`crate::backend::renderer::sync::SyncPoint`] objects to presentation/scheduling code.
+//! 6. Periodically call [`VulkanRenderer::cleanup_dmabuf_cache`] (or
+//!    [`crate::backend::renderer::Renderer::cleanup_texture_cache`]) in long-running compositors.
+//!
+//! # Trait Behavior Notes
+//!
+//! - [`crate::backend::renderer::Renderer::render`] opens Vulkan command recording for one frame and
+//!   returns a [`crate::backend::renderer::Frame`] implementation (`VulkanFrame`).
+//! - [`crate::backend::renderer::Frame::finish`] submits recorded commands and returns a `SyncPoint`.
+//!   Dropping a frame without `finish` aborts recording and never submits partial work.
+//! - [`crate::backend::renderer::Bind`] currently accepts dma-buf render targets.
+//! - [`crate::backend::renderer::ImportDma`] imports dma-bufs as sampled textures with strict
+//!   format/modifier validation.
+//! - [`crate::backend::renderer::ImportMem`] uses host-visible staging uploads and creates writable
+//!   Vulkan textures for shm/memory-backed client paths.
+//! - [`crate::backend::renderer::ExportMem`] performs readback through transfer buffers and returns
+//!   deterministic linear pixel data for supported formats.
+//!
+//! # Format And Modifier Expectations
+//!
+//! - Explicit modifier support is queried from Vulkan (`VK_EXT_image_drm_format_modifier`) and cached.
+//! - Implicit modifier support (`Modifier::Invalid`) is advertised only when Vulkan reports support
+//!   without explicit modifier metadata.
+//! - Explicit modifier imports validate plane count, plane strides, plane offsets, and usage before
+//!   creating Vulkan images.
+//! - Compositor integration should intersect renderer-supported modifiers with plane/allocator
+//!   capabilities instead of assuming one global modifier set.
+//!
+//! # Sync Expectations
+//!
+//! - [`crate::backend::renderer::Renderer::wait`] first resolves renderer-native fence payloads.
+//! - If sync-file import support is available, `SyncPoint` FDs are imported into Vulkan wait paths.
+//! - If explicit sync import/export is unavailable (or import fails with recoverable errors), behavior
+//!   degrades to host-side blocking waits to preserve correctness.
+//! - Capability probes are exposed through [`VulkanRenderer::supports_explicit_sync_import`],
+//!   [`VulkanRenderer::supports_explicit_sync_export`], and
+//!   [`VulkanRenderer::supports_timeline_semaphore`].
+//!
+//! # DRM Composition Integration Snippet
+//!
+//! ```ignore
+//! use smithay::backend::{
+//!     allocator::gbm::{GbmAllocator, GbmDevice},
+//!     drm::{
+//!         compositor::{DrmCompositor, FrameFlags},
+//!         exporter::gbm::GbmFramebufferExporter,
+//!         DrmDevice, DrmDeviceFd, DrmSurface,
+//!     },
+//!     renderer::{
+//!         element::surface::WaylandSurfaceRenderElement,
+//!         vulkan::VulkanRenderer,
+//!     },
+//!     vulkan::{version::Version, Instance, PhysicalDevice},
+//! };
+//! use smithay::output::Output;
+//! use std::collections::HashSet;
+//!
+//! let instance = Instance::new(Version::VERSION_1_3, None)?;
+//! let physical_device = PhysicalDevice::enumerate(&instance)?.next().expect("no Vulkan device");
+//! let mut renderer = VulkanRenderer::new(&physical_device)?;
+//!
+//! let renderer_formats = renderer
+//!     .dmabuf_render_formats()
+//!     .iter()
+//!     .copied()
+//!     .collect::<HashSet<_>>();
+//!
+//! # let output: Output = todo!();
+//! # let surface: DrmSurface = todo!();
+//! # let allocator: GbmAllocator<DrmDeviceFd> = todo!();
+//! # let exporter: GbmFramebufferExporter<DrmDeviceFd> = todo!();
+//! # let drm_device: DrmDevice = todo!();
+//! # let gbm: GbmDevice<DrmDeviceFd> = todo!();
+//! let mut compositor: DrmCompositor<_, _, (), _> = DrmCompositor::new(
+//!     &output,
+//!     surface,
+//!     None,
+//!     allocator,
+//!     exporter,
+//!     [drm_fourcc::DrmFourcc::Argb8888],
+//!     renderer_formats,
+//!     drm_device.cursor_size(),
+//!     Some(gbm),
+//! )?;
+//!
+//! let elements: Vec<WaylandSurfaceRenderElement<VulkanRenderer>> = Vec::new();
+//! let frame_result = compositor.render_frame::<_, _>(
+//!     &mut renderer,
+//!     &elements,
+//!     [0.0, 0.0, 0.0, 1.0],
+//!     FrameFlags::DEFAULT,
+//! )?;
+//!
+//! if !frame_result.is_empty {
+//!     compositor.queue_frame(())?;
+//!     // ...wait for VBlank/page-flip event...
+//!     let _user_data = compositor.frame_submitted()?;
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 #![allow(dead_code)]
 
@@ -150,7 +259,7 @@ impl VulkanRenderer {
         self.device.capabilities().timeline_semaphore()
     }
 
-    /// Returns whether importing native sync-file fds into Vulkan wait paths is supported.
+    /// Returns whether importing native sync-file fds into Vulkan queue wait semaphores is supported.
     ///
     /// When this is `false`, `Renderer::wait` and `Frame::wait` fall back to blocking on
     /// the provided `SyncPoint` at the host level.
