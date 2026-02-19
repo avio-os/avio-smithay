@@ -651,9 +651,56 @@ pub trait ImportDma: Renderer {
 // TODO: Replace this with a trait_alias, once that is stabilized.
 // pub type ImportAll = Renderer + ImportShm + ImportEgl;
 
-/// Common trait for renderers of any wayland buffer type
+/// Common trait for renderers importing wl_buffers backed by shm and dmabuf.
 #[cfg(feature = "wayland_frontend")]
-pub trait ImportAll: Renderer {
+pub trait ImportWlBuffer: Renderer {
+    /// Import a given buffer into the renderer.
+    ///
+    /// Returns a texture_id, which can be used with [`Frame::render_texture_from_to`] (or [`Frame::render_texture_at`])
+    /// or implementation-specific functions.
+    ///
+    /// If not otherwise defined by the implementation, this texture id is only valid for the renderer, that created it.
+    ///
+    /// This operation needs no bound or default rendering target.
+    ///
+    /// The implementation defines, if the id keeps being valid, if the buffer is released,
+    /// to avoid relying on implementation details, keep the buffer alive, until you destroyed this texture again.
+    ///
+    /// If provided the `SurfaceAttributes` can be used to do caching of rendering resources and is generally recommended.
+    ///
+    /// The `damage` argument provides a list of rectangle locating parts of the buffer that need to be updated. When provided
+    /// with an empty list `&[]`, the renderer is allowed to not update the texture at all.
+    ///
+    /// Returns `None`, if the buffer type cannot be determined or does not correspond to a texture (e.g.: single pixel buffer).
+    fn import_wl_buffer(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>>;
+}
+
+// TODO: Do this with specialization, when possible and do default implementations
+#[cfg(feature = "wayland_frontend")]
+impl<R: Renderer + ImportMemWl + ImportDmaWl> ImportWlBuffer for R {
+    #[profiling::function]
+    fn import_wl_buffer(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        surface: Option<&SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        match buffer_type(buffer) {
+            Some(BufferType::Shm) => Some(self.import_shm_buffer(buffer, surface, damage)),
+            Some(BufferType::Dma) => Some(self.import_dma_buffer(buffer, surface, damage)),
+            _ => None,
+        }
+    }
+}
+
+/// Convenience trait for renderers importing every wl_buffer type supported by this Smithay build.
+#[cfg(feature = "wayland_frontend")]
+pub trait ImportAll: ImportWlBuffer {
     /// Import a given buffer into the renderer.
     ///
     /// Returns a texture_id, which can be used with [`Frame::render_texture_from_to`] (or [`Frame::render_texture_at`])
@@ -677,10 +724,11 @@ pub trait ImportAll: Renderer {
         buffer: &wl_buffer::WlBuffer,
         surface: Option<&crate::wayland::compositor::SurfaceData>,
         damage: &[Rectangle<i32, BufferCoord>],
-    ) -> Option<Result<Self::TextureId, Self::Error>>;
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        ImportWlBuffer::import_wl_buffer(self, buffer, surface, damage)
+    }
 }
 
-// TODO: Do this with specialization, when possible and do default implementations
 #[cfg(all(
     feature = "wayland_frontend",
     feature = "backend_egl",
@@ -707,18 +755,280 @@ impl<R: Renderer + ImportMemWl + ImportEgl + ImportDmaWl> ImportAll for R {
     feature = "wayland_frontend",
     not(all(feature = "backend_egl", feature = "use_system_lib"))
 ))]
-impl<R: Renderer + ImportMemWl + ImportDmaWl> ImportAll for R {
-    fn import_buffer(
-        &mut self,
-        buffer: &wl_buffer::WlBuffer,
-        surface: Option<&SurfaceData>,
-        damage: &[Rectangle<i32, BufferCoord>],
-    ) -> Option<Result<Self::TextureId, Self::Error>> {
-        match buffer_type(buffer) {
-            Some(BufferType::Shm) => Some(self.import_shm_buffer(buffer, surface, damage)),
-            Some(BufferType::Dma) => Some(self.import_dma_buffer(buffer, surface, damage)),
-            _ => None,
+impl<R: Renderer + ImportMemWl + ImportDmaWl> ImportAll for R {}
+
+#[cfg(all(
+    feature = "wayland_frontend",
+    feature = "renderer_vulkan",
+    feature = "backend_egl",
+    feature = "use_system_lib"
+))]
+impl ImportAll for crate::backend::renderer::vulkan::VulkanRenderer {}
+
+#[cfg(all(test, feature = "wayland_frontend"))]
+mod import_wl_buffer_tests {
+    use super::*;
+    use crate::{
+        backend::{
+            allocator::{dmabuf::Dmabuf, Fourcc},
+            renderer::test::{DummyError, DummyFrame, DummyFramebuffer, DummyRenderer, DummyTexture},
+        },
+        utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
+        wayland::compositor::SurfaceData,
+    };
+    use wayland_server::protocol::wl_buffer;
+
+    #[derive(Debug, Default)]
+    struct WlOnlyRenderer(DummyRenderer);
+
+    impl RendererSuper for WlOnlyRenderer {
+        type Error = DummyError;
+        type TextureId = DummyTexture;
+        type Framebuffer<'buffer> = DummyFramebuffer;
+        type Frame<'frame, 'buffer>
+            = DummyFrame
+        where
+            'buffer: 'frame,
+            Self: 'frame;
+    }
+
+    impl Renderer for WlOnlyRenderer {
+        fn context_id(&self) -> ContextId<Self::TextureId> {
+            self.0.context_id()
         }
+
+        fn downscale_filter(&mut self, filter: TextureFilter) -> Result<(), Self::Error> {
+            self.0.downscale_filter(filter)
+        }
+
+        fn upscale_filter(&mut self, filter: TextureFilter) -> Result<(), Self::Error> {
+            self.0.upscale_filter(filter)
+        }
+
+        fn set_debug_flags(&mut self, flags: DebugFlags) {
+            self.0.set_debug_flags(flags);
+        }
+
+        fn debug_flags(&self) -> DebugFlags {
+            self.0.debug_flags()
+        }
+
+        fn render<'frame, 'buffer>(
+            &'frame mut self,
+            framebuffer: &'frame mut Self::Framebuffer<'buffer>,
+            output_size: Size<i32, Physical>,
+            dst_transform: Transform,
+        ) -> Result<Self::Frame<'frame, 'buffer>, Self::Error>
+        where
+            'buffer: 'frame,
+        {
+            self.0.render(framebuffer, output_size, dst_transform)
+        }
+
+        fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+            self.0.wait(sync)
+        }
+    }
+
+    impl ImportMem for WlOnlyRenderer {
+        fn import_memory(
+            &mut self,
+            data: &[u8],
+            format: Fourcc,
+            size: Size<i32, BufferCoord>,
+            flipped: bool,
+        ) -> Result<Self::TextureId, Self::Error> {
+            self.0.import_memory(data, format, size, flipped)
+        }
+
+        fn update_memory(
+            &mut self,
+            texture: &Self::TextureId,
+            data: &[u8],
+            region: Rectangle<i32, BufferCoord>,
+        ) -> Result<(), Self::Error> {
+            self.0.update_memory(texture, data, region)
+        }
+
+        fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
+            self.0.mem_formats()
+        }
+    }
+
+    impl ImportMemWl for WlOnlyRenderer {
+        fn import_shm_buffer(
+            &mut self,
+            buffer: &wl_buffer::WlBuffer,
+            surface: Option<&SurfaceData>,
+            damage: &[Rectangle<i32, BufferCoord>],
+        ) -> Result<Self::TextureId, Self::Error> {
+            self.0.import_shm_buffer(buffer, surface, damage)
+        }
+    }
+
+    impl ImportDma for WlOnlyRenderer {
+        fn import_dmabuf(
+            &mut self,
+            dmabuf: &Dmabuf,
+            damage: Option<&[Rectangle<i32, BufferCoord>]>,
+        ) -> Result<Self::TextureId, Self::Error> {
+            self.0.import_dmabuf(dmabuf, damage)
+        }
+    }
+
+    impl ImportDmaWl for WlOnlyRenderer {}
+
+    #[test]
+    fn wl_only_renderer_supports_import_wl_buffer() {
+        fn assert_import_wl_buffer<R: ImportWlBuffer>() {}
+        assert_import_wl_buffer::<WlOnlyRenderer>();
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    #[derive(Debug, Default)]
+    struct EglRenderer(WlOnlyRenderer);
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl RendererSuper for EglRenderer {
+        type Error = DummyError;
+        type TextureId = DummyTexture;
+        type Framebuffer<'buffer> = DummyFramebuffer;
+        type Frame<'frame, 'buffer>
+            = DummyFrame
+        where
+            'buffer: 'frame,
+            Self: 'frame;
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl Renderer for EglRenderer {
+        fn context_id(&self) -> ContextId<Self::TextureId> {
+            self.0.context_id()
+        }
+
+        fn downscale_filter(&mut self, filter: TextureFilter) -> Result<(), Self::Error> {
+            self.0.downscale_filter(filter)
+        }
+
+        fn upscale_filter(&mut self, filter: TextureFilter) -> Result<(), Self::Error> {
+            self.0.upscale_filter(filter)
+        }
+
+        fn set_debug_flags(&mut self, flags: DebugFlags) {
+            self.0.set_debug_flags(flags);
+        }
+
+        fn debug_flags(&self) -> DebugFlags {
+            self.0.debug_flags()
+        }
+
+        fn render<'frame, 'buffer>(
+            &'frame mut self,
+            framebuffer: &'frame mut Self::Framebuffer<'buffer>,
+            output_size: Size<i32, Physical>,
+            dst_transform: Transform,
+        ) -> Result<Self::Frame<'frame, 'buffer>, Self::Error>
+        where
+            'buffer: 'frame,
+        {
+            self.0.render(framebuffer, output_size, dst_transform)
+        }
+
+        fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+            self.0.wait(sync)
+        }
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl ImportMem for EglRenderer {
+        fn import_memory(
+            &mut self,
+            data: &[u8],
+            format: Fourcc,
+            size: Size<i32, BufferCoord>,
+            flipped: bool,
+        ) -> Result<Self::TextureId, Self::Error> {
+            self.0.import_memory(data, format, size, flipped)
+        }
+
+        fn update_memory(
+            &mut self,
+            texture: &Self::TextureId,
+            data: &[u8],
+            region: Rectangle<i32, BufferCoord>,
+        ) -> Result<(), Self::Error> {
+            self.0.update_memory(texture, data, region)
+        }
+
+        fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
+            self.0.mem_formats()
+        }
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl ImportMemWl for EglRenderer {
+        fn import_shm_buffer(
+            &mut self,
+            buffer: &wl_buffer::WlBuffer,
+            surface: Option<&SurfaceData>,
+            damage: &[Rectangle<i32, BufferCoord>],
+        ) -> Result<Self::TextureId, Self::Error> {
+            self.0.import_shm_buffer(buffer, surface, damage)
+        }
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl ImportDma for EglRenderer {
+        fn import_dmabuf(
+            &mut self,
+            dmabuf: &Dmabuf,
+            damage: Option<&[Rectangle<i32, BufferCoord>]>,
+        ) -> Result<Self::TextureId, Self::Error> {
+            self.0.import_dmabuf(dmabuf, damage)
+        }
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl ImportDmaWl for EglRenderer {}
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    impl ImportEgl for EglRenderer {
+        fn bind_wl_display(&mut self, _display: &wayland_server::DisplayHandle) -> Result<(), EglError> {
+            Ok(())
+        }
+
+        fn unbind_wl_display(&mut self) {}
+
+        fn egl_reader(&self) -> Option<&EGLBufferReader> {
+            None
+        }
+
+        fn import_egl_buffer(
+            &mut self,
+            _buffer: &wl_buffer::WlBuffer,
+            _surface: Option<&SurfaceData>,
+            _damage: &[Rectangle<i32, BufferCoord>],
+        ) -> Result<Self::TextureId, Self::Error> {
+            Err(DummyError::SyncInterrupted)
+        }
+    }
+
+    #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+    #[test]
+    fn egl_renderer_supports_import_all() {
+        fn assert_import_all<R: ImportAll>() {}
+        assert_import_all::<EglRenderer>();
+    }
+
+    #[cfg(all(
+        feature = "renderer_vulkan",
+        feature = "backend_egl",
+        feature = "use_system_lib"
+    ))]
+    #[test]
+    fn vulkan_renderer_supports_import_all_without_import_egl() {
+        fn assert_import_all<R: ImportAll>() {}
+        assert_import_all::<crate::backend::renderer::vulkan::VulkanRenderer>();
     }
 }
 

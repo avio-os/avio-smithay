@@ -512,7 +512,7 @@ where
                     return Ok(());
                 }
 
-                match renderer.import_buffer(buffer, Some(states), &buffer_damage) {
+                match ImportAll::import_buffer(renderer, buffer, Some(states), &buffer_damage) {
                     Some(Ok(m)) => {
                         e.insert(Box::new(m));
                         data.renderer_seen.insert(context_id, data.current_commit());
