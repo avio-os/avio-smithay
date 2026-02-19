@@ -123,6 +123,10 @@ impl super::PhdInfo {
         unsafe { instance.get_physical_device_properties2(phd, &mut properties) };
 
         info.properties = properties.properties;
+        let mut features = vk::PhysicalDeviceFeatures2::default();
+        unsafe { instance.get_physical_device_features2(phd, &mut features) };
+        info.features = features.features;
+
         // Initialize the driver info
         info.driver = info.properties_driver.map(DriverInfo::from_driver_properties);
 
