@@ -118,9 +118,7 @@ impl Renderer for VulkanRenderer {
             ?dst_transform,
             "starting vulkan render pass recording"
         );
-        let vr_m0 = unsafe { libc::mallinfo2() }.uordblks as i64;
         self.device.reclaim_completed_submissions()?;
-        let vr_m1 = unsafe { libc::mallinfo2() }.uordblks as i64;
 
         if output_size.w <= 0 || output_size.h <= 0 {
             return Err(VulkanRendererError::TemporaryFailure(
@@ -151,7 +149,6 @@ impl Renderer for VulkanRenderer {
         let pipelines = self.pipelines.pipelines_for_format(target_image.vk_format())?;
 
         let command_buffer = self.device.acquire_command_buffer()?;
-        let vr_m2 = unsafe { libc::mallinfo2() }.uordblks as i64;
         let begin_info =
             vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: Command buffer belongs to this device command pool and is not currently in use.
@@ -160,7 +157,6 @@ impl Renderer for VulkanRenderer {
                 .device_handle()
                 .begin_command_buffer(command_buffer, &begin_info)
         }?;
-        let vr_m3 = unsafe { libc::mallinfo2() }.uordblks as i64;
         self.device
             .insert_debug_label(command_buffer, c"vulkan.render.begin", [0.17, 0.42, 0.86, 1.0]);
 
@@ -170,21 +166,6 @@ impl Renderer for VulkanRenderer {
             target_image.view(),
             transformed_size,
         )?;
-        let vr_m4 = unsafe { libc::mallinfo2() }.uordblks as i64;
-        self.vk_render_probe_count += 1;
-        if self.vk_render_probe_count % 100 == 0 {
-            tracing::warn!(
-                n = self.vk_render_probe_count,
-                d_reclaim = vr_m1 - vr_m0,
-                d_acquire = vr_m2 - vr_m1,
-                d_begin_cb = vr_m3 - vr_m2,
-                d_create_fb = vr_m4 - vr_m3,
-                d_total = vr_m4 - vr_m0,
-                in_flight = self.device.in_flight_submission_count(),
-                reusable = self.device.reusable_command_buffer_count(),
-                "vk_render_malloc"
-            );
-        }
 
         let mut frame = VulkanFrame {
             renderer: self,

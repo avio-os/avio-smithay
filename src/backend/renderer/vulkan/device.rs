@@ -603,10 +603,6 @@ impl DeviceState {
         self.in_flight_submissions.len()
     }
 
-    pub(crate) fn reusable_command_buffer_count(&self) -> usize {
-        self.reusable_command_buffers.len()
-    }
-
     fn acquire_reclaim_fence(&mut self) -> Result<vk::Fence, VulkanRendererError> {
         if let Some(fence) = self.reusable_reclaim_fences.pop() {
             return Ok(fence);
