@@ -209,6 +209,7 @@ pub struct VulkanRenderer {
     blit: BlitState,
     descriptors: DescriptorState,
     pipelines: PipelineState,
+    vk_render_probe_count: u64,
 }
 
 impl VulkanRenderer {
@@ -236,6 +237,7 @@ impl VulkanRenderer {
             blit: BlitState::default(),
             descriptors,
             pipelines,
+            vk_render_probe_count: 0,
         })
     }
 

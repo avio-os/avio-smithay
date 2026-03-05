@@ -1113,6 +1113,7 @@ where
     primary_is_opaque: bool,
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
+    render_frame_probe_count: u64,
     supports_fencing: bool,
     reset_pending: bool,
     signaled_fence: Option<Arc<OwnedFd>>,
@@ -1299,6 +1300,7 @@ where
                     let drm_renderer = DrmCompositor {
                         primary_plane_element_id: Id::new(),
                         primary_plane_damage_bag: DamageBag::new(4),
+                        render_frame_probe_count: 0,
                         primary_is_opaque: is_opaque,
                         reset_pending: true,
                         signaled_fence,
@@ -1481,6 +1483,7 @@ where
         let drm_renderer = DrmCompositor {
             primary_plane_element_id: Id::new(),
             primary_plane_damage_bag: DamageBag::new(4),
+            render_frame_probe_count: 0,
             primary_is_opaque: is_opaque,
             reset_pending: true,
             signaled_fence,
@@ -1721,6 +1724,8 @@ where
         R: Renderer + Bind<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
+        let rf_top = unsafe { libc::mallinfo2() }.uordblks as i64;
+        let mut rf_inner: Option<(i64, i64, i64)> = None;
         let mut clear_color = clear_color.into();
 
         if !self.surface.is_active() {
@@ -2264,12 +2269,15 @@ where
                 )
                 .collect::<Vec<_>>();
 
+            let rf_m0 = unsafe { libc::mallinfo2() }.uordblks as i64;
             let mut framebuffer = renderer
                 .bind(&mut dmabuf)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
+            let rf_m1 = unsafe { libc::mallinfo2() }.uordblks as i64;
             let render_res =
                 self.damage_tracker
                     .render_output(renderer, &mut framebuffer, age, &elements, clear_color);
+            let rf_m2 = unsafe { libc::mallinfo2() }.uordblks as i64;
 
             // restore the renderer debug flags
             renderer.set_debug_flags(renderer_debug_flags);
@@ -2364,6 +2372,8 @@ where
                     return Err(RenderFrameError::from(err));
                 }
             }
+
+            rf_inner = Some((rf_m0, rf_m1, rf_m2));
         } else {
             // if we are constantly doing direct scan-out on the primary plane
             // we have to cleanup the renderer texture cache as this would
@@ -2436,6 +2446,25 @@ where
         // could otherwise be potentially released on `frame_submitted`
         if !next_frame.is_empty() {
             self.next_frame = Some(next_frame);
+        }
+
+        let rf_end = unsafe { libc::mallinfo2() }.uordblks as i64;
+        self.render_frame_probe_count += 1;
+        if self.render_frame_probe_count % 100 == 0 {
+            let (d_bind, d_render_output, d_postprocess) = if let Some((m0, m1, m2)) = rf_inner {
+                (m1 - m0, m2 - m1, rf_end - m2)
+            } else {
+                (0, 0, rf_end - rf_top)
+            };
+            tracing::warn!(
+                n = self.render_frame_probe_count,
+                rendered = render,
+                d_bind,
+                d_render_output,
+                d_postprocess,
+                d_total = rf_end - rf_top,
+                "drm_render_frame_malloc"
+            );
         }
 
         Ok(frame_reference)

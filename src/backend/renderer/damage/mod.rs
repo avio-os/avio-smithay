@@ -194,6 +194,7 @@ pub struct OutputDamageTracker {
     opaque_regions_index: Vec<Range<usize>>,
     element_opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_visible_area_workhouse: Vec<Rectangle<i32, Physical>>,
+    render_output_probe_count: u64,
     span: tracing::Span,
 }
 
@@ -259,6 +260,7 @@ impl OutputDamageTracker {
             opaque_regions_index: Default::default(),
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
+            render_output_probe_count: 0,
             span: info_span!("renderer_damage"),
         }
     }
@@ -278,6 +280,7 @@ impl OutputDamageTracker {
             opaque_regions_index: Default::default(),
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
+            render_output_probe_count: 0,
             last_state: Default::default(),
             span: info_span!("renderer_damage", output = output.name()),
         }
@@ -299,6 +302,7 @@ impl OutputDamageTracker {
             opaque_regions: Default::default(),
             opaque_regions_index: Default::default(),
             element_visible_area_workhouse: Default::default(),
+            render_output_probe_count: 0,
             last_state: Default::default(),
         }
     }
@@ -341,6 +345,7 @@ impl OutputDamageTracker {
 
         // This will hold all the damage we need for this rendering step
         let mut render_elements: Vec<&E> = Vec::with_capacity(elements.len());
+        let ro_m0 = unsafe { libc::mallinfo2() }.uordblks as i64;
         let states = self.damage_output_internal(
             age,
             elements,
@@ -350,6 +355,7 @@ impl OutputDamageTracker {
             Some(clear_color),
             &mut render_elements,
         );
+        let ro_m1 = unsafe { libc::mallinfo2() }.uordblks as i64;
 
         if self.damage.is_empty() {
             trace!("no damage, skipping rendering");
@@ -366,7 +372,9 @@ impl OutputDamageTracker {
             // we have to take the element damage to be able to move it around
             let mut element_damage = std::mem::take(&mut self.element_damage);
             let mut element_opaque_regions = std::mem::take(&mut self.element_opaque_regions);
+            let draw_m0 = unsafe { libc::mallinfo2() }.uordblks as i64;
             let mut frame = renderer.render(framebuffer, output_size, output_transform)?;
+            let draw_m1 = unsafe { libc::mallinfo2() }.uordblks as i64;
 
             element_damage.clear();
             element_damage.extend_from_slice(&self.damage);
@@ -376,6 +384,7 @@ impl OutputDamageTracker {
             trace!("clearing damage {:?}", element_damage);
             frame.clear(clear_color, &element_damage)?;
 
+            let mut draw_count: u32 = 0;
             for (z_index, element) in render_elements.iter().rev().enumerate() {
                 let element_id = element.id();
                 let element_geometry = element.geometry(output_scale);
@@ -433,12 +442,29 @@ impl OutputDamageTracker {
                     &element_damage,
                     &element_opaque_regions,
                 )?;
+                draw_count += 1;
             }
 
             // return the element damage so that we can re-use the allocation
             std::mem::swap(&mut self.element_damage, &mut element_damage);
             std::mem::swap(&mut self.element_opaque_regions, &mut element_opaque_regions);
-            frame.finish()
+            let draw_m2 = unsafe { libc::mallinfo2() }.uordblks as i64;
+            let finish_result = frame.finish();
+            let draw_m3 = unsafe { libc::mallinfo2() }.uordblks as i64;
+            self.render_output_probe_count += 1;
+            if self.render_output_probe_count % 100 == 0 {
+                tracing::warn!(
+                    n = self.render_output_probe_count,
+                    d_damage = ro_m1 - ro_m0,
+                    d_begin_frame = draw_m1 - draw_m0,
+                    d_element_draws = draw_m2 - draw_m1,
+                    d_finish = draw_m3 - draw_m2,
+                    draw_count,
+                    d_total = draw_m3 - ro_m0,
+                    "render_output_malloc"
+                );
+            }
+            finish_result
         })();
 
         match render_res {

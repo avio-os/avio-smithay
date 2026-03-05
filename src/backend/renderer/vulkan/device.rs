@@ -13,10 +13,15 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SubmissionId(u64);
 
-#[derive(Debug)]
 struct InFlightSubmission {
     id: SubmissionId,
     fence: VulkanFence,
+    /// Non-exportable fence used exclusively by `reclaim_completed_submissions` to detect
+    /// completion.  When `supports_sync_file_export` is true, the caller-visible `VulkanFence`
+    /// may be exported as a SYNC_FD — which per the Vulkan spec resets the VkFence to
+    /// unsignaled, making it unsuitable for host-side polling.  This dedicated reclaim fence
+    /// is never exported and therefore always reflects the true completion state.
+    reclaim_fence: vk::Fence,
     command_buffer: vk::CommandBuffer,
     framebuffers: Vec<vk::Framebuffer>,
     wait_semaphores: Vec<vk::Semaphore>,
@@ -69,6 +74,7 @@ pub(crate) struct DeviceState {
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
+    reusable_reclaim_fences: Vec<vk::Fence>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
     pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
@@ -89,6 +95,7 @@ impl fmt::Debug for DeviceState {
             .field("queue", &self.queue)
             .field("command_pool", &self.command_pool)
             .field("reusable_command_buffers", &self.reusable_command_buffers.len())
+            .field("reusable_reclaim_fences", &self.reusable_reclaim_fences.len())
             .field("in_flight_submissions", &self.in_flight_submissions.len())
             .field("next_submission_id", &self.next_submission_id)
             .field("device", &self.device.handle().handle())
@@ -226,6 +233,7 @@ impl DeviceState {
             queue,
             command_pool,
             reusable_command_buffers: Vec::new(),
+            reusable_reclaim_fences: Vec::new(),
             in_flight_submissions: VecDeque::new(),
             pending_waits: Vec::new(),
             next_submission_id: 0,
@@ -449,6 +457,44 @@ impl DeviceState {
             return Err(err.into());
         }
 
+        // When the caller-visible fence is exportable as SYNC_FD, the Vulkan spec mandates that
+        // exporting resets the VkFence to unsignaled.  Since the DRM compositor routinely exports
+        // the fence for KMS in-fencing, `get_fence_status` on the caller-visible fence would
+        // always return false — preventing reclaim.  We solve this by submitting a lightweight
+        // empty batch with a separate non-exportable fence that faithfully tracks completion.
+        //
+        // When SYNC_FD export is not supported, the caller-visible fence is never exported and
+        // can be polled directly, so the reclaim fence is redundant — we use vk::Fence::null()
+        // as a sentinel to skip the extra submit.
+        let reclaim_fence = if self.supports_sync_file_export() {
+            match self.acquire_reclaim_fence() {
+                Ok(rf) => {
+                    // SAFETY: Empty submit; fence signals when all prior queue work completes.
+                    match unsafe {
+                        self.device
+                            .handle()
+                            .queue_submit(self.queue, &[], rf)
+                    } {
+                        Ok(()) => rf,
+                        Err(err) => {
+                            // The real work was already submitted — we cannot un-submit it.
+                            // Fall back to null (polling the caller-visible fence, which may
+                            // not work if exported) rather than losing track of the submission.
+                            warn!(?err, "failed to submit reclaim fence; reclaim may be delayed");
+                            self.recycle_reclaim_fence(rf);
+                            vk::Fence::null()
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, "failed to create reclaim fence; reclaim may be delayed");
+                    vk::Fence::null()
+                }
+            }
+        } else {
+            vk::Fence::null()
+        };
+
         let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
         self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
         self.diagnostics.total_submit_cpu_ns =
@@ -460,6 +506,7 @@ impl DeviceState {
         self.in_flight_submissions.push_back(InFlightSubmission {
             id,
             fence: fence.clone(),
+            reclaim_fence,
             command_buffer,
             framebuffers,
             wait_semaphores,
@@ -556,6 +603,34 @@ impl DeviceState {
         self.in_flight_submissions.len()
     }
 
+    pub(crate) fn reusable_command_buffer_count(&self) -> usize {
+        self.reusable_command_buffers.len()
+    }
+
+    fn acquire_reclaim_fence(&mut self) -> Result<vk::Fence, VulkanRendererError> {
+        if let Some(fence) = self.reusable_reclaim_fences.pop() {
+            return Ok(fence);
+        }
+        let create_info = vk::FenceCreateInfo::default();
+        // SAFETY: Device is valid and create info references no borrowed resources.
+        let fence = unsafe { self.device.handle().create_fence(&create_info, None) }?;
+        Ok(fence)
+    }
+
+    fn recycle_reclaim_fence(&mut self, fence: vk::Fence) {
+        // SAFETY: Fence was signaled (or never submitted) and belongs to this device.
+        if let Err(err) = unsafe {
+            self.device
+                .handle()
+                .reset_fences(&[fence])
+        } {
+            warn!(?err, "failed to reset reclaim fence, destroying instead");
+            unsafe { self.device.handle().destroy_fence(fence, None) };
+            return;
+        }
+        self.reusable_reclaim_fences.push(fence);
+    }
+
     #[instrument(level = "trace", skip(self))]
     #[profiling::function]
     pub(crate) fn reclaim_completed_submissions(&mut self) -> Result<(), VulkanRendererError> {
@@ -564,8 +639,17 @@ impl DeviceState {
                 break;
             };
 
-            // SAFETY: Fence was created by this device and remains valid while tracked in `in_flight_submissions`.
-            let signaled = unsafe { self.device.handle().get_fence_status(front.fence.handle()) }?;
+            // When a dedicated reclaim fence exists, poll it instead of the caller-visible
+            // fence — the latter may have been exported as SYNC_FD (resetting it to unsignaled).
+            // When reclaim_fence is null, SYNC_FD export is not supported, so the caller-visible
+            // fence is safe to poll directly.
+            let poll_fence = if front.reclaim_fence != vk::Fence::null() {
+                front.reclaim_fence
+            } else {
+                front.fence.handle()
+            };
+            // SAFETY: Fence was created by this device and remains valid while tracked.
+            let signaled = unsafe { self.device.handle().get_fence_status(poll_fence) }?;
             if !signaled {
                 break;
             }
@@ -584,11 +668,16 @@ impl DeviceState {
     #[profiling::function]
     pub(crate) fn wait_for_all_submissions(&mut self) -> Result<(), VulkanRendererError> {
         while let Some(submission) = self.in_flight_submissions.pop_front() {
+            let wait_fence = if submission.reclaim_fence != vk::Fence::null() {
+                submission.reclaim_fence
+            } else {
+                submission.fence.handle()
+            };
             // SAFETY: Fence was created by this device and remains valid while tracked.
             unsafe {
                 self.device
                     .handle()
-                    .wait_for_fences(&[submission.fence.handle()], true, u64::MAX)
+                    .wait_for_fences(&[wait_fence], true, u64::MAX)
             }?;
             self.recycle_submission(submission)?;
         }
@@ -600,12 +689,17 @@ impl DeviceState {
         let InFlightSubmission {
             id,
             fence: _fence,
+            reclaim_fence,
             command_buffer,
             framebuffers,
             wait_semaphores,
             submitted_at,
             ..
         } = submission;
+
+        if reclaim_fence != vk::Fence::null() {
+            self.recycle_reclaim_fence(reclaim_fence);
+        }
 
         let completion_ns = duration_to_ns(submitted_at.elapsed());
         self.diagnostics.reclaimed_submissions = self.diagnostics.reclaimed_submissions.saturating_add(1);
@@ -791,5 +885,10 @@ impl Drop for DeviceState {
 
         // SAFETY: Command pool belongs to this device and may be destroyed after queue idle.
         unsafe { self.device.handle().destroy_command_pool(self.command_pool, None) };
+
+        for fence in self.reusable_reclaim_fences.drain(..) {
+            // SAFETY: Fence belongs to this device and is not in-flight (all submissions drained above).
+            unsafe { self.device.handle().destroy_fence(fence, None) };
+        }
     }
 }
