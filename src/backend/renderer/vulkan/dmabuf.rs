@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     os::fd::{AsRawFd, IntoRawFd},
     sync::{
         atomic::{AtomicI32, Ordering},
@@ -8,8 +7,9 @@ use std::{
 };
 
 use ash::vk;
+use indexmap::IndexMap;
 use scopeguard::ScopeGuard;
-use tracing::trace;
+use tracing::{info, trace};
 
 use crate::{
     backend::allocator::{
@@ -83,10 +83,22 @@ struct DmabufImportDescriptor {
 
 #[derive(Debug, Default)]
 pub(crate) struct DmabufState {
-    cache: HashMap<WeakDmabuf, CachedDmabuf>,
+    cache: IndexMap<WeakDmabuf, CachedDmabuf>,
     next_import_id: u64,
+    imports_since_cleanup: u32,
+    import_attempts_total: u64,
+    cleanup_runs: u64,
+    cleanup_scanned: u64,
+    cleanup_stale_evictions: u64,
+    capacity_evictions: u64,
+    max_cache_len: usize,
     cache_stats: VulkanCacheStats,
 }
+
+const MAX_DMABUF_CACHE_ENTRIES: usize = 256;
+const DMABUF_CLEANUP_INTERVAL_IMPORTS: u32 = 64;
+const DMABUF_CLEANUP_SCAN_LIMIT: usize = 64;
+const DMABUF_DIAG_LOG_INTERVAL_IMPORTS: u64 = 256;
 
 impl DmabufState {
     pub(crate) fn import_texture(
@@ -119,11 +131,9 @@ impl DmabufState {
     }
 
     pub(crate) fn cleanup(&mut self) {
-        let before = self.cache.len();
-        self.cache
-            .retain(|_, cached| !cached.handle.is_gone() || Arc::strong_count(&cached.imported) > 1);
-        let removed = before.saturating_sub(self.cache.len()) as u64;
-        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(removed);
+        self.cleanup_runs = self.cleanup_runs.saturating_add(1);
+        self.cleanup_stale_entries(usize::MAX);
+        self.evict_to_capacity();
     }
 
     pub(crate) fn cache_stats(&self) -> VulkanCacheStats {
@@ -137,7 +147,8 @@ impl DmabufState {
         dmabuf: &Dmabuf,
         role: DmabufRole,
     ) -> Result<Arc<ImportedDmabufImage>, VulkanRendererError> {
-        self.cleanup();
+        self.import_attempts_total = self.import_attempts_total.saturating_add(1);
+        self.maybe_cleanup();
 
         let descriptor = Self::validate_dmabuf(dmabuf, formats, role)?;
         let requested_usage = role.required_usage();
@@ -145,6 +156,8 @@ impl DmabufState {
 
         if let Some(cached) = self.cache.get(&key) {
             if cached.signature == descriptor.signature && cached.imported.usage().contains(requested_usage) {
+                let imported = cached.imported.clone();
+                self.promote_entry(&key);
                 self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
                 trace!(
                     hits = self.cache_stats.hits,
@@ -152,7 +165,8 @@ impl DmabufState {
                     evictions = self.cache_stats.evictions,
                     "vulkan dmabuf cache hit"
                 );
-                return Ok(cached.imported.clone());
+                self.maybe_log_cache_diagnostics();
+                return Ok(imported);
             }
         }
 
@@ -165,6 +179,7 @@ impl DmabufState {
             .unwrap_or(requested_usage);
 
         let imported = self.create_imported_image(device, dmabuf, &descriptor, usage)?;
+        let _ = self.cache.shift_remove(&key);
         self.cache.insert(
             key.clone(),
             CachedDmabuf {
@@ -173,14 +188,96 @@ impl DmabufState {
                 imported: imported.clone(),
             },
         );
+        self.update_max_cache_len();
+        self.evict_to_capacity();
         trace!(
             hits = self.cache_stats.hits,
             misses = self.cache_stats.misses,
             evictions = self.cache_stats.evictions,
             "vulkan dmabuf cache miss"
         );
+        self.maybe_log_cache_diagnostics();
 
         Ok(imported)
+    }
+
+    fn maybe_cleanup(&mut self) {
+        self.imports_since_cleanup = self.imports_since_cleanup.saturating_add(1);
+        let needs_cleanup = self.imports_since_cleanup >= DMABUF_CLEANUP_INTERVAL_IMPORTS
+            || self.cache.len() > MAX_DMABUF_CACHE_ENTRIES;
+        if !needs_cleanup {
+            return;
+        }
+
+        self.imports_since_cleanup = 0;
+        self.cleanup_runs = self.cleanup_runs.saturating_add(1);
+        self.cleanup_stale_entries(DMABUF_CLEANUP_SCAN_LIMIT);
+        self.evict_to_capacity();
+    }
+
+    fn cleanup_stale_entries(&mut self, max_scan: usize) {
+        let mut scanned = 0usize;
+        let mut index = 0usize;
+
+        while index < self.cache.len() && scanned < max_scan {
+            let remove = self
+                .cache
+                .get_index(index)
+                .map(|(_, cached)| cached.handle.is_gone() && Arc::strong_count(&cached.imported) <= 1)
+                .unwrap_or(false);
+            scanned = scanned.saturating_add(1);
+
+            if remove {
+                let _ = self.cache.shift_remove_index(index);
+                self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
+                self.cleanup_stale_evictions = self.cleanup_stale_evictions.saturating_add(1);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+        self.cleanup_scanned = self.cleanup_scanned.saturating_add(scanned as u64);
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.cache.len() > MAX_DMABUF_CACHE_ENTRIES {
+            if self.cache.shift_remove_index(0).is_none() {
+                break;
+            }
+            self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
+            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+        }
+    }
+
+    fn promote_entry(&mut self, key: &WeakDmabuf) {
+        let Some(entry) = self.cache.shift_remove(key) else {
+            return;
+        };
+        self.cache.insert(key.clone(), entry);
+    }
+
+    fn update_max_cache_len(&mut self) {
+        self.max_cache_len = self.max_cache_len.max(self.cache.len());
+    }
+
+    fn maybe_log_cache_diagnostics(&self) {
+        if self.import_attempts_total == 0
+            || (self.import_attempts_total % DMABUF_DIAG_LOG_INTERVAL_IMPORTS) != 0
+        {
+            return;
+        }
+        info!(
+            imports_total = self.import_attempts_total,
+            cache_len = self.cache.len(),
+            cache_max_len = self.max_cache_len,
+            hits = self.cache_stats.hits,
+            misses = self.cache_stats.misses,
+            evictions = self.cache_stats.evictions,
+            cleanup_runs = self.cleanup_runs,
+            cleanup_scanned = self.cleanup_scanned,
+            cleanup_stale_evictions = self.cleanup_stale_evictions,
+            capacity_evictions = self.capacity_evictions,
+            "smithay vulkan dmabuf cache diagnostics"
+        );
     }
 
     fn validate_dmabuf(
