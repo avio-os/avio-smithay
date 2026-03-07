@@ -922,6 +922,11 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                         }
 
                         if sync_mode == PlaneSyncMode::Submit && (!supports_fencing || fence.is_none()) {
+                            trace!(
+                                sync_reached = sync.is_reached(),
+                                supports_fencing,
+                                "build_planes: host-wait fallback (no IN_FENCE_FD)"
+                            );
                             let _ = sync.wait();
                         }
                     }
@@ -2347,7 +2352,13 @@ where
                         // Export once and fan out duplicated fds to KMS and superseded-release
                         // consumers. When KMS fencing is unavailable, keep the sync point
                         // unexported so the submit path can still fall back to a host wait.
-                        render_output_result.sync.export().map(Arc::new)
+                        let exported = render_output_result.sync.export().map(Arc::new);
+                        trace!(
+                            exported_ok = exported.is_some(),
+                            sync_reached = render_output_result.sync.is_reached(),
+                            "shared_render_sync_file export"
+                        );
+                        exported
                     } else {
                         None
                     };

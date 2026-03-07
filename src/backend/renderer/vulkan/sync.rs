@@ -1,7 +1,10 @@
 use std::{
     fmt,
     os::fd::{FromRawFd, OwnedFd},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use ash::{khr, vk};
@@ -21,6 +24,11 @@ struct VulkanFenceInner {
     fence: vk::Fence,
     external_fence_fd: Option<Arc<khr::external_fence_fd::Device>>,
     exportable_sync_file: bool,
+    /// Set after a successful `vkGetFenceFdKHR(SYNC_FD)` call. SYNC_FD export
+    /// has move/transfer semantics: the VkFence is reset to unsignaled after
+    /// export, even when the returned fd is -1 (already-signaled sentinel).
+    /// Once exported, the VkFence must not be waited on or re-exported.
+    exported: AtomicBool,
 }
 
 impl fmt::Debug for VulkanFence {
@@ -38,6 +46,7 @@ impl fmt::Debug for VulkanFenceInner {
             .field("device", &self.device.handle().handle())
             .field("fence", &self.fence)
             .field("exportable_sync_file", &self.exportable_sync_file)
+            .field("exported", &self.exported.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -66,6 +75,7 @@ impl VulkanFence {
                 fence,
                 external_fence_fd,
                 exportable_sync_file,
+                exported: AtomicBool::new(false),
             }),
         })
     }
@@ -94,6 +104,12 @@ impl VulkanFence {
             return None;
         }
 
+        // SYNC_FD export has move semantics — the VkFence is reset after export.
+        // Prevent double-export which would wait/export on an undefined fence.
+        if self.inner.exported.load(Ordering::Acquire) {
+            return None;
+        }
+
         let loader = self.inner.external_fence_fd.as_ref()?;
         let get_info = vk::FenceGetFdInfoKHR::default()
             .fence(self.inner.fence)
@@ -108,8 +124,13 @@ impl VulkanFence {
             }
         };
 
+        // Mark as exported BEFORE checking fd value. vkGetFenceFdKHR(SYNC_FD)
+        // transfers the fence payload on success — the VkFence is now reset to
+        // unsignaled regardless of whether fd is -1 or a valid fd.
+        self.inner.exported.store(true, Ordering::Release);
+
         if fd == -1 {
-            trace!("Vulkan fence export returned already-signaled sync_file sentinel");
+            trace!("Vulkan fence export returned already-signaled sync_file sentinel (fence consumed)");
             return None;
         }
 
@@ -128,14 +149,27 @@ impl VulkanFence {
 
 impl Fence for VulkanFence {
     fn is_signaled(&self) -> bool {
+        // An exported SYNC_FD fence has been consumed — treat as signaled so
+        // callers don't poll a reset fence that will never be signaled again.
+        if self.inner.exported.load(Ordering::Acquire) {
+            return true;
+        }
         self.status().unwrap_or(false)
     }
 
     fn wait(&self) -> Result<(), Interrupted> {
+        // An exported SYNC_FD fence has been consumed — the payload was moved
+        // to the sync_file fd. Waiting on the reset VkFence would block forever.
+        if self.inner.exported.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.wait_vk().map_err(|_| Interrupted)
     }
 
     fn is_exportable(&self) -> bool {
+        if self.inner.exported.load(Ordering::Acquire) {
+            return false;
+        }
         self.inner.exportable_sync_file && self.inner.external_fence_fd.is_some()
     }
 
