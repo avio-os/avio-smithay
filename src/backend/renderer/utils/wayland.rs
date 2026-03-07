@@ -1,5 +1,7 @@
 #[cfg(feature = "backend_drm")]
-use crate::wayland::drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState};
+use crate::wayland::drm_syncobj::{
+    ClaimableReleasePoint, DrmSyncPoint, DrmSyncobjCachedState, WeakClaimableReleasePoint,
+};
 use crate::{
     backend::renderer::{
         buffer_dimensions, buffer_has_alpha, element::RenderElement, ContextId, ErasedContextId, ImportAll,
@@ -18,7 +20,8 @@ use crate::{
 
 use std::{
     any::Any,
-    collections::{hash_map::Entry, HashMap},
+    collections::HashMap,
+    os::fd::OwnedFd,
     sync::{Arc, Mutex},
 };
 
@@ -56,23 +59,50 @@ pub struct RendererSurfaceState {
 unsafe impl Send for RendererSurfaceState {}
 unsafe impl Sync for RendererSurfaceState {}
 
+#[derive(Debug, Clone)]
+enum LastRenderSync {
+    Pending(crate::backend::renderer::sync::SyncPoint),
+    Exported(Arc<OwnedFd>),
+}
+
 #[derive(Debug)]
 struct InnerBuffer {
     buffer: WlBuffer,
     #[cfg(feature = "backend_drm")]
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
-    release_point: Option<DrmSyncPoint>,
+    release_point: Mutex<Option<DrmSyncPoint>>,
+    #[cfg(feature = "backend_drm")]
+    has_explicit_release_point: bool,
+    #[cfg(feature = "backend_drm")]
+    release_fallback: Mutex<Option<WeakClaimableReleasePoint>>,
+    #[cfg(feature = "backend_drm")]
+    superseded_release: Mutex<Option<ClaimableReleasePoint>>,
+    #[cfg(feature = "backend_drm")]
+    last_render_sync: Mutex<Option<LastRenderSync>>,
 }
 
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(feature = "backend_drm")]
+        if !self.has_explicit_release_point {
+            self.buffer.release();
+        }
+        #[cfg(not(feature = "backend_drm"))]
         self.buffer.release();
         #[cfg(feature = "backend_drm")]
-        if let Some(release_point) = &self.release_point {
-            if let Err(err) = release_point.signal() {
-                tracing::error!("Failed to signal syncobj release point: {}", err);
+        if let Ok(release_fallback) = self.release_fallback.get_mut() {
+            if let Some(release_fallback) = release_fallback.take() {
+                release_fallback.signal_if_unclaimed();
+            }
+        }
+        #[cfg(feature = "backend_drm")]
+        if let Ok(release_point) = self.release_point.get_mut() {
+            if let Some(release_point) = release_point.take() {
+                if let Err(err) = release_point.signal() {
+                    tracing::error!("Failed to signal syncobj release point: {}", err);
+                }
             }
         }
     }
@@ -93,7 +123,15 @@ impl Buffer {
                 #[cfg(feature = "backend_drm")]
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
-                release_point: None,
+                release_point: Mutex::new(None),
+                #[cfg(feature = "backend_drm")]
+                has_explicit_release_point: false,
+                #[cfg(feature = "backend_drm")]
+                release_fallback: Mutex::new(None),
+                #[cfg(feature = "backend_drm")]
+                superseded_release: Mutex::new(None),
+                #[cfg(feature = "backend_drm")]
+                last_render_sync: Mutex::new(None),
             }),
         }
     }
@@ -105,15 +143,132 @@ impl Buffer {
             inner: Arc::new(InnerBuffer {
                 buffer,
                 acquire_point: Some(acquire_point),
-                release_point: Some(release_point),
+                release_point: Mutex::new(Some(release_point)),
+                has_explicit_release_point: true,
+                release_fallback: Mutex::new(None),
+                superseded_release: Mutex::new(None),
+                last_render_sync: Mutex::new(None),
             }),
         }
     }
 
     #[cfg(feature = "backend_drm")]
-    #[allow(dead_code)]
-    pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
-        self.inner.acquire_point.as_ref()
+    pub(crate) fn acquire_point(&self) -> Option<DrmSyncPoint> {
+        self.inner.acquire_point.clone()
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn take_release_point(&self) -> Option<DrmSyncPoint> {
+        self.inner.release_point.lock().unwrap().take()
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn set_release_fallback(&self, release_fallback: WeakClaimableReleasePoint) {
+        *self.inner.release_fallback.lock().unwrap() = Some(release_fallback);
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn set_superseded_release(&self, superseded_release: ClaimableReleasePoint) {
+        *self.inner.superseded_release.lock().unwrap() = Some(superseded_release);
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn set_last_render_sync(&self, sync: crate::backend::renderer::sync::SyncPoint) {
+        *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Pending(sync));
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn set_last_render_sync_file(&self, sync_file: Arc<OwnedFd>) {
+        *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Exported(sync_file));
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn try_signal_superseded_release_with_last_render_sync(&self) -> bool {
+        let Some(last_render_sync) = self.inner.last_render_sync.lock().unwrap().clone() else {
+            return false;
+        };
+
+        let mut superseded_release = self.inner.superseded_release.lock().unwrap();
+        let Some(claimable) = superseded_release.as_ref() else {
+            return false;
+        };
+
+        match last_render_sync {
+            LastRenderSync::Pending(sync) => {
+                // Only signal immediately if the render sync is already reached.
+                // Do NOT call sync.export() here — for VkFence-based sync points,
+                // SYNC_FD export resets the fence per Vulkan spec. If the fence was
+                // already exported elsewhere (e.g. for KMS IN_FENCE_FD), re-exporting
+                // produces an invalid fd and causes ENOENT in signal_with_sync_file.
+                // If the sync isn't reached yet, return false and let the caller retry
+                // or rely on the drop fallback in ClaimableReleasePoint.
+                if sync.is_reached() {
+                    let signaled = claimable.signal().map_or_else(
+                        |err| {
+                            warn!(?err, "Failed to signal superseded release point immediately");
+                            false
+                        },
+                        |_| true,
+                    );
+                    if signaled {
+                        superseded_release.take();
+                    }
+                    return signaled;
+                }
+
+                false
+            }
+            LastRenderSync::Exported(sync_file) => {
+                let sync_file = match sync_file.try_clone() {
+                    Ok(sync_file) => sync_file,
+                    Err(err) => {
+                        warn!(?err, "Failed to clone exported render sync for superseded release point");
+                        return false;
+                    }
+                };
+
+                match claimable.signal_with_sync_file(sync_file) {
+                    Ok(signaled) => {
+                        if signaled {
+                            superseded_release.take();
+                        }
+                        true
+                    }
+                    Err(err) => {
+                        // sync_file was invalid or DRM ioctl failed — fall back to
+                        // immediate signaling so the release point doesn't stay orphaned.
+                        warn!(?err, "Failed to attach superseded release to render sync, signaling immediately");
+                        let fallback_ok = claimable.signal().unwrap_or(false);
+                        if fallback_ok {
+                            superseded_release.take();
+                        }
+                        fallback_ok
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn signal_superseded_release_with_sync_file(
+        &self,
+        sync_file: std::os::fd::OwnedFd,
+    ) -> std::io::Result<bool> {
+        let mut superseded_release = self.inner.superseded_release.lock().unwrap();
+        let Some(claimable) = superseded_release.as_ref() else {
+            return Ok(false);
+        };
+
+        let signaled = claimable.signal_with_sync_file(sync_file)?;
+        if signaled {
+            superseded_release.take();
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn same_resource(&self, other: &Self) -> bool {
+        self.inner.buffer == other.inner.buffer
     }
 }
 
@@ -166,18 +321,35 @@ impl RendererSurfaceState {
                 self.buffer_transform = attrs.buffer_transform.into();
 
                 if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
+                    if let Some(previous_buffer) = self.buffer.take() {
+                        if let Some(release_point) = previous_buffer.take_release_point() {
+                            let claimable = ClaimableReleasePoint::new(release_point);
+                            previous_buffer.set_release_fallback(claimable.weak());
+                            previous_buffer.set_superseded_release(claimable);
+                            let _ = previous_buffer.try_signal_superseded_release_with_last_render_sync();
+                        }
+                    }
+
+                    let release_point = syncobj_state.release_point.take();
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,
                             #[cfg(feature = "backend_drm")]
                             acquire_point: syncobj_state.acquire_point.take(),
                             #[cfg(feature = "backend_drm")]
-                            release_point: syncobj_state.release_point.take(),
+                            release_point: Mutex::new(release_point.clone()),
+                            #[cfg(feature = "backend_drm")]
+                            has_explicit_release_point: release_point.is_some(),
+                            #[cfg(feature = "backend_drm")]
+                            release_fallback: Mutex::new(None),
+                            #[cfg(feature = "backend_drm")]
+                            superseded_release: Mutex::new(None),
+                            #[cfg(feature = "backend_drm")]
+                            last_render_sync: Mutex::new(None),
                         }),
                     });
+                    self.textures.clear();
                 }
-
-                self.textures.clear();
             }
             Some(BufferAssignment::Removed) => {
                 self.reset();
@@ -500,38 +672,65 @@ where
         let mut data_ref = data.lock().unwrap();
         let data = &mut *data_ref;
 
-        let last_commit = data.renderer_seen.get(&context_id);
-        let buffer_damage = data.damage_since(last_commit.copied());
-        if let Entry::Vacant(e) = data.textures.entry(context_id.clone()) {
-            if let Some(buffer) = data.buffer.as_ref() {
-                // There is no point in importing a single pixel buffer
-                if matches!(
-                    crate::backend::renderer::buffer_type(buffer),
-                    Some(crate::backend::renderer::BufferType::SinglePixel)
-                ) {
+        let Some(buffer) = data.buffer.as_ref().cloned() else {
+            return Ok(());
+        };
+
+        // There is no point in importing a single pixel buffer.
+        if matches!(
+            crate::backend::renderer::buffer_type(&buffer),
+            Some(crate::backend::renderer::BufferType::SinglePixel)
+        ) {
+            return Ok(());
+        }
+
+        let last_commit = data.renderer_seen.get(&context_id).copied();
+        let buffer_damage = data.damage_since(last_commit);
+        let imported_commit = data.current_commit();
+
+        if let Some(existing_texture) = data
+            .textures
+            .get(&context_id)
+            .and_then(|texture| texture.downcast_ref::<R::TextureId>())
+        {
+            match crate::backend::renderer::buffer_type(&buffer) {
+                Some(crate::backend::renderer::BufferType::Shm) => {
+                    let updated_texture = renderer.update_shm_buffer(
+                        existing_texture,
+                        &buffer,
+                        Some(states),
+                        &buffer_damage,
+                    )?;
+                    data.textures
+                        .insert(context_id.clone(), Box::new(updated_texture));
+                    data.renderer_seen.insert(context_id, imported_commit);
                     return Ok(());
                 }
-
-                match ImportAll::import_buffer(renderer, buffer, Some(states), &buffer_damage) {
-                    Some(Ok(m)) => {
-                        e.insert(Box::new(m));
-                        data.renderer_seen.insert(context_id, data.current_commit());
-                    }
-                    Some(Err(err)) => {
-                        warn!("Error loading buffer: {}", err);
-                        return Err(err);
-                    }
-                    None => {
-                        error!("Unknown buffer format for: {:?}", buffer);
-                    }
+                Some(_) => {
+                    data.renderer_seen.insert(context_id, imported_commit);
+                    return Ok(());
                 }
+                None => return Ok(()),
+            }
+        }
+
+        match ImportAll::import_buffer(renderer, &buffer, Some(states), &buffer_damage) {
+            Some(Ok(imported_texture)) => {
+                data.textures.insert(context_id.clone(), Box::new(imported_texture));
+                data.renderer_seen.insert(context_id, imported_commit);
+            }
+            Some(Err(err)) => {
+                warn!("Error loading buffer: {}", err);
+                return Err(err);
+            }
+            None => {
+                error!("Unknown buffer format for: {:?}", buffer);
             }
         }
     }
 
     Ok(())
 }
-
 /// Imports buffers of a surface and its subsurfaces using a given [`Renderer`].
 ///
 /// This (or `import_surface`) need to be called before `draw_render_elements`, if used later.

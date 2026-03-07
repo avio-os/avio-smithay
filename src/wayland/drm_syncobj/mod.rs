@@ -10,8 +10,10 @@
 //! `true`. Or it won't be possible to create the blocker. This is similar to other
 //! implementations.
 //!
-//! The release fence is signalled when all references to a
-//! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
+//! The release fence is signalled when the compositor is done using the buffer.
+//! Superseded explicit-sync buffers may be released as soon as the last sampled
+//! frame completes; other buffers fall back to signaling when all references to
+//! a [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
 //!
 //! ```no_run
 //! # use smithay::delegate_drm_syncobj;

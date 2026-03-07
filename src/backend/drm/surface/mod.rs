@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{AsFd, BorrowedFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -498,6 +498,14 @@ impl DrmSurface {
         match &*self.internal {
             DrmSurfaceInternal::Atomic(surf) => surf.clear(),
             DrmSurfaceInternal::Legacy(surf) => surf.clear(),
+        }
+    }
+
+    /// Take the latest DRM out-fence returned by an atomic commit, if any.
+    pub fn take_out_fence(&self) -> Option<OwnedFd> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.take_out_fence(),
+            DrmSurfaceInternal::Legacy(_) => None,
         }
     }
 }

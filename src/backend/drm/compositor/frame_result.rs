@@ -1,4 +1,8 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    os::fd::OwnedFd,
+    sync::Arc,
+};
 
 use crate::{
     backend::{
@@ -56,10 +60,16 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
 }
 
 impl<B: Buffer, F: Framebuffer, E> RenderFrameResult<'_, B, F, E> {
-    /// Returns if synchronization with kms submission can't be guaranteed through the available apis.
+    /// Returns whether scan-out submission may need a host-side wait fallback.
+    ///
+    /// When this returns `false`, the composited primary plane can be synchronized to KMS
+    /// through `IN_FENCE_FD` alone. When it returns `true`,
+    /// [`super::DrmCompositor::queue_frame`] and [`super::DrmCompositor::commit_frame`]
+    /// will fall back to waiting for the render sync point before submitting the atomic
+    /// commit.
     pub fn needs_sync(&self) -> bool {
         if let PrimaryPlaneElement::Swapchain(ref element) = self.primary_element {
-            !self.supports_fencing || !element.sync.is_exportable()
+            !self.supports_fencing || element.exported_sync_file.is_none()
         } else {
             false
         }
@@ -438,6 +448,7 @@ pub struct PrimarySwapchainElement<B: Buffer, F: Framebuffer> {
     pub(super) slot: DrmScanoutBuffer<B, F>,
     /// Sync point
     pub sync: SyncPoint,
+    pub(super) exported_sync_file: Option<Arc<OwnedFd>>,
     /// The transform applied during rendering
     pub transform: Transform,
     /// The damage on the primary plane
@@ -452,5 +463,161 @@ impl<B: Buffer, F: Framebuffer> PrimarySwapchainElement<B, F> {
             ScanoutBuffer::Swapchain(slot) => slot,
             _ => unreachable!(),
         }
+    }
+
+    /// Clone the compositor render-completion fence as a sync_file, if submission
+    /// can hand it to both KMS and external consumers without re-exporting.
+    #[inline]
+    pub fn export_sync_file(&self) -> Option<OwnedFd> {
+        self.exported_sync_file
+            .as_ref()
+            .and_then(|sync_file| sync_file.try_clone().ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{
+        allocator::{Allocator, Fourcc, Modifier, Swapchain},
+        drm::Framebuffer,
+        renderer::{
+            element::{Id, RenderElementStates},
+            utils::DamageBag,
+        },
+    };
+    use drm::control::framebuffer;
+    use rustix::event::{eventfd, EventfdFlags};
+    use std::{collections::HashMap, num::NonZeroU32, os::fd::AsRawFd};
+
+    use super::super::{CachedDrmFramebuffer, DrmFramebuffer};
+
+    #[derive(Debug, Clone)]
+    struct DummyBuffer;
+
+    impl crate::backend::allocator::Buffer for DummyBuffer {
+        fn size(&self) -> crate::utils::Size<i32, crate::utils::Buffer> {
+            crate::utils::Size::from((1, 1))
+        }
+
+        fn format(&self) -> drm_fourcc::DrmFormat {
+            drm_fourcc::DrmFormat {
+                code: drm_fourcc::DrmFourcc::Argb8888,
+                modifier: drm_fourcc::DrmModifier::Linear,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DummyAllocator;
+
+    impl Allocator for DummyAllocator {
+        type Buffer = DummyBuffer;
+        type Error = std::convert::Infallible;
+
+        fn create_buffer(
+            &mut self,
+            _width: u32,
+            _height: u32,
+            _fourcc: Fourcc,
+            _modifiers: &[Modifier],
+        ) -> Result<Self::Buffer, Self::Error> {
+            Ok(DummyBuffer)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DummyFramebuffer {
+        handle: framebuffer::Handle,
+    }
+
+    impl AsRef<framebuffer::Handle> for DummyFramebuffer {
+        fn as_ref(&self) -> &framebuffer::Handle {
+            &self.handle
+        }
+    }
+
+    impl Framebuffer for DummyFramebuffer {
+        fn format(&self) -> drm_fourcc::DrmFormat {
+            drm_fourcc::DrmFormat {
+                code: drm_fourcc::DrmFourcc::Argb8888,
+                modifier: drm_fourcc::DrmModifier::Linear,
+            }
+        }
+    }
+
+    fn make_primary_swapchain_element(
+        exported_sync_file: Option<Arc<OwnedFd>>,
+    ) -> PrimarySwapchainElement<DummyBuffer, DummyFramebuffer> {
+        let mut swapchain =
+            Swapchain::new(DummyAllocator, 1, 1, Fourcc::Argb8888, vec![drm_fourcc::DrmModifier::Linear]);
+        let slot = swapchain
+            .acquire()
+            .expect("swapchain allocation failed")
+            .expect("no swapchain slot available for test");
+        let slot = DrmScanoutBuffer {
+            buffer: ScanoutBuffer::Swapchain(Arc::new(slot)),
+            fb: CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(DummyFramebuffer {
+                handle: framebuffer::Handle::from(NonZeroU32::new(1).unwrap()),
+            })),
+        };
+
+        PrimarySwapchainElement {
+            slot,
+            sync: SyncPoint::signaled(),
+            exported_sync_file,
+            transform: Transform::Normal,
+            damage: DamageBag::<i32, BufferCoords>::new(1).snapshot(),
+        }
+    }
+
+    fn make_render_frame_result(
+        exported_sync_file: Option<Arc<OwnedFd>>,
+        supports_fencing: bool,
+    ) -> RenderFrameResult<'static, DummyBuffer, DummyFramebuffer, ()> {
+        RenderFrameResult {
+            is_empty: false,
+            states: RenderElementStates {
+                states: HashMap::new(),
+            },
+            primary_element: PrimaryPlaneElement::Swapchain(make_primary_swapchain_element(
+                exported_sync_file,
+            )),
+            overlay_elements: Vec::new(),
+            cursor_element: None,
+            primary_plane_element_id: Id::new(),
+            supports_fencing,
+        }
+    }
+
+    #[test]
+    fn primary_swapchain_element_export_sync_file_clones_cached_fd() {
+        let cached_sync_file = Arc::new(
+            eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
+                .expect("failed to allocate eventfd for test"),
+        );
+        let element = make_primary_swapchain_element(Some(cached_sync_file));
+
+        let first = element
+            .export_sync_file()
+            .expect("expected cached sync_file clone");
+        let second = element
+            .export_sync_file()
+            .expect("expected second cached sync_file clone");
+
+        assert_ne!(first.as_raw_fd(), second.as_raw_fd());
+    }
+
+    #[test]
+    fn render_frame_result_needs_sync_until_submit_sync_file_is_cached() {
+        let needs_sync = make_render_frame_result(None, true);
+        assert!(needs_sync.needs_sync());
+
+        let cached_sync_file = Arc::new(
+            eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
+                .expect("failed to allocate eventfd for test"),
+        );
+        let explicit_submit_sync = make_render_frame_result(Some(cached_sync_file), true);
+        assert!(!explicit_submit_sync.needs_sync());
     }
 }

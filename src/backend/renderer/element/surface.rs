@@ -78,7 +78,7 @@ use crate::{
     utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
         alpha_modifier::AlphaModifierSurfaceCachedState,
-        compositor::{self, SurfaceData, TraversalAction},
+        compositor::{self, SurfaceData},
     },
 };
 
@@ -161,6 +161,7 @@ where
     let location = location.into().to_f64();
     let scale = scale.into();
     let kind = kind.into();
+
     let mut surfaces: Vec<E> = Vec::new();
 
     compositor::with_surface_tree_downward(
@@ -173,12 +174,12 @@ where
             if let Some(data) = data {
                 if let Some(view) = data.lock().unwrap().view() {
                     location += view.offset.to_f64().to_physical(scale);
-                    TraversalAction::DoChildren(location)
+                    compositor::TraversalAction::DoChildren(location)
                 } else {
-                    TraversalAction::SkipChildren
+                    compositor::TraversalAction::SkipChildren
                 }
             } else {
-                TraversalAction::SkipChildren
+                compositor::TraversalAction::SkipChildren
             }
         },
         |surface, states, location| {
@@ -199,7 +200,7 @@ where
                         renderer, surface, states, location, alpha, kind,
                     ) {
                         Ok(Some(surface)) => surfaces.push(surface.into()),
-                        Ok(None) => {} // surface is not mapped
+                        Ok(None) => {}
                         Err(err) => {
                             warn!("Failed to import surface: {}", err);
                         }
@@ -280,7 +281,6 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
             &data_ref.lock().unwrap(),
         ))
     }
-
     fn from_state(
         renderer: &mut R,
         id: Id,

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
 use std::fmt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, RwLock,
@@ -171,6 +171,7 @@ pub struct AtomicDrmSurface {
     prop_mapping: Arc<RwLock<PropMapping>>,
     state: RwLock<State>,
     pending: RwLock<State>,
+    last_out_fence: Mutex<Option<OwnedFd>>,
     pub(super) span: tracing::Span,
 }
 
@@ -218,6 +219,7 @@ impl AtomicDrmSurface {
             prop_mapping,
             state: RwLock::new(state),
             pending: RwLock::new(pending),
+            last_out_fence: Mutex::new(None),
             span,
         };
 
@@ -821,6 +823,9 @@ impl AtomicDrmSurface {
         };
 
         debug!("Setting screen: {:?}", req);
+        let mut req = req;
+        let mut out_fence_fd = -1;
+        let requested_out_fence = req.set_crtc_out_fence_ptr(self.crtc, &mut out_fence_fd)?;
         let result = self
             .fd
             .atomic_commit(
@@ -849,6 +854,8 @@ impl AtomicDrmSurface {
             });
 
         if result.is_ok() {
+            *self.last_out_fence.lock().unwrap() =
+                consume_out_fence(requested_out_fence, out_fence_fd);
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -857,6 +864,8 @@ impl AtomicDrmSurface {
                     used_planes.remove(&plane.handle);
                 }
             }
+        } else {
+            let _ = consume_out_fence(requested_out_fence, out_fence_fd);
         }
 
         result
@@ -878,7 +887,7 @@ impl AtomicDrmSurface {
 
         // page flips work just like commits with fewer parameters..
         let prop_mapping = self.prop_mapping.read().unwrap();
-        let req = AtomicRequest::build_request(
+        let mut req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             None,
@@ -887,6 +896,8 @@ impl AtomicDrmSurface {
             [],
             &*planes,
         )?;
+        let mut out_fence_fd = -1;
+        let requested_out_fence = req.set_crtc_out_fence_ptr(self.crtc, &mut out_fence_fd)?;
 
         // .. and without `AtomicCommitFlags::AllowModeset`.
         // If we would set anything here, that would require a modeset, this would fail,
@@ -911,6 +922,8 @@ impl AtomicDrmSurface {
             });
 
         if res.is_ok() {
+            *self.last_out_fence.lock().unwrap() =
+                consume_out_fence(requested_out_fence, out_fence_fd);
             for plane in planes.iter() {
                 if plane.config.is_some() {
                     used_planes.insert(plane.handle);
@@ -918,6 +931,8 @@ impl AtomicDrmSurface {
                     used_planes.remove(&plane.handle);
                 }
             }
+        } else {
+            let _ = consume_out_fence(requested_out_fence, out_fence_fd);
         }
 
         res
@@ -1017,6 +1032,18 @@ impl AtomicDrmSurface {
     pub fn clear(&self) -> Result<(), Error> {
         self.clear_state()
     }
+
+    pub fn take_out_fence(&self) -> Option<OwnedFd> {
+        self.last_out_fence.lock().unwrap().take()
+    }
+}
+
+fn consume_out_fence(requested: bool, out_fence_fd: i32) -> Option<OwnedFd> {
+    if !requested || out_fence_fd < 0 {
+        return None;
+    }
+
+    Some(unsafe { OwnedFd::from_raw_fd(out_fence_fd) })
 }
 
 struct TestBuffer {
@@ -1190,6 +1217,22 @@ impl<'a> AtomicRequest<'a> {
         }
 
         Ok(())
+    }
+
+    fn set_crtc_out_fence_ptr(
+        &mut self,
+        crtc: crtc::Handle,
+        out_fence_fd: &mut i32,
+    ) -> Result<bool, Error> {
+        if self.mapping.crtc_prop_handle(crtc, "OUT_FENCE_PTR").is_err() {
+            return Ok(false);
+        }
+        let crtc_props = self.crtc_props.entry(crtc).or_default();
+        crtc_props.insert(
+            "OUT_FENCE_PTR",
+            property::Value::UnsignedRange((out_fence_fd as *mut i32 as usize) as u64),
+        );
+        Ok(true)
     }
 
     fn reset_crtc(&mut self, crtc: crtc::Handle) -> Result<(), Error> {
@@ -1398,6 +1441,22 @@ impl<'a> AtomicRequest<'a> {
         }
 
         Ok(())
+    }
+
+    fn set_crtc_out_fence_ptr(
+        &mut self,
+        crtc: crtc::Handle,
+        out_fence_fd: &mut i32,
+    ) -> Result<bool, Error> {
+        let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "OUT_FENCE_PTR") else {
+            return Ok(false);
+        };
+        self.request.add_property(
+            crtc,
+            prop,
+            property::Value::UnsignedRange((out_fence_fd as *mut i32 as usize) as u64),
+        );
+        Ok(true)
     }
 
     fn reset_crtc(&mut self, crtc: crtc::Handle) -> Result<(), Error> {

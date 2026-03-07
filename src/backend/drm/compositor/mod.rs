@@ -134,7 +134,7 @@ use std::{
 };
 
 use drm::{
-    control::{connector, crtc, framebuffer, plane, Device as _, Mode, PlaneType},
+    control::{connector, crtc, framebuffer, plane, Mode, PlaneType},
     Device, DriverCapability,
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
@@ -174,7 +174,6 @@ use crate::{
     utils::{Buffer as BufferCoords, DevPath, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{shm, single_pixel_buffer},
 };
-
 use super::{
     error::AccessError,
     exporter::{gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer},
@@ -277,18 +276,22 @@ impl<B: Buffer> Clone for ScanoutBuffer<B> {
 }
 
 impl<B: Buffer> ScanoutBuffer<B> {
-    fn acquire_point(
-        &self,
-        signaled_fence: Option<&Arc<OwnedFd>>,
-    ) -> Option<(SyncPoint, Option<Arc<OwnedFd>>)> {
+    fn acquire_point(&self) -> Option<(SyncPoint, Option<Arc<OwnedFd>>)> {
         if let Self::Wayland(buffer) = self {
-            // Assume `DrmSyncobjBlocker` is used, so acquire point has already
-            // been signaled. Instead of converting with `SyncPoint::from`.
-            if buffer.acquire_point().is_some() {
-                return Some((SyncPoint::signaled(), signaled_fence.cloned()));
+            if let Some(acquire_point) = buffer.acquire_point() {
+                return Some((SyncPoint::from(acquire_point), None));
             }
         }
         None
+    }
+
+    fn same_storage(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Wayland(lhs), Self::Wayland(rhs)) => lhs.same_resource(rhs),
+            (Self::Swapchain(lhs), Self::Swapchain(rhs)) => Arc::ptr_eq(lhs, rhs),
+            (Self::Cursor(lhs), Self::Cursor(rhs)) => Arc::ptr_eq(lhs, rhs),
+            _ => false,
+        }
     }
 }
 
@@ -623,6 +626,12 @@ struct FrameState<B: Buffer, F: Framebuffer> {
     planes: SmallVec<[(plane::Handle, PlaneState<B, F>); 10]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaneSyncMode {
+    TestOnly,
+    Submit,
+}
+
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     #[inline]
     fn is_assigned(&self, handle: plane::Handle) -> bool {
@@ -678,6 +687,70 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         self.plane_state(handle)
             .and_then(|state| state.config.as_ref().map(|config| &config.buffer))
     }
+
+    #[cfg(feature = "backend_drm")]
+    fn contains_buffer(&self, candidate: &ScanoutBuffer<B>) -> bool {
+        self.planes.iter().any(|(_, state)| {
+            state.config.as_ref().is_some_and(|config| config.buffer.buffer.same_storage(candidate))
+        })
+    }
+
+    #[cfg(feature = "backend_drm")]
+    fn signal_displaced_release_points_with_fence(&self, next_frame: &Self, out_fence: &OwnedFd) {
+        for (_, state) in &self.planes {
+            let Some(config) = state.config.as_ref() else {
+                continue;
+            };
+            if next_frame.contains_buffer(&config.buffer.buffer) {
+                continue;
+            }
+            let ScanoutBuffer::Wayland(buffer) = &config.buffer.buffer else {
+                continue;
+            };
+
+            match out_fence.try_clone() {
+                Ok(sync_file) => match buffer.signal_superseded_release_with_sync_file(sync_file) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "Failed to import DRM out-fence into superseded release point; falling back to drop-time release"
+                        );
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "Failed to clone DRM out-fence for superseded release point; falling back to drop-time release"
+                    );
+                    continue;
+                }
+            }
+
+            let Some(release_point) = buffer.take_release_point() else {
+                continue;
+            };
+
+            match out_fence.try_clone() {
+                Ok(sync_file) => {
+                    if let Err(err) = release_point.signal_with_sync_file(sync_file) {
+                        warn!(?err, "Failed to import DRM out-fence into syncobj release point");
+                        if let Err(fallback_err) = release_point.signal() {
+                            warn!(?fallback_err, "Failed to signal syncobj release point fallback");
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, "Failed to clone DRM out-fence for syncobj release point");
+                    if let Err(fallback_err) = release_point.signal() {
+                        warn!(?fallback_err, "Failed to signal syncobj release point fallback");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
@@ -728,7 +801,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         let backup = current_config.clone();
         *current_config = state;
 
-        let res = surface.test_state(self.build_planes(surface, supports_fencing, true), allow_modeset);
+        let res = surface.test_state(
+            self.build_planes(surface, supports_fencing, true, PlaneSyncMode::TestOnly),
+            allow_modeset,
+        );
 
         if res.is_err() {
             // test failed, restore previous state
@@ -768,7 +844,12 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         }
 
         let res = surface.test_state(
-            self.build_planes(surface, supports_fencing, allow_partial_update),
+            self.build_planes(
+                surface,
+                supports_fencing,
+                allow_partial_update,
+                PlaneSyncMode::TestOnly,
+            ),
             allow_modeset,
         );
 
@@ -791,7 +872,12 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.commit(
-            self.build_planes(surface, supports_fencing, allow_partial_update),
+            self.build_planes(
+                surface,
+                supports_fencing,
+                allow_partial_update,
+                PlaneSyncMode::Submit,
+            ),
             event,
         )
     }
@@ -806,7 +892,12 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip(
-            self.build_planes(surface, supports_fencing, allow_partial_update),
+            self.build_planes(
+                surface,
+                supports_fencing,
+                allow_partial_update,
+                PlaneSyncMode::Submit,
+            ),
             event,
         )
     }
@@ -817,15 +908,22 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &'a DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
+        sync_mode: PlaneSyncMode,
     ) -> impl IntoIterator<Item = super::PlaneState<'a>> {
         for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
             if let Some(config) = state.config.as_mut() {
-                // Try to extract a native fence out of the supplied sync point if any
-                // If the sync point has no native fence or the surface does not support
-                // fencing force a wait
                 if let Some((sync, fence)) = config.sync.as_mut() {
-                    if supports_fencing && fence.is_none() {
-                        *fence = sync.export().map(Arc::new);
+                    // Atomic test commits should stay non-blocking. The actual submission path
+                    // falls back to a host wait if the render completion fence cannot be
+                    // forwarded to KMS as IN_FENCE_FD.
+                    if fence.is_none() {
+                        if supports_fencing {
+                            *fence = sync.export().map(Arc::new);
+                        }
+
+                        if sync_mode == PlaneSyncMode::Submit && (!supports_fencing || fence.is_none()) {
+                            let _ = sync.wait();
+                        }
                     }
                 }
             }
@@ -1115,7 +1213,6 @@ where
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
     supports_fencing: bool,
     reset_pending: bool,
-    signaled_fence: Option<Arc<OwnedFd>>,
 
     framebuffer_exporter: F,
 
@@ -1180,24 +1277,6 @@ where
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
     ) -> FrameResult<Self, A, F> {
-        let signaled_fence = match surface.create_syncobj(true) {
-            Ok(signaled_syncobj) => match surface.syncobj_to_fd(signaled_syncobj, true) {
-                Ok(signaled_fence) => {
-                    let _ = surface.destroy_syncobj(signaled_syncobj);
-                    Some(Arc::new(signaled_fence))
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "failed to export signaled syncobj");
-                    let _ = surface.destroy_syncobj(signaled_syncobj);
-                    None
-                }
-            },
-            Err(err) => {
-                tracing::warn!(?err, "failed to create signaled syncobj");
-                None
-            }
-        };
-
         let span = info_span!(
             parent: None,
             "drm_compositor",
@@ -1302,7 +1381,6 @@ where
 
                         primary_is_opaque: is_opaque,
                         reset_pending: true,
-                        signaled_fence,
                         current_frame,
                         pending_frame: None,
                         queued_frame: None,
@@ -1366,24 +1444,6 @@ where
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
     ) -> FrameResult<Self, A, F> {
-        let signaled_fence = match surface.create_syncobj(true) {
-            Ok(signaled_syncobj) => match surface.syncobj_to_fd(signaled_syncobj, true) {
-                Ok(signaled_fence) => {
-                    let _ = surface.destroy_syncobj(signaled_syncobj);
-                    Some(Arc::new(signaled_fence))
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "failed to export signaled syncobj");
-                    let _ = surface.destroy_syncobj(signaled_syncobj);
-                    None
-                }
-            },
-            Err(err) => {
-                tracing::warn!(?err, "failed to create signaled syncobj");
-                None
-            }
-        };
-
         let span = info_span!(
             parent: None,
             "drm_compositor",
@@ -1484,7 +1544,6 @@ where
             primary_plane_damage_bag: DamageBag::new(4),
             primary_is_opaque: is_opaque,
             reset_pending: true,
-            signaled_fence,
             current_frame,
             pending_frame: None,
             queued_frame: None,
@@ -2256,6 +2315,13 @@ where
                         .map(DrmRenderElements::from)
                 }
             });
+            let primary_plane_wayland_buffers = primary_plane_elements
+                .iter()
+                .filter_map(|element| match element.underlying_storage(renderer) {
+                    Some(UnderlyingStorage::Wayland(buffer)) => Some(buffer.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             // Then render all remaining elements assigned to the primary plane
             let elements = overlay_plane_elements
                 .chain(
@@ -2277,11 +2343,30 @@ where
 
             match render_res {
                 Ok(render_output_result) => {
+                    let shared_render_sync_file = if render_output_result.damage.is_some() && self.supports_fencing {
+                        // Export once and fan out duplicated fds to KMS and superseded-release
+                        // consumers. When KMS fencing is unavailable, keep the sync point
+                        // unexported so the submit path can still fall back to a host wait.
+                        render_output_result.sync.export().map(Arc::new)
+                    } else {
+                        None
+                    };
+
                     if render_output_result.damage.is_none() {
                         // if we receive no damage we can assume no rendering took place
                         // and we should trigger a cleanup of the renderer texture cache
-                        // to prevent holding textures longer then necessary
+                        // to prevent holding textures longer then necessary.
+                        // In this case we intentionally keep the previous last_render_sync on
+                        // sampled wayland buffers because no new compositor read happened.
                         let _ = renderer.cleanup_texture_cache();
+                    } else {
+                        for buffer in &primary_plane_wayland_buffers {
+                            if let Some(sync_file) = shared_render_sync_file.as_ref() {
+                                buffer.set_last_render_sync_file(sync_file.clone());
+                            } else {
+                                buffer.set_last_render_sync(render_output_result.sync.clone());
+                            }
+                        }
                     }
 
                     for (id, state) in render_output_result.states.states.into_iter() {
@@ -2334,7 +2419,8 @@ where
                             )
                             .ok()
                             .flatten();
-                            config.sync = Some((render_output_result.sync.clone(), None));
+                            config.sync =
+                                Some((render_output_result.sync.clone(), shared_render_sync_file.clone()));
                         } else {
                             trace!("skipping primary plane, no damage");
 
@@ -2355,7 +2441,8 @@ where
                                 &output_geometry.size.to_logical(1),
                             )]);
 
-                        config.sync = Some((render_output_result.sync.clone(), None));
+                        config.sync =
+                            Some((render_output_result.sync.clone(), shared_render_sync_file.clone()));
                     }
                 }
                 Err(err) => {
@@ -2374,7 +2461,7 @@ where
         }
 
         let primary_plane_element = if render {
-            let (slot, sync) = {
+            let (slot, sync, exported_sync_file) = {
                 let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
                 let config = primary_plane_state.config.as_ref().unwrap();
                 (
@@ -2384,6 +2471,7 @@ where
                         .as_ref()
                         .map(|(sync, _)| sync.clone())
                         .unwrap_or_default(),
+                    config.sync.as_ref().and_then(|(_, fence)| fence.clone()),
                 )
             };
 
@@ -2392,6 +2480,7 @@ where
                 transform: output_transform,
                 damage: self.primary_plane_damage_bag.snapshot(),
                 sync,
+                exported_sync_file,
             })
         } else {
             PrimaryPlaneElement::Element(primary_plane_scanout_element.unwrap())
@@ -2451,8 +2540,8 @@ where
     /// re-scheduling is to queue a one-shot timer that will trigger after approximately one
     /// retrace duration.
     ///
-    /// *Note*: It is your responsibility to synchronize rendering if the [`RenderFrameResult`]
-    /// returned by the previous [`render_frame`](DrmCompositor::render_frame) call returns `true` on [`RenderFrameResult::needs_sync`].
+    /// If the primary plane render sync cannot be forwarded to KMS as `IN_FENCE_FD`,
+    /// submission falls back to a blocking wait before the atomic commit.
     ///
     /// *Note*: This function needs to be followed up with [`DrmCompositor::frame_submitted`]
     /// when a vblank event is received, that denotes successful scan-out of the frame.
@@ -2501,8 +2590,8 @@ where
     /// re-scheduling is to queue a one-shot timer that will trigger after approximately one
     /// retrace duration.
     ///
-    /// *Note*: It is your responsibility to synchronize rendering if the [`RenderFrameResult`]
-    /// returned by the previous [`render_frame`](DrmCompositor::render_frame) call returns `true` on [`RenderFrameResult::needs_sync`].
+    /// If the primary plane render sync cannot be forwarded to KMS as `IN_FENCE_FD`,
+    /// submission falls back to a blocking wait before the atomic commit.
     ///
     /// *Note*: This function should not be followed up with [`DrmCompositor::frame_submitted`]
     /// and will not generate a vblank event on the underlying device.
@@ -2585,6 +2674,10 @@ where
     ) -> FrameResult<(), A, F> {
         match flip {
             Ok(_) => {
+                if let Some(out_fence) = self.surface.take_out_fence() {
+                    self.current_frame
+                        .signal_displaced_release_points_with_fence(&prepared_frame.frame, &out_fence);
+                }
                 if prepared_frame.kind == PreparedFrameKind::Full {
                     self.reset_pending = false;
                 }
@@ -2646,6 +2739,11 @@ where
     /// Reset the underlying buffers
     pub fn reset_buffers(&mut self) {
         self.swapchain.reset_buffers();
+    }
+
+    /// Take the latest DRM out-fence generated by a successful atomic commit, if any.
+    pub fn take_out_fence(&self) -> Option<OwnedFd> {
+        self.surface.take_out_fence()
     }
 
     /// Reset the age for all buffers.
@@ -4011,10 +4109,7 @@ where
             buffer: element_config.buffer.clone(),
             damage_clips,
             plane_claim,
-            sync: element_config
-                .buffer
-                .buffer
-                .acquire_point(self.signaled_fence.as_ref()),
+            sync: element_config.buffer.buffer.acquire_point(),
         };
 
         let is_compatible = previous_state

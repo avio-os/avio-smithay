@@ -727,6 +727,23 @@ pub trait ImportAll: ImportWlBuffer {
     ) -> Option<Result<Self::TextureId, Self::Error>> {
         ImportWlBuffer::import_wl_buffer(self, buffer, surface, damage)
     }
+
+    /// Update an existing shm-backed texture for a wl_buffer commit.
+    ///
+    /// The default implementation falls back to re-importing the buffer.
+    fn update_shm_buffer(
+        &mut self,
+        texture: &Self::TextureId,
+        buffer: &wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        let _ = texture;
+        match self.import_buffer(buffer, surface, damage) {
+            Some(result) => result,
+            None => unreachable!("update_shm_buffer called for a non-importable wl_buffer"),
+        }
+    }
 }
 
 #[cfg(all(
@@ -763,7 +780,18 @@ impl<R: Renderer + ImportMemWl + ImportDmaWl> ImportAll for R {}
     feature = "backend_egl",
     feature = "use_system_lib"
 ))]
-impl ImportAll for crate::backend::renderer::vulkan::VulkanRenderer {}
+impl ImportAll for crate::backend::renderer::vulkan::VulkanRenderer {
+    fn update_shm_buffer(
+        &mut self,
+        texture: &Self::TextureId,
+        buffer: &wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        let _ = surface;
+        self.update_shm_texture(texture, buffer, damage)
+    }
+}
 
 #[cfg(all(test, feature = "wayland_frontend"))]
 mod import_wl_buffer_tests {

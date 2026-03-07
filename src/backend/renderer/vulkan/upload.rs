@@ -156,87 +156,131 @@ impl ImportMemWl for VulkanRenderer {
         _surface: Option<&SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
-        shm::with_buffer_contents(buffer, |ptr, len, data| {
-            let format = shm::shm_format_to_fourcc(data.format).ok_or(
-                VulkanRendererError::InvalidMemoryUpload("wl_shm buffer format is unsupported"),
-            )?;
-            let bytes_per_pixel = bytes_per_pixel(format)?;
-
-            if data.width <= 0 || data.height <= 0 {
-                return Err(VulkanRendererError::InvalidMemoryUpload(
-                    "wl_shm buffer dimensions must be positive",
-                ));
-            }
-            if data.stride <= 0 {
-                return Err(VulkanRendererError::InvalidMemoryUpload(
-                    "wl_shm buffer stride must be positive",
-                ));
-            }
-
-            let row_bytes = (data.width as usize).checked_mul(bytes_per_pixel).ok_or(
-                VulkanRendererError::InvalidMemoryUpload("wl_shm row byte count overflowed"),
-            )?;
-            if (data.stride as usize) < row_bytes {
-                return Err(VulkanRendererError::InvalidMemoryUpload(
-                    "wl_shm stride is smaller than width * bytes_per_pixel",
-                ));
-            }
-
-            let src_offset = usize::try_from(data.offset).map_err(|_| {
-                VulkanRendererError::InvalidMemoryUpload("wl_shm offset could not be represented")
-            })?;
-            let src_stride = usize::try_from(data.stride).map_err(|_| {
-                VulkanRendererError::InvalidMemoryUpload("wl_shm stride could not be represented")
-            })?;
-            let height = usize::try_from(data.height).map_err(|_| {
-                VulkanRendererError::InvalidMemoryUpload("wl_shm height could not be represented")
-            })?;
-
-            let expected_len = src_offset
-                .checked_add((height - 1).checked_mul(src_stride).ok_or(
-                    VulkanRendererError::InvalidMemoryUpload("wl_shm payload size overflowed"),
-                )?)
-                .and_then(|base| base.checked_add(row_bytes))
-                .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                    "wl_shm payload size overflowed",
-                ))?;
-
-            if len < expected_len {
-                return Err(VulkanRendererError::InvalidMemoryUpload(
-                    "wl_shm payload is smaller than declared dimensions",
-                ));
-            }
-
-            let mut packed = vec![
-                0u8;
-                row_bytes.checked_mul(height).ok_or(
-                    VulkanRendererError::InvalidMemoryUpload("packed wl_shm upload size overflowed",),
-                )?
-            ];
-
-            for row in 0..height {
-                let src_row_offset = src_offset + row * src_stride;
-                let dst_row_offset = row * row_bytes;
-                // SAFETY: Buffer bounds are validated above and we copy exactly `row_bytes` bytes per row.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        ptr.add(src_row_offset),
-                        packed.as_mut_ptr().add(dst_row_offset),
-                        row_bytes,
-                    );
-                }
-            }
-
+        with_packed_shm_buffer(buffer, |packed, format, size| {
             self.upload.import_memory(
                 &mut self.device,
-                &packed,
+                packed,
                 format,
-                Size::from((data.width, data.height)),
+                size,
                 false,
             )
         })
-        .map_err(|_| VulkanRendererError::TemporaryFailure("failed to access wl_shm buffer contents"))?
     }
+
+}
+
+#[cfg(feature = "wayland_frontend")]
+impl VulkanRenderer {
+    pub(crate) fn update_shm_texture(
+        &mut self,
+        texture: &VulkanTexture,
+        buffer: &wl_buffer::WlBuffer,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<VulkanTexture, VulkanRendererError> {
+        if damage.is_empty() {
+            return Ok(texture.clone());
+        }
+
+        with_packed_shm_buffer(buffer, |packed, format, size| {
+            let update_region = damage
+                .iter()
+                .copied()
+                .reduce(|a, b| a.merge(b))
+                .unwrap_or_else(|| Rectangle::from_size(size));
+
+            if update_region.is_empty() {
+                return Ok(texture.clone());
+            }
+
+            match self.upload.update_memory(&mut self.device, texture, packed, update_region) {
+                Ok(()) => Ok(texture.clone()),
+                Err(_) => self
+                    .upload
+                    .import_memory(&mut self.device, packed, format, size, false),
+            }
+        })
+    }
+}
+
+#[cfg(feature = "wayland_frontend")]
+fn with_packed_shm_buffer<T, F>(
+    buffer: &wl_buffer::WlBuffer,
+    f: F,
+) -> Result<T, VulkanRendererError>
+where
+    F: FnOnce(&[u8], Fourcc, Size<i32, BufferCoord>) -> Result<T, VulkanRendererError>,
+{
+    shm::with_buffer_contents(buffer, |ptr, len, data| {
+        let format = shm::shm_format_to_fourcc(data.format).ok_or(
+            VulkanRendererError::InvalidMemoryUpload("wl_shm buffer format is unsupported"),
+        )?;
+        let bytes_per_pixel = bytes_per_pixel(format)?;
+
+        if data.width <= 0 || data.height <= 0 {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "wl_shm buffer dimensions must be positive",
+            ));
+        }
+        if data.stride <= 0 {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "wl_shm buffer stride must be positive",
+            ));
+        }
+
+        let row_bytes = (data.width as usize).checked_mul(bytes_per_pixel).ok_or(
+            VulkanRendererError::InvalidMemoryUpload("wl_shm row byte count overflowed"),
+        )?;
+        if (data.stride as usize) < row_bytes {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "wl_shm stride is smaller than width * bytes_per_pixel",
+            ));
+        }
+
+        let src_offset = usize::try_from(data.offset)
+            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("wl_shm offset could not be represented"))?;
+        let src_stride = usize::try_from(data.stride)
+            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("wl_shm stride could not be represented"))?;
+        let height = usize::try_from(data.height)
+            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("wl_shm height could not be represented"))?;
+
+        let expected_len = src_offset
+            .checked_add((height - 1).checked_mul(src_stride).ok_or(
+                VulkanRendererError::InvalidMemoryUpload("wl_shm payload size overflowed"),
+            )?)
+            .and_then(|base| base.checked_add(row_bytes))
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "wl_shm payload size overflowed",
+            ))?;
+
+        if len < expected_len {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "wl_shm payload is smaller than declared dimensions",
+            ));
+        }
+
+        let mut packed = vec![
+            0u8;
+            row_bytes.checked_mul(height).ok_or(
+                VulkanRendererError::InvalidMemoryUpload("packed wl_shm upload size overflowed"),
+            )?
+        ];
+
+        for row in 0..height {
+            let src_row_offset = src_offset + row * src_stride;
+            let dst_row_offset = row * row_bytes;
+            // SAFETY: Buffer bounds are validated above and we copy exactly `row_bytes` bytes per row.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    ptr.add(src_row_offset),
+                    packed.as_mut_ptr().add(dst_row_offset),
+                    row_bytes,
+                );
+            }
+        }
+
+        f(&packed, format, Size::from((data.width, data.height)))
+    })
+    .map_err(|_| VulkanRendererError::TemporaryFailure("failed to access wl_shm buffer contents"))?
 }
 
 fn upload_region_to_image(
