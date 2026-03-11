@@ -403,6 +403,18 @@ where
     PrivateSurfaceData::with_states(surface, f)
 }
 
+/// Access the states and children list of this surface under a single lock.
+///
+/// This avoids the recursive lock holding pattern of [`with_surface_tree_downward`]
+/// where a parent's lock is held while processing all children. Useful when building
+/// a flattened snapshot of the surface tree for deferred processing (e.g. GPU imports).
+pub fn with_states_and_children<F, T>(surface: &WlSurface, f: F) -> T
+where
+    F: FnOnce(&SurfaceData, &[WlSurface]) -> T,
+{
+    PrivateSurfaceData::with_states_and_children(surface, f)
+}
+
 /// Send the `scale` and `transform` preferences for the given surface when it supports them.
 ///
 /// The new state is only send when it differs from the already cached one on the calling thread.

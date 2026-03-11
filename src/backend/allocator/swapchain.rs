@@ -173,6 +173,13 @@ where
                 {
                     Ok(buffer) => free_slot.buffer = Some(buffer),
                     Err(err) => {
+                        tracing::warn!(
+                            width = self.width,
+                            height = self.height,
+                            fourcc = ?self.fourcc,
+                            modifier_count = self.modifiers.len(),
+                            "swapchain::acquire create_buffer failed"
+                        );
                         free_slot.acquired.store(false, Ordering::SeqCst);
                         return Err(err);
                     }

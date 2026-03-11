@@ -119,6 +119,11 @@ pub struct CropRenderElement<E> {
 }
 
 impl<E: Element> CropRenderElement<E> {
+    /// Access the wrapped element.
+    pub fn element(&self) -> &E {
+        &self.element
+    }
+
     /// Create a cropping render element for an existing element
     ///
     /// The crop rect is expected to be relative to the same origin the element is relative to.

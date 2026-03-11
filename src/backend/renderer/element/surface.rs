@@ -66,6 +66,7 @@ use std::fmt;
 
 use tracing::{instrument, warn};
 use wayland_server::protocol::wl_surface;
+use wayland_server::Resource;
 
 use crate::{
     backend::renderer::{
@@ -73,7 +74,7 @@ use crate::{
             Buffer, DamageSet, DamageSnapshot, OpaqueRegions, RendererSurfaceState,
             RendererSurfaceStateUserData, SurfaceView,
         },
-        Color32F, Frame, ImportAll, Renderer, Texture,
+        Color32F, ErasedContextId, Frame, ImportAll, Renderer, Texture,
     },
     utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
@@ -212,6 +213,176 @@ where
     );
 
     surfaces
+}
+
+/// Like [`render_elements_from_surface_tree`], but uses brief per-surface locks instead of
+/// holding parent locks during the entire subtree traversal. This prevents multi-second
+/// main-thread stalls when the compositor's input path contends with a worker thread
+/// doing slow GPU imports inside the recursive lock scope.
+///
+/// Phase 1: walk the tree collecting `(WlSurface, location)` pairs — each surface is locked
+/// only long enough to read its view offset and children list.
+/// Phase 2: for each collected surface, lock briefly to import + create the render element.
+#[instrument(level = "trace", skip(renderer, location, scale, kind))]
+#[profiling::function]
+pub fn render_elements_from_surface_tree_nonblocking<R, E>(
+    renderer: &mut R,
+    surface: &wl_surface::WlSurface,
+    location: impl Into<Point<i32, Physical>>,
+    scale: impl Into<Scale<f64>>,
+    alpha: f32,
+    kind: impl Into<KindEvaluation>,
+) -> Vec<E>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+    E: From<WaylandSurfaceRenderElement<R>>,
+{
+    let location = location.into().to_f64();
+    let scale = scale.into();
+    let kind = kind.into();
+
+    // Phase 1: collect surfaces with their positions using brief per-surface locks.
+    let mut collected: Vec<(wl_surface::WlSurface, Point<f64, Physical>)> = Vec::new();
+    collect_surface_tree_downward(surface, location, scale, &mut collected);
+
+    // Phase 2: import textures and create render elements.
+    // DmaBuf imports (the slow GPU path) happen OUTSIDE the PrivateSurfaceData lock
+    // to avoid blocking the main thread's Wayland protocol dispatch.
+    let mut surfaces: Vec<E> = Vec::new();
+    for (surface, location) in collected {
+        // Step 1: brief lock — check if DmaBuf import is needed
+        let pending = compositor::with_states(&surface, |states| {
+            check_dmabuf_import_needed::<R>(renderer, states)
+        });
+
+        // Step 2: slow DmaBuf import OUTSIDE the lock
+        if let Some(pending) = pending {
+            match ImportAll::import_buffer(renderer, &*pending.buffer, None, &pending.buffer_damage) {
+                Some(Ok(texture)) => {
+                    // Step 3: brief relock — store imported texture
+                    compositor::with_states(&surface, |states| {
+                        if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                            let mut data = data.lock().unwrap();
+                            data.textures
+                                .insert(pending.context_id.clone(), Box::new(texture));
+                            data.renderer_seen
+                                .insert(pending.context_id, pending.imported_commit);
+                        }
+                    });
+                }
+                Some(Err(err)) => {
+                    warn!("Failed to import surface: {}", err);
+                    continue;
+                }
+                None => {
+                    tracing::error!("Unknown buffer format for pre-imported DmaBuf");
+                    continue;
+                }
+            }
+        }
+
+        // Step 4: brief lock — build render element (import_surface will hit cache for DmaBuf)
+        compositor::with_states(&surface, |states| {
+            let kind = kind.eval(states);
+            match WaylandSurfaceRenderElement::from_surface(
+                renderer, &surface, states, location, alpha, kind,
+            ) {
+                Ok(Some(element)) => surfaces.push(element.into()),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!("Failed to import surface: {}", err);
+                }
+            }
+        });
+    }
+
+    surfaces
+}
+
+/// Recursively collect surfaces in display-depth order (back-to-front) using brief
+/// per-surface locks. Each node's lock is released before processing children.
+fn collect_surface_tree_downward(
+    surface: &wl_surface::WlSurface,
+    location: Point<f64, Physical>,
+    scale: Scale<f64>,
+    collected: &mut Vec<(wl_surface::WlSurface, Point<f64, Physical>)>,
+) {
+    // Single brief lock: read view offset + children list.
+    let result = compositor::with_states_and_children(surface, |states, children| {
+        let data = states.data_map.get::<RendererSurfaceStateUserData>();
+        let Some(data) = data else {
+            return None;
+        };
+        let Some(view) = data.lock().unwrap().view() else {
+            return None;
+        };
+        let adjusted = location + view.offset.to_f64().to_physical(scale);
+        // Clone children for processing after the lock is released.
+        let children: Vec<_> = children.to_vec();
+        Some((adjusted, children))
+    });
+
+    let Some((adjusted_location, children)) = result else {
+        return;
+    };
+
+    // Process children in reverse order (downward = back-to-front).
+    for child in children.iter().rev() {
+        if child.id() == surface.id() {
+            // This is the surface's own position in the z-order.
+            collected.push((surface.clone(), adjusted_location));
+        } else {
+            collect_surface_tree_downward(child, adjusted_location, scale, collected);
+        }
+    }
+}
+
+/// Info needed to perform a DmaBuf import outside the PrivateSurfaceData lock.
+struct PendingDmabufImport {
+    buffer: Buffer,
+    buffer_damage: DamageSet<i32, BufferCoords>,
+    context_id: ErasedContextId,
+    imported_commit: CommitCounter,
+}
+
+/// Check if a surface has an un-cached DmaBuf that needs importing.
+/// Returns `Some(PendingDmabufImport)` if a slow GPU import is needed,
+/// `None` if the texture is already cached or the buffer is SHM/SinglePixel.
+fn check_dmabuf_import_needed<R>(renderer: &R, states: &SurfaceData) -> Option<PendingDmabufImport>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: 'static,
+{
+    let data_ref = states.data_map.get::<RendererSurfaceStateUserData>()?;
+    let data = data_ref.lock().unwrap();
+
+    let buffer = data.buffer.as_ref()?;
+
+    // Only pre-import DmaBuf. SHM is fast (memcpy) and needs `states` param.
+    match crate::backend::renderer::buffer_type(buffer) {
+        Some(crate::backend::renderer::BufferType::Dma) => {}
+        _ => return None,
+    }
+
+    let context_id = renderer.context_id().erased();
+
+    // Already cached? Fast path — import_surface will just update renderer_seen.
+    if data.textures.contains_key(&context_id) {
+        return None;
+    }
+
+    // Cache miss — need slow Vulkan/GPU import outside the lock.
+    let last_commit = data.renderer_seen.get(&context_id).copied();
+    let buffer_damage = data.damage_since(last_commit);
+    let imported_commit = data.current_commit();
+
+    Some(PendingDmabufImport {
+        buffer: buffer.clone(),
+        buffer_damage,
+        context_id,
+        imported_commit,
+    })
 }
 
 /// Texture used for the [`WaylandSurfaceRenderElement`]

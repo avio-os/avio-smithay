@@ -172,13 +172,22 @@ impl Buffer {
         *self.inner.superseded_release.lock().unwrap() = Some(superseded_release);
     }
 
+    /// Record the compositor's render-completion sync point for this buffer.
+    ///
+    /// Used by `try_signal_superseded_release_with_last_render_sync` to
+    /// signal the explicit sync release point only after the GPU finishes
+    /// reading the buffer.
     #[cfg(feature = "backend_drm")]
-    pub(crate) fn set_last_render_sync(&self, sync: crate::backend::renderer::sync::SyncPoint) {
+    pub fn set_last_render_sync(&self, sync: crate::backend::renderer::sync::SyncPoint) {
         *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Pending(sync));
     }
 
+    /// Record the compositor's render-completion sync file for this buffer.
+    ///
+    /// Preferred over [`set_last_render_sync`] when the sync point has
+    /// already been exported to an fd (avoids double-export).
     #[cfg(feature = "backend_drm")]
-    pub(crate) fn set_last_render_sync_file(&self, sync_file: Arc<OwnedFd>) {
+    pub fn set_last_render_sync_file(&self, sync_file: Arc<OwnedFd>) {
         *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Exported(sync_file));
     }
 

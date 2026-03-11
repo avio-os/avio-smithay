@@ -185,6 +185,17 @@ impl PrivateSurfaceData {
         f(&guard.public_data)
     }
 
+    /// Like [`with_states`](Self::with_states), but also provides the children list.
+    /// Both are read under a single lock acquisition, avoiding the need for
+    /// recursive lock holding during tree traversal.
+    pub fn with_states_and_children<T, F>(surface: &WlSurface, f: F) -> T
+    where
+        F: FnOnce(&SurfaceData, &[WlSurface]) -> T,
+    {
+        let guard = Self::lock_user_data(surface);
+        f(&guard.public_data, &guard.children)
+    }
+
     pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) {
         Self::lock_user_data(surface)
             .pending_transaction
