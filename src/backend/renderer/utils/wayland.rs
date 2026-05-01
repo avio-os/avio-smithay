@@ -231,7 +231,10 @@ impl Buffer {
                 let sync_file = match sync_file.try_clone() {
                     Ok(sync_file) => sync_file,
                     Err(err) => {
-                        warn!(?err, "Failed to clone exported render sync for superseded release point");
+                        warn!(
+                            ?err,
+                            "Failed to clone exported render sync for superseded release point"
+                        );
                         return false;
                     }
                 };
@@ -246,7 +249,10 @@ impl Buffer {
                     Err(err) => {
                         // sync_file was invalid or DRM ioctl failed — fall back to
                         // immediate signaling so the release point doesn't stay orphaned.
-                        warn!(?err, "Failed to attach superseded release to render sync, signaling immediately");
+                        warn!(
+                            ?err,
+                            "Failed to attach superseded release to render sync, signaling immediately"
+                        );
                         let fallback_ok = claimable.signal().unwrap_or(false);
                         if fallback_ok {
                             superseded_release.take();
@@ -725,7 +731,8 @@ where
 
         match ImportAll::import_buffer(renderer, &buffer, Some(states), &buffer_damage) {
             Some(Ok(imported_texture)) => {
-                data.textures.insert(context_id.clone(), Box::new(imported_texture));
+                data.textures
+                    .insert(context_id.clone(), Box::new(imported_texture));
                 data.renderer_seen.insert(context_id, imported_commit);
             }
             Some(Err(err)) => {

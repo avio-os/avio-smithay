@@ -175,9 +175,9 @@ impl Drop for InnerContextId {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 /// Texture filtering methods
 pub enum TextureFilter {
-    /// Returns the value of the texture element that is nearest (in Manhattan distance) to the center of the pixel being textured.
-    Linear,
     /// Returns the weighted average of the four texture elements that are closest to the center of the pixel being textured.
+    Linear,
+    /// Returns the value of the texture element that is nearest (in Manhattan distance) to the center of the pixel being textured.
     Nearest,
 }
 
@@ -268,6 +268,90 @@ pub trait TextureMapping: Texture {
     }
 }
 
+/// Analytic rounded clipping applied while sampling a texture.
+///
+/// Coordinates are in framebuffer physical pixels after the frame output
+/// transform has been applied. The texture remains premultiplied in the
+/// compositor's normal encoded-pixel contract; the coverage mask multiplies
+/// all channels uniformly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundedClip {
+    /// Rounded rectangle in framebuffer physical coordinates.
+    pub rect: Rectangle<f64, Physical>,
+    /// Corner radius in physical pixels.
+    pub radius: f32,
+    /// Superellipse exponent. `2.0` is circular; larger values square the shoulders.
+    pub exponent: f32,
+    /// Antialiasing ramp width in physical pixels.
+    pub aa_width: f32,
+    /// Bitmask selecting which corners are rounded.
+    pub corner_mask: u32,
+}
+
+impl RoundedClip {
+    /// Top-left corner bit.
+    pub const TOP_LEFT: u32 = 1 << 0;
+    /// Top-right corner bit.
+    pub const TOP_RIGHT: u32 = 1 << 1;
+    /// Bottom-right corner bit.
+    pub const BOTTOM_RIGHT: u32 = 1 << 2;
+    /// Bottom-left corner bit.
+    pub const BOTTOM_LEFT: u32 = 1 << 3;
+    /// All four corner bits.
+    pub const ALL_CORNERS: u32 = Self::TOP_LEFT | Self::TOP_RIGHT | Self::BOTTOM_RIGHT | Self::BOTTOM_LEFT;
+    /// The lower two corner bits.
+    pub const BOTTOM_CORNERS: u32 = Self::BOTTOM_LEFT | Self::BOTTOM_RIGHT;
+}
+
+/// Renderer-owned texture effect applied while sampling a texture.
+///
+/// These effects are intentionally expressed as compact shader parameters so
+/// compositor policy can choose the animation while each backend keeps control
+/// of the actual shader implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TextureRenderEffectKind {
+    /// No shader effect.
+    None = 0,
+    /// Genie-style squeeze toward an anchor point.
+    Genie = 1,
+    /// Fullscreen/maximize fill with a short depth pulse.
+    Fullscreen = 2,
+    /// Reserved for compositor-specific experiments.
+    Custom = 3,
+}
+
+/// Parameters for [`TextureRenderEffectKind`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextureRenderEffect {
+    /// Effect implementation to use.
+    pub kind: TextureRenderEffectKind,
+    /// Normalized effect progress/intensity.
+    pub progress: f32,
+    /// Normalized destination anchor. Genie uses this as the squeeze target.
+    pub anchor: [f32; 2],
+    /// Backend-specific parameters. Vulkan currently uses `params[0]` as the
+    /// genie neck width. For fullscreen, it uses `params[0]`/`params[2]` as a
+    /// flow direction, `params[1]` as depth pulse strength, and `params[3]` as
+    /// directional flow strength.
+    pub params: [f32; 4],
+}
+
+impl TextureRenderEffect {
+    /// Disabled texture effect.
+    pub const NONE: Self = Self {
+        kind: TextureRenderEffectKind::None,
+        progress: 0.0,
+        anchor: [0.5, 0.5],
+        params: [0.0, 0.0, 0.0, 0.0],
+    };
+
+    /// Returns whether the effect can be skipped by the renderer.
+    pub fn is_none(self) -> bool {
+        self.kind == TextureRenderEffectKind::None || self.progress <= 0.0
+    }
+}
+
 /// Helper trait for [`Renderer`], which defines a rendering api for a currently in-progress frame during [`Renderer::render`].
 ///
 /// Dropping the [`Frame`] or explicitly calling [`Frame::finish`] will free any unused resources. If you need explicit control
@@ -344,6 +428,66 @@ pub trait Frame {
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Self::Error>;
+
+    /// Render a texture with an analytic rounded clip mask applied in the
+    /// destination coordinate space.
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_with_rounded_clip(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        _rounded_clip: RoundedClip,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to(texture, src, dst, damage, opaque_regions, src_transform, alpha)
+    }
+
+    /// Render a texture with a backend-owned shader effect.
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_with_effect(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        _effect: TextureRenderEffect,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to(texture, src, dst, damage, opaque_regions, src_transform, alpha)
+    }
+
+    /// Render a texture with both an analytic rounded clip and a backend-owned
+    /// shader effect.
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_with_rounded_clip_and_effect(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        rounded_clip: RoundedClip,
+        _effect: TextureRenderEffect,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to_with_rounded_clip(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
+            alpha,
+            rounded_clip,
+        )
+    }
 
     /// Output transformation that is applied to this frame
     fn transformation(&self) -> Transform;

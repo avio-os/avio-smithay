@@ -3,6 +3,8 @@ use std::{io::Cursor, sync::Arc};
 use ash::{util::read_spv, vk};
 use indexmap::IndexMap;
 
+use crate::backend::renderer::{TextureRenderEffect, TextureRenderEffectKind};
+
 use super::{device::DeviceHandle, VulkanRendererError};
 
 const SOLID_VERTEX_SHADER_SPV: &[u8] = include_bytes!("shaders/solid.vert.spv");
@@ -51,9 +53,13 @@ pub(crate) struct TexturePushConstants {
     pub(crate) alpha: f32,
     pub(crate) transform: u32,
     pub(crate) y_inverted: u32,
-    pub(crate) _pad0: u32,
+    pub(crate) rounded_clip_flags: u32,
     pub(crate) src_offset: [f32; 2],
     pub(crate) src_scale: [f32; 2],
+    pub(crate) clip_rect: [f32; 4],
+    pub(crate) clip_params: [f32; 4],
+    pub(crate) effect: [f32; 4],
+    pub(crate) effect_params: [f32; 4],
 }
 
 impl Default for TexturePushConstants {
@@ -62,9 +68,13 @@ impl Default for TexturePushConstants {
             alpha: 1.0,
             transform: TextureTransform::Normal as u32,
             y_inverted: 0,
-            _pad0: 0,
+            rounded_clip_flags: 0,
             src_offset: [0.0, 0.0],
             src_scale: [1.0, 1.0],
+            clip_rect: [0.0, 0.0, 0.0, 0.0],
+            clip_params: [0.0, 2.0, 0.5, 0.0],
+            effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
+            effect_params: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -75,15 +85,37 @@ impl TexturePushConstants {
             alpha,
             transform: transform as u32,
             y_inverted: u32::from(y_inverted),
-            _pad0: 0,
+            rounded_clip_flags: 0,
             src_offset: [0.0, 0.0],
             src_scale: [1.0, 1.0],
+            clip_rect: [0.0, 0.0, 0.0, 0.0],
+            clip_params: [0.0, 2.0, 0.5, 0.0],
+            effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
+            effect_params: [0.0, 0.0, 0.0, 0.0],
         }
     }
 
     pub(crate) fn with_src_rect(mut self, offset: [f32; 2], scale: [f32; 2]) -> Self {
         self.src_offset = offset;
         self.src_scale = scale;
+        self
+    }
+
+    pub(crate) fn with_rounded_clip(mut self, flags: u32, rect: [f32; 4], params: [f32; 4]) -> Self {
+        self.rounded_clip_flags = flags;
+        self.clip_rect = rect;
+        self.clip_params = params;
+        self
+    }
+
+    pub(crate) fn with_effect(mut self, effect: TextureRenderEffect) -> Self {
+        self.effect = [
+            effect.kind as u32 as f32,
+            effect.progress.clamp(0.0, 1.0),
+            effect.anchor[0],
+            effect.anchor[1],
+        ];
+        self.effect_params = effect.params;
         self
     }
 }
@@ -422,9 +454,11 @@ impl PipelineState {
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // Shader outputs are premultiplied, matching Wayland/Impeller texture
+        // contents and the compositor's solid color path.
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(blend_enabled)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -550,16 +584,39 @@ fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> Result<vk::Shader
 mod tests {
     use ash::vk;
 
-    use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
+    use crate::backend::{
+        renderer::{TextureRenderEffect, TextureRenderEffectKind},
+        vulkan::{version::Version, Instance, PhysicalDevice},
+    };
 
     use super::{
-        super::descriptor::DescriptorState, super::device::DeviceHandle, super::device::DeviceState,
+        super::descriptor::{DescriptorState, TextureSampler},
+        super::device::DeviceHandle,
+        super::device::DeviceState,
         push_constants_bytes, PipelineState, SolidPushConstants, TexturePushConstants, TextureTransform,
     };
 
     const TEST_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
     const TEST_WIDTH: u32 = 64;
     const TEST_HEIGHT: u32 = 64;
+
+    #[test]
+    fn texture_push_constants_encode_render_effect() {
+        let constants = TexturePushConstants::new(1.0, TextureTransform::Normal, false).with_effect(
+            TextureRenderEffect {
+                kind: TextureRenderEffectKind::Genie,
+                progress: 1.5,
+                anchor: [0.25, 0.875],
+                params: [0.11, 0.0, 0.0, 0.0],
+            },
+        );
+
+        assert_eq!(
+            constants.effect,
+            [TextureRenderEffectKind::Genie as u32 as f32, 1.0, 0.25, 0.875]
+        );
+        assert_eq!(constants.effect_params, [0.11, 0.0, 0.0, 0.0]);
+    }
 
     #[derive(Debug)]
     struct TestImage {
@@ -718,7 +775,7 @@ mod tests {
             Err(_) => return,
         };
 
-        let descriptor_set = match descriptors.texture_descriptor_set(texture.view) {
+        let descriptor_set = match descriptors.texture_descriptor_set(texture.view, TextureSampler::LINEAR) {
             Ok(set) => set,
             Err(_) => return,
         };
@@ -816,7 +873,7 @@ mod tests {
                 texture.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &vk::ClearColorValue {
-                    float32: [1.0, 0.0, 0.0, 1.0],
+                    float32: [0.5, 0.0, 0.0, 0.5],
                 },
                 &[full_range],
             );
@@ -911,7 +968,7 @@ mod tests {
             vk_device.cmd_set_viewport(command_buffer, 0, &right_half_partial_viewport);
             vk_device.cmd_set_scissor(command_buffer, 0, &right_half_partial_scissor);
 
-            let texture_constants = TexturePushConstants::new(0.5, TextureTransform::Normal, false);
+            let texture_constants = TexturePushConstants::new(1.0, TextureTransform::Normal, false);
             vk_device.cmd_push_constants(
                 command_buffer,
                 handles.textured_layout,

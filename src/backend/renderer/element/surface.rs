@@ -285,9 +285,8 @@ where
         // Step 4: brief lock — build render element (import_surface will hit cache for DmaBuf)
         compositor::with_states(&surface, |states| {
             let kind = kind.eval(states);
-            match WaylandSurfaceRenderElement::from_surface(
-                renderer, &surface, states, location, alpha, kind,
-            ) {
+            match WaylandSurfaceRenderElement::from_surface(renderer, &surface, states, location, alpha, kind)
+            {
                 Ok(Some(element)) => surfaces.push(element.into()),
                 Ok(None) => {}
                 Err(err) => {

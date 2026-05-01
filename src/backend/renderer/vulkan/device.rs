@@ -470,11 +470,7 @@ impl DeviceState {
             match self.acquire_reclaim_fence() {
                 Ok(rf) => {
                     // SAFETY: Empty submit; fence signals when all prior queue work completes.
-                    match unsafe {
-                        self.device
-                            .handle()
-                            .queue_submit(self.queue, &[], rf)
-                    } {
+                    match unsafe { self.device.handle().queue_submit(self.queue, &[], rf) } {
                         Ok(()) => rf,
                         Err(err) => {
                             // The real work was already submitted — we cannot un-submit it.
@@ -615,11 +611,7 @@ impl DeviceState {
 
     fn recycle_reclaim_fence(&mut self, fence: vk::Fence) {
         // SAFETY: Fence was signaled (or never submitted) and belongs to this device.
-        if let Err(err) = unsafe {
-            self.device
-                .handle()
-                .reset_fences(&[fence])
-        } {
+        if let Err(err) = unsafe { self.device.handle().reset_fences(&[fence]) } {
             warn!(?err, "failed to reset reclaim fence, destroying instead");
             unsafe { self.device.handle().destroy_fence(fence, None) };
             return;

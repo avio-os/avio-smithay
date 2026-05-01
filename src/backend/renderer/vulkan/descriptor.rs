@@ -5,17 +5,49 @@ use indexmap::IndexMap;
 use tracing::trace;
 
 use super::{device::DeviceHandle, VulkanCacheStats, VulkanRendererError};
+use crate::backend::renderer::TextureFilter;
+
+const BASE_LEVEL_MAX_LOD: f32 = 0.25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TextureSampler {
+    min_filter: TextureFilter,
+    mag_filter: TextureFilter,
+}
+
+impl TextureSampler {
+    pub(crate) const LINEAR: Self = Self {
+        min_filter: TextureFilter::Linear,
+        mag_filter: TextureFilter::Linear,
+    };
+    pub(crate) const NEAREST: Self = Self {
+        min_filter: TextureFilter::Nearest,
+        mag_filter: TextureFilter::Nearest,
+    };
+
+    pub(crate) fn new(min_filter: TextureFilter, mag_filter: TextureFilter) -> Self {
+        Self {
+            min_filter,
+            mag_filter,
+        }
+    }
+
+    fn filters(self) -> (vk::Filter, vk::Filter) {
+        (filter_to_vk(self.min_filter), filter_to_vk(self.mag_filter))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TextureDescriptorKey {
     image_view: vk::ImageView,
+    sampler: TextureSampler,
 }
 
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     device: Arc<DeviceHandle>,
     texture_layout: vk::DescriptorSetLayout,
-    texture_sampler: vk::Sampler,
+    texture_samplers: IndexMap<TextureSampler, vk::Sampler>,
     pool: vk::DescriptorPool,
     texture_sets: IndexMap<TextureDescriptorKey, vk::DescriptorSet>,
     max_texture_sets: usize,
@@ -51,22 +83,12 @@ impl DescriptorState {
         // SAFETY: Device is valid and create-info points to live memory.
         let texture_layout = unsafe { vk_device.create_descriptor_set_layout(&texture_layout_info, None) }?;
 
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .max_lod(0.0);
-
-        // SAFETY: Device is valid and create-info points to live memory.
-        let texture_sampler = match unsafe { vk_device.create_sampler(&sampler_info, None) } {
-            Ok(sampler) => sampler,
+        let texture_samplers = match create_texture_samplers(vk_device) {
+            Ok(samplers) => samplers,
             Err(err) => {
                 // SAFETY: Descriptor set layout was created by this device and is not used after this point.
                 unsafe { vk_device.destroy_descriptor_set_layout(texture_layout, None) };
-                return Err(err.into());
+                return Err(err);
             }
         };
 
@@ -83,7 +105,9 @@ impl DescriptorState {
             Ok(pool) => pool,
             Err(err) => {
                 unsafe {
-                    vk_device.destroy_sampler(texture_sampler, None);
+                    for sampler in texture_samplers.values() {
+                        vk_device.destroy_sampler(*sampler, None);
+                    }
                     vk_device.destroy_descriptor_set_layout(texture_layout, None);
                 }
                 return Err(err.into());
@@ -93,7 +117,7 @@ impl DescriptorState {
         Ok(Self {
             device,
             texture_layout,
-            texture_sampler,
+            texture_samplers,
             pool,
             texture_sets: IndexMap::new(),
             max_texture_sets,
@@ -105,15 +129,12 @@ impl DescriptorState {
         self.texture_layout
     }
 
-    pub(crate) fn texture_sampler(&self) -> vk::Sampler {
-        self.texture_sampler
-    }
-
     pub(crate) fn texture_descriptor_set(
         &mut self,
         image_view: vk::ImageView,
+        sampler: TextureSampler,
     ) -> Result<vk::DescriptorSet, VulkanRendererError> {
-        let key = TextureDescriptorKey { image_view };
+        let key = TextureDescriptorKey { image_view, sampler };
 
         if let Some(existing) = self.texture_sets.shift_remove(&key) {
             // Keep hot entries toward the end of insertion order so old entries are evicted first.
@@ -144,7 +165,7 @@ impl DescriptorState {
                 "Vulkan did not return an allocated descriptor set",
             ))?;
 
-        self.write_texture_descriptor(descriptor_set, image_view);
+        self.write_texture_descriptor(descriptor_set, image_view, sampler);
         self.texture_sets.insert(key, descriptor_set);
         trace!(
             hits = self.cache_stats.hits,
@@ -195,9 +216,14 @@ impl DescriptorState {
         Ok(())
     }
 
-    fn write_texture_descriptor(&self, descriptor_set: vk::DescriptorSet, image_view: vk::ImageView) {
+    fn write_texture_descriptor(
+        &self,
+        descriptor_set: vk::DescriptorSet,
+        image_view: vk::ImageView,
+        sampler: TextureSampler,
+    ) {
         let image_info = [vk::DescriptorImageInfo::default()
-            .sampler(self.texture_sampler)
+            .sampler(self.sampler_handle(sampler))
             .image_view(image_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [vk::WriteDescriptorSet::default()
@@ -209,6 +235,10 @@ impl DescriptorState {
         // SAFETY: Descriptor set and image view are valid handles managed by the renderer.
         unsafe { self.device.handle().update_descriptor_sets(&writes, &[]) };
     }
+
+    fn sampler_handle(&self, sampler: TextureSampler) -> vk::Sampler {
+        self.texture_samplers[&sampler]
+    }
 }
 
 impl Drop for DescriptorState {
@@ -216,8 +246,64 @@ impl Drop for DescriptorState {
         let device = self.device.handle();
         unsafe {
             device.destroy_descriptor_pool(self.pool, None);
-            device.destroy_sampler(self.texture_sampler, None);
+            for sampler in self.texture_samplers.values() {
+                device.destroy_sampler(*sampler, None);
+            }
             device.destroy_descriptor_set_layout(self.texture_layout, None);
         }
+    }
+}
+
+fn create_texture_samplers(
+    device: &ash::Device,
+) -> Result<IndexMap<TextureSampler, vk::Sampler>, VulkanRendererError> {
+    let mut samplers = IndexMap::new();
+    for min_filter in [TextureFilter::Linear, TextureFilter::Nearest] {
+        for mag_filter in [TextureFilter::Linear, TextureFilter::Nearest] {
+            let sampler = TextureSampler::new(min_filter, mag_filter);
+            match create_texture_sampler(device, sampler) {
+                Ok(handle) => {
+                    samplers.insert(sampler, handle);
+                }
+                Err(err) => {
+                    unsafe {
+                        for handle in samplers.values() {
+                            device.destroy_sampler(*handle, None);
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(samplers)
+}
+
+fn create_texture_sampler(
+    device: &ash::Device,
+    sampler: TextureSampler,
+) -> Result<vk::Sampler, VulkanRendererError> {
+    let (min_filter, mag_filter) = sampler.filters();
+    // Vulkan has no direct GL_LINEAR/GL_NEAREST minification mode for a
+    // single-mip texture. Per the spec mapping, clamp to a small non-zero
+    // LOD with nearest mip selection so minFilter can still be selected
+    // without sampling another mip level.
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(mag_filter)
+        .min_filter(min_filter)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .max_lod(BASE_LEVEL_MAX_LOD);
+
+    // SAFETY: Device is valid and create-info points to live memory.
+    unsafe { device.create_sampler(&sampler_info, None) }.map_err(Into::into)
+}
+
+fn filter_to_vk(filter: TextureFilter) -> vk::Filter {
+    match filter {
+        TextureFilter::Linear => vk::Filter::LINEAR,
+        TextureFilter::Nearest => vk::Filter::NEAREST,
     }
 }

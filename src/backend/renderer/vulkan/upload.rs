@@ -157,16 +157,10 @@ impl ImportMemWl for VulkanRenderer {
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
         with_packed_shm_buffer(buffer, |packed, format, size| {
-            self.upload.import_memory(
-                &mut self.device,
-                packed,
-                format,
-                size,
-                false,
-            )
+            self.upload
+                .import_memory(&mut self.device, packed, format, size, false)
         })
     }
-
 }
 
 #[cfg(feature = "wayland_frontend")]
@@ -192,7 +186,10 @@ impl VulkanRenderer {
                 return Ok(texture.clone());
             }
 
-            match self.upload.update_memory(&mut self.device, texture, packed, update_region) {
+            match self
+                .upload
+                .update_memory(&mut self.device, texture, packed, update_region)
+            {
                 Ok(()) => Ok(texture.clone()),
                 Err(_) => self
                     .upload
@@ -203,10 +200,7 @@ impl VulkanRenderer {
 }
 
 #[cfg(feature = "wayland_frontend")]
-fn with_packed_shm_buffer<T, F>(
-    buffer: &wl_buffer::WlBuffer,
-    f: F,
-) -> Result<T, VulkanRendererError>
+fn with_packed_shm_buffer<T, F>(buffer: &wl_buffer::WlBuffer, f: F) -> Result<T, VulkanRendererError>
 where
     F: FnOnce(&[u8], Fourcc, Size<i32, BufferCoord>) -> Result<T, VulkanRendererError>,
 {
@@ -236,12 +230,15 @@ where
             ));
         }
 
-        let src_offset = usize::try_from(data.offset)
-            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("wl_shm offset could not be represented"))?;
-        let src_stride = usize::try_from(data.stride)
-            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("wl_shm stride could not be represented"))?;
-        let height = usize::try_from(data.height)
-            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("wl_shm height could not be represented"))?;
+        let src_offset = usize::try_from(data.offset).map_err(|_| {
+            VulkanRendererError::InvalidMemoryUpload("wl_shm offset could not be represented")
+        })?;
+        let src_stride = usize::try_from(data.stride).map_err(|_| {
+            VulkanRendererError::InvalidMemoryUpload("wl_shm stride could not be represented")
+        })?;
+        let height = usize::try_from(data.height).map_err(|_| {
+            VulkanRendererError::InvalidMemoryUpload("wl_shm height could not be represented")
+        })?;
 
         let expected_len = src_offset
             .checked_add((height - 1).checked_mul(src_stride).ok_or(

@@ -143,6 +143,12 @@ use smallvec::SmallVec;
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 use wayland_server::{protocol::wl_buffer::WlBuffer, Resource};
 
+use super::{
+    error::AccessError,
+    exporter::{gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer},
+    surface::VrrSupport,
+    DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
+};
 #[cfg(feature = "renderer_pixman")]
 use crate::backend::renderer::{
     pixman::{PixmanError, PixmanRenderer, PixmanTexture},
@@ -173,12 +179,6 @@ use crate::{
     output::OutputModeSource,
     utils::{Buffer as BufferCoords, DevPath, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{shm, single_pixel_buffer},
-};
-use super::{
-    error::AccessError,
-    exporter::{gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer},
-    surface::VrrSupport,
-    DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
 };
 
 mod elements;
@@ -691,7 +691,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     #[cfg(feature = "backend_drm")]
     fn contains_buffer(&self, candidate: &ScanoutBuffer<B>) -> bool {
         self.planes.iter().any(|(_, state)| {
-            state.config.as_ref().is_some_and(|config| config.buffer.buffer.same_storage(candidate))
+            state
+                .config
+                .as_ref()
+                .is_some_and(|config| config.buffer.buffer.same_storage(candidate))
         })
     }
 
@@ -2348,20 +2351,21 @@ where
 
             match render_res {
                 Ok(render_output_result) => {
-                    let shared_render_sync_file = if render_output_result.damage.is_some() && self.supports_fencing {
-                        // Export once and fan out duplicated fds to KMS and superseded-release
-                        // consumers. When KMS fencing is unavailable, keep the sync point
-                        // unexported so the submit path can still fall back to a host wait.
-                        let exported = render_output_result.sync.export().map(Arc::new);
-                        trace!(
-                            exported_ok = exported.is_some(),
-                            sync_reached = render_output_result.sync.is_reached(),
-                            "shared_render_sync_file export"
-                        );
-                        exported
-                    } else {
-                        None
-                    };
+                    let shared_render_sync_file =
+                        if render_output_result.damage.is_some() && self.supports_fencing {
+                            // Export once and fan out duplicated fds to KMS and superseded-release
+                            // consumers. When KMS fencing is unavailable, keep the sync point
+                            // unexported so the submit path can still fall back to a host wait.
+                            let exported = render_output_result.sync.export().map(Arc::new);
+                            trace!(
+                                exported_ok = exported.is_some(),
+                                sync_reached = render_output_result.sync.is_reached(),
+                                "shared_render_sync_file export"
+                            );
+                            exported
+                        } else {
+                            None
+                        };
 
                     if render_output_result.damage.is_none() {
                         // if we receive no damage we can assume no rendering took place
@@ -2463,7 +2467,6 @@ where
                     return Err(RenderFrameError::from(err));
                 }
             }
-
         } else {
             // if we are constantly doing direct scan-out on the primary plane
             // we have to cleanup the renderer texture cache as this would

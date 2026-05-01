@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    os::fd::OwnedFd,
-    sync::Arc,
-};
+use std::{collections::HashSet, os::fd::OwnedFd, sync::Arc};
 
 use crate::{
     backend::{
@@ -549,8 +545,13 @@ mod tests {
     fn make_primary_swapchain_element(
         exported_sync_file: Option<Arc<OwnedFd>>,
     ) -> PrimarySwapchainElement<DummyBuffer, DummyFramebuffer> {
-        let mut swapchain =
-            Swapchain::new(DummyAllocator, 1, 1, Fourcc::Argb8888, vec![drm_fourcc::DrmModifier::Linear]);
+        let mut swapchain = Swapchain::new(
+            DummyAllocator,
+            1,
+            1,
+            Fourcc::Argb8888,
+            vec![drm_fourcc::DrmModifier::Linear],
+        );
         let slot = swapchain
             .acquire()
             .expect("swapchain allocation failed")

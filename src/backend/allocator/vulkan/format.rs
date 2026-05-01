@@ -48,28 +48,25 @@ macro_rules! vk_format_table {
     };
 }
 
-// FIXME: SRGB format is not always correct.
-//
 // Vulkan classifies formats by both channel sizes and colorspace. FourCC format codes do not classify formats
 // based on colorspace.
 //
-// To implement this correctly, it is likely that parsing vulkan.xml and classifying families of colorspaces
-// would be needed since there are a lot of formats.
-//
-// Many of these conversions come from wsi_common_wayland.c in Mesa
+// The compositor's current SDR render contract keeps Wayland/DRM buffers as encoded UNORM pixels. Wayland
+// specifies alpha-bearing buffers as premultiplied in electrical values, so automatic SRGB sampling would
+// linearize already-premultiplied channels before the shader can repair that relationship.
 vk_format_table! {
-    Argb8888 => B8G8R8A8_SRGB,
-    Xrgb8888 => B8G8R8A8_SRGB,
+    Argb8888 => B8G8R8A8_UNORM,
+    Xrgb8888 => B8G8R8A8_UNORM,
 
-    Abgr8888 => R8G8B8A8_SRGB,
-    Xbgr8888 => R8G8B8A8_SRGB,
+    Abgr8888 => R8G8B8A8_UNORM,
+    Xbgr8888 => R8G8B8A8_UNORM,
 
     // PACK32 formats are equivalent to u32 instead of [u8; 4] and thus depend their layout depends the host
     // endian.
     #[cfg(target_endian = "little")]
-    Rgba8888 => A8B8G8R8_SRGB_PACK32,
+    Rgba8888 => A8B8G8R8_UNORM_PACK32,
     #[cfg(target_endian = "little")]
-    Rgbx8888 => A8B8G8R8_SRGB_PACK32,
+    Rgbx8888 => A8B8G8R8_UNORM_PACK32,
 
     #[cfg(target_endian = "little")]
     Argb2101010 => A2R10G10B10_UNORM_PACK32,
@@ -80,4 +77,20 @@ vk_format_table! {
     Abgr2101010 => A2B10G10R10_UNORM_PACK32,
     #[cfg(target_endian = "little")]
     Xbgr2101010 => A2B10G10R10_UNORM_PACK32,
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk;
+
+    use super::get_vk_format;
+    use crate::backend::allocator::Fourcc;
+
+    #[test]
+    fn eight_bit_color_formats_are_encoded_unorm() {
+        assert_eq!(get_vk_format(Fourcc::Argb8888), Some(vk::Format::B8G8R8A8_UNORM));
+        assert_eq!(get_vk_format(Fourcc::Xrgb8888), Some(vk::Format::B8G8R8A8_UNORM));
+        assert_eq!(get_vk_format(Fourcc::Abgr8888), Some(vk::Format::R8G8B8A8_UNORM));
+        assert_eq!(get_vk_format(Fourcc::Xbgr8888), Some(vk::Format::R8G8B8A8_UNORM));
+    }
 }

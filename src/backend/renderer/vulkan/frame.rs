@@ -12,16 +12,17 @@ use crate::{
         },
         renderer::{
             sync::SyncPoint, Bind, Blit, BlitFrame, Color32F, ContextId, Frame, ImportDma, Renderer,
-            RendererSuper, Texture, TextureFilter,
+            RendererSuper, RoundedClip, Texture, TextureFilter, TextureRenderEffect,
         },
     },
-    utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
+    utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform},
 };
 
 #[cfg(feature = "wayland_frontend")]
 use crate::backend::renderer::ImportDmaWl;
 
 use super::{
+    descriptor::TextureSampler,
     dmabuf::ImportedDmabufImage,
     pipeline::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
@@ -419,197 +420,96 @@ impl Frame for VulkanFrame<'_> {
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Self::Error> {
-        if damage.is_empty() {
-            return Ok(());
-        }
-
-        let Some(texture_image) = texture.imported_image().cloned() else {
-            return Err(VulkanRendererError::NotImplemented(
-                "render_texture_from_to currently requires dma-buf-backed VulkanTexture",
-            ));
-        };
-
-        self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
-
-        let (command_buffer, pipelines, transform, size) = {
-            let recording = self.recording()?;
-            (
-                recording.command_buffer,
-                recording.pipelines,
-                recording.transform,
-                recording.size,
-            )
-        };
-
-        let frame_bounds = Rectangle::from_size(size);
-        let Some(viewport_rect) = transform.transform_rect_in(dst, &size).intersection(frame_bounds) else {
-            return Ok(());
-        };
-
-        let draw_damage = Self::transformed_damage_rects(transform, size, dst, damage);
-        if draw_damage.is_empty() {
-            return Ok(());
-        }
-
-        let texture_size = texture.size();
-        if texture_size.w <= 0 || texture_size.h <= 0 {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "texture dimensions must be positive",
-            ));
-        }
-
-        if src.size.w <= 0.0 || src.size.h <= 0.0 {
-            return Ok(());
-        }
-
-        if src.loc.x < 0.0
-            || src.loc.y < 0.0
-            || src.loc.x + src.size.w > texture_size.w as f64
-            || src.loc.y + src.size.h > texture_size.h as f64
-        {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "source rectangle must remain within the source texture bounds",
-            ));
-        }
-
-        let texture_transform = combine_image_transform(src_transform, transform);
-        let src_offset = [
-            src.loc.x as f32 / texture_size.w as f32,
-            src.loc.y as f32 / texture_size.h as f32,
-        ];
-        let src_scale = [
-            src.size.w as f32 / texture_size.w as f32,
-            src.size.h as f32 / texture_size.h as f32,
-        ];
-
-        let push_constants = TexturePushConstants::new(
+        self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
             alpha,
-            TextureTransform::from(texture_transform),
-            texture.y_inverted(),
+            None,
+            TextureRenderEffect::NONE,
         )
-        .with_src_rect(src_offset, src_scale);
+    }
 
-        let descriptor_set = self
-            .renderer
-            .descriptors
-            .texture_descriptor_set(texture_image.view())?;
+    #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
+    #[profiling::function]
+    fn render_texture_from_to_with_rounded_clip(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        rounded_clip: RoundedClip,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
+            alpha,
+            Some(rounded_clip),
+            TextureRenderEffect::NONE,
+        )
+    }
 
-        let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
-        let use_opaque_only = alpha >= 1.0 && !texture_has_alpha;
+    #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
+    #[profiling::function]
+    fn render_texture_from_to_with_effect(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        effect: TextureRenderEffect,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
+            alpha,
+            None,
+            effect,
+        )
+    }
 
-        let transformed_opaque = if alpha >= 1.0 {
-            Self::transformed_damage_rects(transform, size, dst, opaque_regions)
-        } else {
-            Vec::new()
-        };
-
-        let (opaque_draws, blended_draws) = if use_opaque_only {
-            (draw_damage, Vec::new())
-        } else if !transformed_opaque.is_empty() {
-            let mut opaque = Vec::new();
-            let mut blended = Vec::new();
-
-            for rect in draw_damage {
-                if transformed_opaque
-                    .iter()
-                    .any(|opaque_rect| opaque_rect.contains_rect(rect))
-                {
-                    opaque.push(rect);
-                } else {
-                    blended.push(rect);
-                }
-            }
-
-            (opaque, blended)
-        } else {
-            (Vec::new(), draw_damage)
-        };
-
-        // SAFETY: Command buffer recording is active and all handles belong to this renderer device.
-        unsafe {
-            self.renderer.device.insert_debug_label(
-                command_buffer,
-                c"vulkan.frame.render_texture",
-                [0.74, 0.34, 0.89, 1.0],
-            );
-            self.renderer.device.device_handle().cmd_set_viewport(
-                command_buffer,
-                0,
-                &[to_vk_viewport(viewport_rect)],
-            );
-
-            if !opaque_draws.is_empty() {
-                self.renderer.device.device_handle().cmd_bind_pipeline(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.textured_opaque_pipeline,
-                );
-                self.renderer.device.device_handle().cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.textured_layout,
-                    0,
-                    &[descriptor_set],
-                    &[],
-                );
-                self.renderer.device.device_handle().cmd_push_constants(
-                    command_buffer,
-                    pipelines.textured_layout,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    push_constants_bytes(&push_constants),
-                );
-
-                for rect in &opaque_draws {
-                    self.renderer.device.device_handle().cmd_set_scissor(
-                        command_buffer,
-                        0,
-                        &[to_vk_rect(*rect)],
-                    );
-                    self.renderer
-                        .device
-                        .device_handle()
-                        .cmd_draw(command_buffer, 4, 1, 0, 0);
-                }
-            }
-
-            if !blended_draws.is_empty() {
-                self.renderer.device.device_handle().cmd_bind_pipeline(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.textured_pipeline,
-                );
-                self.renderer.device.device_handle().cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.textured_layout,
-                    0,
-                    &[descriptor_set],
-                    &[],
-                );
-                self.renderer.device.device_handle().cmd_push_constants(
-                    command_buffer,
-                    pipelines.textured_layout,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    push_constants_bytes(&push_constants),
-                );
-
-                for rect in &blended_draws {
-                    self.renderer.device.device_handle().cmd_set_scissor(
-                        command_buffer,
-                        0,
-                        &[to_vk_rect(*rect)],
-                    );
-                    self.renderer
-                        .device
-                        .device_handle()
-                        .cmd_draw(command_buffer, 4, 1, 0, 0);
-                }
-            }
-        }
-
-        Ok(())
+    #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
+    #[profiling::function]
+    fn render_texture_from_to_with_rounded_clip_and_effect(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        rounded_clip: RoundedClip,
+        effect: TextureRenderEffect,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
+            alpha,
+            Some(rounded_clip),
+            effect,
+        )
     }
 
     fn transformation(&self) -> Transform {
@@ -827,6 +727,239 @@ impl VulkanFrame<'_> {
         self.recording_mut()?
             .pending_layouts
             .insert(image.id(), (image.clone(), new_layout));
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_internal(
+        &mut self,
+        texture: &VulkanTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        rounded_clip: Option<RoundedClip>,
+        effect: TextureRenderEffect,
+    ) -> Result<(), VulkanRendererError> {
+        if damage.is_empty() {
+            return Ok(());
+        }
+
+        let Some(texture_image) = texture.imported_image().cloned() else {
+            return Err(VulkanRendererError::NotImplemented(
+                "render_texture_from_to currently requires dma-buf-backed VulkanTexture",
+            ));
+        };
+
+        self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
+
+        let (command_buffer, pipelines, transform, size) = {
+            let recording = self.recording()?;
+            (
+                recording.command_buffer,
+                recording.pipelines,
+                recording.transform,
+                recording.size,
+            )
+        };
+
+        let frame_bounds = Rectangle::from_size(size);
+        let Some(viewport_rect) = transform.transform_rect_in(dst, &size).intersection(frame_bounds) else {
+            return Ok(());
+        };
+
+        let rounded_clip = rounded_clip.map(|clip| transform_rounded_clip(transform, size, clip));
+        let has_rounded_clip = rounded_clip
+            .map(|clip| clip.corner_mask != 0 && clip.radius > 0.0)
+            .unwrap_or(false);
+
+        let draw_damage = Self::transformed_damage_rects(transform, size, dst, damage);
+        if draw_damage.is_empty() {
+            return Ok(());
+        }
+
+        let texture_size = texture.size();
+        if texture_size.w <= 0 || texture_size.h <= 0 {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "texture dimensions must be positive",
+            ));
+        }
+
+        if src.size.w <= 0.0 || src.size.h <= 0.0 {
+            return Ok(());
+        }
+
+        if src.loc.x < 0.0
+            || src.loc.y < 0.0
+            || src.loc.x + src.size.w > texture_size.w as f64
+            || src.loc.y + src.size.h > texture_size.h as f64
+        {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "source rectangle must remain within the source texture bounds",
+            ));
+        }
+
+        let texture_transform = combine_image_transform(src_transform, transform);
+        let src_offset = [
+            src.loc.x as f32 / texture_size.w as f32,
+            src.loc.y as f32 / texture_size.h as f32,
+        ];
+        let src_scale = [
+            src.size.w as f32 / texture_size.w as f32,
+            src.size.h as f32 / texture_size.h as f32,
+        ];
+
+        let mut push_constants = TexturePushConstants::new(
+            alpha,
+            TextureTransform::from(texture_transform),
+            texture.y_inverted(),
+        )
+        .with_src_rect(src_offset, src_scale)
+        .with_effect(effect);
+
+        if let Some(clip) = rounded_clip {
+            push_constants = push_constants.with_rounded_clip(
+                clip.corner_mask,
+                rounded_clip_rect_push_constant(clip.rect),
+                [
+                    clip.radius.max(0.0),
+                    clip.exponent.max(2.0),
+                    clip.aa_width.max(0.001),
+                    0.0,
+                ],
+            );
+        }
+
+        let sampler = texture_sampler_for_render(
+            src,
+            dst,
+            src_transform,
+            self.renderer.downscale_filter,
+            self.renderer.upscale_filter,
+        );
+        let descriptor_set = self
+            .renderer
+            .descriptors
+            .texture_descriptor_set(texture_image.view(), sampler)?;
+
+        let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
+        let has_shader_effect = !effect.is_none();
+        let use_opaque_only = alpha >= 1.0 && !texture_has_alpha && !has_rounded_clip && !has_shader_effect;
+
+        let transformed_opaque = if alpha >= 1.0 && !has_rounded_clip && !has_shader_effect {
+            Self::transformed_damage_rects(transform, size, dst, opaque_regions)
+        } else {
+            Vec::new()
+        };
+
+        let (opaque_draws, blended_draws) = if use_opaque_only {
+            (draw_damage, Vec::new())
+        } else if !transformed_opaque.is_empty() {
+            let mut opaque = Vec::new();
+            let mut blended = Vec::new();
+
+            for rect in draw_damage {
+                if transformed_opaque
+                    .iter()
+                    .any(|opaque_rect| opaque_rect.contains_rect(rect))
+                {
+                    opaque.push(rect);
+                } else {
+                    blended.push(rect);
+                }
+            }
+
+            (opaque, blended)
+        } else {
+            (Vec::new(), draw_damage)
+        };
+
+        // SAFETY: Command buffer recording is active and all handles belong to this renderer device.
+        unsafe {
+            self.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.frame.render_texture",
+                [0.74, 0.34, 0.89, 1.0],
+            );
+            self.renderer.device.device_handle().cmd_set_viewport(
+                command_buffer,
+                0,
+                &[to_vk_viewport(viewport_rect)],
+            );
+
+            if !opaque_draws.is_empty() {
+                self.renderer.device.device_handle().cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipelines.textured_opaque_pipeline,
+                );
+                self.renderer.device.device_handle().cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipelines.textured_layout,
+                    0,
+                    &[descriptor_set],
+                    &[],
+                );
+                self.renderer.device.device_handle().cmd_push_constants(
+                    command_buffer,
+                    pipelines.textured_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push_constants_bytes(&push_constants),
+                );
+
+                for rect in &opaque_draws {
+                    self.renderer.device.device_handle().cmd_set_scissor(
+                        command_buffer,
+                        0,
+                        &[to_vk_rect(*rect)],
+                    );
+                    self.renderer
+                        .device
+                        .device_handle()
+                        .cmd_draw(command_buffer, 4, 1, 0, 0);
+                }
+            }
+
+            if !blended_draws.is_empty() {
+                self.renderer.device.device_handle().cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipelines.textured_pipeline,
+                );
+                self.renderer.device.device_handle().cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipelines.textured_layout,
+                    0,
+                    &[descriptor_set],
+                    &[],
+                );
+                self.renderer.device.device_handle().cmd_push_constants(
+                    command_buffer,
+                    pipelines.textured_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push_constants_bytes(&push_constants),
+                );
+
+                for rect in &blended_draws {
+                    self.renderer.device.device_handle().cmd_set_scissor(
+                        command_buffer,
+                        0,
+                        &[to_vk_rect(*rect)],
+                    );
+                    self.renderer
+                        .device
+                        .device_handle()
+                        .cmd_draw(command_buffer, 4, 1, 0, 0);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1173,6 +1306,125 @@ fn to_vk_viewport(rect: Rectangle<i32, Physical>) -> vk::Viewport {
     }
 }
 
+fn rounded_clip_rect_push_constant(rect: Rectangle<f64, Physical>) -> [f32; 4] {
+    [
+        rect.loc.x as f32,
+        rect.loc.y as f32,
+        rect.size.w as f32,
+        rect.size.h as f32,
+    ]
+}
+
+fn transform_rounded_clip(
+    transform: Transform,
+    frame_size: Size<i32, Physical>,
+    clip: RoundedClip,
+) -> RoundedClip {
+    let frame_size = frame_size.to_f64();
+    let rect = transform.transform_rect_in(clip.rect, &frame_size);
+    RoundedClip {
+        rect,
+        corner_mask: transform_corner_mask(transform, frame_size, clip.rect, rect, clip.corner_mask),
+        ..clip
+    }
+}
+
+fn transform_corner_mask(
+    transform: Transform,
+    frame_size: Size<f64, Physical>,
+    source_rect: Rectangle<f64, Physical>,
+    transformed_rect: Rectangle<f64, Physical>,
+    source_mask: u32,
+) -> u32 {
+    let corners = [
+        (
+            RoundedClip::TOP_LEFT,
+            Point::from((source_rect.loc.x, source_rect.loc.y)),
+        ),
+        (
+            RoundedClip::TOP_RIGHT,
+            Point::from((source_rect.loc.x + source_rect.size.w, source_rect.loc.y)),
+        ),
+        (
+            RoundedClip::BOTTOM_RIGHT,
+            Point::from((
+                source_rect.loc.x + source_rect.size.w,
+                source_rect.loc.y + source_rect.size.h,
+            )),
+        ),
+        (
+            RoundedClip::BOTTOM_LEFT,
+            Point::from((source_rect.loc.x, source_rect.loc.y + source_rect.size.h)),
+        ),
+    ];
+
+    corners
+        .into_iter()
+        .filter(|(flag, _)| source_mask & *flag != 0)
+        .map(|(_, point)| {
+            transformed_corner_flag(transform.transform_point_in(point, &frame_size), transformed_rect)
+        })
+        .fold(0, |mask, flag| mask | flag)
+}
+
+fn transformed_corner_flag(point: Point<f64, Physical>, rect: Rectangle<f64, Physical>) -> u32 {
+    let center_x = rect.loc.x + rect.size.w * 0.5;
+    let center_y = rect.loc.y + rect.size.h * 0.5;
+    match (point.x <= center_x, point.y <= center_y) {
+        (true, true) => RoundedClip::TOP_LEFT,
+        (false, true) => RoundedClip::TOP_RIGHT,
+        (false, false) => RoundedClip::BOTTOM_RIGHT,
+        (true, false) => RoundedClip::BOTTOM_LEFT,
+    }
+}
+
+fn texture_sampler_for_render(
+    src: Rectangle<f64, BufferCoord>,
+    dst: Rectangle<i32, Physical>,
+    src_transform: Transform,
+    downscale_filter: TextureFilter,
+    upscale_filter: TextureFilter,
+) -> TextureSampler {
+    let source_size = source_size_in_destination_axes(src, src_transform);
+    let destination_size = (dst.size.w.max(0) as f64, dst.size.h.max(0) as f64);
+    if source_size.0 <= 0.0 || source_size.1 <= 0.0 || destination_size.0 <= 0.0 || destination_size.1 <= 0.0
+    {
+        return TextureSampler::LINEAR;
+    }
+
+    if source_rect_is_texel_aligned(src)
+        && nearly_equal(source_size.0, destination_size.0)
+        && nearly_equal(source_size.1, destination_size.1)
+    {
+        return TextureSampler::NEAREST;
+    }
+
+    TextureSampler::new(downscale_filter, upscale_filter)
+}
+
+fn source_size_in_destination_axes(src: Rectangle<f64, BufferCoord>, src_transform: Transform) -> (f64, f64) {
+    if transform_swaps_axes(src_transform) {
+        (src.size.h, src.size.w)
+    } else {
+        (src.size.w, src.size.h)
+    }
+}
+
+fn transform_swaps_axes(transform: Transform) -> bool {
+    matches!(
+        transform,
+        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+    )
+}
+
+fn nearly_equal(lhs: f64, rhs: f64) -> bool {
+    (lhs - rhs).abs() <= 0.001
+}
+
+fn source_rect_is_texel_aligned(src: Rectangle<f64, BufferCoord>) -> bool {
+    nearly_equal(src.loc.x, src.loc.x.round()) && nearly_equal(src.loc.y, src.loc.y.round())
+}
+
 fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
     match layout {
         vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
@@ -1274,7 +1526,10 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 
 #[cfg(test)]
 mod tests {
-    use super::{combine_image_transform, VulkanRenderer, VulkanRendererError};
+    use super::{
+        combine_image_transform, texture_sampler_for_render, TextureSampler, VulkanRenderer,
+        VulkanRendererError,
+    };
     use crate::{
         backend::{
             allocator::{
@@ -1288,7 +1543,7 @@ mod tests {
             },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
-        utils::{Physical, Rectangle, Size, Transform},
+        utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
 
     fn init_renderer_and_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
@@ -1318,6 +1573,71 @@ mod tests {
 
     fn output_size_for_target(transform: Transform, target_size: Size<i32, Physical>) -> Size<i32, Physical> {
         transform.invert().transform_size(target_size)
+    }
+
+    fn src_rect(width: f64, height: f64) -> Rectangle<f64, BufferCoord> {
+        Rectangle::new((0.0, 0.0).into(), (width, height).into())
+    }
+
+    fn dst_rect(width: i32, height: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new((0, 0).into(), (width, height).into())
+    }
+
+    #[test]
+    fn exact_texture_render_uses_nearest_sampler() {
+        assert_eq!(
+            texture_sampler_for_render(
+                src_rect(64.0, 32.0),
+                dst_rect(64, 32),
+                Transform::Normal,
+                TextureFilter::Linear,
+                TextureFilter::Linear,
+            ),
+            TextureSampler::NEAREST
+        );
+    }
+
+    #[test]
+    fn scaled_texture_render_uses_renderer_filters() {
+        assert_eq!(
+            texture_sampler_for_render(
+                src_rect(64.0, 32.0),
+                dst_rect(128, 64),
+                Transform::Normal,
+                TextureFilter::Linear,
+                TextureFilter::Nearest,
+            ),
+            TextureSampler::new(TextureFilter::Linear, TextureFilter::Nearest)
+        );
+    }
+
+    #[test]
+    fn rotated_exact_texture_render_compares_swapped_axes() {
+        assert_eq!(
+            texture_sampler_for_render(
+                src_rect(64.0, 32.0),
+                dst_rect(32, 64),
+                Transform::_90,
+                TextureFilter::Linear,
+                TextureFilter::Linear,
+            ),
+            TextureSampler::NEAREST
+        );
+    }
+
+    #[test]
+    fn fractional_source_origin_keeps_renderer_filters() {
+        let src = Rectangle::new((0.5, 0.0).into(), (64.0, 32.0).into());
+        assert_eq!(
+            texture_sampler_for_render(
+                src,
+                dst_rect(64, 32),
+                Transform::Normal,
+                TextureFilter::Linear,
+                TextureFilter::Linear,
+            ),
+            TextureSampler::LINEAR
+        );
     }
 
     #[test]

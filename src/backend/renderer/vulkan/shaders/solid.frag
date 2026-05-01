@@ -7,5 +7,5 @@ layout(push_constant) uniform SolidPushConstants {
 layout(location = 0) out vec4 out_color;
 
 void main() {
-    out_color = constants.color;
+    out_color = vec4(constants.color.rgb * constants.color.a, constants.color.a);
 }

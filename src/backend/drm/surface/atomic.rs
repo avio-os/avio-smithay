@@ -854,8 +854,7 @@ impl AtomicDrmSurface {
             });
 
         if result.is_ok() {
-            *self.last_out_fence.lock().unwrap() =
-                consume_out_fence(requested_out_fence, out_fence_fd);
+            *self.last_out_fence.lock().unwrap() = consume_out_fence(requested_out_fence, out_fence_fd);
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -922,8 +921,7 @@ impl AtomicDrmSurface {
             });
 
         if res.is_ok() {
-            *self.last_out_fence.lock().unwrap() =
-                consume_out_fence(requested_out_fence, out_fence_fd);
+            *self.last_out_fence.lock().unwrap() = consume_out_fence(requested_out_fence, out_fence_fd);
             for plane in planes.iter() {
                 if plane.config.is_some() {
                     used_planes.insert(plane.handle);
@@ -1219,11 +1217,7 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
-    fn set_crtc_out_fence_ptr(
-        &mut self,
-        crtc: crtc::Handle,
-        out_fence_fd: &mut i32,
-    ) -> Result<bool, Error> {
+    fn set_crtc_out_fence_ptr(&mut self, crtc: crtc::Handle, out_fence_fd: &mut i32) -> Result<bool, Error> {
         if self.mapping.crtc_prop_handle(crtc, "OUT_FENCE_PTR").is_err() {
             return Ok(false);
         }
@@ -1443,11 +1437,7 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
-    fn set_crtc_out_fence_ptr(
-        &mut self,
-        crtc: crtc::Handle,
-        out_fence_fd: &mut i32,
-    ) -> Result<bool, Error> {
+    fn set_crtc_out_fence_ptr(&mut self, crtc: crtc::Handle, out_fence_fd: &mut i32) -> Result<bool, Error> {
         let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "OUT_FENCE_PTR") else {
             return Ok(false);
         };
