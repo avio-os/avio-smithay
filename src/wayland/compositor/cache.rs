@@ -24,7 +24,8 @@
 // and described in `transaction.rs`.
 
 use std::{
-    collections::VecDeque,
+    any::TypeId,
+    collections::{HashMap, VecDeque},
     sync::{Mutex, MutexGuard},
 };
 
@@ -151,6 +152,13 @@ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
 /// The stored values are initialized lazily the first time [`get`][Self::get] is invoked with this type as argument.
 pub struct MultiCache {
     caches: appendlist::AppendList<Box<dyn Cache + Send>>,
+    // TypeId -> index into `caches`. AppendList never moves existing entries
+    // so indices are stable for the lifetime of the cache. Without this map,
+    // every `find_or_insert` walks the entire list and performs a `dyn Any`
+    // downcast on each entry — measurable on hot paths like `with_states`
+    // where input dispatch can hit several distinct cached state types per
+    // event.
+    type_index: Mutex<HashMap<TypeId, usize>>,
 }
 
 impl std::fmt::Debug for MultiCache {
@@ -163,22 +171,34 @@ impl MultiCache {
     pub(crate) fn new() -> Self {
         Self {
             caches: appendlist::AppendList::new(),
+            type_index: Mutex::new(HashMap::new()),
         }
     }
 
     fn find_or_insert<T: Cacheable + Send + 'static>(&self) -> &Mutex<CachedState<T>> {
-        for cache in &self.caches {
-            if let Some(v) = (**cache).as_any().downcast_ref() {
-                return v;
-            }
+        let key = TypeId::of::<Mutex<CachedState<T>>>();
+        // Single lock spans the read-or-insert race so the cache and the
+        // index never disagree about which slot holds `T`. Uncontended in
+        // practice — `MultiCache` access is already serialized by the
+        // surface's user-data lock.
+        let mut index = self
+            .type_index
+            .lock()
+            .expect("MultiCache type index poisoned");
+        if let Some(&idx) = index.get(&key) {
+            return (*self.caches[idx])
+                .as_any()
+                .downcast_ref()
+                .expect("indexed cache entry has stable type");
         }
-        // if we reach here, then the value is not yet in the list, insert it
+        let new_idx = self.caches.len();
         self.caches
             .push(Box::new(Mutex::new(CachedState::<T>::default())) as Box<_>);
-        (*self.caches[self.caches.len() - 1])
+        index.insert(key, new_idx);
+        (*self.caches[new_idx])
             .as_any()
             .downcast_ref()
-            .unwrap()
+            .expect("just-inserted cache entry matches `T`")
     }
 
     /// Access the [`CachedState`] associated with type `T`
