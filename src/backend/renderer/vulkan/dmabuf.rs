@@ -1,7 +1,7 @@
 use std::{
     os::fd::{AsRawFd, IntoRawFd},
     sync::{
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
     },
 };
@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     device::{DeviceHandle, DeviceState},
-    format::FormatCapabilities,
+    format::{texture_view_components, FormatCapabilities},
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
@@ -473,7 +473,32 @@ impl DmabufState {
             return Err(err.into());
         }
 
-        let view_info = vk::ImageViewCreateInfo::default()
+        let sampled_view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(descriptor.vk_format)
+            .components(texture_view_components(format.code, usage))
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+
+        let sampled_view = match unsafe { vk_device.create_image_view(&sampled_view_info, None) } {
+            Ok(view) => view,
+            Err(err) => {
+                unsafe {
+                    vk_device.free_memory(memory, None);
+                    vk_device.destroy_image(image, None);
+                }
+                return Err(err.into());
+            }
+        };
+
+        let render_view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(descriptor.vk_format)
@@ -486,10 +511,11 @@ impl DmabufState {
                     .layer_count(1),
             );
 
-        let view = match unsafe { vk_device.create_image_view(&view_info, None) } {
+        let render_view = match unsafe { vk_device.create_image_view(&render_view_info, None) } {
             Ok(view) => view,
             Err(err) => {
                 unsafe {
+                    vk_device.destroy_image_view(sampled_view, None);
                     vk_device.free_memory(memory, None);
                     vk_device.destroy_image(image, None);
                 }
@@ -504,7 +530,8 @@ impl DmabufState {
             import_id,
             image,
             memory,
-            view,
+            sampled_view,
+            render_view,
             size,
             format,
             descriptor.vk_format,
@@ -533,13 +560,15 @@ pub(crate) struct ImportedDmabufImage {
     import_id: u64,
     image: vk::Image,
     memory: vk::DeviceMemory,
-    view: vk::ImageView,
+    sampled_view: vk::ImageView,
+    render_view: vk::ImageView,
     size: Size<i32, BufferCoord>,
     format: Format,
     vk_format: vk::Format,
     usage: vk::ImageUsageFlags,
     y_inverted: bool,
     layout: AtomicI32,
+    owned_by_foreign: AtomicBool,
     device: Arc<DeviceHandle>,
 }
 
@@ -549,7 +578,8 @@ impl std::fmt::Debug for ImportedDmabufImage {
             .field("import_id", &self.import_id)
             .field("image", &self.image)
             .field("memory", &self.memory)
-            .field("view", &self.view)
+            .field("sampled_view", &self.sampled_view)
+            .field("render_view", &self.render_view)
             .field("size", &self.size)
             .field("format", &self.format)
             .field("vk_format", &self.vk_format)
@@ -565,7 +595,8 @@ impl ImportedDmabufImage {
         import_id: u64,
         image: vk::Image,
         memory: vk::DeviceMemory,
-        view: vk::ImageView,
+        sampled_view: vk::ImageView,
+        render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
         format: Format,
         vk_format: vk::Format,
@@ -578,13 +609,17 @@ impl ImportedDmabufImage {
             import_id,
             image,
             memory,
-            view,
+            sampled_view,
+            render_view,
             size,
             format,
             vk_format,
             usage,
             y_inverted,
             layout: AtomicI32::new(initial_layout.as_raw()),
+            // Every DMA-BUF import starts outside this VkDevice's ownership.
+            // The first layout transition acquires it from VK_QUEUE_FAMILY_FOREIGN_EXT.
+            owned_by_foreign: AtomicBool::new(true),
             device,
         }
     }
@@ -598,7 +633,11 @@ impl ImportedDmabufImage {
     }
 
     pub(crate) fn view(&self) -> vk::ImageView {
-        self.view
+        self.sampled_view
+    }
+
+    pub(crate) fn render_view(&self) -> vk::ImageView {
+        self.render_view
     }
 
     pub(crate) fn vk_format(&self) -> vk::Format {
@@ -628,13 +667,22 @@ impl ImportedDmabufImage {
     pub(crate) fn set_layout(&self, layout: vk::ImageLayout) {
         self.layout.store(layout.as_raw(), Ordering::Relaxed);
     }
+
+    pub(crate) fn take_foreign_ownership(&self) -> bool {
+        self.owned_by_foreign.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn set_foreign_ownership(&self) {
+        self.owned_by_foreign.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for ImportedDmabufImage {
     fn drop(&mut self) {
         let device = self.device.handle();
         unsafe {
-            device.destroy_image_view(self.view, None);
+            device.destroy_image_view(self.sampled_view, None);
+            device.destroy_image_view(self.render_view, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
         }

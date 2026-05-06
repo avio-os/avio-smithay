@@ -12,8 +12,8 @@ use crate::{
 };
 
 use super::{
-    device::DeviceState, dmabuf::ImportedDmabufImage, VulkanRenderer, VulkanRendererError, VulkanTarget,
-    VulkanTexture,
+    device::DeviceState, dmabuf::ImportedDmabufImage, format::texture_view_components, VulkanRenderer,
+    VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
 #[derive(Debug)]
@@ -109,7 +109,34 @@ impl ReadbackState {
             return Err(err.into());
         }
 
-        let view_info = vk::ImageViewCreateInfo::default()
+        let sampled_view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk_format)
+            .components(texture_view_components(format, usage))
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+
+        // SAFETY: Image view create info references a live image handle.
+        let sampled_view = match unsafe { vk_device.create_image_view(&sampled_view_info, None) } {
+            Ok(view) => view,
+            Err(err) => {
+                // SAFETY: Handles belong to this device and were created above.
+                unsafe {
+                    vk_device.free_memory(memory, None);
+                    vk_device.destroy_image(image, None);
+                }
+                return Err(err.into());
+            }
+        };
+
+        let render_view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(vk_format)
@@ -123,11 +150,12 @@ impl ReadbackState {
             );
 
         // SAFETY: Image view create info references a live image handle.
-        let view = match unsafe { vk_device.create_image_view(&view_info, None) } {
+        let render_view = match unsafe { vk_device.create_image_view(&render_view_info, None) } {
             Ok(view) => view,
             Err(err) => {
                 // SAFETY: Handles belong to this device and were created above.
                 unsafe {
+                    vk_device.destroy_image_view(sampled_view, None);
                     vk_device.free_memory(memory, None);
                     vk_device.destroy_image(image, None);
                 }
@@ -139,7 +167,8 @@ impl ReadbackState {
             self.next_offscreen_id(),
             image,
             memory,
-            view,
+            sampled_view,
+            render_view,
             size,
             Format {
                 code: format,

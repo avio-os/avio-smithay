@@ -461,6 +461,19 @@ impl<B: Buffer, F: Framebuffer> PrimarySwapchainElement<B, F> {
         }
     }
 
+    /// Clone the underlying swapchain slot keepalive.
+    ///
+    /// Holding this value keeps the slot acquired and prevents the swapchain
+    /// from reusing the same backing buffer while an external consumer still
+    /// reads from an exported DMA-BUF view of it.
+    #[inline]
+    pub fn slot_keepalive(&self) -> Arc<Slot<B>> {
+        match &self.slot.buffer {
+            ScanoutBuffer::Swapchain(slot) => slot.clone(),
+            _ => unreachable!(),
+        }
+    }
+
     /// Clone the compositor render-completion fence as a sync_file, if submission
     /// can hand it to both KMS and external consumers without re-exporting.
     #[inline]

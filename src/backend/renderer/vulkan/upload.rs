@@ -17,7 +17,8 @@ use crate::{
 };
 
 use super::{
-    device::DeviceState, dmabuf::ImportedDmabufImage, VulkanRenderer, VulkanRendererError, VulkanTexture,
+    device::DeviceState, dmabuf::ImportedDmabufImage, format::texture_view_components, VulkanRenderer,
+    VulkanRendererError, VulkanTexture,
 };
 
 const SUPPORTED_MEMORY_FORMATS: &[Fourcc] = &[
@@ -703,7 +704,34 @@ fn create_upload_image(
         return Err(err.into());
     }
 
-    let view_info = vk::ImageViewCreateInfo::default()
+    let sampled_view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(vk_format)
+        .components(texture_view_components(format, usage))
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        );
+
+    // SAFETY: Image view create info references a live image handle for this device.
+    let sampled_view = match unsafe { vk_device.create_image_view(&sampled_view_info, None) } {
+        Ok(view) => view,
+        Err(err) => {
+            // SAFETY: Handles belong to this device and were created above.
+            unsafe {
+                vk_device.free_memory(memory, None);
+                vk_device.destroy_image(image, None);
+            }
+            return Err(err.into());
+        }
+    };
+
+    let render_view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(vk_format)
@@ -717,11 +745,12 @@ fn create_upload_image(
         );
 
     // SAFETY: Image view create info references a live image handle for this device.
-    let view = match unsafe { vk_device.create_image_view(&view_info, None) } {
+    let render_view = match unsafe { vk_device.create_image_view(&render_view_info, None) } {
         Ok(view) => view,
         Err(err) => {
             // SAFETY: Handles belong to this device and were created above.
             unsafe {
+                vk_device.destroy_image_view(sampled_view, None);
                 vk_device.free_memory(memory, None);
                 vk_device.destroy_image(image, None);
             }
@@ -733,7 +762,8 @@ fn create_upload_image(
         import_id,
         image,
         memory,
-        view,
+        sampled_view,
+        render_view,
         size,
         Format {
             code: format,

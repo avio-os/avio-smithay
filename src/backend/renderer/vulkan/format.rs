@@ -3,7 +3,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::backend::{
     allocator::{
-        format::FormatSet,
+        format::{has_alpha, FormatSet},
         vulkan::format::{get_vk_format, known_formats},
         Format, Fourcc, Modifier,
     },
@@ -24,6 +24,32 @@ impl FormatUsage {
             FormatUsage::Import => vk::ImageUsageFlags::SAMPLED,
             FormatUsage::RenderTarget => vk::ImageUsageFlags::COLOR_ATTACHMENT,
         }
+    }
+}
+
+/// Returns the component mapping for a sampled texture view of a DRM format.
+///
+/// DRM "X" formats are opaque by definition, but Vulkan has no corresponding
+/// X channel formats for the commonly used RGB layouts. They are imported as
+/// alpha-bearing VkFormats and the image view must force alpha to one so every
+/// shader samples the DRM format's alpha semantics.
+pub(crate) fn texture_view_components(fourcc: Fourcc, usage: vk::ImageUsageFlags) -> vk::ComponentMapping {
+    let has_alpha = has_alpha(fourcc);
+    let has_storage_usage = usage.contains(vk::ImageUsageFlags::STORAGE);
+    debug_assert!(
+        has_alpha || !has_storage_usage,
+        "opaque storage image views must use identity swizzles; create a separate sampled texture view"
+    );
+
+    vk::ComponentMapping {
+        r: vk::ComponentSwizzle::IDENTITY,
+        g: vk::ComponentSwizzle::IDENTITY,
+        b: vk::ComponentSwizzle::IDENTITY,
+        a: if has_alpha || has_storage_usage {
+            vk::ComponentSwizzle::IDENTITY
+        } else {
+            vk::ComponentSwizzle::ONE
+        },
     }
 }
 
@@ -321,8 +347,9 @@ impl FormatCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::FormatCapabilities;
+    use super::{texture_view_components, FormatCapabilities};
     use crate::backend::allocator::{Format, Fourcc, Modifier};
+    use ash::vk;
     use indexmap::IndexMap;
 
     fn sample_capabilities() -> FormatCapabilities {
@@ -392,6 +419,34 @@ mod tests {
         assert!(caps.supports_implicit_import_modifier(Fourcc::Argb8888));
         assert!(!caps.supports_implicit_render_modifier(Fourcc::Argb8888));
         assert!(!caps.supports_implicit_import_modifier(Fourcc::Xrgb8888));
+    }
+
+    #[test]
+    fn texture_view_components_force_opaque_formats_to_one_alpha() {
+        let components = texture_view_components(Fourcc::Xrgb8888, vk::ImageUsageFlags::SAMPLED);
+        assert_eq!(components.r, vk::ComponentSwizzle::IDENTITY);
+        assert_eq!(components.g, vk::ComponentSwizzle::IDENTITY);
+        assert_eq!(components.b, vk::ComponentSwizzle::IDENTITY);
+        assert_eq!(components.a, vk::ComponentSwizzle::ONE);
+    }
+
+    #[test]
+    fn texture_view_components_keep_alpha_formats_identity() {
+        let components = texture_view_components(Fourcc::Argb8888, vk::ImageUsageFlags::SAMPLED);
+        assert_eq!(components.r, vk::ComponentSwizzle::IDENTITY);
+        assert_eq!(components.g, vk::ComponentSwizzle::IDENTITY);
+        assert_eq!(components.b, vk::ComponentSwizzle::IDENTITY);
+        assert_eq!(components.a, vk::ComponentSwizzle::IDENTITY);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "opaque storage image views must use identity swizzles")]
+    fn opaque_storage_texture_views_trip_debug_assertion() {
+        let _ = texture_view_components(
+            Fourcc::Xrgb8888,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
+        );
     }
 
     #[test]

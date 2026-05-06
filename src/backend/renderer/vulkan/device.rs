@@ -144,6 +144,7 @@ impl DeviceState {
         let mut extensions = vec![
             ext::image_drm_format_modifier::NAME,
             ext::external_memory_dma_buf::NAME,
+            ext::queue_family_foreign::NAME,
             khr::external_memory_fd::NAME,
         ];
 

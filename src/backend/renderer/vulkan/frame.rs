@@ -45,6 +45,7 @@ struct FrameRecording {
     command_buffer: vk::CommandBuffer,
     framebuffer: vk::Framebuffer,
     target: Arc<ImportedDmabufImage>,
+    release_target_to_foreign: bool,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -55,6 +56,7 @@ struct FrameRecording {
 #[derive(Debug)]
 struct FrameResumeContext {
     target: Arc<ImportedDmabufImage>,
+    release_target_to_foreign: bool,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -164,7 +166,7 @@ impl Renderer for VulkanRenderer {
         let framebuffer = create_framebuffer(
             self.device.device_handle(),
             pipelines.render_pass,
-            target_image.view(),
+            target_image.render_view(),
             transformed_size,
         )?;
 
@@ -175,6 +177,7 @@ impl Renderer for VulkanRenderer {
                 command_buffer,
                 framebuffer,
                 target: target_image,
+                release_target_to_foreign: target.release_to_foreign_on_finish(),
                 pipelines,
                 transform: dst_transform,
                 output_size,
@@ -686,19 +689,30 @@ impl VulkanFrame<'_> {
                 .unwrap_or_else(|| image.current_layout());
             (recording.command_buffer, old_layout)
         };
+        let acquire_from_foreign = image.take_foreign_ownership();
 
-        if old_layout == new_layout {
+        if old_layout == new_layout && !acquire_from_foreign {
             return Ok(());
         }
 
-        let (src_stage_mask, src_access_mask) = stage_access_for_layout(old_layout);
+        let (mut src_stage_mask, mut src_access_mask) = stage_access_for_layout(old_layout);
         let (dst_stage_mask, dst_access_mask) = stage_access_for_layout(new_layout);
+        let (src_queue_family_index, dst_queue_family_index) = if acquire_from_foreign {
+            src_stage_mask = vk::PipelineStageFlags::TOP_OF_PIPE;
+            src_access_mask = vk::AccessFlags::empty();
+            (
+                vk::QUEUE_FAMILY_FOREIGN_EXT,
+                self.renderer.device.queue_family_index(),
+            )
+        } else {
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+        };
 
         let barrier = [vk::ImageMemoryBarrier::default()
             .old_layout(old_layout)
             .new_layout(new_layout)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .src_queue_family_index(src_queue_family_index)
+            .dst_queue_family_index(dst_queue_family_index)
             .image(image.image())
             .subresource_range(
                 vk::ImageSubresourceRange::default()
@@ -729,6 +743,56 @@ impl VulkanFrame<'_> {
             .insert(image.id(), (image.clone(), new_layout));
 
         Ok(())
+    }
+
+    fn release_recording_target_to_foreign(&mut self, recording: &mut FrameRecording) {
+        if !recording.release_target_to_foreign {
+            return;
+        }
+
+        let old_layout = recording
+            .pending_layouts
+            .get(&recording.target.id())
+            .map(|(_, layout)| *layout)
+            .unwrap_or_else(|| recording.target.current_layout());
+        let new_layout = vk::ImageLayout::GENERAL;
+        let (src_stage_mask, src_access_mask) = stage_access_for_layout(old_layout);
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(self.renderer.device.queue_family_index())
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .image(recording.target.image())
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .src_access_mask(src_access_mask)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
+
+        // SAFETY: Command buffer recording is active after the render pass has ended.
+        // The target image is a DMA-BUF imported for render-target usage; releasing it
+        // to FOREIGN makes the color attachment writes visible to cross-process
+        // consumers before the completion fence is signaled.
+        unsafe {
+            self.renderer.device.device_handle().cmd_pipeline_barrier(
+                recording.command_buffer,
+                src_stage_mask,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barrier,
+            );
+        }
+
+        recording
+            .pending_layouts
+            .insert(recording.target.id(), (recording.target.clone(), new_layout));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1020,6 +1084,7 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .cmd_end_render_pass(recording.command_buffer);
         }
+        self.release_recording_target_to_foreign(&mut recording);
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
         if let Err(err) = unsafe {
@@ -1063,6 +1128,9 @@ impl VulkanFrame<'_> {
 
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
             image.set_layout(layout);
+        }
+        if recording.release_target_to_foreign {
+            recording.target.set_foreign_ownership();
         }
 
         self.state = VulkanFrameState::Finished;
@@ -1134,6 +1202,7 @@ impl VulkanFrame<'_> {
         self.state = VulkanFrameState::Idle;
         Ok(FrameResumeContext {
             target: recording.target,
+            release_target_to_foreign: recording.release_target_to_foreign,
             pipelines: recording.pipelines,
             transform: recording.transform,
             output_size: recording.output_size,
@@ -1166,7 +1235,7 @@ impl VulkanFrame<'_> {
         let framebuffer = match create_framebuffer(
             self.renderer.device.device_handle(),
             context.pipelines.render_pass,
-            context.target.view(),
+            context.target.render_view(),
             context.size,
         ) {
             Ok(framebuffer) => framebuffer,
@@ -1182,6 +1251,7 @@ impl VulkanFrame<'_> {
             command_buffer,
             framebuffer,
             target: context.target.clone(),
+            release_target_to_foreign: context.release_target_to_foreign,
             pipelines: context.pipelines,
             transform: context.transform,
             output_size: context.output_size,

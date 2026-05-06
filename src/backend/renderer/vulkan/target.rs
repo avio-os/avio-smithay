@@ -12,6 +12,7 @@ pub struct VulkanTarget {
     size: Size<i32, BufferCoord>,
     format: Option<Fourcc>,
     imported: Option<Arc<ImportedDmabufImage>>,
+    release_to_foreign_on_finish: bool,
 }
 
 impl VulkanTarget {
@@ -21,6 +22,7 @@ impl VulkanTarget {
             size,
             format,
             imported: None,
+            release_to_foreign_on_finish: false,
         }
     }
 
@@ -29,7 +31,12 @@ impl VulkanTarget {
         size: Size<i32, BufferCoord>,
         format: Option<Fourcc>,
     ) -> Self {
-        Self::from_imported_image(imported, size, format)
+        Self {
+            size,
+            format,
+            imported: Some(imported),
+            release_to_foreign_on_finish: true,
+        }
     }
 
     pub(crate) fn from_imported_image(
@@ -41,6 +48,7 @@ impl VulkanTarget {
             size,
             format,
             imported: Some(imported),
+            release_to_foreign_on_finish: false,
         }
     }
 
@@ -50,6 +58,10 @@ impl VulkanTarget {
 
     pub(crate) fn imported_image(&self) -> Option<&Arc<ImportedDmabufImage>> {
         self.imported.as_ref()
+    }
+
+    pub(crate) fn release_to_foreign_on_finish(&self) -> bool {
+        self.release_to_foreign_on_finish
     }
 }
 
