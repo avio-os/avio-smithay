@@ -45,10 +45,13 @@ use std::{
         atomic::{self, AtomicBool},
         Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use calloop::{timer::TimeoutAction, LoopHandle, RegistrationToken};
+use calloop::{
+    timer::{TimeoutAction, Timer},
+    LoopHandle, RegistrationToken,
+};
 use wayland_protocols::ext::idle_notify::v1::server::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::{self, ExtIdleNotifierV1},
@@ -68,11 +71,18 @@ pub trait IdleNotifierHandler: Sized {
 }
 
 /// User data of the [`ExtIdleNotificationV1`] resource
+///
+/// `deadline` carries the *current* fire-time and is bumped by every call to
+/// [`IdleNotifierState::notify_activity_for_wl_seat`]. The calloop timer is
+/// inserted once per notification and self-reschedules at fire time when the
+/// deadline has been bumped, so activity events cost only one mutex-guarded
+/// store instead of an O(n) calloop-heap remove + reinsert.
 #[derive(Debug)]
 pub struct IdleNotificationUserData {
     seat: WlSeat,
     is_idle: AtomicBool,
     timeout: Duration,
+    deadline: Mutex<Instant>,
     timer_token: Mutex<Option<RegistrationToken>>,
 
     /// If listener was created with `get_input_idle_notification`
@@ -86,6 +96,20 @@ impl IdleNotificationUserData {
 
     fn set_timer_token(&self, idle: Option<RegistrationToken>) {
         *self.timer_token.lock().unwrap() = idle;
+    }
+
+    fn has_timer_token(&self) -> bool {
+        self.timer_token.lock().unwrap().is_some()
+    }
+
+    fn deadline(&self) -> Instant {
+        *self.deadline.lock().unwrap()
+    }
+
+    fn bump_deadline(&self, now: Instant) -> Instant {
+        let new_deadline = now + self.timeout;
+        *self.deadline.lock().unwrap() = new_deadline;
+        new_deadline
     }
 
     fn set_idle(&self, idle: bool) {
@@ -150,7 +174,7 @@ impl<D: IdleNotifierHandler> IdleNotifierState<D> {
                     self.loop_handle.remove(token);
                 }
             } else {
-                self.reinsert_timer(notification);
+                self.arm_timer(notification);
             }
         }
     }
@@ -163,10 +187,17 @@ impl<D: IdleNotifierHandler> IdleNotifierState<D> {
     /// Should be called whenever activity occurs on a seat, eg. mouse/keyboard input.
     ///
     /// You may want to use [`Self::notify_activity`] instead which accepts a [`Seat`].
+    ///
+    /// Hot-path-cheap: each call bumps the per-notification deadline in place.
+    /// Existing calloop timers are not removed or re-inserted; they self-
+    /// reschedule at fire time if the deadline moved past their original
+    /// firing instant.
     pub fn notify_activity_for_wl_seat(&mut self, seat: &WlSeat) {
         let Some(notifications) = self.notifications.get(seat) else {
             return;
         };
+
+        let now = Instant::now();
 
         for notification in notifications {
             let data = notification.data::<IdleNotificationUserData>().unwrap();
@@ -176,7 +207,18 @@ impl<D: IdleNotifierHandler> IdleNotifierState<D> {
                 data.set_idle(false);
             }
 
-            self.reinsert_timer(notification);
+            if !data.ignore_inhibitor && self.is_inhibited {
+                continue;
+            }
+
+            data.bump_deadline(now);
+
+            // Only insert a calloop source if none is currently armed (initial
+            // arm, or re-arm after a fire). Otherwise the existing timer will
+            // observe the bumped deadline at fire time and self-reschedule.
+            if !data.has_timer_token() {
+                self.arm_timer(notification);
+            }
         }
     }
 
@@ -189,7 +231,13 @@ impl<D: IdleNotifierHandler> IdleNotifierState<D> {
         self.notifications.values().flatten()
     }
 
-    fn reinsert_timer(&self, notification: &ExtIdleNotificationV1) {
+    /// Arm a calloop timer to fire at the notification's current deadline.
+    ///
+    /// Used for the initial timer insertion, after a previous timer fires and
+    /// self-drops, and when leaving the inhibited state. The timer's fire
+    /// handler inspects the (possibly bumped) deadline and either delivers
+    /// the idle event or self-reschedules — see [`Self::notify_activity_for_wl_seat`].
+    fn arm_timer(&self, notification: &ExtIdleNotificationV1) {
         let data = notification.data::<IdleNotificationUserData>().unwrap();
 
         if let Some(token) = data.take_timer_token() {
@@ -200,25 +248,32 @@ impl<D: IdleNotifierHandler> IdleNotifierState<D> {
             return;
         }
 
-        let token = self
-            .loop_handle
-            .insert_source(calloop::timer::Timer::from_duration(data.timeout), {
-                let idle_notification = notification.clone();
-                move |_, _, state| {
-                    let data = idle_notification.data::<IdleNotificationUserData>().unwrap();
+        let deadline = data.deadline();
+        let token = self.loop_handle.insert_source(Timer::from_deadline(deadline), {
+            let idle_notification = notification.clone();
+            move |_, _, state| {
+                let data = idle_notification.data::<IdleNotificationUserData>().unwrap();
+                let now = Instant::now();
+                let deadline = data.deadline();
 
-                    let is_inhibited = !data.ignore_inhibitor && state.idle_notifier_state().is_inhibited;
-                    let is_idle_already = data.is_idle();
-
-                    if !is_inhibited && !is_idle_already {
-                        idle_notification.idled();
-                        data.set_idle(true);
-                    }
-
-                    data.set_timer_token(None);
-                    TimeoutAction::Drop
+                // Activity arrived after we were scheduled — re-aim at the
+                // bumped deadline instead of firing the idle event.
+                if now < deadline {
+                    return TimeoutAction::ToInstant(deadline);
                 }
-            });
+
+                let is_inhibited = !data.ignore_inhibitor && state.idle_notifier_state().is_inhibited;
+                let is_idle_already = data.is_idle();
+
+                if !is_inhibited && !is_idle_already {
+                    idle_notification.idled();
+                    data.set_idle(true);
+                }
+
+                data.set_timer_token(None);
+                TimeoutAction::Drop
+            }
+        });
 
         data.set_timer_token(token.ok());
     }
@@ -275,6 +330,7 @@ where
         match request {
             ext_idle_notifier_v1::Request::GetIdleNotification { id, timeout, seat } => {
                 let timeout = Duration::from_millis(timeout as u64);
+                let deadline = Instant::now() + timeout;
 
                 let idle_notifier_state = state.idle_notifier_state();
 
@@ -284,12 +340,13 @@ where
                         seat: seat.clone(),
                         is_idle: AtomicBool::new(false),
                         timeout,
+                        deadline: Mutex::new(deadline),
                         timer_token: Mutex::new(None),
                         ignore_inhibitor: false,
                     },
                 );
 
-                idle_notifier_state.reinsert_timer(&idle_notification);
+                idle_notifier_state.arm_timer(&idle_notification);
 
                 state
                     .idle_notifier_state()
@@ -300,6 +357,7 @@ where
             }
             ext_idle_notifier_v1::Request::GetInputIdleNotification { id, timeout, seat } => {
                 let timeout = Duration::from_millis(timeout as u64);
+                let deadline = Instant::now() + timeout;
 
                 let idle_notifier_state = state.idle_notifier_state();
 
@@ -309,12 +367,13 @@ where
                         seat: seat.clone(),
                         is_idle: AtomicBool::new(false),
                         timeout,
+                        deadline: Mutex::new(deadline),
                         timer_token: Mutex::new(None),
                         ignore_inhibitor: true,
                     },
                 );
 
-                idle_notifier_state.reinsert_timer(&idle_notification);
+                idle_notifier_state.arm_timer(&idle_notification);
 
                 state
                     .idle_notifier_state()
