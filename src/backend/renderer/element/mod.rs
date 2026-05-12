@@ -27,6 +27,7 @@ use std::{
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::{backend::ObjectId, Resource};
 
+use crate::backend::allocator::dmabuf::Dmabuf;
 use crate::{
     output::{Output, WeakOutput},
     utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Transform},
@@ -206,6 +207,8 @@ pub enum UnderlyingStorage<'a> {
     Wayland(&'a Buffer),
     /// A memory backed buffer
     Memory(&'a memory::MemoryBuffer),
+    /// A DMA-BUF backed buffer
+    Dmabuf(&'a Dmabuf),
 }
 
 /// Defines the (optional) reason why a [`Element`] was selected for

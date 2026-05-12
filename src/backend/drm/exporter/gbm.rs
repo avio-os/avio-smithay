@@ -3,6 +3,7 @@
 use std::os::unix::io::AsFd;
 
 use drm::node::DrmNode;
+use drm_fourcc::DrmModifier;
 
 use super::{ExportBuffer, ExportFramebuffer};
 #[cfg(feature = "wayland_frontend")]
@@ -11,6 +12,7 @@ use crate::backend::{
     allocator::{
         dmabuf::AsDmabuf,
         gbm::{GbmBuffer, GbmConvertError},
+        Buffer,
     },
     drm::{
         gbm::{framebuffer_from_bo, framebuffer_from_dmabuf, Error as GbmError, GbmFramebuffer},
@@ -86,6 +88,9 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
                         .map(Some)?
                 }
             }
+            ExportBuffer::Dmabuf(dmabuf) => {
+                framebuffer_from_dmabuf(drm, &self.gbm, dmabuf, use_opaque, false).map(Some)?
+            }
         };
         Ok(framebuffer)
     }
@@ -118,6 +123,9 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
                 _ => false,
             },
             ExportBuffer::Allocator(_) => true,
+            ExportBuffer::Dmabuf(dmabuf) => {
+                dmabuf.format().modifier != DrmModifier::Invalid && self.import_node == dmabuf.node()
+            }
         }
     }
 
@@ -126,6 +134,9 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
     fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, GbmBuffer>) -> bool {
         match buffer {
             ExportBuffer::Allocator(_) => true,
+            ExportBuffer::Dmabuf(dmabuf) => {
+                dmabuf.format().modifier != DrmModifier::Invalid && self.import_node == dmabuf.node()
+            }
         }
     }
 }

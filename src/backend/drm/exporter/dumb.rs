@@ -40,6 +40,7 @@ impl ExportFramebuffer<DumbBuffer> for DrmDeviceFd {
             ExportBuffer::Allocator(buffer) => framebuffer_from_dumb_buffer(self, buffer, use_opaque)
                 .map_err(Error::Drm)
                 .map(Some),
+            ExportBuffer::Dmabuf(_) => Err(Error::Unsupported),
         }
     }
 
@@ -49,6 +50,7 @@ impl ExportFramebuffer<DumbBuffer> for DrmDeviceFd {
             #[cfg(feature = "wayland_frontend")]
             ExportBuffer::Wayland(_) => false,
             ExportBuffer::Allocator(_) => true,
+            ExportBuffer::Dmabuf(_) => false,
         }
     }
 }

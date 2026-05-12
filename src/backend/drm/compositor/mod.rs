@@ -157,7 +157,7 @@ use crate::backend::renderer::{
 use crate::{
     backend::{
         allocator::{
-            dmabuf::{AsDmabuf, Dmabuf},
+            dmabuf::{AsDmabuf, Dmabuf, WeakDmabuf},
             format::{get_opaque, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
             Allocator, Buffer, Slot, Swapchain,
@@ -261,6 +261,7 @@ impl RenderElementState {
 #[derive(Debug)]
 enum ScanoutBuffer<B: Buffer> {
     Wayland(crate::backend::renderer::utils::Buffer),
+    Dmabuf(Dmabuf),
     Swapchain(Arc<Slot<B>>),
     Cursor(Arc<GbmBuffer>),
 }
@@ -269,6 +270,7 @@ impl<B: Buffer> Clone for ScanoutBuffer<B> {
     fn clone(&self) -> Self {
         match self {
             Self::Wayland(arg0) => Self::Wayland(arg0.clone()),
+            Self::Dmabuf(arg0) => Self::Dmabuf(arg0.clone()),
             Self::Swapchain(arg0) => Self::Swapchain(arg0.clone()),
             Self::Cursor(arg0) => Self::Cursor(arg0.clone()),
         }
@@ -288,6 +290,7 @@ impl<B: Buffer> ScanoutBuffer<B> {
     fn same_storage(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Wayland(lhs), Self::Wayland(rhs)) => lhs.same_resource(rhs),
+            (Self::Dmabuf(lhs), Self::Dmabuf(rhs)) => lhs == rhs,
             (Self::Swapchain(lhs), Self::Swapchain(rhs)) => Arc::ptr_eq(lhs, rhs),
             (Self::Cursor(lhs), Self::Cursor(rhs)) => Arc::ptr_eq(lhs, rhs),
             _ => false,
@@ -301,6 +304,7 @@ impl<B: Buffer> ScanoutBuffer<B> {
         match storage {
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer.clone())),
             UnderlyingStorage::Memory { .. } => None,
+            UnderlyingStorage::Dmabuf(dmabuf) => Some(Self::Dmabuf(dmabuf.clone())),
         }
     }
 }
@@ -392,6 +396,7 @@ impl<B: Buffer, F: Framebuffer> Framebuffer for DrmScanoutBuffer<B, F> {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum ElementFramebufferCacheBuffer {
     Wayland(wayland_server::Weak<WlBuffer>),
+    Dmabuf(WeakDmabuf),
 }
 
 impl ElementFramebufferCacheBuffer {
@@ -400,6 +405,7 @@ impl ElementFramebufferCacheBuffer {
         match storage {
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer.downgrade())),
             UnderlyingStorage::Memory { .. } => None,
+            UnderlyingStorage::Dmabuf(dmabuf) => Some(Self::Dmabuf(dmabuf.weak())),
         }
     }
 }
@@ -426,6 +432,7 @@ impl ElementFramebufferCacheKey {
     fn is_alive(&self) -> bool {
         match self.buffer {
             ElementFramebufferCacheBuffer::Wayland(ref buffer) => buffer.is_alive(),
+            ElementFramebufferCacheBuffer::Dmabuf(ref buffer) => !buffer.is_gone(),
         }
     }
 }
@@ -3423,6 +3430,7 @@ where
                     .transpose()
                     .ok()
                     .flatten(),
+                UnderlyingStorage::Dmabuf(_) => None,
                 UnderlyingStorage::Memory(memory) => {
                     let format = memory.format();
                     let size = memory.size();
@@ -4234,21 +4242,33 @@ fn apply_underlying_storage_transform(
     match storage {
         UnderlyingStorage::Wayland(buffer) => {
             if buffer_y_inverted(buffer).unwrap_or(false) {
-                match element_transform {
-                    Transform::Normal => Transform::Flipped,
-                    Transform::_90 => Transform::Flipped90,
-                    Transform::_180 => Transform::Flipped180,
-                    Transform::_270 => Transform::Flipped270,
-                    Transform::Flipped => Transform::Normal,
-                    Transform::Flipped90 => Transform::_90,
-                    Transform::Flipped180 => Transform::_180,
-                    Transform::Flipped270 => Transform::_270,
-                }
+                apply_y_inverted_transform(element_transform)
+            } else {
+                element_transform
+            }
+        }
+        UnderlyingStorage::Dmabuf(dmabuf) => {
+            if dmabuf.y_inverted() {
+                apply_y_inverted_transform(element_transform)
             } else {
                 element_transform
             }
         }
         UnderlyingStorage::Memory { .. } => element_transform,
+    }
+}
+
+#[inline]
+fn apply_y_inverted_transform(element_transform: Transform) -> Transform {
+    match element_transform {
+        Transform::Normal => Transform::Flipped,
+        Transform::_90 => Transform::Flipped90,
+        Transform::_180 => Transform::Flipped180,
+        Transform::_270 => Transform::Flipped270,
+        Transform::Flipped => Transform::Normal,
+        Transform::Flipped90 => Transform::_90,
+        Transform::Flipped180 => Transform::_180,
+        Transform::Flipped270 => Transform::_270,
     }
 }
 
@@ -4400,6 +4420,7 @@ where
             })
             .unwrap_or(false)
         }
+        UnderlyingStorage::Dmabuf(_) => false,
         UnderlyingStorage::Memory(memory) => {
             if memory.format() != bo_format {
                 return false;
