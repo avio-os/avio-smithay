@@ -544,6 +544,10 @@ fn wait_on_sync_point(
     sync: &SyncPoint,
     wait_stage_mask: vk::PipelineStageFlags,
 ) -> Result<(), VulkanRendererError> {
+    if sync.is_reached() {
+        return Ok(());
+    }
+
     if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
         return vulkan_fence.wait_vk().map_err(Into::into);
     }
