@@ -2268,6 +2268,7 @@ where
             .map(|config| matches!(config.buffer, ScanoutBuffer::Swapchain(_)))
             .unwrap_or(false);
 
+        let mut primary_rendered_this_frame = false;
         if render {
             trace!(
                 "rendering {} elements on the primary {:?}",
@@ -2360,6 +2361,7 @@ where
                 Ok(render_output_result) => {
                     let shared_render_sync_file =
                         if render_output_result.damage.is_some() && self.supports_fencing {
+                            primary_rendered_this_frame = true;
                             // Export once and fan out duplicated fds to KMS and superseded-release
                             // consumers. When KMS fencing is unavailable, keep the sync point
                             // unexported so the submit path can still fall back to a host wait.
@@ -2456,6 +2458,7 @@ where
                         trace!(
                             "clearing previous direct scan-out on primary plane, damaging complete output"
                         );
+                        primary_rendered_this_frame = true;
                         self.primary_plane_damage_bag
                             .add([output_geometry.to_logical(1).to_buffer(
                                 1,
@@ -2502,6 +2505,7 @@ where
                 damage: self.primary_plane_damage_bag.snapshot(),
                 sync,
                 exported_sync_file,
+                rendered_this_frame: primary_rendered_this_frame,
             })
         } else {
             PrimaryPlaneElement::Element(primary_plane_scanout_element.unwrap())

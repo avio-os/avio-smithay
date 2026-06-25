@@ -445,6 +445,9 @@ pub struct PrimarySwapchainElement<B: Buffer, F: Framebuffer> {
     /// Sync point
     pub sync: SyncPoint,
     pub(super) exported_sync_file: Option<Arc<OwnedFd>>,
+    /// True when this `render_frame` call rendered into the primary swapchain
+    /// buffer and `exported_sync_file` belongs to the current render.
+    pub(super) rendered_this_frame: bool,
     /// The transform applied during rendering
     pub transform: Transform,
     /// The damage on the primary plane
@@ -481,6 +484,23 @@ impl<B: Buffer, F: Framebuffer> PrimarySwapchainElement<B, F> {
         self.exported_sync_file
             .as_ref()
             .and_then(|sync_file| sync_file.try_clone().ok())
+    }
+
+    /// Clone the render-completion fence only when it was produced by the
+    /// current `render_frame` call.
+    #[inline]
+    pub fn export_current_render_sync_file(&self) -> Option<OwnedFd> {
+        self.rendered_this_frame
+            .then(|| self.export_sync_file())
+            .flatten()
+    }
+
+    /// Returns whether this frame actually rendered into the primary
+    /// swapchain. If this is false, the element may still carry a cached sync
+    /// file from an older primary-plane config.
+    #[inline]
+    pub fn rendered_this_frame(&self) -> bool {
+        self.rendered_this_frame
     }
 }
 
@@ -557,6 +577,7 @@ mod tests {
 
     fn make_primary_swapchain_element(
         exported_sync_file: Option<Arc<OwnedFd>>,
+        rendered_this_frame: bool,
     ) -> PrimarySwapchainElement<DummyBuffer, DummyFramebuffer> {
         let mut swapchain = Swapchain::new(
             DummyAllocator,
@@ -580,6 +601,7 @@ mod tests {
             slot,
             sync: SyncPoint::signaled(),
             exported_sync_file,
+            rendered_this_frame,
             transform: Transform::Normal,
             damage: DamageBag::<i32, BufferCoords>::new(1).snapshot(),
         }
@@ -596,6 +618,7 @@ mod tests {
             },
             primary_element: PrimaryPlaneElement::Swapchain(make_primary_swapchain_element(
                 exported_sync_file,
+                true,
             )),
             overlay_elements: Vec::new(),
             cursor_element: None,
@@ -610,7 +633,7 @@ mod tests {
             eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
                 .expect("failed to allocate eventfd for test"),
         );
-        let element = make_primary_swapchain_element(Some(cached_sync_file));
+        let element = make_primary_swapchain_element(Some(cached_sync_file), true);
 
         let first = element
             .export_sync_file()
@@ -620,6 +643,21 @@ mod tests {
             .expect("expected second cached sync_file clone");
 
         assert_ne!(first.as_raw_fd(), second.as_raw_fd());
+    }
+
+    #[test]
+    fn primary_swapchain_element_exports_current_sync_only_for_current_render() {
+        let cached_sync_file: Arc<OwnedFd> = Arc::new(
+            eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
+                .expect("eventfd should be available")
+                .into(),
+        );
+        let stale = make_primary_swapchain_element(Some(cached_sync_file.clone()), false);
+        assert!(stale.export_sync_file().is_some());
+        assert!(stale.export_current_render_sync_file().is_none());
+
+        let current = make_primary_swapchain_element(Some(cached_sync_file), true);
+        assert!(current.export_current_render_sync_file().is_some());
     }
 
     #[test]
