@@ -172,6 +172,24 @@ impl Buffer {
         *self.inner.superseded_release.lock().unwrap() = Some(superseded_release);
     }
 
+    #[cfg(feature = "backend_drm")]
+    fn has_pending_explicit_release(&self) -> bool {
+        if !self.inner.has_explicit_release_point {
+            return false;
+        }
+
+        if self.inner.release_point.lock().unwrap().is_some() {
+            return true;
+        }
+
+        self.inner.superseded_release.lock().unwrap().is_some()
+    }
+
+    #[cfg(feature = "backend_drm")]
+    fn clear_last_render_sync(&self) {
+        *self.inner.last_render_sync.lock().unwrap() = None;
+    }
+
     /// Record the compositor's render-completion sync point for this buffer.
     ///
     /// Used by `try_signal_superseded_release_with_last_render_sync` to
@@ -179,6 +197,10 @@ impl Buffer {
     /// reading the buffer.
     #[cfg(feature = "backend_drm")]
     pub fn set_last_render_sync(&self, sync: crate::backend::renderer::sync::SyncPoint) {
+        if !self.has_pending_explicit_release() {
+            self.clear_last_render_sync();
+            return;
+        }
         *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Pending(sync));
     }
 
@@ -188,6 +210,10 @@ impl Buffer {
     /// already been exported to an fd (avoids double-export).
     #[cfg(feature = "backend_drm")]
     pub fn set_last_render_sync_file(&self, sync_file: Arc<OwnedFd>) {
+        if !self.has_pending_explicit_release() {
+            self.clear_last_render_sync();
+            return;
+        }
         *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Exported(sync_file));
     }
 
@@ -221,6 +247,8 @@ impl Buffer {
                     );
                     if signaled {
                         superseded_release.take();
+                        drop(superseded_release);
+                        self.clear_last_render_sync();
                     }
                     return signaled;
                 }
@@ -243,6 +271,8 @@ impl Buffer {
                     Ok(signaled) => {
                         if signaled {
                             superseded_release.take();
+                            drop(superseded_release);
+                            self.clear_last_render_sync();
                         }
                         true
                     }
@@ -256,6 +286,8 @@ impl Buffer {
                         let fallback_ok = claimable.signal().unwrap_or(false);
                         if fallback_ok {
                             superseded_release.take();
+                            drop(superseded_release);
+                            self.clear_last_render_sync();
                         }
                         fallback_ok
                     }
@@ -277,6 +309,8 @@ impl Buffer {
         let signaled = claimable.signal_with_sync_file(sync_file)?;
         if signaled {
             superseded_release.take();
+            drop(superseded_release);
+            self.clear_last_render_sync();
         }
         Ok(true)
     }
