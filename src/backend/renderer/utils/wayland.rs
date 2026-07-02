@@ -208,10 +208,28 @@ impl Buffer {
     ///
     /// Preferred over [`set_last_render_sync`] when the sync point has
     /// already been exported to an fd (avoids double-export).
+    ///
+    /// Explicit-sync buffers keep the fd to signal their release point.
+    /// Implicit-sync dmabufs instead import the fd into the buffer
+    /// reservation as a shared READ fence right away: after
+    /// `wl_buffer.release` the client's next GPU writes then wait on the
+    /// compositor's in-flight reads instead of racing them (Vulkan reads
+    /// never reach the reservation on their own). Best-effort — kernels
+    /// without `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` fall back to plain
+    /// release-ordering semantics.
     #[cfg(feature = "backend_drm")]
     pub fn set_last_render_sync_file(&self, sync_file: Arc<OwnedFd>) {
         if !self.has_pending_explicit_release() {
             self.clear_last_render_sync();
+            if let Ok(dmabuf) = crate::wayland::dmabuf::get_dmabuf(&self.inner.buffer) {
+                use std::os::fd::AsFd;
+                if let Err(err) = dmabuf.import_sync_file_read(sync_file.as_ref().as_fd()) {
+                    tracing::trace!(
+                        error = %err,
+                        "failed to import render sync file into implicit-sync buffer reservation"
+                    );
+                }
+            }
             return;
         }
         *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Exported(sync_file));

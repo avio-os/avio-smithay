@@ -325,6 +325,50 @@ impl Dmabuf {
         Ok(DmabufMapping { len, ptr })
     }
 
+    /// Import a sync file into every plane's reservation as a READ (shared)
+    /// fence.
+    ///
+    /// This publishes the compositor's GPU reads to implicit-sync clients:
+    /// after `wl_buffer.release`, the client's next writes to the buffer wait
+    /// on the imported fence instead of racing an in-flight composite. Vulkan
+    /// renderers need this explicitly — unlike GL, their reads never reach
+    /// the dma-buf reservation on their own.
+    ///
+    /// Returns `Err` when the kernel lacks `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`
+    /// (pre-5.17) or the import fails; callers should treat that as
+    /// best-effort and fall back to release-ordering semantics.
+    pub fn import_sync_file_read(
+        &self,
+        sync_file: std::os::unix::io::BorrowedFd<'_>,
+    ) -> Result<(), std::io::Error> {
+        use std::os::unix::io::AsRawFd;
+
+        #[repr(C)]
+        struct dma_buf_import_sync_file {
+            flags: u32,
+            fd: i32,
+        }
+        // DMA_BUF_SYNC_READ: the fence represents a shared read; future
+        // writers wait on it, future readers do not.
+        const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+        const DMA_BUF_IMPORT_SYNC_FILE: rustix::ioctl::Opcode =
+            rustix::ioctl::opcode::write::<dma_buf_import_sync_file>(b'b', 3);
+
+        for plane in &self.0.planes {
+            let data = dma_buf_import_sync_file {
+                flags: DMA_BUF_SYNC_READ,
+                fd: sync_file.as_raw_fd(),
+            };
+            // SAFETY: `plane.fd` is a live dmabuf fd and `data` matches the
+            // kernel's `struct dma_buf_import_sync_file` layout.
+            unsafe {
+                rustix::ioctl::ioctl(&plane.fd, Setter::<DMA_BUF_IMPORT_SYNC_FILE, _>::new(data))
+            }
+            .map_err(std::io::Error::from)?;
+        }
+        Ok(())
+    }
+
     /// Synchronize access for the plane at the specified index
     ///
     /// Returns `Err` if the plane with the specified index does not exist or
