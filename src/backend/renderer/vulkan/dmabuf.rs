@@ -422,13 +422,14 @@ impl DmabufState {
 
         image_create_info = image_create_info.push_next(&mut external_memory_image_info);
 
-        let image = match unsafe { vk_device.create_image(&image_create_info, None) } {
-            Ok(image) => image,
-            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
-                return Err(VulkanRendererError::UnsupportedDmabufFormat(format))
-            }
-            Err(err) => return Err(err.into()),
-        };
+        let image =
+            match device_handle.observe_result(unsafe { vk_device.create_image(&image_create_info, None) }) {
+                Ok(image) => image,
+                Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
+                    return Err(VulkanRendererError::UnsupportedDmabufFormat(format))
+                }
+                Err(err) => return Err(err.into()),
+            };
 
         let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
         let memory_type_index = Self::pick_memory_type(memory_requirements.memory_type_bits)?;
@@ -453,23 +454,26 @@ impl DmabufState {
             .push_next(&mut import_info)
             .push_next(&mut dedicated_info);
 
-        let memory = match unsafe { vk_device.allocate_memory(&alloc_info, None) } {
-            Ok(memory) => {
-                // Ownership of the import fd has moved to Vulkan.
-                let _ = ScopeGuard::into_inner(import_fd_guard);
-                memory
-            }
-            Err(err) => {
-                unsafe { vk_device.destroy_image(image, None) };
-                return Err(err.into());
-            }
-        };
+        let memory =
+            match device_handle.observe_result(unsafe { vk_device.allocate_memory(&alloc_info, None) }) {
+                Ok(memory) => {
+                    // Ownership of the import fd has moved to Vulkan.
+                    let _ = ScopeGuard::into_inner(import_fd_guard);
+                    memory
+                }
+                Err(err) => {
+                    device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_image(image, None) });
+                    return Err(err.into());
+                }
+            };
 
-        if let Err(err) = unsafe { vk_device.bind_image_memory(image, memory, 0) } {
-            unsafe {
+        if let Err(err) =
+            device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memory, 0) })
+        {
+            device_handle.destroy_with(|vk_device| unsafe {
                 vk_device.free_memory(memory, None);
                 vk_device.destroy_image(image, None);
-            }
+            });
             return Err(err.into());
         }
 
@@ -487,13 +491,15 @@ impl DmabufState {
                     .layer_count(1),
             );
 
-        let sampled_view = match unsafe { vk_device.create_image_view(&sampled_view_info, None) } {
+        let sampled_view = match device_handle
+            .observe_result(unsafe { vk_device.create_image_view(&sampled_view_info, None) })
+        {
             Ok(view) => view,
             Err(err) => {
-                unsafe {
+                device_handle.destroy_with(|vk_device| unsafe {
                     vk_device.free_memory(memory, None);
                     vk_device.destroy_image(image, None);
-                }
+                });
                 return Err(err.into());
             }
         };
@@ -511,14 +517,16 @@ impl DmabufState {
                     .layer_count(1),
             );
 
-        let render_view = match unsafe { vk_device.create_image_view(&render_view_info, None) } {
+        let render_view = match device_handle
+            .observe_result(unsafe { vk_device.create_image_view(&render_view_info, None) })
+        {
             Ok(view) => view,
             Err(err) => {
-                unsafe {
+                device_handle.destroy_with(|vk_device| unsafe {
                     vk_device.destroy_image_view(sampled_view, None);
                     vk_device.free_memory(memory, None);
                     vk_device.destroy_image(image, None);
-                }
+                });
                 return Err(err.into());
             }
         };
@@ -679,13 +687,14 @@ impl ImportedDmabufImage {
 
 impl Drop for ImportedDmabufImage {
     fn drop(&mut self) {
-        let device = self.device.handle();
-        unsafe {
+        // Skipped on a lost device: destroying these objects on a lost VkDevice faults on NVIDIA.
+        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
+        self.device.destroy_with(|device| unsafe {
             device.destroy_image_view(self.sampled_view, None);
             device.destroy_image_view(self.render_view, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
-        }
+        });
     }
 }
 

@@ -186,11 +186,20 @@ impl DescriptorState {
             return Ok(());
         }
 
+        if self.device.has_pending_submissions() {
+            trace!(
+                cached_sets = self.texture_sets.len(),
+                "skipping vulkan descriptor cache clear while submissions are pending"
+            );
+            return Ok(());
+        }
+
         let sets = self.texture_sets.values().copied().collect::<Vec<_>>();
         self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(sets.len() as u64);
         self.texture_sets.clear();
 
-        // SAFETY: All descriptor sets originate from this pool and are no longer referenced after cache clear.
+        // SAFETY: All descriptor sets originate from this pool, have been removed from the
+        // cache, and no command buffer using them is pending.
         unsafe { self.device.handle().free_descriptor_sets(self.pool, &sets) }?;
 
         Ok(())
@@ -201,12 +210,19 @@ impl DescriptorState {
             return Ok(());
         }
 
+        if self.device.has_pending_submissions() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "descriptor cache is full while submissions are pending",
+            ));
+        }
+
         let Some((_, descriptor_set)) = self.texture_sets.shift_remove_index(0) else {
             return Ok(());
         };
         self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
 
-        // SAFETY: Descriptor set originates from this pool and has been removed from the cache.
+        // SAFETY: Descriptor set originates from this pool, has been removed from the cache,
+        // and no command buffer using it is pending.
         unsafe {
             self.device
                 .handle()
@@ -243,14 +259,15 @@ impl DescriptorState {
 
 impl Drop for DescriptorState {
     fn drop(&mut self) {
-        let device = self.device.handle();
-        unsafe {
+        // Skipped on a lost device: destroying these objects on a lost VkDevice faults on NVIDIA.
+        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
+        self.device.destroy_with(|device| unsafe {
             device.destroy_descriptor_pool(self.pool, None);
             for sampler in self.texture_samplers.values() {
                 device.destroy_sampler(*sampler, None);
             }
             device.destroy_descriptor_set_layout(self.texture_layout, None);
-        }
+        });
     }
 }
 

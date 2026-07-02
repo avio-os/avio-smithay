@@ -538,36 +538,19 @@ impl<R: Renderer + ImportAll> Element for WaylandSurfaceRenderElement<R> {
     }
 
     fn damage_since(&self, scale: Scale<f64>, commit: Option<CommitCounter>) -> DamageSet<i32, Physical> {
-        let dst_size = self.size(scale);
         self.damage
             .damage_since(commit)
             .unwrap_or_else(|| DamageSet::from_slice(&[Rectangle::from_size(self.buffer_dimensions)]))
             .iter()
             .filter_map(|rect| {
-                rect.to_f64()
-                    // first bring the damage into logical space
-                    // Note: We use f64 for this as the damage could
-                    // be not dividable by the buffer scale without
-                    // a rest
-                    .to_logical(
-                        self.buffer_scale as f64,
-                        self.buffer_transform,
-                        &self.buffer_dimensions.to_f64(),
-                    )
-                    // then crop by the surface view (viewporter for example could define a src rect)
-                    .intersection(self.view.src)
-                    // move and scale the cropped rect (viewporter could define a dst size)
-                    .map(|rect| self.view.rect_to_global(rect).to_i32_up::<i32>())
-                    // now bring the damage to physical space
-                    .map(|rect| {
-                        // We calculate the scale between to rounded
-                        // surface size and the scaled surface size
-                        // and use it to scale the damage to the rounded
-                        // surface size by multiplying the output scale
-                        // with the result.
-                        let surface_scale = dst_size.to_f64() / self.view.dst.to_f64().to_physical(scale);
-                        rect.to_physical_precise_up(surface_scale * scale)
-                    })
+                self.view.buffer_damage_to_element(
+                    *rect,
+                    self.buffer_dimensions,
+                    self.buffer_scale,
+                    self.buffer_transform,
+                    self.size(scale),
+                    scale,
+                )
             })
             .collect::<DamageSet<_, _>>()
     }

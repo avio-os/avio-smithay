@@ -7,7 +7,7 @@ use crate::{
         buffer_dimensions, buffer_has_alpha, element::RenderElement, ContextId, ErasedContextId, ImportAll,
         Renderer, Texture,
     },
-    utils::{Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
         compositor::{
             self, add_destruction_hook, is_sync_subsurface, with_surface_tree_downward,
@@ -421,7 +421,8 @@ impl RendererSurfaceState {
             let buffer_damage = attrs.damage.drain(..).flat_map(|dmg| {
                 match dmg {
                     Damage::Buffer(rect) => rect,
-                    Damage::Surface(rect) => surface_view.rect_to_local(rect).to_i32_up().to_buffer(
+                    Damage::Surface(rect) => surface_view.surface_damage_to_buffer(
+                        rect,
                         self.buffer_scale,
                         self.buffer_transform,
                         &surface_size,
@@ -657,33 +658,6 @@ impl SurfaceView {
             Default::default()
         };
         SurfaceView { src, dst, offset }
-    }
-
-    pub(crate) fn rect_to_global<N>(&self, rect: Rectangle<N, Logical>) -> Rectangle<f64, Logical>
-    where
-        N: Coordinate,
-    {
-        let scale = self.scale();
-        let mut rect = rect.to_f64();
-        rect.loc -= self.src.loc;
-        rect.upscale(scale)
-    }
-
-    pub(crate) fn rect_to_local<N>(&self, rect: Rectangle<N, Logical>) -> Rectangle<f64, Logical>
-    where
-        N: Coordinate,
-    {
-        let scale = self.scale();
-        let mut rect = rect.to_f64().downscale(scale);
-        rect.loc += self.src.loc;
-        rect
-    }
-
-    fn scale(&self) -> Scale<f64> {
-        Scale::from((
-            self.dst.w as f64 / self.src.size.w,
-            self.dst.h as f64 / self.src.size.h,
-        ))
     }
 }
 

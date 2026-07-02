@@ -1,7 +1,9 @@
 //! Utility module for helpers around drawing [`WlSurface`](wayland_server::protocol::wl_surface::WlSurface)s
 //! and [`RenderElement`](super::element::RenderElement)s with [`Renderer`](super::Renderer)s.
 
-use crate::utils::{Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Size};
+use crate::utils::{
+    Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 use std::{collections::VecDeque, fmt, sync::Arc};
 
 #[cfg(feature = "wayland_frontend")]
@@ -543,4 +545,195 @@ pub struct SurfaceView {
     pub dst: Size<i32, Logical>,
     /// The logical offset for a sub-surface
     pub offset: Point<i32, Logical>,
+}
+
+impl SurfaceView {
+    /// Scale from source-local logical coordinates to destination logical coordinates.
+    pub fn scale(&self) -> Scale<f64> {
+        Scale::from((
+            self.dst.w as f64 / self.src.size.w,
+            self.dst.h as f64 / self.src.size.h,
+        ))
+    }
+
+    /// Convert a rectangle from source-local logical coordinates to destination-local logical coordinates.
+    pub fn rect_to_global<N>(&self, rect: Rectangle<N, Logical>) -> Rectangle<f64, Logical>
+    where
+        N: Coordinate,
+    {
+        let scale = self.scale();
+        let mut rect = rect.to_f64();
+        rect.loc -= self.src.loc;
+        rect.upscale(scale)
+    }
+
+    /// Convert a rectangle from destination-local logical coordinates to source-local logical coordinates.
+    pub fn rect_to_local<N>(&self, rect: Rectangle<N, Logical>) -> Rectangle<f64, Logical>
+    where
+        N: Coordinate,
+    {
+        let scale = self.scale();
+        let mut rect = rect.to_f64().downscale(scale);
+        rect.loc += self.src.loc;
+        rect
+    }
+
+    /// Convert `wl_surface.damage` surface-local damage into buffer coordinates.
+    pub fn surface_damage_to_buffer(
+        &self,
+        rect: Rectangle<i32, Logical>,
+        buffer_scale: i32,
+        buffer_transform: Transform,
+        surface_size: &Size<i32, Logical>,
+    ) -> Rectangle<i32, BufferCoord> {
+        if self.src.size.w <= 0.0 || self.src.size.h <= 0.0 || self.dst.w <= 0 || self.dst.h <= 0 {
+            return Rectangle::from_size(*surface_size).to_buffer(
+                buffer_scale,
+                buffer_transform,
+                surface_size,
+            );
+        }
+
+        self.rect_to_local(rect)
+            .to_i32_up()
+            .to_buffer(buffer_scale, buffer_transform, surface_size)
+    }
+
+    /// Project buffer-coordinate damage into element-local physical damage.
+    ///
+    /// This is the shared primitive used by Wayland surface elements and
+    /// retained snapshot elements: exact buffer damage is clipped through the
+    /// current surface view, scaled to the destination, then rounded into the
+    /// element's physical coordinate space. `None` means the damage does not
+    /// intersect this view.
+    pub fn buffer_damage_to_element(
+        &self,
+        rect: Rectangle<i32, BufferCoord>,
+        buffer_dimensions: Size<i32, BufferCoord>,
+        buffer_scale: i32,
+        buffer_transform: Transform,
+        element_physical_size: Size<i32, Physical>,
+        output_scale: Scale<f64>,
+    ) -> Option<Rectangle<i32, Physical>> {
+        if self.src.size.w <= 0.0 || self.src.size.h <= 0.0 || self.dst.w <= 0 || self.dst.h <= 0 {
+            return Some(Rectangle::from_size(element_physical_size));
+        }
+
+        let ideal_dst_size = self.dst.to_f64().to_physical(output_scale);
+        if ideal_dst_size.w <= 0.0 || ideal_dst_size.h <= 0.0 {
+            return Some(Rectangle::from_size(element_physical_size));
+        }
+
+        rect.to_f64()
+            .to_logical(buffer_scale as f64, buffer_transform, &buffer_dimensions.to_f64())
+            .intersection(self.src)
+            .map(|rect| self.rect_to_global(rect).to_i32_up::<i32>())
+            .map(|rect| {
+                let rounding_scale = element_physical_size.to_f64() / ideal_dst_size;
+                rect.to_physical_precise_up(rounding_scale * output_scale)
+            })
+            .filter(|rect| !rect.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::Transform;
+
+    #[test]
+    fn surface_view_projects_buffer_damage_to_element_identity() {
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::new((0.0, 0.0).into(), (640.0, 480.0).into()),
+            dst: Size::<i32, Logical>::from((640, 480)),
+            offset: Default::default(),
+        };
+
+        let damage = view
+            .buffer_damage_to_element(
+                Rectangle::<i32, BufferCoord>::new((0, 160).into(), (640, 80).into()),
+                Size::<i32, BufferCoord>::from((640, 480)),
+                1,
+                Transform::Normal,
+                Size::<i32, Physical>::from((640, 480)),
+                Scale::from(1.0),
+            )
+            .expect("damage intersects view");
+
+        assert_eq!(
+            damage,
+            Rectangle::<i32, Physical>::new((0, 160).into(), (640, 80).into())
+        );
+    }
+
+    #[test]
+    fn surface_view_projects_buffer_damage_through_viewport_scale() {
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::new((0.0, 100.0).into(), (640.0, 200.0).into()),
+            dst: Size::<i32, Logical>::from((640, 100)),
+            offset: Default::default(),
+        };
+
+        let damage = view
+            .buffer_damage_to_element(
+                Rectangle::<i32, BufferCoord>::new((0, 150).into(), (640, 50).into()),
+                Size::<i32, BufferCoord>::from((640, 480)),
+                1,
+                Transform::Normal,
+                Size::<i32, Physical>::from((640, 100)),
+                Scale::from(1.0),
+            )
+            .expect("damage intersects view");
+
+        assert_eq!(
+            damage,
+            Rectangle::<i32, Physical>::new((0, 25).into(), (640, 25).into())
+        );
+    }
+
+    #[test]
+    fn surface_view_converts_surface_damage_to_buffer_damage() {
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::new((0.0, 100.0).into(), (640.0, 200.0).into()),
+            dst: Size::<i32, Logical>::from((640, 100)),
+            offset: Default::default(),
+        };
+
+        let damage = view.surface_damage_to_buffer(
+            Rectangle::<i32, Logical>::new((0, 25).into(), (640, 25).into()),
+            1,
+            Transform::Normal,
+            &Size::<i32, Logical>::from((640, 480)),
+        );
+
+        assert_eq!(
+            damage,
+            Rectangle::<i32, BufferCoord>::new((0, 150).into(), (640, 50).into())
+        );
+    }
+
+    #[test]
+    fn surface_view_invalid_projection_falls_back_to_full_element() {
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::new((0.0, 0.0).into(), (0.0, 480.0).into()),
+            dst: Size::<i32, Logical>::from((640, 480)),
+            offset: Default::default(),
+        };
+
+        let damage = view
+            .buffer_damage_to_element(
+                Rectangle::<i32, BufferCoord>::new((10, 10).into(), (20, 20).into()),
+                Size::<i32, BufferCoord>::from((640, 480)),
+                1,
+                Transform::Normal,
+                Size::<i32, Physical>::from((640, 480)),
+                Scale::from(1.0),
+            )
+            .expect("invalid projection is conservative full damage");
+
+        assert_eq!(
+            damage,
+            Rectangle::<i32, Physical>::new((0, 0).into(), (640, 480).into())
+        );
+    }
 }

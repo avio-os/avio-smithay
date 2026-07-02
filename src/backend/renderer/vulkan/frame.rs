@@ -236,9 +236,9 @@ impl Renderer for VulkanRenderer {
     #[instrument(level = "trace", skip(self))]
     #[profiling::function]
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
+        self.device.reclaim_completed_submissions()?;
         self.dmabuf.cleanup();
         self.descriptors.clear_texture_cache()?;
-        self.device.reclaim_completed_submissions()?;
         Ok(())
     }
 }
@@ -696,6 +696,10 @@ impl VulkanFrame<'_> {
         let acquire_from_foreign = image.take_foreign_ownership();
 
         if old_layout == new_layout && !acquire_from_foreign {
+            self.recording_mut()?
+                .pending_layouts
+                .entry(image.id())
+                .or_insert_with(|| (image.clone(), new_layout));
             return Ok(());
         }
 
@@ -1091,19 +1095,17 @@ impl VulkanFrame<'_> {
         self.release_recording_target_to_foreign(&mut recording);
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
-        if let Err(err) = unsafe {
+        if let Err(err) = self.renderer.device.shared_device().observe_result(unsafe {
             self.renderer
                 .device
                 .device_handle()
                 .end_command_buffer(recording.command_buffer)
-        } {
+        }) {
             // SAFETY: Framebuffer was created for this device and command buffer will not be submitted.
-            unsafe {
-                self.renderer
-                    .device
-                    .device_handle()
-                    .destroy_framebuffer(recording.framebuffer, None)
-            };
+            self.renderer
+                .device
+                .shared_device()
+                .destroy_with(|device| unsafe { device.destroy_framebuffer(recording.framebuffer, None) });
             let _ = self
                 .renderer
                 .device
@@ -1113,11 +1115,12 @@ impl VulkanFrame<'_> {
             return Err(err.into());
         }
 
-        let (_, submission_fence) = match self
-            .renderer
-            .device
-            .submit_with_framebuffers_and_fence(recording.command_buffer, vec![recording.framebuffer])
-        {
+        let retained_images = retained_recording_images(&recording);
+        let (_, submission_fence) = match self.renderer.device.submit_with_resources_and_fence(
+            recording.command_buffer,
+            vec![recording.framebuffer],
+            retained_images,
+        ) {
             Ok(submission) => submission,
             Err(err) => {
                 let _ = self
@@ -1163,19 +1166,17 @@ impl VulkanFrame<'_> {
         }
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
-        if let Err(err) = unsafe {
+        if let Err(err) = self.renderer.device.shared_device().observe_result(unsafe {
             self.renderer
                 .device
                 .device_handle()
                 .end_command_buffer(recording.command_buffer)
-        } {
+        }) {
             // SAFETY: Framebuffer was created for this device and command buffer will not be submitted.
-            unsafe {
-                self.renderer
-                    .device
-                    .device_handle()
-                    .destroy_framebuffer(recording.framebuffer, None)
-            };
+            self.renderer
+                .device
+                .shared_device()
+                .destroy_with(|device| unsafe { device.destroy_framebuffer(recording.framebuffer, None) });
             let _ = self
                 .renderer
                 .device
@@ -1185,11 +1186,12 @@ impl VulkanFrame<'_> {
             return Err(err.into());
         }
 
-        if let Err(err) = self
-            .renderer
-            .device
-            .submit_with_framebuffers_and_fence(recording.command_buffer, vec![recording.framebuffer])
-        {
+        let retained_images = retained_recording_images(&recording);
+        if let Err(err) = self.renderer.device.submit_with_resources(
+            recording.command_buffer,
+            vec![recording.framebuffer],
+            retained_images,
+        ) {
             let _ = self
                 .renderer
                 .device
@@ -1307,12 +1309,12 @@ impl VulkanFrame<'_> {
 
         if let Some(recording) = self.recording.take() {
             // SAFETY: Framebuffer was created by this device and command buffer is not submitted on abort.
-            unsafe {
-                self.renderer
-                    .device
-                    .device_handle()
-                    .destroy_framebuffer(recording.framebuffer, None)
-            };
+            // Skipped on a lost device: destroying it on a lost VkDevice faults on NVIDIA. `destroy_with`
+            // is the single ownership-encoded teardown gate; a no-op when lost.
+            self.renderer
+                .device
+                .shared_device()
+                .destroy_with(|device| unsafe { device.destroy_framebuffer(recording.framebuffer, None) });
 
             if let Err(err) = self
                 .renderer
@@ -1336,6 +1338,13 @@ impl Drop for VulkanFrame<'_> {
 
         self.abort_recording();
     }
+}
+
+fn retained_recording_images(recording: &FrameRecording) -> Vec<Arc<ImportedDmabufImage>> {
+    let mut images = Vec::with_capacity(recording.pending_layouts.len().saturating_add(1));
+    images.push(recording.target.clone());
+    images.extend(recording.pending_layouts.values().map(|(image, _)| image.clone()));
+    images
 }
 
 fn create_framebuffer(

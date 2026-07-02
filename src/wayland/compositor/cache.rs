@@ -181,10 +181,7 @@ impl MultiCache {
         // index never disagree about which slot holds `T`. Uncontended in
         // practice — `MultiCache` access is already serialized by the
         // surface's user-data lock.
-        let mut index = self
-            .type_index
-            .lock()
-            .expect("MultiCache type index poisoned");
+        let mut index = self.type_index.lock().expect("MultiCache type index poisoned");
         if let Some(&idx) = index.get(&key) {
             return (*self.caches[idx])
                 .as_any()

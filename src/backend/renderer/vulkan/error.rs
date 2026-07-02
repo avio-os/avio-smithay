@@ -88,6 +88,26 @@ pub enum VulkanRendererError {
 }
 
 impl VulkanRendererError {
+    /// Returns `true` when this error represents an unrecoverable loss of the
+    /// underlying Vulkan device (as opposed to a merely temporary or
+    /// allocation failure).
+    ///
+    /// This is deliberately distinct from [`kind`](Self::kind): `kind` lumps
+    /// every [`VulkanRendererError::Vk`] together with
+    /// [`VulkanRendererError::ContextLost`] under
+    /// [`VulkanRendererErrorKind::ContextLost`], so it cannot distinguish
+    /// `VK_ERROR_DEVICE_LOST` (renderer must be recreated) from, e.g.,
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` (an allocation failure the caller may
+    /// recover from by evicting cached resources). Device-loss recovery and
+    /// out-of-memory eviction are different policies; only the former should
+    /// trigger renderer re-initialization.
+    pub fn is_device_lost(&self) -> bool {
+        matches!(
+            self,
+            VulkanRendererError::Vk(vk::Result::ERROR_DEVICE_LOST) | VulkanRendererError::ContextLost(_)
+        )
+    }
+
     /// Returns the coarse error class for this error value.
     pub const fn kind(&self) -> VulkanRendererErrorKind {
         match self {
@@ -115,11 +135,48 @@ impl VulkanRendererError {
     }
 }
 
+impl crate::backend::renderer::damage::MaybeDeviceLost for VulkanRendererError {
+    #[inline]
+    fn is_device_lost(&self) -> bool {
+        VulkanRendererError::is_device_lost(self)
+    }
+}
+
 impl From<VulkanRendererError> for SwapBuffersError {
     fn from(err: VulkanRendererError) -> Self {
         match err.kind() {
             VulkanRendererErrorKind::ContextLost => SwapBuffersError::ContextLost(Box::new(err)),
             VulkanRendererErrorKind::TemporaryFailure => SwapBuffersError::TemporaryFailure(Box::new(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_device_lost_distinguishes_loss_from_oom_and_other() {
+        // Genuine device loss: the renderer must be recreated.
+        assert!(VulkanRendererError::Vk(vk::Result::ERROR_DEVICE_LOST).is_device_lost());
+        assert!(VulkanRendererError::ContextLost("surface lost").is_device_lost());
+
+        // Out-of-device-memory is an allocation failure, NOT a device loss:
+        // the caller recovers by evicting cached resources, never by tearing
+        // down and re-initializing the renderer.
+        assert!(!VulkanRendererError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).is_device_lost());
+        assert!(!VulkanRendererError::Vk(vk::Result::ERROR_OUT_OF_HOST_MEMORY).is_device_lost());
+
+        // Other transient / classification errors are not device loss.
+        assert!(!VulkanRendererError::TemporaryFailure("retry").is_device_lost());
+        assert!(!VulkanRendererError::NoCompatibleMemoryType.is_device_lost());
+
+        // `kind()` cannot make this distinction: it lumps every `Vk(_)` and
+        // `ContextLost(_)` under `ContextLost`, which is exactly why
+        // `is_device_lost()` exists as a separate predicate.
+        assert_eq!(
+            VulkanRendererError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).kind(),
+            VulkanRendererErrorKind::ContextLost
+        );
     }
 }

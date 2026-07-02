@@ -57,7 +57,8 @@ impl ReadbackState {
             return Err(VulkanRendererError::UnsupportedMemoryFormat(format));
         }
 
-        let vk_device = device.device_handle();
+        let device_handle = device.shared_device();
+        let vk_device = device_handle.handle();
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_SRC
@@ -80,7 +81,7 @@ impl ReadbackState {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         // SAFETY: Device is valid and create info references live memory.
-        let image = unsafe { vk_device.create_image(&create_info, None) }?;
+        let image = device_handle.observe_result(unsafe { vk_device.create_image(&create_info, None) })?;
         // SAFETY: Image belongs to this device and remains valid until explicit destruction.
         let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
         let memory_type_index = pick_image_memory_type(device, memory_requirements.memory_type_bits)
@@ -90,22 +91,25 @@ impl ReadbackState {
             .allocation_size(memory_requirements.size)
             .memory_type_index(memory_type_index);
         // SAFETY: Device is valid and allocation info references live memory.
-        let memory = match unsafe { vk_device.allocate_memory(&allocate_info, None) } {
-            Ok(memory) => memory,
-            Err(err) => {
-                // SAFETY: Image belongs to this device and has not been bound.
-                unsafe { vk_device.destroy_image(image, None) };
-                return Err(err.into());
-            }
-        };
+        let memory =
+            match device_handle.observe_result(unsafe { vk_device.allocate_memory(&allocate_info, None) }) {
+                Ok(memory) => memory,
+                Err(err) => {
+                    // SAFETY: Image belongs to this device and has not been bound.
+                    device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_image(image, None) });
+                    return Err(err.into());
+                }
+            };
 
         // SAFETY: Image and memory belong to this device and offset 0 is valid.
-        if let Err(err) = unsafe { vk_device.bind_image_memory(image, memory, 0) } {
+        if let Err(err) =
+            device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memory, 0) })
+        {
             // SAFETY: Handles belong to this device and were created above.
-            unsafe {
+            device_handle.destroy_with(|vk_device| unsafe {
                 vk_device.free_memory(memory, None);
                 vk_device.destroy_image(image, None);
-            }
+            });
             return Err(err.into());
         }
 
@@ -124,14 +128,16 @@ impl ReadbackState {
             );
 
         // SAFETY: Image view create info references a live image handle.
-        let sampled_view = match unsafe { vk_device.create_image_view(&sampled_view_info, None) } {
+        let sampled_view = match device_handle
+            .observe_result(unsafe { vk_device.create_image_view(&sampled_view_info, None) })
+        {
             Ok(view) => view,
             Err(err) => {
                 // SAFETY: Handles belong to this device and were created above.
-                unsafe {
+                device_handle.destroy_with(|vk_device| unsafe {
                     vk_device.free_memory(memory, None);
                     vk_device.destroy_image(image, None);
-                }
+                });
                 return Err(err.into());
             }
         };
@@ -150,15 +156,17 @@ impl ReadbackState {
             );
 
         // SAFETY: Image view create info references a live image handle.
-        let render_view = match unsafe { vk_device.create_image_view(&render_view_info, None) } {
+        let render_view = match device_handle
+            .observe_result(unsafe { vk_device.create_image_view(&render_view_info, None) })
+        {
             Ok(view) => view,
             Err(err) => {
                 // SAFETY: Handles belong to this device and were created above.
-                unsafe {
+                device_handle.destroy_with(|vk_device| unsafe {
                     vk_device.destroy_image_view(sampled_view, None);
                     vk_device.free_memory(memory, None);
                     vk_device.destroy_image(image, None);
-                }
+                });
                 return Err(err.into());
             }
         };
@@ -226,12 +234,12 @@ impl ReadbackState {
         let cleanup_buffer_device = cleanup_device.clone();
         let cleanup_buffer = scopeguard::guard(staging_buffer, |buffer| {
             // SAFETY: Buffer belongs to this device and is no longer referenced after readback completion.
-            unsafe { cleanup_buffer_device.handle().destroy_buffer(buffer, None) };
+            cleanup_buffer_device.destroy_with(|device| unsafe { device.destroy_buffer(buffer, None) });
         });
         let cleanup_memory_device = cleanup_device.clone();
         let cleanup_memory = scopeguard::guard(staging_memory, |memory| {
             // SAFETY: Memory belongs to this device and is no longer referenced after readback completion.
-            unsafe { cleanup_memory_device.handle().free_memory(memory, None) };
+            cleanup_memory_device.destroy_with(|device| unsafe { device.free_memory(memory, None) });
         });
 
         let vk_device = cleanup_device.handle();
@@ -511,14 +519,15 @@ fn create_readback_buffer(
     device: &DeviceState,
     size: usize,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, bool), VulkanRendererError> {
-    let vk_device = device.device_handle();
+    let device_handle = device.shared_device();
+    let vk_device = device_handle.handle();
     let create_info = vk::BufferCreateInfo::default()
         .size(size as u64)
         .usage(vk::BufferUsageFlags::TRANSFER_DST)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     // SAFETY: Device is valid and create info references live data.
-    let buffer = unsafe { vk_device.create_buffer(&create_info, None) }?;
+    let buffer = device_handle.observe_result(unsafe { vk_device.create_buffer(&create_info, None) })?;
     // SAFETY: Buffer belongs to this device and remains valid until destroyed.
     let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
 
@@ -530,22 +539,23 @@ fn create_readback_buffer(
         .allocation_size(memory_requirements.size)
         .memory_type_index(memory_type_index);
     // SAFETY: Device is valid and allocation info references live data.
-    let memory = match unsafe { vk_device.allocate_memory(&alloc_info, None) } {
+    let memory = match device_handle.observe_result(unsafe { vk_device.allocate_memory(&alloc_info, None) }) {
         Ok(memory) => memory,
         Err(err) => {
             // SAFETY: Buffer belongs to this device and allocation failed before binding.
-            unsafe { vk_device.destroy_buffer(buffer, None) };
+            device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
             return Err(err.into());
         }
     };
 
     // SAFETY: Buffer and memory belong to this device and offset 0 is valid for this allocation.
-    if let Err(err) = unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) } {
+    if let Err(err) = device_handle.observe_result(unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) })
+    {
         // SAFETY: Handles belong to this device and were created above.
-        unsafe {
+        device_handle.destroy_with(|vk_device| unsafe {
             vk_device.free_memory(memory, None);
             vk_device.destroy_buffer(buffer, None);
-        }
+        });
         return Err(err.into());
     }
 

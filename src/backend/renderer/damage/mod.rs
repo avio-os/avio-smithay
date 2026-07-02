@@ -197,6 +197,24 @@ pub struct OutputDamageTracker {
     span: tracing::Span,
 }
 
+/// A renderer error that can self-report whether it represents an
+/// unrecoverable loss of the underlying graphics device.
+///
+/// Generic error wrappers (such as [`Error`] and the DRM compositor's
+/// `RenderFrameError`) cannot inspect the concrete renderer error they carry.
+/// Implementing this trait on a renderer error lets those wrappers forward a
+/// typed device-loss query instead of forcing callers to string-match a
+/// flattened message. Renderers that have no notion of device loss may use the
+/// default implementation, which always returns `false`.
+pub trait MaybeDeviceLost {
+    /// Returns `true` when this error represents an unrecoverable device loss
+    /// (the renderer must be recreated), as opposed to a temporary or
+    /// allocation failure.
+    fn is_device_lost(&self) -> bool {
+        false
+    }
+}
+
 /// Errors thrown by [`OutputDamageTracker::render_output`]
 #[derive(thiserror::Error)]
 pub enum Error<E: std::error::Error> {
@@ -206,6 +224,17 @@ pub enum Error<E: std::error::Error> {
     /// The given [`Output`] has no mode set
     #[error(transparent)]
     OutputNoMode(#[from] OutputNoMode),
+}
+
+impl<E: std::error::Error + MaybeDeviceLost> Error<E> {
+    /// Returns `true` when this error was caused by an unrecoverable loss of
+    /// the rendering device (see [`MaybeDeviceLost`]).
+    pub fn is_device_lost(&self) -> bool {
+        match self {
+            Error::Rendering(err) => err.is_device_lost(),
+            Error::OutputNoMode(_) => false,
+        }
+    }
 }
 
 /// Represents the result from rendering the output

@@ -11,6 +11,7 @@ const SOLID_VERTEX_SHADER_SPV: &[u8] = include_bytes!("shaders/solid.vert.spv");
 const SOLID_FRAGMENT_SHADER_SPV: &[u8] = include_bytes!("shaders/solid.frag.spv");
 const TEXTURE_VERTEX_SHADER_SPV: &[u8] = include_bytes!("shaders/texture.vert.spv");
 const TEXTURE_FRAGMENT_SHADER_SPV: &[u8] = include_bytes!("shaders/texture.frag.spv");
+const KAWASE_FRAGMENT_SHADER_SPV: &[u8] = include_bytes!("shaders/kawase.frag.spv");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u32)]
@@ -120,6 +121,31 @@ impl TexturePushConstants {
     }
 }
 
+/// Push constants for the dual-Kawase blur pass. Layout mirrors the GLSL
+/// push-constant block in `shaders/kawase.frag` (std430: vec2 at offset 0,
+/// scalars packed after, padded to 32 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KawasePushConstants {
+    pub(crate) halfpixel: [f32; 2],
+    pub(crate) offset: f32,
+    pub(crate) mode: u32,
+    pub(crate) linearize: u32,
+    pub(crate) _pad: [u32; 3],
+}
+
+impl KawasePushConstants {
+    pub(crate) fn new(halfpixel: [f32; 2], offset: f32, upsample: bool, linearize: bool) -> Self {
+        Self {
+            halfpixel,
+            offset,
+            mode: u32::from(upsample),
+            linearize: u32::from(linearize),
+            _pad: [0; 3],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PipelineHandles {
     pub(crate) render_pass: vk::RenderPass,
@@ -127,8 +153,10 @@ pub(crate) struct PipelineHandles {
     pub(crate) solid_opaque_pipeline: vk::Pipeline,
     pub(crate) textured_pipeline: vk::Pipeline,
     pub(crate) textured_opaque_pipeline: vk::Pipeline,
+    pub(crate) kawase_pipeline: vk::Pipeline,
     pub(crate) solid_layout: vk::PipelineLayout,
     pub(crate) textured_layout: vk::PipelineLayout,
+    pub(crate) kawase_layout: vk::PipelineLayout,
 }
 
 #[derive(Debug)]
@@ -138,6 +166,7 @@ struct FormatPipelineSet {
     solid_opaque_pipeline: vk::Pipeline,
     textured_pipeline: vk::Pipeline,
     textured_opaque_pipeline: vk::Pipeline,
+    kawase_pipeline: vk::Pipeline,
 }
 
 #[derive(Debug)]
@@ -150,6 +179,8 @@ pub(crate) struct PipelineState {
     solid_fragment_module: vk::ShaderModule,
     texture_vertex_module: vk::ShaderModule,
     texture_fragment_module: vk::ShaderModule,
+    kawase_fragment_module: vk::ShaderModule,
+    kawase_layout: vk::PipelineLayout,
     per_format: IndexMap<vk::Format, FormatPipelineSet>,
 }
 
@@ -263,6 +294,49 @@ impl PipelineState {
             }
         };
 
+        let kawase_fragment_module = match create_shader_module(vk_device, KAWASE_FRAGMENT_SHADER_SPV) {
+            Ok(module) => module,
+            Err(err) => {
+                unsafe {
+                    vk_device.destroy_pipeline_layout(textured_layout, None);
+                    vk_device.destroy_pipeline_layout(solid_layout, None);
+                    vk_device.destroy_shader_module(texture_fragment_module, None);
+                    vk_device.destroy_shader_module(texture_vertex_module, None);
+                    vk_device.destroy_shader_module(solid_fragment_module, None);
+                    vk_device.destroy_shader_module(solid_vertex_module, None);
+                    vk_device.destroy_pipeline_cache(pipeline_cache, None);
+                }
+                return Err(err);
+            }
+        };
+
+        let kawase_push_constants = [vk::PushConstantRange::default()
+            .offset(0)
+            .size(std::mem::size_of::<KawasePushConstants>() as u32)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let kawase_set_layouts = [texture_descriptor_layout];
+        let kawase_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&kawase_set_layouts)
+            .push_constant_ranges(&kawase_push_constants);
+
+        // SAFETY: Device is valid and create-info references live data.
+        let kawase_layout = match unsafe { vk_device.create_pipeline_layout(&kawase_layout_info, None) } {
+            Ok(layout) => layout,
+            Err(err) => {
+                unsafe {
+                    vk_device.destroy_shader_module(kawase_fragment_module, None);
+                    vk_device.destroy_pipeline_layout(textured_layout, None);
+                    vk_device.destroy_pipeline_layout(solid_layout, None);
+                    vk_device.destroy_shader_module(texture_fragment_module, None);
+                    vk_device.destroy_shader_module(texture_vertex_module, None);
+                    vk_device.destroy_shader_module(solid_fragment_module, None);
+                    vk_device.destroy_shader_module(solid_vertex_module, None);
+                    vk_device.destroy_pipeline_cache(pipeline_cache, None);
+                }
+                return Err(err.into());
+            }
+        };
+
         Ok(Self {
             device,
             pipeline_cache,
@@ -272,8 +346,14 @@ impl PipelineState {
             solid_fragment_module,
             texture_vertex_module,
             texture_fragment_module,
+            kawase_fragment_module,
+            kawase_layout,
             per_format: IndexMap::new(),
         })
+    }
+
+    pub(crate) fn kawase_layout(&self) -> vk::PipelineLayout {
+        self.kawase_layout
     }
 
     pub(crate) fn solid_layout(&self) -> vk::PipelineLayout {
@@ -330,8 +410,10 @@ impl PipelineState {
             solid_opaque_pipeline: set.solid_opaque_pipeline,
             textured_pipeline: set.textured_pipeline,
             textured_opaque_pipeline: set.textured_opaque_pipeline,
+            kawase_pipeline: set.kawase_pipeline,
             solid_layout: self.solid_layout,
             textured_layout: self.textured_layout,
+            kawase_layout: self.kawase_layout,
         })
     }
 
@@ -410,12 +492,35 @@ impl PipelineState {
             }
         };
 
+        // Kawase writes every covered pixel; blending stays disabled so the
+        // pass is a pure resample (opaque overwrite).
+        let kawase_pipeline = match self.create_graphics_pipeline(
+            render_pass,
+            self.kawase_layout,
+            self.texture_vertex_module,
+            self.kawase_fragment_module,
+            false,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                unsafe {
+                    vk_device.destroy_pipeline(textured_opaque_pipeline, None);
+                    vk_device.destroy_pipeline(textured_pipeline, None);
+                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
+                    vk_device.destroy_pipeline(solid_pipeline, None);
+                    vk_device.destroy_render_pass(render_pass, None);
+                }
+                return Err(err);
+            }
+        };
+
         Ok(FormatPipelineSet {
             render_pass,
             solid_pipeline,
             solid_opaque_pipeline,
             textured_pipeline,
             textured_opaque_pipeline,
+            kawase_pipeline,
         })
     }
 
@@ -505,27 +610,33 @@ impl PipelineState {
 
 impl Drop for PipelineState {
     fn drop(&mut self) {
-        let device = self.device.handle();
-
-        for (_, set) in self.per_format.drain(..) {
-            unsafe {
-                device.destroy_pipeline(set.textured_opaque_pipeline, None);
-                device.destroy_pipeline(set.textured_pipeline, None);
-                device.destroy_pipeline(set.solid_opaque_pipeline, None);
-                device.destroy_pipeline(set.solid_pipeline, None);
-                device.destroy_render_pass(set.render_pass, None);
+        // Skipped on a lost device: destroying these objects on a lost VkDevice faults on NVIDIA.
+        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
+        let per_format = std::mem::take(&mut self.per_format);
+        self.device.destroy_with(|device| {
+            for (_, set) in per_format {
+                unsafe {
+                    device.destroy_pipeline(set.kawase_pipeline, None);
+                    device.destroy_pipeline(set.textured_opaque_pipeline, None);
+                    device.destroy_pipeline(set.textured_pipeline, None);
+                    device.destroy_pipeline(set.solid_opaque_pipeline, None);
+                    device.destroy_pipeline(set.solid_pipeline, None);
+                    device.destroy_render_pass(set.render_pass, None);
+                }
             }
-        }
 
-        unsafe {
-            device.destroy_shader_module(self.texture_fragment_module, None);
-            device.destroy_shader_module(self.texture_vertex_module, None);
-            device.destroy_shader_module(self.solid_fragment_module, None);
-            device.destroy_shader_module(self.solid_vertex_module, None);
-            device.destroy_pipeline_layout(self.textured_layout, None);
-            device.destroy_pipeline_layout(self.solid_layout, None);
-            device.destroy_pipeline_cache(self.pipeline_cache, None);
-        }
+            unsafe {
+                device.destroy_shader_module(self.kawase_fragment_module, None);
+                device.destroy_shader_module(self.texture_fragment_module, None);
+                device.destroy_shader_module(self.texture_vertex_module, None);
+                device.destroy_shader_module(self.solid_fragment_module, None);
+                device.destroy_shader_module(self.solid_vertex_module, None);
+                device.destroy_pipeline_layout(self.kawase_layout, None);
+                device.destroy_pipeline_layout(self.textured_layout, None);
+                device.destroy_pipeline_layout(self.solid_layout, None);
+                device.destroy_pipeline_cache(self.pipeline_cache, None);
+            }
+        });
     }
 }
 
@@ -628,11 +739,11 @@ mod tests {
 
     impl Drop for TestImage {
         fn drop(&mut self) {
-            unsafe {
-                self.device.handle().destroy_image_view(self.view, None);
-                self.device.handle().destroy_image(self.image, None);
-                self.device.handle().free_memory(self.memory, None);
-            }
+            self.device.destroy_with(|device| unsafe {
+                device.destroy_image_view(self.view, None);
+                device.destroy_image(self.image, None);
+                device.free_memory(self.memory, None);
+            });
         }
     }
 
@@ -669,10 +780,10 @@ mod tests {
 
     impl Drop for TestBuffer {
         fn drop(&mut self) {
-            unsafe {
-                self.device.handle().destroy_buffer(self.buffer, None);
-                self.device.handle().free_memory(self.memory, None);
-            }
+            self.device.destroy_with(|device| unsafe {
+                device.destroy_buffer(self.buffer, None);
+                device.free_memory(self.memory, None);
+            });
         }
     }
 
@@ -684,9 +795,8 @@ mod tests {
 
     impl Drop for TestFramebuffer {
         fn drop(&mut self) {
-            unsafe {
-                self.device.handle().destroy_framebuffer(self.framebuffer, None);
-            }
+            self.device
+                .destroy_with(|device| unsafe { device.destroy_framebuffer(self.framebuffer, None) });
         }
     }
 

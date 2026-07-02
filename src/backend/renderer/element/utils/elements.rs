@@ -317,6 +317,11 @@ pub struct RelocateRenderElement<E> {
 }
 
 impl<E: Element> RelocateRenderElement<E> {
+    /// Access the wrapped element.
+    pub fn element(&self) -> &E {
+        &self.element
+    }
+
     /// Crate an re-locate element for an existing element
     pub fn from_element(element: E, location: impl Into<Point<i32, Physical>>, relocate: Relocate) -> Self {
         let location = location.into();

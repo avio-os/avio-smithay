@@ -165,7 +165,7 @@ use crate::{
         drm::{plane_has_property, DrmError, PlaneDamageClips},
         renderer::{
             buffer_y_inverted,
-            damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
+            damage::{Error as OutputDamageTrackerError, MaybeDeviceLost, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
                 RenderElementStates, RenderingReason, UnderlyingStorage,
@@ -4534,6 +4534,27 @@ pub enum RenderFrameError<
     /// Rendering the frame encountered en error
     #[error(transparent)]
     RenderFrame(#[from] OutputDamageTrackerError<R>),
+}
+
+impl<A, B, F, R> RenderFrameError<A, B, F, R>
+where
+    A: std::error::Error + Send + Sync + 'static,
+    B: std::error::Error + Send + Sync + 'static,
+    F: std::error::Error + Send + Sync + 'static,
+    R: std::error::Error + MaybeDeviceLost,
+{
+    /// Returns `true` when this error was caused by an unrecoverable loss of
+    /// the rendering device (see [`MaybeDeviceLost`]).
+    ///
+    /// Only the renderer-side ([`RenderFrameError::RenderFrame`]) failure path
+    /// can carry device loss; frame-preparation failures are DRM/allocator
+    /// errors that do not indicate a lost graphics device.
+    pub fn is_device_lost(&self) -> bool {
+        match self {
+            RenderFrameError::PrepareFrame(_) => false,
+            RenderFrameError::RenderFrame(err) => err.is_device_lost(),
+        }
+    }
 }
 
 impl<A, B, F, R> std::fmt::Debug for RenderFrameError<A, B, F, R>

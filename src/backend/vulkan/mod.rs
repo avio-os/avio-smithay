@@ -68,7 +68,10 @@
 use std::{
     env::{self, VarError},
     ffi::{CStr, CString},
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    },
 };
 
 use ash::{
@@ -329,6 +332,7 @@ impl Instance {
             version: api_version,
             debug_state,
             span,
+            lost: Arc::new(AtomicBool::new(false)),
             enabled_extensions,
         };
 
@@ -373,6 +377,21 @@ impl Instance {
     /// This corresponds to the version specified when building the instance.
     pub fn api_version(&self) -> Version {
         self.0.version
+    }
+
+    /// Marks this Vulkan instance as lost, causing teardown to skip driver calls
+    /// that are unsafe after a device-loss cascade on some drivers.
+    pub fn mark_lost(&self) {
+        self.0.lost.store(true, Ordering::Release);
+    }
+
+    /// Returns whether this instance has been marked lost.
+    pub fn is_lost(&self) -> bool {
+        self.0.lost.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn lost_flag(&self) -> Arc<AtomicBool> {
+        self.0.lost.clone()
     }
 
     /// Returns a reference to the underlying [`ash::Instance`].

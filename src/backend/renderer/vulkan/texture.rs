@@ -71,6 +71,16 @@ impl VulkanTexture {
         self.imported.as_ref()
     }
 
+    /// Returns true when no other owner can currently submit work touching this
+    /// imported image. Compositors use this before reusing or evicting retained
+    /// offscreen targets.
+    pub fn is_externally_idle(&self) -> bool {
+        self.imported
+            .as_ref()
+            .map(|image| Arc::strong_count(image) <= 1)
+            .unwrap_or(true)
+    }
+
     pub(crate) fn memory_writable(&self) -> bool {
         self.memory_writable
     }

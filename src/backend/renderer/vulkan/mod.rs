@@ -118,6 +118,7 @@
 
 mod blit;
 mod descriptor;
+mod kawase;
 mod device;
 mod dmabuf;
 mod error;
@@ -130,6 +131,8 @@ mod target;
 mod texture;
 mod upload;
 
+pub use blit::VulkanBlitChainStep;
+pub use kawase::VulkanKawasePass;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
@@ -247,6 +250,18 @@ impl VulkanRenderer {
     /// Returns the currently active runtime debug flags.
     pub fn debug_flags(&self) -> DebugFlags {
         self.debug_flags
+    }
+
+    /// Marks the renderer's Vulkan device lost and propagates the mark to the
+    /// owning Vulkan instance teardown gate.
+    pub fn mark_device_lost(&self) {
+        self.device.mark_lost();
+    }
+
+    /// Returns whether the renderer's Vulkan device or owning instance has been
+    /// marked lost.
+    pub fn is_device_lost(&self) -> bool {
+        self.device.is_lost()
     }
 
     /// The queue family selected for renderer command submissions.

@@ -57,6 +57,9 @@ impl VulkanFence {
         external_fence_fd: Option<Arc<khr::external_fence_fd::Device>>,
         exportable_sync_file: bool,
     ) -> Result<Self, VulkanRendererError> {
+        if device.is_lost() {
+            return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
+        }
         let mut export_info;
         let mut create_info = vk::FenceCreateInfo::default();
 
@@ -67,7 +70,7 @@ impl VulkanFence {
         }
 
         // SAFETY: Device is valid and create info references live memory.
-        let fence = unsafe { device.handle().create_fence(&create_info, None) }?;
+        let fence = device.observe_result(unsafe { device.handle().create_fence(&create_info, None) })?;
 
         Ok(Self {
             inner: Arc::new(VulkanFenceInner {
@@ -85,18 +88,31 @@ impl VulkanFence {
     }
 
     pub(crate) fn status(&self) -> Result<bool, vk::Result> {
+        // A fence on a lost device can't be meaningfully polled (the driver call faults/UB on
+        // NVIDIA). A lost device will never signal again, so report it as signaled to keep
+        // teardown and callers from blocking on a dead device.
+        if self.inner.device.is_lost() {
+            return Ok(true);
+        }
         // SAFETY: Fence belongs to this device and remains valid while `self` is alive.
-        unsafe { self.inner.device.handle().get_fence_status(self.inner.fence) }
+        self.inner
+            .device
+            .observe_result(unsafe { self.inner.device.handle().get_fence_status(self.inner.fence) })
     }
 
     pub(crate) fn wait_vk(&self) -> Result<(), vk::Result> {
+        // A fence on a lost device must not be waited on (the driver call faults/UB on NVIDIA);
+        // a lost device never signals, so treat the wait as immediately complete.
+        if self.inner.device.is_lost() {
+            return Ok(());
+        }
         // SAFETY: Fence belongs to this device and remains valid while `self` is alive.
-        unsafe {
+        self.inner.device.observe_result(unsafe {
             self.inner
                 .device
                 .handle()
                 .wait_for_fences(&[self.inner.fence], true, u64::MAX)
-        }
+        })
     }
 
     pub(crate) fn export_sync_file(&self) -> Option<OwnedFd> {
@@ -116,7 +132,11 @@ impl VulkanFence {
             .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
 
         // SAFETY: Fence belongs to the same device as `loader` and remains valid for this call.
-        let fd = match unsafe { loader.get_fence_fd(&get_info) } {
+        let fd = match self
+            .inner
+            .device
+            .observe_result(unsafe { loader.get_fence_fd(&get_info) })
+        {
             Ok(fd) => fd,
             Err(err) => {
                 warn!(?err, "failed to export Vulkan fence as sync_file fd");
@@ -181,19 +201,23 @@ impl Fence for VulkanFence {
 impl Drop for VulkanFenceInner {
     fn drop(&mut self) {
         // SAFETY: Fence belongs to this device and is only destroyed once when the final owner drops.
-        unsafe { self.device.handle().destroy_fence(self.fence, None) };
+        // Skipped on a lost device: destroying a fence on a lost VkDevice faults on NVIDIA
+        // (destroy_fence → libnvidia-eglcore SIGSEGV — the device-loss teardown crash this guards).
+        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
+        self.device
+            .destroy_with(|device| unsafe { device.destroy_fence(self.fence, None) });
     }
 }
 
 pub(crate) fn import_sync_file_to_fence(
-    device: &ash::Device,
+    device: &DeviceHandle,
     external_fence_fd: &khr::external_fence_fd::Device,
     sync_file: OwnedFd,
 ) -> Result<vk::Fence, VulkanRendererError> {
     let fence_info = vk::FenceCreateInfo::default();
 
     // SAFETY: Device is valid and create info references no borrowed memory.
-    let fence = match unsafe { device.create_fence(&fence_info, None) } {
+    let fence = match device.observe_result(unsafe { device.handle().create_fence(&fence_info, None) }) {
         Ok(fence) => fence,
         Err(err) => return Err(err.into()),
     };
@@ -211,8 +235,8 @@ pub(crate) fn import_sync_file_to_fence(
         .fd(*sync_file_guard);
 
     // SAFETY: Fence and device are valid and import info references live memory.
-    if let Err(err) = unsafe { external_fence_fd.import_fence_fd(&import_info) } {
-        unsafe { device.destroy_fence(fence, None) };
+    if let Err(err) = device.observe_result(unsafe { external_fence_fd.import_fence_fd(&import_info) }) {
+        device.destroy_with(|device| unsafe { device.destroy_fence(fence, None) });
         return Err(err.into());
     }
 
@@ -223,17 +247,18 @@ pub(crate) fn import_sync_file_to_fence(
 }
 
 pub(crate) fn import_sync_file_to_semaphore(
-    device: &ash::Device,
+    device: &DeviceHandle,
     external_semaphore_fd: &khr::external_semaphore_fd::Device,
     sync_file: OwnedFd,
 ) -> Result<vk::Semaphore, VulkanRendererError> {
     let semaphore_info = vk::SemaphoreCreateInfo::default();
 
     // SAFETY: Device is valid and create info references no borrowed memory.
-    let semaphore = match unsafe { device.create_semaphore(&semaphore_info, None) } {
-        Ok(semaphore) => semaphore,
-        Err(err) => return Err(err.into()),
-    };
+    let semaphore =
+        match device.observe_result(unsafe { device.handle().create_semaphore(&semaphore_info, None) }) {
+            Ok(semaphore) => semaphore,
+            Err(err) => return Err(err.into()),
+        };
 
     let sync_file_raw = std::os::fd::IntoRawFd::into_raw_fd(sync_file);
     // SAFETY: `fd` is owned by this guard and closed exactly once on early-return paths.
@@ -248,8 +273,10 @@ pub(crate) fn import_sync_file_to_semaphore(
         .fd(*sync_file_guard);
 
     // SAFETY: Semaphore and device are valid and import info references live memory.
-    if let Err(err) = unsafe { external_semaphore_fd.import_semaphore_fd(&import_info) } {
-        unsafe { device.destroy_semaphore(semaphore, None) };
+    if let Err(err) =
+        device.observe_result(unsafe { external_semaphore_fd.import_semaphore_fd(&import_info) })
+    {
+        device.destroy_with(|device| unsafe { device.destroy_semaphore(semaphore, None) });
         return Err(err.into());
     }
 

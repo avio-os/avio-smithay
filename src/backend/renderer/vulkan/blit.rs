@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ash::vk;
 use indexmap::IndexMap;
 use tracing::{instrument, trace};
@@ -9,11 +11,57 @@ use crate::{
 
 use super::{
     device::DeviceState, dmabuf::ImportedDmabufImage, VulkanRenderer, VulkanRendererError, VulkanTarget,
+    VulkanTexture,
 };
+
+/// One image blit operation in a Vulkan batch.
+#[derive(Debug, Clone)]
+pub struct VulkanBlitChainStep {
+    source: VulkanTexture,
+    destination: VulkanTexture,
+    source_rect: Rectangle<i32, Physical>,
+    destination_rect: Rectangle<i32, Physical>,
+    filter: TextureFilter,
+}
+
+impl VulkanBlitChainStep {
+    /// Creates a blit step using cloned texture handles.
+    pub fn new(
+        source: &VulkanTexture,
+        destination: &VulkanTexture,
+        source_rect: Rectangle<i32, Physical>,
+        destination_rect: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Self {
+        Self {
+            source: source.clone(),
+            destination: destination.clone(),
+            source_rect,
+            destination_rect,
+            filter,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct BlitState {
     format_features: IndexMap<vk::Format, vk::FormatFeatureFlags>,
+}
+
+#[derive(Debug)]
+struct ResolvedBlitChainStep {
+    source: Arc<ImportedDmabufImage>,
+    destination: Arc<ImportedDmabufImage>,
+    source_rect: Rectangle<i32, Physical>,
+    destination_rect: Rectangle<i32, Physical>,
+    filter: TextureFilter,
+}
+
+#[derive(Debug)]
+pub(crate) struct TrackedBlitImageLayout {
+    pub(crate) image: Arc<ImportedDmabufImage>,
+    pub(crate) current_layout: vk::ImageLayout,
+    pub(crate) restore_layout: vk::ImageLayout,
 }
 
 impl BlitState {
@@ -22,8 +70,8 @@ impl BlitState {
     fn blit_images(
         &mut self,
         device: &mut DeviceState,
-        from: &ImportedDmabufImage,
-        to: &ImportedDmabufImage,
+        from: Arc<ImportedDmabufImage>,
+        to: Arc<ImportedDmabufImage>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
@@ -114,106 +162,7 @@ impl BlitState {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
 
-        if scaled {
-            let blit_regions = [vk::ImageBlit::default()
-                .src_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .src_offsets([
-                    vk::Offset3D {
-                        x: src.loc.x,
-                        y: src.loc.y,
-                        z: 0,
-                    },
-                    vk::Offset3D {
-                        x: src.loc.x + src.size.w,
-                        y: src.loc.y + src.size.h,
-                        z: 1,
-                    },
-                ])
-                .dst_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .dst_offsets([
-                    vk::Offset3D {
-                        x: dst.loc.x,
-                        y: dst.loc.y,
-                        z: 0,
-                    },
-                    vk::Offset3D {
-                        x: dst.loc.x + dst.size.w,
-                        y: dst.loc.y + dst.size.h,
-                        z: 1,
-                    },
-                ])];
-
-            // SAFETY: Command buffer recording is active and source/destination images belong to this device.
-            unsafe {
-                vk_device.cmd_blit_image(
-                    command_buffer,
-                    from.image(),
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    to.image(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &blit_regions,
-                    match filter {
-                        TextureFilter::Linear => vk::Filter::LINEAR,
-                        TextureFilter::Nearest => vk::Filter::NEAREST,
-                    },
-                );
-            }
-        } else {
-            let copy_regions = [vk::ImageCopy::default()
-                .src_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .src_offset(vk::Offset3D {
-                    x: src.loc.x,
-                    y: src.loc.y,
-                    z: 0,
-                })
-                .dst_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .dst_offset(vk::Offset3D {
-                    x: dst.loc.x,
-                    y: dst.loc.y,
-                    z: 0,
-                })
-                .extent(vk::Extent3D {
-                    width: src.size.w as u32,
-                    height: src.size.h as u32,
-                    depth: 1,
-                })];
-
-            // SAFETY: Command buffer recording is active and source/destination images belong to this device.
-            unsafe {
-                vk_device.cmd_copy_image(
-                    command_buffer,
-                    from.image(),
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    to.image(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &copy_regions,
-                );
-            }
-        }
+        record_image_blit(vk_device, command_buffer, &from, &to, src, dst, filter);
 
         transition_image_layout(
             vk_device,
@@ -236,8 +185,128 @@ impl BlitState {
             return Err(err.into());
         }
 
+        let (_, submission_fence) = match device.submit_with_resources_and_fence(
+            command_buffer,
+            Vec::new(),
+            vec![from.clone(), to.clone()],
+        ) {
+            Ok(submission) => submission,
+            Err(err) => {
+                let _ = device.discard_command_buffer(command_buffer);
+                return Err(err);
+            }
+        };
+
+        from.set_layout(from_layout);
+        to.set_layout(restore_to_layout);
+
+        Ok(SyncPoint::from(submission_fence))
+    }
+
+    #[instrument(level = "trace", skip(self, device, steps))]
+    #[profiling::function]
+    fn blit_texture_chain(
+        &mut self,
+        device: &mut DeviceState,
+        steps: &[VulkanBlitChainStep],
+    ) -> Result<SyncPoint, VulkanRendererError> {
+        trace!(step_count = steps.len(), "recording vulkan blit chain");
+        if steps.is_empty() {
+            return Ok(SyncPoint::signaled());
+        }
+
+        let mut resolved_steps = Vec::with_capacity(steps.len());
+        for step in steps {
+            let Some(source) = step.source.imported_image().cloned() else {
+                return Err(VulkanRendererError::NotImplemented(
+                    "blit chain currently requires image-backed Vulkan source textures",
+                ));
+            };
+            let Some(destination) = step.destination.imported_image().cloned() else {
+                return Err(VulkanRendererError::NotImplemented(
+                    "blit chain currently requires image-backed Vulkan destination textures",
+                ));
+            };
+            self.validate_blit_images(
+                device,
+                &source,
+                &destination,
+                step.source_rect,
+                step.destination_rect,
+                step.filter,
+            )?;
+            resolved_steps.push(ResolvedBlitChainStep {
+                source,
+                destination,
+                source_rect: step.source_rect,
+                destination_rect: step.destination_rect,
+                filter: step.filter,
+            });
+        }
+
+        validate_blit_chain_source_layouts(&resolved_steps)?;
+
+        let command_buffer = device.acquire_command_buffer()?;
+        let vk_device = device.device_handle();
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: Command buffer belongs to this device command pool and is not currently in-flight.
+        if let Err(err) = unsafe { vk_device.begin_command_buffer(command_buffer, &begin_info) } {
+            let _ = device.discard_command_buffer(command_buffer);
+            return Err(err.into());
+        }
+        device.insert_debug_label(command_buffer, c"vulkan.blit_chain", [0.94, 0.56, 0.18, 1.0]);
+
+        let mut layouts = IndexMap::new();
+        for step in &resolved_steps {
+            transition_tracked_image_layout(
+                vk_device,
+                command_buffer,
+                &mut layouts,
+                step.source.clone(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            transition_tracked_image_layout(
+                vk_device,
+                command_buffer,
+                &mut layouts,
+                step.destination.clone(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            record_image_blit(
+                vk_device,
+                command_buffer,
+                &step.source,
+                &step.destination,
+                step.source_rect,
+                step.destination_rect,
+                step.filter,
+            );
+        }
+
+        for tracked in layouts.values_mut() {
+            transition_image_layout(
+                vk_device,
+                command_buffer,
+                tracked.image.image(),
+                tracked.current_layout,
+                tracked.restore_layout,
+            );
+            tracked.current_layout = tracked.restore_layout;
+        }
+
+        // SAFETY: Command buffer recording is valid and all commands were encoded above.
+        if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
+            let _ = device.discard_command_buffer(command_buffer);
+            return Err(err.into());
+        }
+
+        let retained_images = resolved_steps
+            .iter()
+            .flat_map(|step| [step.source.clone(), step.destination.clone()])
+            .collect::<Vec<_>>();
         let (_, submission_fence) =
-            match device.submit_with_framebuffers_and_fence(command_buffer, Vec::new()) {
+            match device.submit_with_resources_and_fence(command_buffer, Vec::new(), retained_images) {
                 Ok(submission) => submission,
                 Err(err) => {
                     let _ = device.discard_command_buffer(command_buffer);
@@ -245,10 +314,68 @@ impl BlitState {
                 }
             };
 
-        from.set_layout(from_layout);
-        to.set_layout(restore_to_layout);
+        for tracked in layouts.values() {
+            tracked.image.set_layout(tracked.restore_layout);
+        }
 
         Ok(SyncPoint::from(submission_fence))
+    }
+
+    fn validate_blit_images(
+        &mut self,
+        device: &DeviceState,
+        from: &ImportedDmabufImage,
+        to: &ImportedDmabufImage,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<(), VulkanRendererError> {
+        if from.id() == to.id() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "blit source and destination must be different images",
+            ));
+        }
+
+        validate_rect(from.size(), src, "source")?;
+        validate_rect(to.size(), dst, "destination")?;
+
+        if from.vk_format() != to.vk_format() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "blit currently requires matching source and destination formats",
+            ));
+        }
+
+        if !from.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "source image does not support transfer-source usage for blit",
+            ));
+        }
+        if !to.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "destination image does not support transfer-destination usage for blit",
+            ));
+        }
+
+        let scaled = src.size != dst.size;
+        if scaled {
+            let features = self.query_format_features(device, from.vk_format());
+            if !features.contains(vk::FormatFeatureFlags::BLIT_SRC)
+                || !features.contains(vk::FormatFeatureFlags::BLIT_DST)
+            {
+                return Err(VulkanRendererError::TemporaryFailure(
+                    "scaled blit is unsupported for the image format on this device",
+                ));
+            }
+            if filter == TextureFilter::Linear
+                && !features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+            {
+                return Err(VulkanRendererError::TemporaryFailure(
+                    "linear filtered blit is unsupported for the source format",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn query_format_features(&mut self, device: &DeviceState, format: vk::Format) -> vk::FormatFeatureFlags {
@@ -282,12 +409,12 @@ impl Blit for VulkanRenderer {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error> {
-        let Some(from_image) = from.imported_image() else {
+        let Some(from_image) = from.imported_image().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "blit currently requires image-backed Vulkan source targets",
             ));
         };
-        let Some(to_image) = to.imported_image() else {
+        let Some(to_image) = to.imported_image().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "blit currently requires image-backed Vulkan destination targets",
             ));
@@ -295,6 +422,18 @@ impl Blit for VulkanRenderer {
 
         self.blit
             .blit_images(&mut self.device, from_image, to_image, src, dst, filter)
+    }
+}
+
+impl VulkanRenderer {
+    /// Blits a sequence of Vulkan textures in one command-buffer submission.
+    #[instrument(level = "trace", skip(self, steps))]
+    #[profiling::function]
+    pub fn blit_texture_chain(
+        &mut self,
+        steps: &[VulkanBlitChainStep],
+    ) -> Result<SyncPoint, VulkanRendererError> {
+        self.blit.blit_texture_chain(&mut self.device, steps)
     }
 }
 
@@ -337,7 +476,170 @@ fn validate_rect(
     Ok(())
 }
 
-fn transition_image_layout(
+fn validate_blit_chain_source_layouts(steps: &[ResolvedBlitChainStep]) -> Result<(), VulkanRendererError> {
+    let mut layouts = IndexMap::new();
+    for step in steps {
+        let source_layout = layouts
+            .get(&step.source.id())
+            .copied()
+            .unwrap_or_else(|| step.source.current_layout());
+        if source_layout == vk::ImageLayout::UNDEFINED {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "source image contents are undefined and cannot be blitted",
+            ));
+        }
+        layouts.insert(step.source.id(), vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        layouts.insert(step.destination.id(), vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+    Ok(())
+}
+
+pub(crate) fn transition_tracked_image_layout(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    layouts: &mut IndexMap<u64, TrackedBlitImageLayout>,
+    image: Arc<ImportedDmabufImage>,
+    new_layout: vk::ImageLayout,
+) {
+    let entry = layouts.entry(image.id()).or_insert_with(|| {
+        let current_layout = image.current_layout();
+        let restore_layout = if current_layout == vk::ImageLayout::UNDEFINED {
+            vk::ImageLayout::GENERAL
+        } else {
+            current_layout
+        };
+        TrackedBlitImageLayout {
+            image,
+            current_layout,
+            restore_layout,
+        }
+    });
+    if entry.current_layout == new_layout {
+        return;
+    }
+
+    transition_image_layout(
+        device,
+        command_buffer,
+        entry.image.image(),
+        entry.current_layout,
+        new_layout,
+    );
+    entry.current_layout = new_layout;
+}
+
+fn record_image_blit(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    from: &ImportedDmabufImage,
+    to: &ImportedDmabufImage,
+    src: Rectangle<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+    filter: TextureFilter,
+) {
+    if src.size != dst.size {
+        let blit_regions = [vk::ImageBlit::default()
+            .src_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .src_offsets([
+                vk::Offset3D {
+                    x: src.loc.x,
+                    y: src.loc.y,
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: src.loc.x + src.size.w,
+                    y: src.loc.y + src.size.h,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .dst_offsets([
+                vk::Offset3D {
+                    x: dst.loc.x,
+                    y: dst.loc.y,
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: dst.loc.x + dst.size.w,
+                    y: dst.loc.y + dst.size.h,
+                    z: 1,
+                },
+            ])];
+
+        // SAFETY: Command buffer recording is active and source/destination images belong to this device.
+        unsafe {
+            device.cmd_blit_image(
+                command_buffer,
+                from.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                to.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &blit_regions,
+                match filter {
+                    TextureFilter::Linear => vk::Filter::LINEAR,
+                    TextureFilter::Nearest => vk::Filter::NEAREST,
+                },
+            );
+        }
+    } else {
+        let copy_regions = [vk::ImageCopy::default()
+            .src_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .src_offset(vk::Offset3D {
+                x: src.loc.x,
+                y: src.loc.y,
+                z: 0,
+            })
+            .dst_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .dst_offset(vk::Offset3D {
+                x: dst.loc.x,
+                y: dst.loc.y,
+                z: 0,
+            })
+            .extent(vk::Extent3D {
+                width: src.size.w as u32,
+                height: src.size.h as u32,
+                depth: 1,
+            })];
+
+        // SAFETY: Command buffer recording is active and source/destination images belong to this device.
+        unsafe {
+            device.cmd_copy_image(
+                command_buffer,
+                from.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                to.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy_regions,
+            );
+        }
+    }
+}
+
+pub(crate) fn transition_image_layout(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,
@@ -411,7 +713,10 @@ mod tests {
     use crate::{
         backend::{
             allocator::Fourcc,
-            renderer::{Bind, Blit, Color32F, ExportMem, Frame, Offscreen, Renderer, TextureFilter},
+            renderer::{
+                vulkan::VulkanBlitChainStep, Bind, Blit, Color32F, ExportMem, Frame, Offscreen, Renderer,
+                TextureFilter,
+            },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -515,6 +820,77 @@ mod tests {
         let mapping = renderer
             .copy_framebuffer(&dst_target, buffer_region, format)
             .expect("readback after blit should succeed");
+        let bytes = renderer
+            .map_texture(&mapping)
+            .expect("map_texture should expose readback bytes");
+
+        assert_eq!(&bytes[0..4], &expected_red_pixel(format));
+    }
+
+    #[test]
+    fn blit_texture_chain_uses_one_submission_for_dependent_steps() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let src_size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let mid_size: Size<i32, BufferCoord> = Size::from((8, 8));
+        let dst_size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let src_region: Rectangle<i32, Physical> =
+            Rectangle::from_size(Size::<i32, Physical>::from((16, 16)));
+        let mid_region: Rectangle<i32, Physical> = Rectangle::from_size(Size::<i32, Physical>::from((8, 8)));
+        let dst_region: Rectangle<i32, Physical> =
+            Rectangle::from_size(Size::<i32, Physical>::from((16, 16)));
+
+        let mut src = match renderer.create_buffer(format, src_size) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+        let mid = match renderer.create_buffer(format, mid_size) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+        let mut dst = match renderer.create_buffer(format, dst_size) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+
+        let mut src_target = match renderer.bind(&mut src) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+        let dst_target = match renderer.bind(&mut dst) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+
+        {
+            let mut frame = match renderer.render(&mut src_target, src_region.size, Transform::Normal) {
+                Ok(frame) => frame,
+                Err(_) => return,
+            };
+            frame
+                .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &[src_region])
+                .expect("clear source target should succeed");
+            let sync = frame.finish().expect("source frame finish should succeed");
+            let _ = sync.wait();
+        }
+
+        let sync = renderer
+            .blit_texture_chain(&[
+                VulkanBlitChainStep::new(&src, &mid, src_region, mid_region, TextureFilter::Linear),
+                VulkanBlitChainStep::new(&mid, &dst, mid_region, dst_region, TextureFilter::Linear),
+            ])
+            .expect("dependent blit chain should submit");
+        let _ = sync.wait();
+
+        let mapping = renderer
+            .copy_framebuffer(&dst_target, Rectangle::from_size(dst_size), format)
+            .expect("readback after blit chain should succeed");
         let bytes = renderer
             .map_texture(&mapping)
             .expect("map_texture should expose readback bytes");
