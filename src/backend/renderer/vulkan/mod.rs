@@ -363,6 +363,18 @@ impl VulkanRenderer {
         self.dmabuf.cleanup();
     }
 
+    /// Drop any wait semaphores staged via [`Renderer::wait`] that no
+    /// submission has consumed yet.
+    ///
+    /// Staged waits have no frame affinity: they are drained by whichever
+    /// submission happens next on the renderer's queue. A compositor that
+    /// stages waits for a frame which then ends without a submission (no
+    /// damage, abort) must clear them, or an unrelated later submission
+    /// inherits the waits — and with them any fence that never signals.
+    pub fn clear_pending_acquire_waits(&mut self) {
+        self.device.clear_pending_wait_semaphores();
+    }
+
     /// Exports the current Vulkan pipeline cache blob for persistence by the caller.
     pub fn pipeline_cache_data(&self) -> Result<Vec<u8>, VulkanRendererError> {
         self.pipelines.pipeline_cache_data()
