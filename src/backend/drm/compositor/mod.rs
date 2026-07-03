@@ -2830,6 +2830,92 @@ where
         self.pending_frame.is_none() && self.queued_frame.is_none()
     }
 
+    /// Queue a cursor-plane-only reposition of the currently presented frame.
+    ///
+    /// The cheap path for pointer motion: no renderer, no element walk, no
+    /// damage scan, no swapchain slot, no plane tests — the current frame's
+    /// plane state is re-committed unchanged except for the cursor plane's
+    /// destination, computed with the same transform math as
+    /// [`try_assign_cursor_plane`]. `element_location` is the cursor
+    /// element's physical location (pointer minus hotspot), exactly what the
+    /// element would report via `Element::location` during a full render.
+    ///
+    /// Returns `Ok(false)` (nothing queued) when the fast path does not
+    /// apply — a frame is pending or queued, a modeset is pending, the
+    /// current frame has no cursor plane, or the location is unchanged —
+    /// in which case the caller falls back to a full [`render_frame`]
+    /// (which also handles cursor image changes; this path never repaints
+    /// the cursor buffer).
+    ///
+    /// [`try_assign_cursor_plane`]: Self::try_assign_cursor_plane
+    /// [`render_frame`]: Self::render_frame
+    pub fn queue_cursor_position(
+        &mut self,
+        element_location: Point<i32, Physical>,
+        user_data: U,
+    ) -> FrameResult<bool, A, F> {
+        if self.pending_frame.is_some() || self.queued_frame.is_some() || self.next_frame.is_some() {
+            return Ok(false);
+        }
+        // A pending mode/connector change must go through the full commit
+        // path (submit() would pick the blocking modeset commit).
+        if self.surface.commit_pending() {
+            return Ok(false);
+        }
+        let Some(cursor_handle) = self.planes.cursor.iter().map(|info| info.handle).find(|handle| {
+            self.current_frame
+                .plane_state(*handle)
+                .map(|state| state.config.is_some())
+                .unwrap_or(false)
+        }) else {
+            return Ok(false);
+        };
+
+        let (current_size, _output_scale, output_transform) = match (&self.output_mode_source).try_into()
+        {
+            Ok(mode) => mode,
+            // No current mode (output disabling); the full path handles it.
+            Err(_) => return Ok(false),
+        };
+        let output_transform: Transform = output_transform;
+        let output_transform = output_transform.invert();
+        let output_size = output_transform.transform_size(current_size);
+
+        let mut frame = FrameState {
+            planes: self
+                .current_frame
+                .planes
+                .iter()
+                .map(|(handle, state)| (*handle, state.clone()))
+                .collect(),
+        };
+        for (_, state) in frame.planes.iter_mut() {
+            state.skip = true;
+            state.needs_test = false;
+        }
+        let Some(plane_state) = frame.plane_state_mut(cursor_handle) else {
+            return Ok(false);
+        };
+        let Some(config) = plane_state.config.as_mut() else {
+            return Ok(false);
+        };
+        let cursor_plane_size = config.properties.dst.size;
+        let location = output_transform.transform_point_in(element_location, &output_size)
+            - output_transform.transform_point_in(Point::default(), &cursor_plane_size);
+        if config.properties.dst.loc == location {
+            return Ok(false);
+        }
+        config.properties.dst.loc = location;
+        plane_state.skip = false;
+
+        self.next_frame = Some(PreparedFrame {
+            frame,
+            kind: PreparedFrameKind::Partial,
+        });
+        self.queue_frame(user_data)?;
+        Ok(true)
+    }
+
     /// Diagnostic snapshot of the frame pipeline, for stall autopsies.
     ///
     /// When a commit sits pending far longer than the output's refresh

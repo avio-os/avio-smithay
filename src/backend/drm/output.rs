@@ -692,6 +692,16 @@ where
         self.with_compositor(|compositor| compositor.frame_pipeline_diagnostics())
     }
 
+    /// Queue a cursor-plane-only reposition of the currently presented
+    /// frame. See [`DrmCompositor::queue_cursor_position`].
+    pub fn queue_cursor_position(
+        &mut self,
+        element_location: crate::utils::Point<i32, crate::utils::Physical>,
+        user_data: U,
+    ) -> FrameResult<bool, A, F> {
+        self.with_compositor(|compositor| compositor.queue_cursor_position(element_location, user_data))
+    }
+
     /// Get the format of the underlying swapchain
     pub fn format(&self) -> DrmFourcc {
         self.with_compositor(|compositor| compositor.format())
