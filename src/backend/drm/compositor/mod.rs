@@ -2757,6 +2757,18 @@ where
         flip.map_err(FrameError::DrmError)
     }
 
+    /// Returns `true` when no commit is awaiting its page-flip and no frame
+    /// is queued in userspace — i.e. [`DrmCompositor::queue_frame`] would
+    /// submit immediately and cannot replace an outstanding frame.
+    ///
+    /// Callers that opportunistically re-present (e.g. cursor-only updates
+    /// paced by vblank) should gate on this so they never displace a queued
+    /// full frame: a replaced [`QueuedFrame`] is dropped silently together
+    /// with its `user_data`.
+    pub fn is_frame_pipeline_idle(&self) -> bool {
+        self.pending_frame.is_none() && self.queued_frame.is_none()
+    }
+
     /// Marks the current frame as submitted.
     ///
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`](super::DrmDevice)

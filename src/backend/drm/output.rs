@@ -680,6 +680,12 @@ where
         self.with_compositor(|compositor| compositor.frame_submitted())
     }
 
+    /// Returns `true` when no commit is awaiting its page-flip and no frame
+    /// is queued in userspace. See [`DrmCompositor::is_frame_pipeline_idle`].
+    pub fn is_frame_pipeline_idle(&self) -> bool {
+        self.with_compositor(|compositor| compositor.is_frame_pipeline_idle())
+    }
+
     /// Get the format of the underlying swapchain
     pub fn format(&self) -> DrmFourcc {
         self.with_compositor(|compositor| compositor.format())
