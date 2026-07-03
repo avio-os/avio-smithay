@@ -692,18 +692,14 @@ impl DeviceState {
             .device
             .observe_result(unsafe { self.device.handle().create_fence(&fence_info, None) })?;
 
-        let pending_waits = std::mem::take(&mut self.pending_waits);
-        let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
-            pending_waits.into_iter().unzip();
-
+        // Blocking submissions are upload/transfer helpers: they write fresh
+        // data and sample no externally-fenced buffers, so they must not
+        // consume `pending_waits`. Those waits belong to the next render
+        // submission (the first pass that samples the fenced buffers);
+        // draining them here would both host-block this call on unrelated
+        // fences and strip synchronization from the render they guard.
         let command_buffers = [command_buffer];
-        let mut submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        if !wait_semaphores.is_empty() {
-            submit = submit
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_dst_stage_mask);
-        }
-        let submit_info = [submit];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
 
         // SAFETY: Queue, fence, and command buffers are valid; queue access is serialized by `&mut self`.
         if let Err(err) = self
@@ -711,10 +707,6 @@ impl DeviceState {
             .observe_result(unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) })
         {
             self.device.destroy_with(|device| {
-                for semaphore in wait_semaphores {
-                    // SAFETY: Semaphore belongs to this device and the submission did not succeed.
-                    unsafe { device.destroy_semaphore(semaphore, None) };
-                }
                 // SAFETY: Fence belongs to this device and is not in-flight after failed submission.
                 unsafe { device.destroy_fence(fence, None) };
             });
@@ -729,10 +721,6 @@ impl DeviceState {
         self.device.destroy_with(|device| {
             // SAFETY: Fence belongs to this device and is no longer needed after wait completes/errors.
             unsafe { device.destroy_fence(fence, None) };
-            for semaphore in wait_semaphores {
-                // SAFETY: Submission completion is determined by the host fence above; semaphore can be released.
-                unsafe { device.destroy_semaphore(semaphore, None) };
-            }
         });
         wait_result?;
 
@@ -814,6 +802,47 @@ impl DeviceState {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
         loop {
+            let needs_late_reclaim_fence = match self.in_flight_submissions.front() {
+                Some(front) => {
+                    front.reclaim_fence == vk::Fence::null() && self.supports_sync_file_export()
+                }
+                None => break,
+            };
+            if needs_late_reclaim_fence {
+                // The reclaim-fence submit failed at submission time. The
+                // caller-visible fence may since have been exported as
+                // SYNC_FD (resetting it to unsignaled), so polling it could
+                // report pending forever and wedge reclamation behind this
+                // entry. Submit a late reclaim fence instead: an empty batch
+                // signals when all previously submitted queue work completes,
+                // which bounds the front submission. On failure, retry on the
+                // next reclaim pass rather than falling back to a dead poll.
+                let reclaim_fence = match self.acquire_reclaim_fence() {
+                    Ok(reclaim_fence) => reclaim_fence,
+                    Err(err) => {
+                        warn!(?err, "failed to create late reclaim fence; retrying next pass");
+                        break;
+                    }
+                };
+                // SAFETY: Empty submit; fence signals when all prior queue work completes.
+                match self
+                    .device
+                    .observe_result(unsafe { self.device.handle().queue_submit(self.queue, &[], reclaim_fence) })
+                {
+                    Ok(()) => {
+                        self.in_flight_submissions
+                            .front_mut()
+                            .expect("front checked above")
+                            .reclaim_fence = reclaim_fence;
+                    }
+                    Err(err) => {
+                        warn!(?err, "failed to submit late reclaim fence; retrying next pass");
+                        self.recycle_reclaim_fence(reclaim_fence);
+                        break;
+                    }
+                }
+            }
+
             let Some(front) = self.in_flight_submissions.front() else {
                 break;
             };
