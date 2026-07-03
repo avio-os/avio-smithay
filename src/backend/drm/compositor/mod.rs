@@ -2854,7 +2854,7 @@ where
         element_location: Point<i32, Physical>,
         user_data: U,
     ) -> FrameResult<bool, A, F> {
-        if self.pending_frame.is_some() || self.queued_frame.is_some() || self.next_frame.is_some() {
+        if self.pending_frame.is_some() || self.queued_frame.is_some() {
             return Ok(false);
         }
         // A pending mode/connector change must go through the full commit
@@ -2862,6 +2862,11 @@ where
         if self.surface.commit_pending() {
             return Ok(false);
         }
+        // `next_frame` is a staging slot that every `render_frame` overwrites;
+        // an entry left behind by a frame that was never queued (an empty
+        // render) is abandoned by construction and must not block — or leak
+        // into — the reposition commit built below.
+        self.next_frame = None;
         let Some(cursor_handle) = self.planes.cursor.iter().map(|info| info.handle).find(|handle| {
             self.current_frame
                 .plane_state(*handle)
