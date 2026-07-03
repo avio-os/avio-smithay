@@ -702,6 +702,15 @@ where
         self.with_compositor(|compositor| compositor.queue_cursor_position(element_location, user_data))
     }
 
+    /// Queue a cursor-plane-only clear of the currently presented frame.
+    /// See [`DrmCompositor::queue_cursor_clear`].
+    pub fn queue_cursor_clear(
+        &mut self,
+        user_data: U,
+    ) -> FrameResult<super::compositor::CursorRepositionOutcome, A, F> {
+        self.with_compositor(|compositor| compositor.queue_cursor_clear(user_data))
+    }
+
     /// Get the format of the underlying swapchain
     pub fn format(&self) -> DrmFourcc {
         self.with_compositor(|compositor| compositor.format())

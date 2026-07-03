@@ -2937,6 +2937,60 @@ where
         Ok(CursorRepositionOutcome::Queued)
     }
 
+    /// Queue a cursor-plane-only clear of the currently presented frame.
+    ///
+    /// The counterpart of [`queue_cursor_position`] for the pointer leaving
+    /// an output: the current frame is re-committed unchanged except that
+    /// the cursor plane is disabled. Outcomes mirror the reposition —
+    /// `Unchanged` when no cursor plane is showing (nothing to clear),
+    /// `Unavailable` when the fast path cannot serve the output right now
+    /// and the caller must fall back to a full render (which clears the
+    /// plane by not assigning it).
+    ///
+    /// [`queue_cursor_position`]: Self::queue_cursor_position
+    pub fn queue_cursor_clear(&mut self, user_data: U) -> FrameResult<CursorRepositionOutcome, A, F> {
+        if self.pending_frame.is_some() || self.queued_frame.is_some() {
+            return Ok(CursorRepositionOutcome::Unavailable);
+        }
+        if self.surface.commit_pending() {
+            return Ok(CursorRepositionOutcome::Unavailable);
+        }
+        let Some(cursor_handle) = self.planes.cursor.iter().map(|info| info.handle).find(|handle| {
+            self.current_frame
+                .plane_state(*handle)
+                .map(|state| state.config.is_some())
+                .unwrap_or(false)
+        }) else {
+            return Ok(CursorRepositionOutcome::Unchanged);
+        };
+
+        let mut frame = FrameState {
+            planes: self
+                .current_frame
+                .planes
+                .iter()
+                .map(|(handle, state)| (*handle, state.clone()))
+                .collect(),
+        };
+        for (_, state) in frame.planes.iter_mut() {
+            state.skip = true;
+            state.needs_test = false;
+        }
+        let Some(plane_state) = frame.plane_state_mut(cursor_handle) else {
+            return Ok(CursorRepositionOutcome::Unavailable);
+        };
+        plane_state.config = None;
+        plane_state.element_state = None;
+        plane_state.skip = false;
+
+        self.next_frame = Some(PreparedFrame {
+            frame,
+            kind: PreparedFrameKind::Partial,
+        });
+        self.queue_frame(user_data)?;
+        Ok(CursorRepositionOutcome::Queued)
+    }
+
     /// Diagnostic snapshot of the frame pipeline, for stall autopsies.
     ///
     /// When a commit sits pending far longer than the output's refresh
