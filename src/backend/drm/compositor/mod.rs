@@ -923,6 +923,17 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
             if let Some(config) = state.config.as_mut() {
                 if let Some((sync, fence)) = config.sync.as_mut() {
+                    // A signaled sync needs no kernel-side wait at all: drop
+                    // it instead of attaching IN_FENCE_FD. Re-presents of
+                    // unchanged planes (cursor-only commits forward the
+                    // previous config) would otherwise re-attach the previous
+                    // render's long-signaled fence on every commit, churning
+                    // the driver's fence-wait machinery at pulse rate for no
+                    // synchronization value.
+                    if sync.is_reached() {
+                        config.sync = None;
+                        continue;
+                    }
                     // Atomic test commits should stay non-blocking. The actual submission path
                     // falls back to a host wait if the render completion fence cannot be
                     // forwarded to KMS as IN_FENCE_FD.
@@ -981,10 +992,19 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                     transform: config.properties.transform,
                     damage_clips: config.damage_clips.as_ref().map(|d| d.blob()),
                     fb: *config.buffer.as_ref(),
-                    fence: config
-                        .sync
-                        .as_ref()
-                        .and_then(|(_, fence)| fence.as_ref().map(|fence| fence.as_fd())),
+                    fence: config.sync.as_ref().and_then(|(sync, fence)| {
+                        // Skipped-but-configured planes (an unchanged primary
+                        // under a cursor-only commit) carry the sync of the
+                        // commit that originally presented their buffer; that
+                        // fence signaled before the buffer could reach the
+                        // screen. Attach IN_FENCE_FD only while genuinely
+                        // pending — a signaled fence adds kernel fence-wait
+                        // churn per commit and no synchronization.
+                        if sync.is_reached() {
+                            return None;
+                        }
+                        fence.as_ref().map(|fence| fence.as_fd())
+                    }),
                 }),
             })
     }
