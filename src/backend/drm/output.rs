@@ -698,7 +698,7 @@ where
         &mut self,
         element_location: crate::utils::Point<i32, crate::utils::Physical>,
         user_data: U,
-    ) -> FrameResult<bool, A, F> {
+    ) -> FrameResult<super::compositor::CursorRepositionOutcome, A, F> {
         self.with_compositor(|compositor| compositor.queue_cursor_position(element_location, user_data))
     }
 

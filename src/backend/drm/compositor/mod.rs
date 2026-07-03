@@ -1132,6 +1132,24 @@ struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>
     user_data: U,
 }
 
+/// Outcome of [`DrmCompositor::queue_cursor_position`].
+///
+/// `Unchanged` and `Unavailable` are deliberately distinct: an unchanged
+/// position is a no-op (the cursor plane is fine — sub-pixel motion rounded
+/// to the same pixel), while `Unavailable` means the fast path cannot serve
+/// this output right now (busy pipeline, pending modeset, no established
+/// cursor plane) and the caller must fall back to a full render. Callers
+/// that track cursor-plane health must not treat `Unchanged` as plane loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorRepositionOutcome {
+    /// A cursor-plane-only commit was queued.
+    Queued,
+    /// The new location maps to the plane's current position; nothing to do.
+    Unchanged,
+    /// The fast path does not apply; fall back to a full render.
+    Unavailable,
+}
+
 /// Diagnostic snapshot of the frame pipeline, returned by
 /// [`DrmCompositor::frame_pipeline_diagnostics`].
 #[derive(Debug, Clone, Copy)]
@@ -2840,12 +2858,10 @@ where
     /// element's physical location (pointer minus hotspot), exactly what the
     /// element would report via `Element::location` during a full render.
     ///
-    /// Returns `Ok(false)` (nothing queued) when the fast path does not
-    /// apply — a frame is pending or queued, a modeset is pending, the
-    /// current frame has no cursor plane, or the location is unchanged —
-    /// in which case the caller falls back to a full [`render_frame`]
-    /// (which also handles cursor image changes; this path never repaints
-    /// the cursor buffer).
+    /// See [`CursorRepositionOutcome`] for the non-queued outcomes; only
+    /// `Unavailable` requires a full [`render_frame`] fallback (which also
+    /// handles cursor image changes; this path never repaints the cursor
+    /// buffer).
     ///
     /// [`try_assign_cursor_plane`]: Self::try_assign_cursor_plane
     /// [`render_frame`]: Self::render_frame
@@ -2853,14 +2869,14 @@ where
         &mut self,
         element_location: Point<i32, Physical>,
         user_data: U,
-    ) -> FrameResult<bool, A, F> {
+    ) -> FrameResult<CursorRepositionOutcome, A, F> {
         if self.pending_frame.is_some() || self.queued_frame.is_some() {
-            return Ok(false);
+            return Ok(CursorRepositionOutcome::Unavailable);
         }
         // A pending mode/connector change must go through the full commit
         // path (submit() would pick the blocking modeset commit).
         if self.surface.commit_pending() {
-            return Ok(false);
+            return Ok(CursorRepositionOutcome::Unavailable);
         }
         // `next_frame` is a staging slot that every `render_frame` overwrites;
         // an entry left behind by a frame that was never queued (an empty
@@ -2873,14 +2889,14 @@ where
                 .map(|state| state.config.is_some())
                 .unwrap_or(false)
         }) else {
-            return Ok(false);
+            return Ok(CursorRepositionOutcome::Unavailable);
         };
 
         let (current_size, _output_scale, output_transform) = match (&self.output_mode_source).try_into()
         {
             Ok(mode) => mode,
             // No current mode (output disabling); the full path handles it.
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(CursorRepositionOutcome::Unavailable),
         };
         let output_transform: Transform = output_transform;
         let output_transform = output_transform.invert();
@@ -2899,16 +2915,16 @@ where
             state.needs_test = false;
         }
         let Some(plane_state) = frame.plane_state_mut(cursor_handle) else {
-            return Ok(false);
+            return Ok(CursorRepositionOutcome::Unavailable);
         };
         let Some(config) = plane_state.config.as_mut() else {
-            return Ok(false);
+            return Ok(CursorRepositionOutcome::Unavailable);
         };
         let cursor_plane_size = config.properties.dst.size;
         let location = output_transform.transform_point_in(element_location, &output_size)
             - output_transform.transform_point_in(Point::default(), &cursor_plane_size);
         if config.properties.dst.loc == location {
-            return Ok(false);
+            return Ok(CursorRepositionOutcome::Unchanged);
         }
         config.properties.dst.loc = location;
         plane_state.skip = false;
@@ -2918,7 +2934,7 @@ where
             kind: PreparedFrameKind::Partial,
         });
         self.queue_frame(user_data)?;
-        Ok(true)
+        Ok(CursorRepositionOutcome::Queued)
     }
 
     /// Diagnostic snapshot of the frame pipeline, for stall autopsies.
