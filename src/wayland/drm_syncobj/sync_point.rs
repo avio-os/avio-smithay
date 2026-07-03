@@ -243,7 +243,7 @@ impl DrmSyncPoint {
             .upgrade()
             .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?;
 
-        let imported_syncobj = device.fd_to_syncobj(sync_file.as_fd(), true)?;
+        let imported_syncobj = import_sync_file_as_syncobj(&device, sync_file.as_fd())?;
         let transfer_result = device.syncobj_timeline_transfer(imported_syncobj, ctx.syncobj, 0, self.point);
         let destroy_result = device.destroy_syncobj(imported_syncobj);
 
@@ -298,6 +298,50 @@ impl DrmSyncPoint {
         };
         Ok((blocker, source))
     }
+}
+
+/// Import a sync_file fence into a freshly created binary syncobj.
+///
+/// `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` with `IMPORT_SYNC_FILE` attaches the
+/// sync_file's fence to an *existing* syncobj passed in `handle` — the kernel
+/// does not create one, and handle 0 fails with `ENOENT`. drm-rs's
+/// `fd_to_syncobj` hardcodes handle 0, so the ioctl is issued directly here
+/// against a syncobj created first. The caller owns (and must destroy) the
+/// returned handle.
+fn import_sync_file_as_syncobj(
+    device: &DrmDeviceFd,
+    sync_file: BorrowedFd<'_>,
+) -> io::Result<drm::control::syncobj::Handle> {
+    use drm_ffi::drm_syncobj_handle;
+    use std::os::unix::io::AsRawFd;
+
+    const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1;
+    // DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, per include/uapi/drm/drm.h (base 'd',
+    // nr 0xC2, read-write on struct drm_syncobj_handle) — matching
+    // drm-ffi's own binding of this ioctl.
+    const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: rustix::ioctl::Opcode =
+        rustix::ioctl::opcode::read_write::<drm_syncobj_handle>(b'd', 0xC2);
+
+    let syncobj = device.create_syncobj(false)?;
+    let mut args = drm_syncobj_handle {
+        handle: syncobj.into(),
+        flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+        fd: sync_file.as_raw_fd(),
+        pad: 0,
+    };
+    // SAFETY: `device` is a live DRM fd and `args` matches the kernel's
+    // `struct drm_syncobj_handle` layout for this opcode.
+    let import_result = unsafe {
+        rustix::ioctl::ioctl(
+            device,
+            rustix::ioctl::Updater::<DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, drm_syncobj_handle>::new(&mut args),
+        )
+    };
+    if let Err(err) = import_result {
+        let _ = device.destroy_syncobj(syncobj);
+        return Err(io::Error::from(err));
+    }
+    Ok(syncobj)
 }
 
 impl Fence for DrmSyncPoint {
