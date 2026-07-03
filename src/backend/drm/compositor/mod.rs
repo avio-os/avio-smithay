@@ -2278,8 +2278,20 @@ where
             .unwrap_or(false);
 
         if render && frame_flags.contains(FrameFlags::DENY_PRIMARY_PLANE_RENDER) {
-            // Bail before any renderer work: a denied frame must not submit.
-            return Err(FrameError::PrimaryPlaneRenderDenied.into());
+            // `render` alone only says the primary is composite-type — under
+            // forced composition that is every frame, including ones whose
+            // composite pass will find no damage, perform no GPU work and
+            // forward the previous frame's plane state. The deny targets
+            // re-presents of a retained frame, where new primary damage can
+            // only come from a cursor-kind element that failed cursor-plane
+            // assignment (retained element damage is frozen). Bail before any
+            // renderer work in exactly that case.
+            if primary_plane_elements
+                .iter()
+                .any(|element| element.kind() == Kind::Cursor)
+            {
+                return Err(FrameError::PrimaryPlaneRenderDenied.into());
+            }
         }
 
         let mut primary_rendered_this_frame = false;
@@ -2373,6 +2385,19 @@ where
 
             match render_res {
                 Ok(render_output_result) => {
+                    if frame_flags.contains(FrameFlags::DENY_PRIMARY_PLANE_RENDER)
+                        && render_output_result.damage.is_some()
+                    {
+                        // Backstop for the deny contract: the composite pass
+                        // unexpectedly painted damage from a non-cursor
+                        // source. Refuse to hand the frame out — the caller
+                        // has no release-fence bookkeeping for it — and
+                        // force a full render on the next frame, since the
+                        // damage tracker has already advanced past this
+                        // never-presented one.
+                        self.reset_pending = true;
+                        return Err(FrameError::PrimaryPlaneRenderDenied.into());
+                    }
                     let shared_render_sync_file =
                         if render_output_result.damage.is_some() && self.supports_fencing {
                             primary_rendered_this_frame = true;
