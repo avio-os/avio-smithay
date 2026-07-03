@@ -1112,6 +1112,22 @@ struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>
     user_data: U,
 }
 
+/// Diagnostic snapshot of the frame pipeline, returned by
+/// [`DrmCompositor::frame_pipeline_diagnostics`].
+#[derive(Debug, Clone, Copy)]
+pub struct FramePipelineDiagnostics {
+    /// A commit has been handed to the kernel and its page-flip has not
+    /// completed yet.
+    pub commit_pending: bool,
+    /// A rendered frame is held in userspace behind the pending commit.
+    pub frame_queued: bool,
+    /// State of the pending commit's primary-plane in-fence: `None` when no
+    /// pending commit or no fence fd is attached; `Some(false)` means the
+    /// kernel is still waiting on the fence — for a long-stuck flip this
+    /// names a dead fence producer.
+    pub primary_in_fence_signaled: Option<bool>,
+}
+
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
 where
     A: Allocator,
@@ -2792,6 +2808,38 @@ where
     /// with its `user_data`.
     pub fn is_frame_pipeline_idle(&self) -> bool {
         self.pending_frame.is_none() && self.queued_frame.is_none()
+    }
+
+    /// Diagnostic snapshot of the frame pipeline, for stall autopsies.
+    ///
+    /// When a commit sits pending far longer than the output's refresh
+    /// interval, the discriminating fact is the state of its primary-plane
+    /// in-fence: a flip stuck behind an unsignaled fence means the fence
+    /// producer is the problem; a stuck flip with a signaled (or absent)
+    /// fence points at event delivery or the kernel.
+    pub fn frame_pipeline_diagnostics(&self) -> FramePipelineDiagnostics {
+        let pending_primary_sync = self
+            .pending_frame
+            .as_ref()
+            .and_then(|pending| pending.frame.plane_state(self.surface.plane()))
+            .and_then(|state| state.config.as_ref())
+            .and_then(|config| config.sync.as_ref());
+        FramePipelineDiagnostics {
+            commit_pending: self.pending_frame.is_some(),
+            frame_queued: self.queued_frame.is_some(),
+            primary_in_fence_signaled: pending_primary_sync
+                .and_then(|(_, fd)| fd.as_deref())
+                .map(|fd| {
+                    let mut poll_fd =
+                        [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
+                    rustix::event::poll(
+                        &mut poll_fd,
+                        Some(&rustix::time::Timespec { tv_sec: 0, tv_nsec: 0 }),
+                    )
+                    .ok()
+                    .is_some_and(|ready| ready > 0)
+                }),
+        }
     }
 
     /// Marks the current frame as submitted.

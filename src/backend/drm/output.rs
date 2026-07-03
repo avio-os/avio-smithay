@@ -686,6 +686,12 @@ where
         self.with_compositor(|compositor| compositor.is_frame_pipeline_idle())
     }
 
+    /// Diagnostic snapshot of the frame pipeline, for stall autopsies. See
+    /// [`DrmCompositor::frame_pipeline_diagnostics`].
+    pub fn frame_pipeline_diagnostics(&self) -> super::compositor::FramePipelineDiagnostics {
+        self.with_compositor(|compositor| compositor.frame_pipeline_diagnostics())
+    }
+
     /// Get the format of the underlying swapchain
     pub fn format(&self) -> DrmFourcc {
         self.with_compositor(|compositor| compositor.format())
