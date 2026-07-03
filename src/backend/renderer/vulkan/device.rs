@@ -487,6 +487,12 @@ impl DeviceState {
         Ok(())
     }
 
+    pub(crate) fn take_pending_wait_semaphores(&mut self) -> usize {
+        let count = self.pending_waits.len();
+        self.clear_pending_wait_semaphores();
+        count
+    }
+
     pub(crate) fn clear_pending_wait_semaphores(&mut self) {
         let pending = std::mem::take(&mut self.pending_waits);
         // On a lost device these never-submitted semaphores cannot be destroyed without
