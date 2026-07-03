@@ -1200,6 +1200,15 @@ bitflags::bitflags! {
         const ALLOW_CURSOR_PLANE_SCANOUT = 8;
         /// Return `EmptyFrame`, if only the cursor plane would have been updated
         const SKIP_CURSOR_ONLY_UPDATES = 16;
+        /// Fail with [`FrameError::PrimaryPlaneRenderDenied`] instead of
+        /// re-rendering the primary plane.
+        ///
+        /// For re-presents of an already-synchronized retained frame where
+        /// only auxiliary planes (cursor) may change: a primary composite
+        /// from such a path would submit GPU work outside the caller's
+        /// release-fence bookkeeping. The check runs before any render
+        /// submission, so a denied frame performs no GPU work.
+        const DENY_PRIMARY_PLANE_RENDER = 32;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
@@ -2267,6 +2276,11 @@ where
             .plane_buffer(self.surface.plane())
             .map(|config| matches!(config.buffer, ScanoutBuffer::Swapchain(_)))
             .unwrap_or(false);
+
+        if render && frame_flags.contains(FrameFlags::DENY_PRIMARY_PLANE_RENDER) {
+            // Bail before any renderer work: a denied frame must not submit.
+            return Err(FrameError::PrimaryPlaneRenderDenied.into());
+        }
 
         let mut primary_rendered_this_frame = false;
         if render {
@@ -4518,6 +4532,10 @@ pub enum FrameError<
     /// `queue_frame` or trying to queue a frame without changes.
     #[error("No frame has been prepared or it does not contain any changes")]
     EmptyFrame,
+    /// The frame required re-rendering the primary plane, which the caller
+    /// denied via [`FrameFlags::DENY_PRIMARY_PLANE_RENDER`]
+    #[error("The frame required a primary plane re-render, which the frame flags deny")]
+    PrimaryPlaneRenderDenied,
 }
 
 /// Error returned from [`DrmCompositor::render_frame`]
@@ -4585,7 +4603,9 @@ impl<
             | x @ FrameError::NoSupportedRendererFormat
             | x @ FrameError::PrimaryPlaneClaimFailed
             | x @ FrameError::NoFramebuffer => SwapBuffersError::ContextLost(Box::new(x)),
-            x @ FrameError::NoFreeSlotsError | x @ FrameError::EmptyFrame => {
+            x @ FrameError::NoFreeSlotsError
+            | x @ FrameError::EmptyFrame
+            | x @ FrameError::PrimaryPlaneRenderDenied => {
                 SwapBuffersError::TemporaryFailure(Box::new(x))
             }
             FrameError::DrmError(err) => err.into(),
