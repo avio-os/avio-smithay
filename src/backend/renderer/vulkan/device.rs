@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     ffi::CStr,
     fmt,
-    os::fd::OwnedFd,
+    os::fd::{FromRawFd, OwnedFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -27,12 +27,13 @@ pub(crate) struct SubmissionId(u64);
 struct InFlightSubmission {
     id: SubmissionId,
     fence: VulkanFence,
-    /// Non-exportable fence used exclusively by `reclaim_completed_submissions` to detect
-    /// completion.  When `supports_sync_file_export` is true, the caller-visible `VulkanFence`
-    /// may be exported as a SYNC_FD — which per the Vulkan spec resets the VkFence to
-    /// unsignaled, making it unsuitable for host-side polling.  This dedicated reclaim fence
-    /// is never exported and therefore always reflects the true completion state.
-    reclaim_fence: vk::Fence,
+    /// Binary semaphore signaled by this submission whose SYNC_FD was
+    /// exported right after submit (the caller-visible sync_file). The
+    /// VkFence is never exported, so it faithfully tracks completion and is
+    /// polled directly for reclamation; the semaphore is kept alive until
+    /// the submission retires (a semaphore referenced by pending GPU work
+    /// must not be destroyed) and destroyed on recycle.
+    export_semaphore: Option<vk::Semaphore>,
     command_buffer: vk::CommandBuffer,
     framebuffers: Vec<vk::Framebuffer>,
     retained_images: Vec<Arc<ImportedDmabufImage>>,
@@ -46,6 +47,7 @@ pub(crate) struct DeviceCapabilities {
     sync_file_import: bool,
     sync_file_export: bool,
     sync_file_semaphore_import: bool,
+    sync_file_semaphore_export: bool,
 }
 
 impl DeviceCapabilities {
@@ -63,6 +65,10 @@ impl DeviceCapabilities {
 
     pub(crate) fn sync_file_semaphore_import(self) -> bool {
         self.sync_file_semaphore_import
+    }
+
+    pub(crate) fn sync_file_semaphore_export(self) -> bool {
+        self.sync_file_semaphore_export
     }
 }
 
@@ -86,7 +92,6 @@ pub(crate) struct DeviceState {
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
-    reusable_reclaim_fences: Vec<vk::Fence>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
     pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
@@ -107,7 +112,6 @@ impl fmt::Debug for DeviceState {
             .field("queue", &self.queue)
             .field("command_pool", &self.command_pool)
             .field("reusable_command_buffers", &self.reusable_command_buffers.len())
-            .field("reusable_reclaim_fences", &self.reusable_reclaim_fences.len())
             .field("in_flight_submissions", &self.in_flight_submissions.len())
             .field("next_submission_id", &self.next_submission_id)
             .field("device", &self.device.handle().handle())
@@ -330,7 +334,6 @@ impl DeviceState {
             queue,
             command_pool,
             reusable_command_buffers: Vec::new(),
-            reusable_reclaim_fences: Vec::new(),
             in_flight_submissions: VecDeque::new(),
             pending_waits: Vec::new(),
             next_submission_id: 0,
@@ -386,7 +389,9 @@ impl DeviceState {
     }
 
     pub(crate) fn supports_sync_file_export(&self) -> bool {
-        self.capabilities.sync_file_export() && self.external_fence_fd.is_some()
+        // Render-completion sync_files are exported from a per-submission
+        // binary semaphore (never from the VkFence — see VulkanFenceInner).
+        self.capabilities.sync_file_semaphore_export() && self.external_semaphore_fd.is_some()
     }
 
     pub(crate) fn debug_markers_enabled(&self) -> bool {
@@ -569,11 +574,28 @@ impl DeviceState {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
         let submit_started_at = Instant::now();
-        let fence = VulkanFence::create(
-            self.shared_device(),
-            self.external_fence_fd.clone(),
-            self.supports_sync_file_export(),
-        )?;
+        let fence = VulkanFence::create(self.shared_device())?;
+
+        // Render-completion export rides a dedicated binary semaphore signaled
+        // by this submission, exported exactly once immediately after submit
+        // while the signal operation is provably pending. Exporting the
+        // VkFence instead (vkGetFenceFdKHR has move semantics) was observed
+        // racing fence completion on NVIDIA, yielding valid fds bound to a
+        // consumed payload — sync_files that never signal.
+        let export_semaphore = if self.supports_sync_file_export() {
+            match self.create_export_semaphore() {
+                Ok(semaphore) => Some(semaphore),
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "failed to create export semaphore; submission completes without an exportable sync_file"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let pending_waits = std::mem::take(&mut self.pending_waits);
         let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
@@ -585,6 +607,10 @@ impl DeviceState {
             submit = submit
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_dst_stage_mask);
+        }
+        let signal_semaphores = export_semaphore.map(|semaphore| [semaphore]);
+        if let Some(signal_semaphores) = signal_semaphores.as_ref() {
+            submit = submit.signal_semaphores(signal_semaphores);
         }
         let submit_info = [submit];
 
@@ -602,6 +628,10 @@ impl DeviceState {
                     // SAFETY: Semaphore belongs to this device and the submission did not succeed.
                     unsafe { device.destroy_semaphore(semaphore, None) };
                 }
+                if let Some(semaphore) = export_semaphore {
+                    // SAFETY: Semaphore belongs to this device and was never submitted.
+                    unsafe { device.destroy_semaphore(semaphore, None) };
+                }
                 for framebuffer in framebuffers {
                     // SAFETY: Framebuffer belongs to this device and is not referenced by a failed submission.
                     unsafe { device.destroy_framebuffer(framebuffer, None) };
@@ -610,42 +640,17 @@ impl DeviceState {
             return Err(err.into());
         }
 
-        // When the caller-visible fence is exportable as SYNC_FD, the Vulkan spec mandates that
-        // exporting resets the VkFence to unsignaled.  Since the DRM compositor routinely exports
-        // the fence for KMS in-fencing, `get_fence_status` on the caller-visible fence would
-        // always return false — preventing reclaim.  We solve this by submitting a lightweight
-        // empty batch with a separate non-exportable fence that faithfully tracks completion.
-        //
-        // When SYNC_FD export is not supported, the caller-visible fence is never exported and
-        // can be polled directly, so the reclaim fence is redundant — we use vk::Fence::null()
-        // as a sentinel to skip the extra submit.
-        let reclaim_fence = if self.supports_sync_file_export() {
-            match self.acquire_reclaim_fence() {
-                Ok(rf) => {
-                    // SAFETY: Empty submit; fence signals when all prior queue work completes.
-                    match self
-                        .device
-                        .observe_result(unsafe { self.device.handle().queue_submit(self.queue, &[], rf) })
-                    {
-                        Ok(()) => rf,
-                        Err(err) => {
-                            // The real work was already submitted — we cannot un-submit it.
-                            // Fall back to null (polling the caller-visible fence, which may
-                            // not work if exported) rather than losing track of the submission.
-                            warn!(?err, "failed to submit reclaim fence; reclaim may be delayed");
-                            self.recycle_reclaim_fence(rf);
-                            vk::Fence::null()
-                        }
-                    }
-                }
+        if let Some(semaphore) = export_semaphore {
+            match self.export_semaphore_sync_file(semaphore) {
+                Ok(fd) => fence.set_exported_sync_file(fd),
                 Err(err) => {
-                    warn!(?err, "failed to create reclaim fence; reclaim may be delayed");
-                    vk::Fence::null()
+                    // The semaphore stays in the submission for deferred
+                    // destruction; callers see a non-exportable sync point and
+                    // fall back to genuine host waits (the fence is truthful).
+                    warn!(?err, "failed to export submission sync_file from semaphore");
                 }
             }
-        } else {
-            vk::Fence::null()
-        };
+        }
 
         let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
         self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
@@ -659,7 +664,7 @@ impl DeviceState {
         self.in_flight_submissions.push_back(InFlightSubmission {
             id,
             fence: fence.clone(),
-            reclaim_fence,
+            export_semaphore,
             command_buffer,
             framebuffers,
             retained_images,
@@ -762,37 +767,47 @@ impl DeviceState {
         self.in_flight_submissions.len()
     }
 
-    fn acquire_reclaim_fence(&mut self) -> Result<vk::Fence, VulkanRendererError> {
+    /// Create the binary semaphore that carries a submission's exportable
+    /// SYNC_FD payload.
+    fn create_export_semaphore(&self) -> Result<vk::Semaphore, VulkanRendererError> {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
-        if let Some(fence) = self.reusable_reclaim_fences.pop() {
-            return Ok(fence);
-        }
-        let create_info = vk::FenceCreateInfo::default();
-        // SAFETY: Device is valid and create info references no borrowed resources.
-        let fence = self
+        let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+        // SAFETY: Device is valid and create info references live memory.
+        let semaphore = self
             .device
-            .observe_result(unsafe { self.device.handle().create_fence(&create_info, None) })?;
-        Ok(fence)
+            .observe_result(unsafe { self.device.handle().create_semaphore(&create_info, None) })?;
+        Ok(semaphore)
     }
 
-    fn recycle_reclaim_fence(&mut self, fence: vk::Fence) {
-        // A lost device cannot reset or recycle a fence; drop it without touching the dead driver.
-        let Some(device) = self.device.handle_for_destroy() else {
-            return;
+    /// Export the SYNC_FD from a submission's export semaphore. Must be
+    /// called immediately after the successful `vkQueueSubmit` that signals
+    /// the semaphore, while the signal operation is pending — the export has
+    /// move semantics and binds the fd to that pending operation.
+    fn export_semaphore_sync_file(&self, semaphore: vk::Semaphore) -> Result<OwnedFd, VulkanRendererError> {
+        let Some(loader) = self.external_semaphore_fd.as_ref() else {
+            return Err(VulkanRendererError::ContextLost(
+                "external semaphore fd extension unavailable",
+            ));
         };
-        // SAFETY: Fence was signaled (or never submitted) and belongs to this device.
-        if let Err(err) = self
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: Semaphore belongs to the same device as `loader` and has a pending signal op.
+        let fd = self
             .device
-            .observe_result(unsafe { device.reset_fences(&[fence]) })
-        {
-            warn!(?err, "failed to reset reclaim fence, destroying instead");
-            self.device
-                .destroy_with(|device| unsafe { device.destroy_fence(fence, None) });
-            return;
+            .observe_result(unsafe { loader.get_semaphore_fd(&get_info) })?;
+        if fd < 0 {
+            warn!(fd, "semaphore sync_file export returned an invalid fd");
+            return Err(VulkanRendererError::ContextLost(
+                "semaphore sync_file export returned an invalid fd",
+            ));
         }
-        self.reusable_reclaim_fences.push(fence);
+        // SAFETY: Vulkan returns ownership of a valid fd on success; negative values handled above.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -802,60 +817,14 @@ impl DeviceState {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
         loop {
-            let needs_late_reclaim_fence = match self.in_flight_submissions.front() {
-                Some(front) => {
-                    front.reclaim_fence == vk::Fence::null() && self.supports_sync_file_export()
-                }
-                None => break,
-            };
-            if needs_late_reclaim_fence {
-                // The reclaim-fence submit failed at submission time. The
-                // caller-visible fence may since have been exported as
-                // SYNC_FD (resetting it to unsignaled), so polling it could
-                // report pending forever and wedge reclamation behind this
-                // entry. Submit a late reclaim fence instead: an empty batch
-                // signals when all previously submitted queue work completes,
-                // which bounds the front submission. On failure, retry on the
-                // next reclaim pass rather than falling back to a dead poll.
-                let reclaim_fence = match self.acquire_reclaim_fence() {
-                    Ok(reclaim_fence) => reclaim_fence,
-                    Err(err) => {
-                        warn!(?err, "failed to create late reclaim fence; retrying next pass");
-                        break;
-                    }
-                };
-                // SAFETY: Empty submit; fence signals when all prior queue work completes.
-                match self
-                    .device
-                    .observe_result(unsafe { self.device.handle().queue_submit(self.queue, &[], reclaim_fence) })
-                {
-                    Ok(()) => {
-                        self.in_flight_submissions
-                            .front_mut()
-                            .expect("front checked above")
-                            .reclaim_fence = reclaim_fence;
-                    }
-                    Err(err) => {
-                        warn!(?err, "failed to submit late reclaim fence; retrying next pass");
-                        self.recycle_reclaim_fence(reclaim_fence);
-                        break;
-                    }
-                }
-            }
-
             let Some(front) = self.in_flight_submissions.front() else {
                 break;
             };
 
-            // When a dedicated reclaim fence exists, poll it instead of the caller-visible
-            // fence — the latter may have been exported as SYNC_FD (resetting it to unsignaled).
-            // When reclaim_fence is null, SYNC_FD export is not supported, so the caller-visible
-            // fence is safe to poll directly.
-            let poll_fence = if front.reclaim_fence != vk::Fence::null() {
-                front.reclaim_fence
-            } else {
-                front.fence.handle()
-            };
+            // The caller-visible fence is never exported (the sync_file rides
+            // a dedicated semaphore), so it faithfully tracks completion and
+            // can be polled directly.
+            let poll_fence = front.fence.handle();
             // SAFETY: Fence was created by this device and remains valid while tracked.
             let signaled = match self
                 .device
@@ -885,16 +854,13 @@ impl DeviceState {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
         while let Some(submission) = self.in_flight_submissions.pop_front() {
-            let wait_fence = if submission.reclaim_fence != vk::Fence::null() {
-                submission.reclaim_fence
-            } else {
-                submission.fence.handle()
-            };
+            // The caller-visible fence is never exported, so it faithfully
+            // tracks completion and can be waited on directly.
             // SAFETY: Fence was created by this device and remains valid while tracked.
             if let Err(err) = self.device.observe_result(unsafe {
                 self.device
                     .handle()
-                    .wait_for_fences(&[wait_fence], true, u64::MAX)
+                    .wait_for_fences(&[submission.fence.handle()], true, u64::MAX)
             }) {
                 return Err(err.into());
             }
@@ -908,7 +874,7 @@ impl DeviceState {
         let InFlightSubmission {
             id,
             fence: _fence,
-            reclaim_fence,
+            export_semaphore,
             command_buffer,
             framebuffers,
             wait_semaphores,
@@ -916,8 +882,13 @@ impl DeviceState {
             ..
         } = submission;
 
-        if reclaim_fence != vk::Fence::null() {
-            self.recycle_reclaim_fence(reclaim_fence);
+        if let Some(semaphore) = export_semaphore {
+            // The submission completed, so no pending operation references the
+            // semaphore anymore; its exported payload lives on in the fd.
+            self.device.destroy_with(|device| {
+                // SAFETY: Semaphore belongs to this device and is no longer in use.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            });
         }
 
         let completion_ns = duration_to_ns(submitted_at.elapsed());
@@ -1054,7 +1025,9 @@ impl DeviceState {
                 (false, false)
             };
 
-        let sync_file_semaphore_import = if enabled_extensions.contains(&khr::external_semaphore_fd::NAME) {
+        let (sync_file_semaphore_import, sync_file_semaphore_export) = if enabled_extensions
+            .contains(&khr::external_semaphore_fd::NAME)
+        {
             let semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
                 .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
             let mut semaphore_properties = vk::ExternalSemaphoreProperties::default();
@@ -1068,11 +1041,16 @@ impl DeviceState {
                 )
             };
 
-            semaphore_properties
-                .external_semaphore_features
-                .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE)
+            (
+                semaphore_properties
+                    .external_semaphore_features
+                    .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE),
+                semaphore_properties
+                    .external_semaphore_features
+                    .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE),
+            )
         } else {
-            false
+            (false, false)
         };
 
         DeviceCapabilities {
@@ -1080,6 +1058,7 @@ impl DeviceState {
             sync_file_import,
             sync_file_export,
             sync_file_semaphore_import,
+            sync_file_semaphore_export,
         }
     }
 }
@@ -1132,11 +1111,6 @@ impl Drop for DeviceState {
 
             // SAFETY: Command pool belongs to this device and may be destroyed after queue idle.
             unsafe { device.destroy_command_pool(self.command_pool, None) };
-
-            for fence in self.reusable_reclaim_fences.drain(..) {
-                // SAFETY: Fence belongs to this device and is not in-flight (all submissions drained above).
-                unsafe { device.destroy_fence(fence, None) };
-            }
         });
     }
 }
@@ -1192,6 +1166,95 @@ mod tests {
         assert!(
             handle.handle_for_destroy().is_some(),
             "cleared flag restores availability"
+        );
+    }
+
+    /// End-to-end check of the render-completion sync_file contract: the
+    /// exported fd comes from the submission's dedicated export semaphore,
+    /// signals when the submission completes, export is an idempotent dup,
+    /// and the never-exported VkFence tracks true completion state for
+    /// reclamation. Skips silently when no GPU is present.
+    #[test]
+    fn submission_sync_file_export_signals_on_completion() {
+        use ash::vk;
+
+        let instance = match Instance::new(Version::VERSION_1_3, None) {
+            Ok(instance) => instance,
+            Err(_) => return,
+        };
+        let physical_device = match PhysicalDevice::enumerate(&instance) {
+            Ok(mut iter) => match iter.next() {
+                Some(phd) => phd,
+                None => return,
+            },
+            Err(_) => return,
+        };
+        let mut device = match DeviceState::new(&physical_device) {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        if !device.supports_sync_file_export() {
+            return;
+        }
+
+        let command_buffer = device
+            .acquire_command_buffer()
+            .expect("command buffer acquisition should succeed");
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: Command buffer and device are valid; the recording is empty.
+        unsafe {
+            device
+                .shared_device()
+                .handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+                .expect("begin_command_buffer should succeed");
+            device
+                .shared_device()
+                .handle()
+                .end_command_buffer(command_buffer)
+                .expect("end_command_buffer should succeed");
+        }
+
+        let (_id, fence) = device
+            .submit_with_framebuffers_and_fence(command_buffer, Vec::new())
+            .expect("submission should succeed");
+
+        let sync_file = fence
+            .export_sync_file()
+            .expect("submission must carry an exportable sync_file");
+        assert!(
+            fence.export_sync_file().is_some(),
+            "sync_file export must be an idempotent dup, not a consuming operation"
+        );
+
+        fence.wait_vk().expect("fence wait should succeed");
+        assert!(
+            fence.status().unwrap_or(false),
+            "the never-exported fence must report true completion state"
+        );
+
+        let mut poll_fd = [rustix::event::PollFd::new(
+            &sync_file,
+            rustix::event::PollFlags::IN,
+        )];
+        let ready = rustix::event::poll(
+            &mut poll_fd,
+            Some(&rustix::time::Timespec { tv_sec: 0, tv_nsec: 0 }),
+        )
+        .expect("sync_file poll should succeed");
+        assert!(
+            ready > 0,
+            "the exported sync_file must be signaled once the submission completed"
+        );
+
+        device
+            .reclaim_completed_submissions()
+            .expect("reclaim should succeed");
+        assert_eq!(
+            device.in_flight_submission_count(),
+            0,
+            "the completed submission must reclaim via the un-exported fence"
         );
     }
 }
