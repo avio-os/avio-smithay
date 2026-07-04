@@ -158,7 +158,7 @@ use crate::{
     backend::{
         allocator::{
             dmabuf::{AsDmabuf, Dmabuf, WeakDmabuf},
-            format::{get_opaque, has_alpha},
+            format::{get_opaque, get_transparent, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
             Allocator, Buffer, Slot, Swapchain,
         },
@@ -1262,6 +1262,9 @@ bitflags::bitflags! {
         /// release-fence bookkeeping. The check runs before any render
         /// submission, so a denied frame performs no GPU work.
         const DENY_PRIMARY_PLANE_RENDER = 32;
+        /// Allow rendering compositor-owned scene content into an overlay plane
+        /// above a direct-scanout primary element.
+        const ALLOW_OUTPUT_LAYER_SCANOUT = 64;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
@@ -1299,6 +1302,10 @@ where
     next_frame: Option<PreparedFrame<A, F>>,
 
     swapchain: Swapchain<A>,
+    output_layer_swapchain: Option<Swapchain<A>>,
+    output_layer_damage_tracker: OutputDamageTracker,
+    output_layer_element_id: Id,
+    output_layer_damage_bag: DamageBag<i32, BufferCoords>,
 
     cursor_size: Size<i32, Physical>,
     cursor_state: Option<CursorState<G>>,
@@ -1347,7 +1354,38 @@ where
         output_mode_source: impl Into<OutputModeSource> + Debug,
         surface: DrmSurface,
         planes: Option<Planes>,
+        allocator: A,
+        framebuffer_exporter: F,
+        color_formats: impl IntoIterator<Item = DrmFourcc>,
+        renderer_formats: impl IntoIterator<Item = DrmFormat>,
+        cursor_size: Size<u32, BufferCoords>,
+        gbm: Option<GbmDevice<G>>,
+    ) -> FrameResult<Self, A, F> {
+        Self::new_with_output_layer_allocator(
+            output_mode_source,
+            surface,
+            planes,
+            allocator,
+            None,
+            framebuffer_exporter,
+            color_formats,
+            renderer_formats,
+            cursor_size,
+            gbm,
+        )
+    }
+
+    /// Initialize a new [`DrmCompositor`] with a secondary compositor-owned
+    /// swapchain that may be rendered into an overlay plane above a primary
+    /// direct-scanout element.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub fn new_with_output_layer_allocator(
+        output_mode_source: impl Into<OutputModeSource> + Debug,
+        surface: DrmSurface,
+        planes: Option<Planes>,
         mut allocator: A,
+        mut output_layer_allocator: Option<A>,
         framebuffer_exporter: F,
         color_formats: impl IntoIterator<Item = DrmFourcc>,
         renderer_formats: impl IntoIterator<Item = DrmFormat>,
@@ -1426,6 +1464,25 @@ where
                 format,
             ) {
                 Ok((swapchain, is_opaque)) => {
+                    let output_layer_format = if has_alpha(swapchain.format()) {
+                        Some(swapchain.format())
+                    } else {
+                        get_transparent(swapchain.format())
+                    };
+                    let output_layer_swapchain = output_layer_allocator.take().and_then(|allocator| {
+                        let mode = surface.pending_mode();
+                        output_layer_format.map(|format| {
+                            Swapchain::new(
+                                allocator,
+                                mode.size().0 as u32,
+                                mode.size().1 as u32,
+                                format,
+                                swapchain.modifiers().to_vec(),
+                            )
+                        })
+                    });
+                    let output_layer_damage_tracker =
+                        OutputDamageTracker::from_mode_source(output_mode_source.clone());
                     let cursor_state = gbm.map(|gbm| {
                         #[cfg(feature = "renderer_pixman")]
                         let pixman_renderer = match PixmanRenderer::new() {
@@ -1463,6 +1520,10 @@ where
                         queued_frame: None,
                         next_frame: None,
                         swapchain,
+                        output_layer_swapchain,
+                        output_layer_damage_tracker,
+                        output_layer_element_id: Id::new(),
+                        output_layer_damage_bag: DamageBag::new(4),
                         framebuffer_exporter,
                         cursor_size,
                         cursor_state,
@@ -1565,6 +1626,7 @@ where
 
         let cursor_size = Size::from((cursor_size.w as i32, cursor_size.h as i32));
         let damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
+        let output_layer_damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         let supports_fencing = !surface.is_legacy()
             && surface
                 .get_driver_capability(DriverCapability::SyncObj)
@@ -1626,6 +1688,10 @@ where
             queued_frame: None,
             next_frame: None,
             swapchain,
+            output_layer_swapchain: None,
+            output_layer_damage_tracker,
+            output_layer_element_id: Id::new(),
+            output_layer_damage_bag: DamageBag::new(4),
             framebuffer_exporter,
             cursor_size,
             cursor_state,
@@ -2141,6 +2207,9 @@ where
         // This will hold the element assigned on the cursor plane if any
         let mut cursor_plane_element: Option<&'a E> = None;
         let mut cursor_plane_assignment: Option<PlaneAssignmentInfo> = None;
+        let mut output_layer_plane_assignment: Option<PlaneAssignmentInfo> = None;
+        let mut output_layer_plane: Option<plane::Handle> = None;
+        let mut output_layer_elements: Vec<&'a E> = Vec::new();
 
         let output_elements_len = output_elements.len();
         for (index, (element, element_geometry, element_visible_area, element_is_opaque)) in
@@ -2195,10 +2264,8 @@ where
                 Ok(direct_scan_out_plane) => {
                     match direct_scan_out_plane.type_ {
                         drm::control::PlaneType::Overlay => {
-                            overlay_plane_elements.insert(
-                                direct_scan_out_plane.handle,
-                                (element, direct_scan_out_plane),
-                            );
+                            overlay_plane_elements
+                                .insert(direct_scan_out_plane.handle, (element, direct_scan_out_plane));
                         }
                         drm::control::PlaneType::Primary => {
                             primary_plane_scanout_element = Some(element);
@@ -2235,6 +2302,82 @@ where
             }
         }
 
+        if frame_flags.contains(FrameFlags::ALLOW_OUTPUT_LAYER_SCANOUT)
+            && self.output_layer_swapchain.is_some()
+            && primary_plane_scanout_element.is_none()
+            && overlay_plane_elements.is_empty()
+            && primary_plane_elements.len() >= 2
+        {
+            let split_at = primary_plane_elements.len() - 1;
+            let scene_elements = &primary_plane_elements[..split_at];
+            let candidate = primary_plane_elements[split_at];
+            let scene_has_cursor = scene_elements
+                .iter()
+                .any(|element| element.kind() == Kind::Cursor);
+
+            if !scene_has_cursor && candidate.kind() == Kind::ScanoutCandidate {
+                let candidate_geometry = candidate.geometry(output_scale);
+                let visible_area = candidate_geometry
+                    .intersection(output_geometry)
+                    .map(|geometry| (geometry.size.w * geometry.size.h).max(0) as usize)
+                    .unwrap_or_default();
+                match self.try_assign_primary_plane(
+                    renderer,
+                    candidate,
+                    output_elements_len.saturating_sub(1),
+                    candidate_geometry,
+                    &mut element_states,
+                    output_scale,
+                    &mut next_frame_state,
+                    output_transform,
+                    output_geometry,
+                    frame_flags,
+                ) {
+                    Ok(primary_assignment) => {
+                        match self.try_assign_output_layer_plane(&mut next_frame_state, current_size) {
+                            Ok(layer_assignment) => {
+                                primary_plane_scanout_element = Some(candidate);
+                                primary_plane_assignment = Some(primary_assignment);
+                                output_layer_plane = Some(layer_assignment.handle);
+                                output_layer_plane_assignment = Some(layer_assignment);
+                                output_layer_elements = scene_elements.to_vec();
+                                primary_plane_elements.clear();
+                                render_element_states.states.insert(
+                                    candidate.id().clone(),
+                                    RenderElementState::zero_copy(visible_area),
+                                );
+                                trace!(
+                                    candidate = ?candidate.id(),
+                                    scene_element_count = output_layer_elements.len(),
+                                    overlay_plane = ?layer_assignment.handle,
+                                    "assigned primary direct scanout with compositor output layer"
+                                );
+                            }
+                            Err(reason) => {
+                                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
+                                primary_plane_scanout_element = None;
+                                primary_plane_assignment = None;
+                                if let Some(reason) = reason {
+                                    render_element_states
+                                        .states
+                                        .entry(candidate.id().clone())
+                                        .or_insert_with(|| RenderElementState::rendering_with_reason(reason));
+                                }
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        if let Some(reason) = reason {
+                            render_element_states
+                                .states
+                                .entry(candidate.id().clone())
+                                .or_insert_with(|| RenderElementState::rendering_with_reason(reason));
+                        }
+                    }
+                }
+            }
+        }
+
         // Cleanup old state (e.g. old dmabuffers)
         for element_state in element_states.values_mut() {
             element_state.fb_cache.cleanup();
@@ -2254,7 +2397,7 @@ where
         // If not do a single atomic commit test and when that fails render everything that failed
         // the test on the primary plane. This will also automatically correct any mistake we made
         // during plane assignment and start the full test cycle on the next frame.
-        if next_frame_state
+        let complete_test_failed = next_frame_state
             .test_state_complete(
                 previous_state,
                 &self.surface,
@@ -2262,8 +2405,8 @@ where
                 false,
                 allow_partial_update,
             )
-            .is_err()
-        {
+            .is_err();
+        if complete_test_failed {
             trace!("atomic test failed for frame, resetting frame");
 
             let mut removed_overlay_elements: Vec<(usize, &E)> = Vec::with_capacity(
@@ -2315,7 +2458,7 @@ where
             // to make sure we actually have a slot on the primary
             // plane we can render into
             if !removed_overlay_elements.is_empty() {
-                next_frame_state.set_state(self.surface.plane(), primary_plane_state);
+                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
             }
 
             removed_overlay_elements.sort_by_key(|(z_index, _)| *z_index);
@@ -2324,6 +2467,43 @@ where
                 .map(|(_, element)| element)
                 .chain(primary_plane_elements.into_iter())
                 .collect();
+        }
+
+        if let Some(layer_plane) = output_layer_plane {
+            let output_layer_survived = !complete_test_failed
+                && next_frame_state
+                    .plane_state(layer_plane)
+                    .and_then(|state| state.config.as_ref())
+                    .is_some();
+            if !output_layer_survived {
+                if let Some(state) = next_frame_state.plane_state_mut(layer_plane) {
+                    state.config = None;
+                    state.element_state = None;
+                    state.needs_test = false;
+                    state.skip = false;
+                }
+                if let Some(primary_element) = primary_plane_scanout_element {
+                    render_element_states.states.remove(primary_element.id());
+                }
+                output_layer_plane = None;
+                output_layer_plane_assignment = None;
+                output_layer_elements.clear();
+                primary_plane_scanout_element = None;
+                primary_plane_assignment = None;
+                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
+
+                let cursor_id = cursor_plane_element.map(|element| element.id().clone());
+                primary_plane_elements = output_elements
+                    .iter()
+                    .filter_map(|(element, _, _, _)| {
+                        if cursor_id.as_ref() == Some(element.id()) {
+                            None
+                        } else {
+                            Some(*element)
+                        }
+                    })
+                    .collect();
+            }
         }
 
         // If a plane has been moved or no longer has a buffer we need to report that as damage
@@ -2337,6 +2517,129 @@ where
                     .is_none()
             {
                 self.overlay_plane_element_ids.remove_plane(handle);
+            }
+        }
+
+        let mut output_layer_rendered_this_frame = false;
+        let mut output_layer_exported_sync_file: Option<Arc<OwnedFd>> = None;
+        if let Some(layer_plane) = output_layer_plane {
+            let output_layer_render = next_frame_state
+                .plane_buffer(layer_plane)
+                .map(|config| matches!(config.buffer, ScanoutBuffer::Swapchain(_)))
+                .unwrap_or(false);
+
+            if output_layer_render {
+                trace!(
+                    "rendering {} elements on output-layer overlay {:?}",
+                    output_layer_elements.len(),
+                    layer_plane,
+                );
+                let (mut dmabuf, age) = {
+                    let plane_state = next_frame_state.plane_state(layer_plane).unwrap();
+                    let config = plane_state.config.as_ref().unwrap();
+                    let slot = match &config.buffer.buffer {
+                        ScanoutBuffer::Swapchain(slot) => slot,
+                        _ => unreachable!(),
+                    };
+
+                    let dmabuf = slot.export().map_err(FrameError::AsDmabufError)?;
+                    let age = slot.age().into();
+                    (dmabuf, age)
+                };
+
+                let output_layer_wayland_buffers = output_layer_elements
+                    .iter()
+                    .filter_map(|element| match element.underlying_storage(renderer) {
+                        Some(UnderlyingStorage::Wayland(buffer)) => Some(buffer.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                let renderer_debug_flags = renderer.debug_flags();
+                renderer.set_debug_flags(self.debug_flags);
+
+                let mut framebuffer = renderer
+                    .bind(&mut dmabuf)
+                    .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
+                let render_res = self.output_layer_damage_tracker.render_output(
+                    renderer,
+                    &mut framebuffer,
+                    age,
+                    &output_layer_elements,
+                    Color32F::TRANSPARENT,
+                );
+
+                renderer.set_debug_flags(renderer_debug_flags);
+
+                match render_res {
+                    Ok(render_output_result) => {
+                        let shared_render_sync_file = if render_output_result.damage.is_some() {
+                            output_layer_rendered_this_frame = true;
+                            if self.supports_fencing {
+                                render_output_result.sync.export().map(Arc::new)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if render_output_result.damage.is_none() {
+                            let _ = renderer.cleanup_texture_cache();
+                        } else {
+                            for buffer in &output_layer_wayland_buffers {
+                                if let Some(sync_file) = shared_render_sync_file.as_ref() {
+                                    buffer.set_last_render_sync_file(sync_file.clone());
+                                } else {
+                                    buffer.set_last_render_sync(render_output_result.sync.clone());
+                                }
+                            }
+                        }
+
+                        for (id, state) in render_output_result.states.states.into_iter() {
+                            if let Some(existing_state) = render_element_states.states.get_mut(&id) {
+                                if matches!(
+                                    existing_state.presentation_state,
+                                    RenderElementPresentationState::Skipped
+                                ) {
+                                    *existing_state = state;
+                                } else {
+                                    existing_state.visible_area += state.visible_area;
+                                }
+                            } else {
+                                render_element_states.states.insert(id.clone(), state);
+                            }
+                        }
+
+                        if let Some(render_damage) = render_output_result.damage {
+                            let plane_state = next_frame_state.plane_state_mut(layer_plane).unwrap();
+                            let config = plane_state.config.as_mut().unwrap();
+                            self.output_layer_damage_bag.add(render_damage.iter().map(|d| {
+                                d.to_logical(1).to_buffer(
+                                    1,
+                                    Transform::Normal,
+                                    &output_geometry.size.to_logical(1),
+                                )
+                            }));
+                            config.damage_clips = PlaneDamageClips::from_damage(
+                                self.surface.device_fd(),
+                                config.properties.src,
+                                config.properties.dst,
+                                render_damage.iter().copied(),
+                            )
+                            .ok()
+                            .flatten();
+                            output_layer_exported_sync_file = shared_render_sync_file.clone();
+                            config.sync = Some((render_output_result.sync.clone(), shared_render_sync_file));
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+                            output_layer_swapchain.reset_buffers();
+                        }
+                        return Err(RenderFrameError::from(err));
+                    }
+                }
             }
         }
 
@@ -2420,16 +2723,10 @@ where
                                 }
                             })
                             .unwrap_or_default();
-                        let is_underlay =
-                            plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
+                        let is_underlay = plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
                         if is_underlay {
                             Some(
-                                HolepunchRenderElement::from_render_element(
-                                    id,
-                                    element,
-                                    output_scale,
-                                )
-                                .into(),
+                                HolepunchRenderElement::from_render_element(id, element, output_scale).into(),
                             )
                         } else {
                             OverlayPlaneElement::from_render_element(id, *element, output_scale)
@@ -2663,6 +2960,11 @@ where
             primary_plane_assignment,
             overlay_elements,
             overlay_plane_assignments,
+            output_layer_plane_assignment,
+            output_layer_element_count: output_layer_elements.len(),
+            output_layer_elements,
+            output_layer_rendered_this_frame,
+            output_layer_exported_sync_file,
             cursor_element: cursor_plane_element,
             cursor_plane_assignment,
             states: render_element_states,
@@ -2707,18 +3009,7 @@ where
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
 
-        if let Some(plane_state) = prepared_frame.frame.plane_state(self.surface.plane()) {
-            if !plane_state.skip {
-                let slot = plane_state.buffer().and_then(|config| match &config.buffer {
-                    ScanoutBuffer::Swapchain(slot) => Some(slot),
-                    _ => None,
-                });
-
-                if let Some(slot) = slot {
-                    self.swapchain.submitted(slot);
-                }
-            }
-        }
+        self.mark_submitted_swapchain_slots(&prepared_frame.frame);
 
         self.queued_frame = Some(QueuedFrame {
             prepared_frame,
@@ -2753,18 +3044,7 @@ where
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
 
-        if let Some(plane_state) = prepared_frame.frame.plane_state(self.surface.plane()) {
-            if !plane_state.skip {
-                let slot = plane_state.buffer().and_then(|config| match &config.buffer {
-                    ScanoutBuffer::Swapchain(slot) => Some(slot),
-                    _ => None,
-                });
-
-                if let Some(slot) = slot {
-                    self.swapchain.submitted(slot);
-                }
-            }
-        }
+        self.mark_submitted_swapchain_slots(&prepared_frame.frame);
 
         let flip = prepared_frame
             .frame
@@ -2812,6 +3092,26 @@ where
         };
 
         self.handle_flip(prepared_frame, Some(user_data), flip)
+    }
+
+    fn mark_submitted_swapchain_slots(&mut self, frame: &CompositorFrameState<A, F>) {
+        for (_, plane_state) in frame.planes.iter() {
+            if plane_state.skip {
+                continue;
+            }
+
+            let Some(slot) = plane_state.buffer().and_then(|config| match &config.buffer {
+                ScanoutBuffer::Swapchain(slot) => Some(slot),
+                _ => None,
+            }) else {
+                continue;
+            };
+
+            self.swapchain.submitted(slot);
+            if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+                output_layer_swapchain.submitted(slot);
+            }
+        }
     }
 
     fn handle_flip(
@@ -2922,8 +3222,7 @@ where
             return Ok(CursorRepositionOutcome::Unavailable);
         };
 
-        let (current_size, _output_scale, output_transform) = match (&self.output_mode_source).try_into()
-        {
+        let (current_size, _output_scale, output_transform) = match (&self.output_mode_source).try_into() {
             Ok(mode) => mode,
             // No current mode (output disabling); the full path handles it.
             Err(_) => return Ok(CursorRepositionOutcome::Unavailable),
@@ -3038,18 +3337,18 @@ where
         FramePipelineDiagnostics {
             commit_pending: self.pending_frame.is_some(),
             frame_queued: self.queued_frame.is_some(),
-            primary_in_fence_signaled: pending_primary_sync
-                .and_then(|(_, fd)| fd.as_deref())
-                .map(|fd| {
-                    let mut poll_fd =
-                        [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
-                    rustix::event::poll(
-                        &mut poll_fd,
-                        Some(&rustix::time::Timespec { tv_sec: 0, tv_nsec: 0 }),
-                    )
-                    .ok()
-                    .is_some_and(|ready| ready > 0)
-                }),
+            primary_in_fence_signaled: pending_primary_sync.and_then(|(_, fd)| fd.as_deref()).map(|fd| {
+                let mut poll_fd = [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
+                rustix::event::poll(
+                    &mut poll_fd,
+                    Some(&rustix::time::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                )
+                .ok()
+                .is_some_and(|ready| ready > 0)
+            }),
         }
     }
 
@@ -3074,6 +3373,9 @@ where
     /// Reset the underlying buffers
     pub fn reset_buffers(&mut self) {
         self.swapchain.reset_buffers();
+        if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+            output_layer_swapchain.reset_buffers();
+        }
     }
 
     /// Take the latest DRM out-fence generated by a successful atomic commit, if any.
@@ -3087,6 +3389,9 @@ where
     /// modify the damage for each surface.
     pub fn reset_buffer_ages(&mut self) {
         self.swapchain.reset_buffer_ages();
+        if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+            output_layer_swapchain.reset_buffer_ages();
+        }
     }
 
     /// Returns the underlying [`crtc`] of this surface
@@ -3244,6 +3549,7 @@ where
         .map_err(|(_, err)| err)?;
 
         self.swapchain = swapchain;
+        self.output_layer_swapchain = None;
         self.primary_is_opaque = is_oapque;
 
         Ok(())
@@ -3257,6 +3563,7 @@ where
         }
 
         self.damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
+        self.output_layer_damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         self.output_mode_source = output_mode_source;
     }
 
@@ -3460,6 +3767,143 @@ where
         }
 
         res
+    }
+
+    fn try_assign_output_layer_plane(
+        &mut self,
+        frame_state: &mut CompositorFrameState<A, F>,
+        current_size: Size<i32, Physical>,
+    ) -> Result<PlaneAssignmentInfo, Option<RenderingReason>> {
+        if self.output_layer_swapchain.is_none() {
+            return Err(None);
+        }
+
+        let candidate_planes = self
+            .planes
+            .overlay
+            .iter()
+            .filter(|plane| !frame_state.is_assigned(plane.handle))
+            .filter(|plane| self.output_layer_plane_is_above_primary(plane))
+            .filter(|plane| plane.has_alpha_property)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for plane in candidate_planes {
+            let Some(plane_claim) = self.surface.claim_plane(plane.handle) else {
+                continue;
+            };
+
+            let slot = {
+                let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() else {
+                    return Err(None);
+                };
+                match output_layer_swapchain.acquire() {
+                    Ok(Some(slot)) => slot,
+                    Ok(None) => return Err(Some(RenderingReason::ScanoutFailed)),
+                    Err(err) => {
+                        trace!(
+                            ?err,
+                            "failed to acquire output-layer swapchain slot for overlay plane"
+                        );
+                        return Err(Some(RenderingReason::ScanoutFailed));
+                    }
+                }
+            };
+
+            if !has_alpha(slot.format().code) || !plane.formats.contains(&slot.format()) {
+                continue;
+            }
+
+            let dmabuf = match slot.export() {
+                Ok(dmabuf) => dmabuf,
+                Err(err) => {
+                    trace!(?err, "failed to export output-layer swapchain slot");
+                    continue;
+                }
+            };
+
+            if slot
+                .userdata()
+                .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>()
+                .is_none()
+            {
+                let fb_buffer = match self.framebuffer_exporter.add_framebuffer(
+                    self.surface.device_fd(),
+                    ExportBuffer::Allocator(&slot),
+                    false,
+                ) {
+                    Ok(Some(fb_buffer)) => fb_buffer,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        trace!(?err, "failed to export output-layer framebuffer");
+                        continue;
+                    }
+                };
+                slot.userdata().insert_if_missing_threadsafe(|| {
+                    CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb_buffer))
+                });
+            }
+
+            let fb = slot
+                .userdata()
+                .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>()
+                .unwrap()
+                .clone();
+
+            let config = PlaneConfig {
+                properties: PlaneProperties {
+                    src: Rectangle::from_size(dmabuf.size()).to_f64(),
+                    dst: Rectangle::from_size(current_size),
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    format: slot.format(),
+                },
+                buffer: DrmScanoutBuffer {
+                    buffer: ScanoutBuffer::Swapchain(Arc::new(slot)),
+                    fb,
+                },
+                damage_clips: None,
+                plane_claim,
+                sync: None,
+            };
+
+            let plane_state = PlaneState {
+                skip: false,
+                needs_test: true,
+                element_state: Some(PlaneElementState {
+                    id: self.output_layer_element_id.clone(),
+                    commit: CommitCounter::default(),
+                    z_index: 0,
+                    cursor_size: None,
+                }),
+                config: Some(config),
+            };
+
+            if frame_state
+                .test_state(
+                    &self.surface,
+                    self.supports_fencing,
+                    plane.handle,
+                    plane_state,
+                    false,
+                )
+                .is_ok()
+            {
+                let mut assignment: PlaneAssignmentInfo = (&plane).into();
+                assignment.is_underlay = false;
+                return Ok(assignment);
+            }
+        }
+
+        Err(Some(RenderingReason::ScanoutFailed))
+    }
+
+    fn output_layer_plane_is_above_primary(&self, plane: &PlaneInfo) -> bool {
+        match (self.surface.plane_info().zpos, plane.zpos) {
+            (Some(primary_zpos), Some(plane_zpos)) => plane_zpos > primary_zpos,
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4319,8 +4763,7 @@ where
                 return Err(None);
             }
 
-            let mut assignment =
-                self.try_assign_plane(element, element_config, plane, scale, frame_state)?;
+            let mut assignment = self.try_assign_plane(element, element_config, plane, scale, frame_state)?;
             assignment.is_underlay = is_underlay;
             Ok(assignment)
         };
@@ -4904,9 +5347,7 @@ impl<
             | x @ FrameError::NoFramebuffer => SwapBuffersError::ContextLost(Box::new(x)),
             x @ FrameError::NoFreeSlotsError
             | x @ FrameError::EmptyFrame
-            | x @ FrameError::PrimaryPlaneRenderDenied => {
-                SwapBuffersError::TemporaryFailure(Box::new(x))
-            }
+            | x @ FrameError::PrimaryPlaneRenderDenied => SwapBuffersError::TemporaryFailure(Box::new(x)),
             FrameError::DrmError(err) => err.into(),
             FrameError::Allocator(err) => SwapBuffersError::ContextLost(Box::new(err)),
             FrameError::AsDmabufError(err) => SwapBuffersError::ContextLost(Box::new(err)),

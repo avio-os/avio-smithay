@@ -64,6 +64,16 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     pub overlay_elements: Vec<&'a E>,
     /// Selected overlay/underlay planes in the same order as `overlay_elements`.
     pub overlay_plane_assignments: Vec<PlaneAssignmentInfo>,
+    /// Selected compositor-owned output layer plane when scene content was
+    /// rendered above a direct-scanout primary element.
+    pub output_layer_plane_assignment: Option<PlaneAssignmentInfo>,
+    /// Scene elements rendered into the compositor-owned output layer.
+    pub output_layer_elements: Vec<&'a E>,
+    /// Number of scene elements rendered into the compositor-owned output layer.
+    pub output_layer_element_count: usize,
+    /// True when the output layer performed GPU rendering in this frame.
+    pub output_layer_rendered_this_frame: bool,
+    pub(super) output_layer_exported_sync_file: Option<Arc<OwnedFd>>,
     /// Optional cursor plane element
     ///
     /// If set always above all other elements
@@ -85,10 +95,25 @@ impl<B: Buffer, F: Framebuffer, E> RenderFrameResult<'_, B, F, E> {
     /// commit.
     pub fn needs_sync(&self) -> bool {
         if let PrimaryPlaneElement::Swapchain(ref element) = self.primary_element {
-            !self.supports_fencing || element.exported_sync_file.is_none()
-        } else {
-            false
+            if !self.supports_fencing || element.exported_sync_file.is_none() {
+                return true;
+            }
         }
+        self.output_layer_rendered_this_frame
+            && (!self.supports_fencing || self.output_layer_exported_sync_file.is_none())
+    }
+
+    /// Clone the compositor-owned output-layer render-completion fence when it
+    /// was produced by the current `render_frame` call.
+    #[inline]
+    pub fn export_current_output_layer_render_sync_file(&self) -> Option<OwnedFd> {
+        self.output_layer_rendered_this_frame
+            .then(|| {
+                self.output_layer_exported_sync_file
+                    .as_ref()
+                    .and_then(|sync_file| sync_file.try_clone().ok())
+            })
+            .flatten()
     }
 }
 
@@ -242,13 +267,24 @@ where
         #[allow(clippy::mutable_key_type)]
         let filter_ids: HashSet<Id> = filter.into_iter().collect();
 
-        let mut elements: Vec<FrameResultDamageElement<'_, '_, E, B>> =
-            Vec::with_capacity(usize::from(self.cursor_element.is_some()) + self.overlay_elements.len() + 1);
+        let mut elements: Vec<FrameResultDamageElement<'_, '_, E, B>> = Vec::with_capacity(
+            usize::from(self.cursor_element.is_some())
+                + self.output_layer_elements.len()
+                + self.overlay_elements.len()
+                + 1,
+        );
         if let Some(cursor) = self.cursor_element {
             if !filter_ids.contains(cursor.id()) {
                 elements.push(FrameResultDamageElement::Element(cursor));
             }
         }
+
+        elements.extend(
+            self.output_layer_elements
+                .iter()
+                .filter(|e| !filter_ids.contains(e.id()))
+                .map(|e| FrameResultDamageElement::Element(*e)),
+        );
 
         elements.extend(
             self.overlay_elements
@@ -317,14 +353,27 @@ where
 
         let mut opaque_regions: Vec<Rectangle<i32, Physical>> = Vec::new();
 
-        let mut elements_to_render: Vec<&'a E> =
-            Vec::with_capacity(usize::from(self.cursor_element.is_some()) + self.overlay_elements.len() + 1);
+        let mut elements_to_render: Vec<&'a E> = Vec::with_capacity(
+            usize::from(self.cursor_element.is_some())
+                + self.output_layer_elements.len()
+                + self.overlay_elements.len()
+                + 1,
+        );
 
         if let Some(cursor_element) = self.cursor_element.as_ref() {
             if !filter_ids.contains(cursor_element.id()) {
                 elements_to_render.push(*cursor_element);
                 opaque_regions.extend(cursor_element.opaque_regions(scale));
             }
+        }
+
+        for element in self
+            .output_layer_elements
+            .iter()
+            .filter(|e| !filter_ids.contains(e.id()))
+        {
+            elements_to_render.push(element);
+            opaque_regions.extend(element.opaque_regions(scale));
         }
 
         for element in self
@@ -454,6 +503,15 @@ impl<B: Buffer + std::fmt::Debug, F: Framebuffer + std::fmt::Debug, E: std::fmt:
             .field("primary_plane_assignment", &self.primary_plane_assignment)
             .field("overlay_elements", &self.overlay_elements)
             .field("overlay_plane_assignments", &self.overlay_plane_assignments)
+            .field(
+                "output_layer_plane_assignment",
+                &self.output_layer_plane_assignment,
+            )
+            .field("output_layer_elements", &self.output_layer_elements)
+            .field(
+                "output_layer_rendered_this_frame",
+                &self.output_layer_rendered_this_frame,
+            )
             .field("cursor_element", &self.cursor_element)
             .field("cursor_plane_assignment", &self.cursor_plane_assignment)
             .finish()
@@ -646,6 +704,11 @@ mod tests {
             primary_plane_assignment: None,
             overlay_elements: Vec::new(),
             overlay_plane_assignments: Vec::new(),
+            output_layer_plane_assignment: None,
+            output_layer_elements: Vec::new(),
+            output_layer_element_count: 0,
+            output_layer_rendered_this_frame: false,
+            output_layer_exported_sync_file: None,
             cursor_element: None,
             cursor_plane_assignment: None,
             primary_plane_element_id: Id::new(),

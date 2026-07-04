@@ -143,6 +143,8 @@ pub struct PlaneInfo {
     pub type_: PlaneType,
     /// z-position of the plane if available
     pub zpos: Option<i32>,
+    /// Whether the plane exposes a constant alpha property.
+    pub has_alpha_property: bool,
     /// Formats supported by this plane
     pub formats: FormatSet,
     /// Recommended plane size in order of preference
@@ -186,12 +188,14 @@ fn planes(
         if resources.filter_crtcs(filter).contains(crtc) {
             let zpos = plane_zpos(dev, plane).ok().flatten();
             let type_ = plane_type(dev, plane)?;
+            let has_alpha_property = plane_has_property(dev, plane, "alpha").unwrap_or(false);
             let formats = plane_formats(dev, plane)?;
             let size_hints = plane_size_hints(dev, plane)?;
             let plane_info = PlaneInfo {
                 handle: plane,
                 type_,
                 zpos,
+                has_alpha_property,
                 formats,
                 size_hints,
             };

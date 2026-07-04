@@ -337,11 +337,12 @@ where
                 let surface = self.device.create_surface(crtc, mode, connectors)?;
 
                 if implicit_modifiers {
-                    DrmCompositor::<A, F, U, G>::new(
+                    DrmCompositor::<A, F, U, G>::new_with_output_layer_allocator(
                         output_mode_source.clone(),
                         surface,
                         planes.clone(),
                         self.allocator.clone(),
+                        Some(self.allocator.clone()),
                         self.exporter.clone(),
                         self.color_formats.iter().copied(),
                         self.renderer_formats
@@ -352,11 +353,12 @@ where
                         self.gbm.clone(),
                     )
                 } else {
-                    DrmCompositor::<A, F, U, G>::new(
+                    DrmCompositor::<A, F, U, G>::new_with_output_layer_allocator(
                         output_mode_source.clone(),
                         surface,
                         planes.clone(),
                         self.allocator.clone(),
+                        Some(self.allocator.clone()),
                         self.exporter.clone(),
                         self.color_formats.iter().copied(),
                         self.renderer_formats.iter().copied(),
