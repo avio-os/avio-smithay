@@ -18,8 +18,22 @@ use crate::{
     output::OutputNoMode,
     utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform},
 };
+use drm::control::{plane, PlaneType};
 
 use super::{DrmScanoutBuffer, ScanoutBuffer};
+
+/// DRM plane selected for a rendered element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneAssignmentInfo {
+    /// DRM plane handle.
+    pub handle: plane::Handle,
+    /// Kernel-reported plane type.
+    pub type_: PlaneType,
+    /// Optional plane z-position when exposed by the driver.
+    pub zpos: Option<i32>,
+    /// True when the selected overlay plane is below the primary plane.
+    pub is_underlay: bool,
+}
 
 /// Result for [`DrmCompositor::render_frame`][super::DrmCompositor::render_frame]
 ///
@@ -44,12 +58,18 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     pub states: RenderElementStates,
     /// Element for the primary plane
     pub primary_element: PrimaryPlaneElement<'a, B, F, E>,
+    /// Selected primary scanout plane when `primary_element` is a direct element.
+    pub primary_plane_assignment: Option<PlaneAssignmentInfo>,
     /// Overlay elements in front to back order
     pub overlay_elements: Vec<&'a E>,
+    /// Selected overlay/underlay planes in the same order as `overlay_elements`.
+    pub overlay_plane_assignments: Vec<PlaneAssignmentInfo>,
     /// Optional cursor plane element
     ///
     /// If set always above all other elements
     pub cursor_element: Option<&'a E>,
+    /// Selected cursor plane when `cursor_element` is present.
+    pub cursor_plane_assignment: Option<PlaneAssignmentInfo>,
 
     pub(super) primary_plane_element_id: Id,
     pub(super) supports_fencing: bool,
@@ -431,8 +451,11 @@ impl<B: Buffer + std::fmt::Debug, F: Framebuffer + std::fmt::Debug, E: std::fmt:
             .field("is_empty", &self.is_empty)
             .field("states", &self.states)
             .field("primary_element", &self.primary_element)
+            .field("primary_plane_assignment", &self.primary_plane_assignment)
             .field("overlay_elements", &self.overlay_elements)
+            .field("overlay_plane_assignments", &self.overlay_plane_assignments)
             .field("cursor_element", &self.cursor_element)
+            .field("cursor_plane_assignment", &self.cursor_plane_assignment)
             .finish()
     }
 }
@@ -620,8 +643,11 @@ mod tests {
                 exported_sync_file,
                 true,
             )),
+            primary_plane_assignment: None,
             overlay_elements: Vec::new(),
+            overlay_plane_assignments: Vec::new(),
             cursor_element: None,
+            cursor_plane_assignment: None,
             primary_plane_element_id: Id::new(),
             supports_fencing,
         }

@@ -134,7 +134,7 @@ use std::{
 };
 
 use drm::{
-    control::{connector, crtc, framebuffer, plane, Mode, PlaneType},
+    control::{connector, crtc, framebuffer, plane, Mode},
     Device, DriverCapability,
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
@@ -1112,17 +1112,16 @@ impl OverlayPlaneElementIds {
     }
 }
 
-struct PlaneAssignment {
-    handle: plane::Handle,
-    type_: PlaneType,
-}
+type PlaneAssignment = PlaneAssignmentInfo;
 
-impl From<&PlaneInfo> for PlaneAssignment {
+impl From<&PlaneInfo> for PlaneAssignmentInfo {
     #[inline]
     fn from(value: &PlaneInfo) -> Self {
-        PlaneAssignment {
+        PlaneAssignmentInfo {
             handle: value.handle,
             type_: value.type_,
+            zpos: value.zpos,
+            is_underlay: false,
         }
     }
 }
@@ -2136,10 +2135,12 @@ where
         let mut primary_plane_elements: Vec<&'a E> = Vec::with_capacity(elements.len());
         // This will hold the element per plane that has been assigned to a overlay/underlay
         // plane for direct scan-out
-        let mut overlay_plane_elements: IndexMap<plane::Handle, &'a E> =
+        let mut primary_plane_assignment: Option<PlaneAssignmentInfo> = None;
+        let mut overlay_plane_elements: IndexMap<plane::Handle, (&'a E, PlaneAssignmentInfo)> =
             IndexMap::with_capacity(self.planes.overlay.len());
         // This will hold the element assigned on the cursor plane if any
         let mut cursor_plane_element: Option<&'a E> = None;
+        let mut cursor_plane_assignment: Option<PlaneAssignmentInfo> = None;
 
         let output_elements_len = output_elements.len();
         for (index, (element, element_geometry, element_visible_area, element_is_opaque)) in
@@ -2194,10 +2195,19 @@ where
                 Ok(direct_scan_out_plane) => {
                     match direct_scan_out_plane.type_ {
                         drm::control::PlaneType::Overlay => {
-                            overlay_plane_elements.insert(direct_scan_out_plane.handle, element);
+                            overlay_plane_elements.insert(
+                                direct_scan_out_plane.handle,
+                                (element, direct_scan_out_plane),
+                            );
                         }
-                        drm::control::PlaneType::Primary => primary_plane_scanout_element = Some(element),
-                        drm::control::PlaneType::Cursor => cursor_plane_element = Some(element),
+                        drm::control::PlaneType::Primary => {
+                            primary_plane_scanout_element = Some(element);
+                            primary_plane_assignment = Some(direct_scan_out_plane);
+                        }
+                        drm::control::PlaneType::Cursor => {
+                            cursor_plane_element = Some(element);
+                            cursor_plane_assignment = Some(direct_scan_out_plane);
+                        }
                     }
 
                     if let Some(state) = render_element_states.states.get_mut(element_id) {
@@ -2272,11 +2282,15 @@ where
                 // Check if the element we are potentially going to remove is
                 // on the primary plane, cursor plane or an overlay plane
                 let element = if *plane == self.surface.plane() {
+                    primary_plane_assignment = None;
                     primary_plane_scanout_element.take()
                 } else if self.planes.cursor.iter().any(|p| *plane == p.handle) {
+                    cursor_plane_assignment = None;
                     cursor_plane_element.take()
                 } else {
-                    overlay_plane_elements.shift_remove(plane)
+                    overlay_plane_elements
+                        .shift_remove(plane)
+                        .map(|(element, _assignment)| element)
                 };
 
                 // If we have no element on this plane skip the rest
@@ -2386,31 +2400,42 @@ where
             // commit -> unlikely but possible
             // So we use an Id per plane for as long as we have the same element
             // on that plane.
-            let overlay_plane_elements = overlay_plane_elements.iter().filter_map(|(p, element)| {
-                let id = self
-                    .overlay_plane_element_ids
-                    .plane_id_for_element_id(p, element.id());
-
-                let plane_z_pos = self
-                    .planes
-                    .overlay
+            let overlay_plane_elements =
+                overlay_plane_elements
                     .iter()
-                    .find_map(|info| {
-                        if info.handle == *p {
-                            Some(info.zpos.unwrap_or_default())
+                    .filter_map(|(p, (element, _assignment))| {
+                        let id = self
+                            .overlay_plane_element_ids
+                            .plane_id_for_element_id(p, element.id());
+
+                        let plane_z_pos = self
+                            .planes
+                            .overlay
+                            .iter()
+                            .find_map(|info| {
+                                if info.handle == *p {
+                                    Some(info.zpos.unwrap_or_default())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        let is_underlay =
+                            plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
+                        if is_underlay {
+                            Some(
+                                HolepunchRenderElement::from_render_element(
+                                    id,
+                                    element,
+                                    output_scale,
+                                )
+                                .into(),
+                            )
                         } else {
-                            None
+                            OverlayPlaneElement::from_render_element(id, *element, output_scale)
+                                .map(DrmRenderElements::from)
                         }
-                    })
-                    .unwrap_or_default();
-                let is_underlay = plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
-                if is_underlay {
-                    Some(HolepunchRenderElement::from_render_element(id, element, output_scale).into())
-                } else {
-                    OverlayPlaneElement::from_render_element(id, *element, output_scale)
-                        .map(DrmRenderElements::from)
-                }
-            });
+                    });
             let primary_plane_wayland_buffers = primary_plane_elements
                 .iter()
                 .filter_map(|element| match element.underlying_storage(renderer) {
@@ -2630,11 +2655,16 @@ where
             },
             frame: next_frame_state,
         };
+        let (overlay_elements, overlay_plane_assignments): (Vec<_>, Vec<_>) =
+            overlay_plane_elements.into_values().unzip();
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
             primary_element: primary_plane_element,
-            overlay_elements: overlay_plane_elements.into_values().collect(),
+            primary_plane_assignment,
+            overlay_elements,
+            overlay_plane_assignments,
             cursor_element: cursor_plane_element,
+            cursor_plane_assignment,
             states: render_element_states,
             primary_plane_element_id: self.primary_plane_element_id.clone(),
             supports_fencing: self.supports_fencing,
@@ -4289,7 +4319,10 @@ where
                 return Err(None);
             }
 
-            self.try_assign_plane(element, element_config, plane, scale, frame_state)
+            let mut assignment =
+                self.try_assign_plane(element, element_config, plane, scale, frame_state)?;
+            assignment.is_underlay = is_underlay;
+            Ok(assignment)
         };
 
         // First try to assign the element to a compatible plane, this can save us
