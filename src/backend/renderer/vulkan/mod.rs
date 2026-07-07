@@ -118,12 +118,12 @@
 
 mod blit;
 mod descriptor;
-mod kawase;
 mod device;
 mod dmabuf;
 mod error;
 mod format;
 mod frame;
+mod kawase;
 mod pipeline;
 mod readback;
 mod sync;
@@ -132,8 +132,8 @@ mod texture;
 mod upload;
 
 pub use blit::VulkanBlitChainStep;
-pub use kawase::VulkanKawasePass;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
+pub use kawase::VulkanKawasePass;
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
 

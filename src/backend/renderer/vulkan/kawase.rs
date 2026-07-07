@@ -67,10 +67,7 @@ struct ResolvedKawasePass {
     constants: KawasePushConstants,
 }
 
-fn kawase_halfpixel(
-    source: Size<i32, BufferCoord>,
-    destination: Size<i32, BufferCoord>,
-) -> [f32; 2] {
+fn kawase_halfpixel(source: Size<i32, BufferCoord>, destination: Size<i32, BufferCoord>) -> [f32; 2] {
     // Offsets are expressed relative to the SMALLER pyramid level (KWin's
     // convention): for a downsample that is the destination, for an upsample
     // the source.
@@ -150,8 +147,8 @@ impl VulkanRenderer {
 
         let command_buffer = self.device.acquire_command_buffer()?;
         let vk_device = self.device.device_handle();
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: Command buffer belongs to this device command pool and is not currently in-flight.
         if let Err(err) = unsafe { vk_device.begin_command_buffer(command_buffer, &begin_info) } {
             let _ = self.device.discard_command_buffer(command_buffer);
@@ -192,8 +189,7 @@ impl VulkanRenderer {
                     .height(extent.height)
                     .layers(1);
                 // SAFETY: Device is valid and create info references live handles.
-                let framebuffer =
-                    unsafe { vk_device.create_framebuffer(&framebuffer_info, None) }?;
+                let framebuffer = unsafe { vk_device.create_framebuffer(&framebuffer_info, None) }?;
                 framebuffers.push(framebuffer);
 
                 let render_area = vk::Rect2D {
@@ -287,17 +283,17 @@ impl VulkanRenderer {
             .iter()
             .flat_map(|pass| [pass.source.clone(), pass.destination.clone()])
             .collect::<Vec<_>>();
-        let (_, submission_fence) = match self.device.submit_with_resources_and_fence(
-            command_buffer,
-            framebuffers,
-            retained_images,
-        ) {
-            Ok(submission) => submission,
-            Err(err) => {
-                let _ = self.device.discard_command_buffer(command_buffer);
-                return Err(err);
-            }
-        };
+        let (_, submission_fence) =
+            match self
+                .device
+                .submit_with_resources_and_fence(command_buffer, framebuffers, retained_images)
+            {
+                Ok(submission) => submission,
+                Err(err) => {
+                    let _ = self.device.discard_command_buffer(command_buffer);
+                    return Err(err);
+                }
+            };
 
         for tracked in layouts.values() {
             tracked.image.set_layout(tracked.restore_layout);
@@ -312,9 +308,7 @@ mod tests {
     use crate::{
         backend::{
             allocator::Fourcc,
-            renderer::{
-                vulkan::VulkanKawasePass, Bind, Color32F, ExportMem, Frame, Offscreen, Renderer,
-            },
+            renderer::{vulkan::VulkanKawasePass, Bind, Color32F, ExportMem, Frame, Offscreen, Renderer},
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -386,11 +380,7 @@ mod tests {
 
         let target = renderer.bind(&mut full).expect("bind for readback");
         let mapping = renderer
-            .copy_framebuffer(
-                &target,
-                Rectangle::from_size(full_size),
-                format,
-            )
+            .copy_framebuffer(&target, Rectangle::from_size(full_size), format)
             .expect("readback");
         let data = renderer.map_texture(&mapping).expect("map");
         // Sample the center pixel; a solid mid-gray must survive the round

@@ -361,10 +361,8 @@ impl Dmabuf {
             };
             // SAFETY: `plane.fd` is a live dmabuf fd and `data` matches the
             // kernel's `struct dma_buf_import_sync_file` layout.
-            unsafe {
-                rustix::ioctl::ioctl(&plane.fd, Setter::<DMA_BUF_IMPORT_SYNC_FILE, _>::new(data))
-            }
-            .map_err(std::io::Error::from)?;
+            unsafe { rustix::ioctl::ioctl(&plane.fd, Setter::<DMA_BUF_IMPORT_SYNC_FILE, _>::new(data)) }
+                .map_err(std::io::Error::from)?;
         }
         Ok(())
     }

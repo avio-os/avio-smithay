@@ -1031,33 +1031,32 @@ impl DeviceState {
                 (false, false)
             };
 
-        let (sync_file_semaphore_import, sync_file_semaphore_export) = if enabled_extensions
-            .contains(&khr::external_semaphore_fd::NAME)
-        {
-            let semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
-                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-            let mut semaphore_properties = vk::ExternalSemaphoreProperties::default();
+        let (sync_file_semaphore_import, sync_file_semaphore_export) =
+            if enabled_extensions.contains(&khr::external_semaphore_fd::NAME) {
+                let semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let mut semaphore_properties = vk::ExternalSemaphoreProperties::default();
 
-            // SAFETY: `semaphore_properties` points to valid writable memory and `semaphore_info` outlives the call.
-            unsafe {
-                instance.get_physical_device_external_semaphore_properties(
-                    physical_device.handle(),
-                    &semaphore_info,
-                    &mut semaphore_properties,
+                // SAFETY: `semaphore_properties` points to valid writable memory and `semaphore_info` outlives the call.
+                unsafe {
+                    instance.get_physical_device_external_semaphore_properties(
+                        physical_device.handle(),
+                        &semaphore_info,
+                        &mut semaphore_properties,
+                    )
+                };
+
+                (
+                    semaphore_properties
+                        .external_semaphore_features
+                        .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE),
+                    semaphore_properties
+                        .external_semaphore_features
+                        .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE),
                 )
+            } else {
+                (false, false)
             };
-
-            (
-                semaphore_properties
-                    .external_semaphore_features
-                    .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE),
-                semaphore_properties
-                    .external_semaphore_features
-                    .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE),
-            )
-        } else {
-            (false, false)
-        };
 
         DeviceCapabilities {
             timeline_semaphore: timeline.timeline_semaphore == vk::TRUE,
@@ -1206,8 +1205,8 @@ mod tests {
         let command_buffer = device
             .acquire_command_buffer()
             .expect("command buffer acquisition should succeed");
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: Command buffer and device are valid; the recording is empty.
         unsafe {
             device
@@ -1246,7 +1245,10 @@ mod tests {
         )];
         let ready = rustix::event::poll(
             &mut poll_fd,
-            Some(&rustix::time::Timespec { tv_sec: 0, tv_nsec: 0 }),
+            Some(&rustix::time::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
         )
         .expect("sync_file poll should succeed");
         assert!(
