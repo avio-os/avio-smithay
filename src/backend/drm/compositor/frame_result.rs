@@ -8,7 +8,7 @@ use crate::{
         },
         drm::Framebuffer,
         renderer::{
-            damage::OutputDamageTracker,
+            damage::{OutputDamageSummary, OutputDamageTracker},
             element::{Element, Id, RenderElement, RenderElementStates},
             sync::SyncPoint,
             utils::{CommitCounter, DamageSet, DamageSnapshot, OpaqueRegions},
@@ -73,6 +73,16 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     pub output_layer_element_count: usize,
     /// True when the output layer performed GPU rendering in this frame.
     pub output_layer_rendered_this_frame: bool,
+    /// Number of damaged rectangles rendered into the compositor-owned output
+    /// layer this frame.
+    pub output_layer_damage_rect_count: usize,
+    /// Total damaged pixel area rendered into the compositor-owned output layer
+    /// this frame.
+    pub output_layer_damage_area: u64,
+    /// Breakdown from the output-layer damage tracker before Avio sees only the
+    /// collapsed aggregate damage.
+    pub output_layer_damage_summary: OutputDamageSummary,
+    pub(super) output_layer_render_sync: Option<SyncPoint>,
     pub(super) output_layer_exported_sync_file: Option<Arc<OwnedFd>>,
     /// Optional cursor plane element
     ///
@@ -113,6 +123,15 @@ impl<B: Buffer, F: Framebuffer, E> RenderFrameResult<'_, B, F, E> {
                     .as_ref()
                     .and_then(|sync_file| sync_file.try_clone().ok())
             })
+            .flatten()
+    }
+
+    /// Clone the compositor-owned output-layer render-completion sync point
+    /// when it was produced by the current `render_frame` call.
+    #[inline]
+    pub fn current_output_layer_render_sync(&self) -> Option<SyncPoint> {
+        self.output_layer_rendered_this_frame
+            .then(|| self.output_layer_render_sync.clone())
             .flatten()
     }
 }
@@ -512,6 +531,7 @@ impl<B: Buffer + std::fmt::Debug, F: Framebuffer + std::fmt::Debug, E: std::fmt:
                 "output_layer_rendered_this_frame",
                 &self.output_layer_rendered_this_frame,
             )
+            .field("output_layer_damage_summary", &self.output_layer_damage_summary)
             .field("cursor_element", &self.cursor_element)
             .field("cursor_plane_assignment", &self.cursor_plane_assignment)
             .finish()
@@ -708,6 +728,10 @@ mod tests {
             output_layer_elements: Vec::new(),
             output_layer_element_count: 0,
             output_layer_rendered_this_frame: false,
+            output_layer_damage_rect_count: 0,
+            output_layer_damage_area: 0,
+            output_layer_damage_summary: OutputDamageSummary::default(),
+            output_layer_render_sync: None,
             output_layer_exported_sync_file: None,
             cursor_element: None,
             cursor_plane_assignment: None,

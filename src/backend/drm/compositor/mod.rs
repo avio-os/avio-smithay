@@ -165,7 +165,9 @@ use crate::{
         drm::{plane_has_property, DrmError, PlaneDamageClips},
         renderer::{
             buffer_y_inverted,
-            damage::{Error as OutputDamageTrackerError, MaybeDeviceLost, OutputDamageTracker},
+            damage::{
+                Error as OutputDamageTrackerError, MaybeDeviceLost, OutputDamageSummary, OutputDamageTracker,
+            },
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
                 RenderElementStates, RenderingReason, UnderlyingStorage,
@@ -2522,6 +2524,10 @@ where
 
         let mut output_layer_rendered_this_frame = false;
         let mut output_layer_exported_sync_file: Option<Arc<OwnedFd>> = None;
+        let mut output_layer_damage_rect_count = 0usize;
+        let mut output_layer_damage_area = 0u64;
+        let mut output_layer_damage_summary = OutputDamageSummary::default();
+        let mut output_layer_render_sync: Option<SyncPoint> = None;
         if let Some(layer_plane) = output_layer_plane {
             let output_layer_render = next_frame_state
                 .plane_buffer(layer_plane)
@@ -2573,6 +2579,7 @@ where
 
                 match render_res {
                     Ok(render_output_result) => {
+                        output_layer_damage_summary = render_output_result.damage_summary;
                         let shared_render_sync_file = if render_output_result.damage.is_some() {
                             output_layer_rendered_this_frame = true;
                             if self.supports_fencing {
@@ -2612,6 +2619,12 @@ where
                         }
 
                         if let Some(render_damage) = render_output_result.damage {
+                            output_layer_damage_rect_count = render_damage.len();
+                            output_layer_damage_area = render_damage
+                                .iter()
+                                .map(|d| (d.size.w.max(0) as u64) * (d.size.h.max(0) as u64))
+                                .sum();
+                            output_layer_render_sync = Some(render_output_result.sync.clone());
                             let plane_state = next_frame_state.plane_state_mut(layer_plane).unwrap();
                             let config = plane_state.config.as_mut().unwrap();
                             self.output_layer_damage_bag.add(render_damage.iter().map(|d| {
@@ -2964,6 +2977,10 @@ where
             output_layer_element_count: output_layer_elements.len(),
             output_layer_elements,
             output_layer_rendered_this_frame,
+            output_layer_damage_rect_count,
+            output_layer_damage_area,
+            output_layer_damage_summary,
+            output_layer_render_sync,
             output_layer_exported_sync_file,
             cursor_element: cursor_plane_element,
             cursor_plane_assignment,

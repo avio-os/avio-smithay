@@ -109,7 +109,7 @@ use crate::{
 };
 
 use super::{
-    element::{Element, Id, RenderElement, RenderElementState, RenderElementStates},
+    element::{Element, Id, Kind, RenderElement, RenderElementState, RenderElementStates},
     sync::SyncPoint,
     utils::CommitCounter,
     Color32F,
@@ -188,6 +188,7 @@ pub struct OutputDamageTracker {
     mode: OutputModeSource,
     last_state: RendererState,
     damage_shaper: DamageShaper,
+    damage_summary: OutputDamageSummary,
     damage: Vec<Rectangle<i32, Physical>>,
     element_damage: Vec<Rectangle<i32, Physical>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
@@ -244,18 +245,88 @@ pub struct RenderOutputResult<'a> {
     pub sync: SyncPoint,
     /// Holds the damage from the rendering operation
     pub damage: Option<&'a Vec<Rectangle<i32, Physical>>>,
+    /// Explains why the damage tracker decided this output needed repainting.
+    pub damage_summary: OutputDamageSummary,
     /// Holds the render element states
     pub states: RenderElementStates,
 }
 
+/// Compact attribution for the damage produced by one output damage-tracker pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutputDamageSummary {
+    /// Buffer age supplied by the target swapchain.
+    pub buffer_age: usize,
+    /// Element-reported damage before buffer-age expansion.
+    pub element_damage_rect_count: usize,
+    /// Total area of element-reported damage before buffer-age expansion.
+    pub element_damage_area: u64,
+    /// Number of elements that reported direct buffer/content damage.
+    pub element_damage_element_count: usize,
+    /// Element index with the largest direct buffer/content damage contribution.
+    pub top_element_damage_index: Option<usize>,
+    /// Kind of the element with the largest direct buffer/content damage contribution.
+    pub top_element_damage_kind: Option<Kind>,
+    /// Rectangle count reported by the element with the largest direct buffer/content damage contribution.
+    pub top_element_damage_rect_count: usize,
+    /// Area reported by the element with the largest direct buffer/content damage contribution.
+    pub top_element_damage_area: u64,
+    /// Current geometry area of the element with the largest direct buffer/content damage contribution.
+    pub top_element_damage_geometry_area: u64,
+    /// Damage generated because an element's geometry, source, transform, alpha,
+    /// or z-order changed relative to the previous rendered output-layer frame.
+    pub element_state_change_count: usize,
+    /// Total area damaged by element geometry, source, transform, alpha, or z-order changes.
+    pub element_state_change_damage_area: u64,
+    /// Element index with the largest state-change damage contribution.
+    pub top_element_state_change_index: Option<usize>,
+    /// Kind of the element with the largest state-change damage contribution.
+    pub top_element_state_change_kind: Option<Kind>,
+    /// Area damaged by the largest element state-change contribution.
+    pub top_element_state_change_area: u64,
+    /// Current geometry area of the element with the largest state-change contribution.
+    pub top_element_state_change_geometry_area: u64,
+    /// Damage generated because an element from the previous frame disappeared.
+    pub element_gone_count: usize,
+    /// Total area damaged by elements that disappeared since the previous rendered frame.
+    pub element_gone_damage_area: u64,
+    /// Damage generated because regions that were opaque last frame are no
+    /// longer covered by opaque content this frame.
+    pub opaque_uncovered_rect_count: usize,
+    /// Total area damaged by previously opaque regions that became uncovered.
+    pub opaque_uncovered_area: u64,
+    /// True when output size, transform, or clear color forced a full repaint.
+    pub output_state_full_damage: bool,
+    /// True when the target buffer age was unavailable or too old, forcing a
+    /// full repaint of the target buffer.
+    pub buffer_age_full_damage: bool,
+    /// Final shaped damage submitted to the renderer.
+    pub final_damage_rect_count: usize,
+    /// Total final shaped damage area submitted to the renderer.
+    pub final_damage_area: u64,
+}
+
 impl RenderOutputResult<'_> {
-    fn skipped(states: RenderElementStates) -> Self {
+    fn skipped(states: RenderElementStates, damage_summary: OutputDamageSummary) -> Self {
         Self {
             sync: SyncPoint::signaled(),
             damage: None,
+            damage_summary,
             states,
         }
     }
+}
+
+fn rect_area(rect: Rectangle<i32, Physical>) -> u64 {
+    let width = rect.size.w.max(0) as u64;
+    let height = rect.size.h.max(0) as u64;
+    width.saturating_mul(height)
+}
+
+fn rects_area(rects: &[Rectangle<i32, Physical>]) -> u64 {
+    rects
+        .iter()
+        .copied()
+        .fold(0u64, |area, rect| area.saturating_add(rect_area(rect)))
 }
 
 impl<E: std::error::Error> std::fmt::Debug for Error<E> {
@@ -282,6 +353,7 @@ impl OutputDamageTracker {
             },
             last_state: Default::default(),
             damage_shaper: Default::default(),
+            damage_summary: Default::default(),
             damage: Default::default(),
             element_damage: Default::default(),
             opaque_regions: Default::default(),
@@ -302,6 +374,7 @@ impl OutputDamageTracker {
         Self {
             mode: OutputModeSource::Auto(output.clone()),
             damage_shaper: Default::default(),
+            damage_summary: Default::default(),
             damage: Default::default(),
             element_damage: Default::default(),
             opaque_regions: Default::default(),
@@ -324,6 +397,7 @@ impl OutputDamageTracker {
             mode: output_mode_source.into(),
             span: info_span!("render_damage"),
             damage_shaper: Default::default(),
+            damage_summary: Default::default(),
             damage: Default::default(),
             element_damage: Default::default(),
             element_opaque_regions: Default::default(),
@@ -385,7 +459,7 @@ impl OutputDamageTracker {
 
         if self.damage.is_empty() {
             trace!("no damage, skipping rendering");
-            return Ok(RenderOutputResult::skipped(states));
+            return Ok(RenderOutputResult::skipped(states, self.damage_summary));
         }
 
         trace!(
@@ -477,6 +551,7 @@ impl OutputDamageTracker {
             Ok(sync) => Ok(RenderOutputResult {
                 sync,
                 damage: Some(&self.damage),
+                damage_summary: self.damage_summary,
                 states,
             }),
             Err(err) => {
@@ -546,6 +621,10 @@ impl OutputDamageTracker {
         E: Element,
     {
         self.damage.clear();
+        self.damage_summary = OutputDamageSummary {
+            buffer_age: age,
+            ..OutputDamageSummary::default()
+        };
         self.opaque_regions.clear();
         self.opaque_regions_index.clear();
 
@@ -557,7 +636,7 @@ impl OutputDamageTracker {
         let mut element_damage = std::mem::take(&mut self.element_damage);
 
         let mut element_visible_area_workhouse = std::mem::take(&mut self.element_visible_area_workhouse);
-        for element in elements.iter() {
+        for (element_index, element) in elements.iter().enumerate() {
             let element_id = element.id();
             let element_loc = element.geometry(output_scale).loc;
 
@@ -591,6 +670,7 @@ impl OutputDamageTracker {
                 continue;
             }
 
+            let element_output_damage_start = self.damage.len();
             let element_output_damage = element
                 .damage_since(
                     output_scale,
@@ -603,6 +683,27 @@ impl OutputDamageTracker {
                 })
                 .filter_map(|geo| geo.intersection(output_geo));
             self.damage.extend(element_output_damage);
+            let element_output_damage = &self.damage[element_output_damage_start..];
+            if !element_output_damage.is_empty() {
+                let element_damage_area = rects_area(element_output_damage);
+                self.damage_summary.element_damage_element_count =
+                    self.damage_summary.element_damage_element_count.saturating_add(1);
+                self.damage_summary.element_damage_rect_count = self
+                    .damage_summary
+                    .element_damage_rect_count
+                    .saturating_add(element_output_damage.len());
+                self.damage_summary.element_damage_area = self
+                    .damage_summary
+                    .element_damage_area
+                    .saturating_add(element_damage_area);
+                if element_damage_area > self.damage_summary.top_element_damage_area {
+                    self.damage_summary.top_element_damage_index = Some(element_index);
+                    self.damage_summary.top_element_damage_kind = Some(element.kind());
+                    self.damage_summary.top_element_damage_rect_count = element_output_damage.len();
+                    self.damage_summary.top_element_damage_area = element_damage_area;
+                    self.damage_summary.top_element_damage_geometry_area = rect_area(element_output_geometry);
+                }
+            }
 
             let element_opaque_regions_start_index = self.opaque_regions.len();
             let element_opaque_regions = element
@@ -647,12 +748,22 @@ impl OutputDamageTracker {
         });
 
         for (_, state) in elements_gone {
+            let gone_damage_start = self.damage.len();
             self.damage.extend(
                 state
                     .last_instances
                     .iter()
                     .filter_map(|i| i.last_geometry.intersection(output_geo)),
             );
+            let gone_damage = &self.damage[gone_damage_start..];
+            if !gone_damage.is_empty() {
+                self.damage_summary.element_gone_count =
+                    self.damage_summary.element_gone_count.saturating_add(1);
+                self.damage_summary.element_gone_damage_area = self
+                    .damage_summary
+                    .element_gone_damage_area
+                    .saturating_add(rects_area(gone_damage));
+            }
         }
 
         // if the element has been moved or it's alpha or z index changed, damage it
@@ -675,6 +786,7 @@ impl OutputDamageTracker {
                 })
                 .unwrap_or(true)
             {
+                let state_change_damage_start = self.damage.len();
                 if let Some(intersection) = element_geometry.intersection(output_geo) {
                     self.damage.push(intersection);
                 }
@@ -686,6 +798,23 @@ impl OutputDamageTracker {
                             .filter_map(|i| i.last_geometry.intersection(output_geo)),
                     );
                 }
+                let state_change_damage = &self.damage[state_change_damage_start..];
+                if !state_change_damage.is_empty() {
+                    let state_change_damage_area = rects_area(state_change_damage);
+                    self.damage_summary.element_state_change_count =
+                        self.damage_summary.element_state_change_count.saturating_add(1);
+                    self.damage_summary.element_state_change_damage_area = self
+                        .damage_summary
+                        .element_state_change_damage_area
+                        .saturating_add(state_change_damage_area);
+                    if state_change_damage_area > self.damage_summary.top_element_state_change_area {
+                        self.damage_summary.top_element_state_change_index = Some(z_index);
+                        self.damage_summary.top_element_state_change_kind = Some(element.kind());
+                        self.damage_summary.top_element_state_change_area = state_change_damage_area;
+                        self.damage_summary.top_element_state_change_geometry_area =
+                            rect_area(element_geometry);
+                    }
+                }
             }
         }
 
@@ -694,6 +823,16 @@ impl OutputDamageTracker {
         element_damage.extend_from_slice(&self.last_state.opaque_regions);
         element_damage =
             Rectangle::subtract_rects_many_in_place(element_damage, self.opaque_regions.iter().copied());
+        if !element_damage.is_empty() {
+            self.damage_summary.opaque_uncovered_rect_count = self
+                .damage_summary
+                .opaque_uncovered_rect_count
+                .saturating_add(element_damage.len());
+            self.damage_summary.opaque_uncovered_area = self
+                .damage_summary
+                .opaque_uncovered_area
+                .saturating_add(rects_area(&element_damage));
+        }
         self.damage.extend_from_slice(&element_damage);
 
         // we no longer need the element damage, return it so that we can
@@ -705,6 +844,7 @@ impl OutputDamageTracker {
             || self.last_state.clear_color != clear_color
         {
             // The output geometry or transform changed, so just damage everything
+            self.damage_summary.output_state_full_damage = true;
             trace!(
                 previous_geometry = ?self.last_state.size,
                 current_geometry = ?output_geo.size,
@@ -729,6 +869,7 @@ impl OutputDamageTracker {
             self.damage
                 .extend(self.last_state.old_damage.iter().take(age - 1).flatten().copied());
         } else {
+            self.damage_summary.buffer_age_full_damage = true;
             trace!(
                 "no old damage available, re-render everything. age: {} old_damage len: {}",
                 age,
@@ -756,6 +897,8 @@ impl OutputDamageTracker {
         });
 
         self.damage_shaper.shape_damage(&mut self.damage);
+        self.damage_summary.final_damage_rect_count = self.damage.len();
+        self.damage_summary.final_damage_area = rects_area(&self.damage);
 
         if self.damage.is_empty() {
             trace!("nothing damaged, exiting early");
