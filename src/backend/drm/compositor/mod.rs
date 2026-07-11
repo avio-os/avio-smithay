@@ -1012,6 +1012,25 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     }
 }
 
+/// Diag bisect toggle (2026-07-11 H5): CPU-wait the output-layer render and
+/// attach no IN_FENCE_FD on its overlay plane. Diagnostics only — never a
+/// shipped default; the verdict decides the permanent driver policy.
+fn output_layer_host_wait_diag() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AVIO_DIAG_OUTPUT_LAYER_HOST_WAIT").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// Diag bisect toggle (2026-07-11 H5): allocate the output-layer swapchain
+/// LINEAR instead of inheriting the primary's modifiers. Diagnostics only.
+fn output_layer_linear_diag() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AVIO_DIAG_OUTPUT_LAYER_LINEAR").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
@@ -1473,13 +1492,25 @@ where
                     };
                     let output_layer_swapchain = output_layer_allocator.take().and_then(|allocator| {
                         let mode = surface.pending_mode();
+                        // Diag bisect (2026-07-11 H5): the layer swapchain
+                        // inherits the primary's (block-linear on NVIDIA)
+                        // modifiers; the overlay plane accepts them at the
+                        // atomic TEST but the driver's overlay decode of
+                        // that layout is a corruption suspect. Forcing
+                        // LINEAR isolates it: clean output under this
+                        // toggle convicts the block-linear overlay path.
+                        let modifiers = if output_layer_linear_diag() {
+                            vec![DrmModifier::Linear]
+                        } else {
+                            swapchain.modifiers().to_vec()
+                        };
                         output_layer_format.map(|format| {
                             Swapchain::new(
                                 allocator,
                                 mode.size().0 as u32,
                                 mode.size().1 as u32,
                                 format,
-                                swapchain.modifiers().to_vec(),
+                                modifiers,
                             )
                         })
                     });
@@ -2662,7 +2693,22 @@ where
                             .ok()
                             .flatten();
                             output_layer_exported_sync_file = shared_render_sync_file.clone();
-                            config.sync = Some((render_output_result.sync.clone(), shared_render_sync_file));
+                            if output_layer_host_wait_diag() {
+                                // Diag bisect (2026-07-11 H5): the prime
+                                // suspect for persistent output-layer
+                                // corruption is the NVIDIA overlay plane's
+                                // IN_FENCE_FD wait on a pending Vulkan fence
+                                // (driver-series reports match the visual
+                                // signature). Wait on the host instead and
+                                // attach no fence, so the commit carries a
+                                // fully materialized buffer. Clean output
+                                // under this toggle convicts the driver's
+                                // overlay fence path.
+                                let _ = render_output_result.sync.wait();
+                            } else {
+                                config.sync =
+                                    Some((render_output_result.sync.clone(), shared_render_sync_file));
+                            }
                         }
                     }
                     Err(err) => {
