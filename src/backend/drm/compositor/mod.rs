@@ -1041,6 +1041,15 @@ fn output_layer_clear_red_diag() -> bool {
     })
 }
 
+/// Diag bisect toggle (2026-07-11 H5): force age-0 full repaints of the
+/// output layer with the normal transparent clear. Diagnostics only.
+fn output_layer_full_repaint_diag() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AVIO_DIAG_OUTPUT_LAYER_FULL_REPAINT").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
@@ -2616,6 +2625,13 @@ where
                 // layer dmabuf is broken regardless of content.
                 let (clear_color, age) = if output_layer_clear_red_diag() {
                     (Color32F::new(1.0, 0.0, 0.0, 1.0), 0)
+                } else if output_layer_full_repaint_diag() {
+                    // Full repaint with the normal transparent clear: solid
+                    // red proved age-0 stable, so this splits the red test's
+                    // two variables — clean here convicts the partial-repaint
+                    // damage machinery; corruption here convicts the
+                    // transparent-clear/alpha path.
+                    (Color32F::TRANSPARENT, 0)
                 } else {
                     (Color32F::TRANSPARENT, age)
                 };
