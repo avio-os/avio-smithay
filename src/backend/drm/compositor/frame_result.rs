@@ -69,6 +69,9 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     pub output_layer_plane_assignment: Option<PlaneAssignmentInfo>,
     /// Scene elements rendered into the compositor-owned output layer.
     pub output_layer_elements: Vec<&'a E>,
+    /// Original front-to-back scene index of the primary element within the
+    /// output-layer element list. `None` means the primary is behind it.
+    pub output_layer_primary_index: Option<usize>,
     /// Number of scene elements rendered into the compositor-owned output layer.
     pub output_layer_element_count: usize,
     /// True when the output layer performed GPU rendering in this frame.
@@ -93,9 +96,18 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
 
     pub(super) primary_plane_element_id: Id,
     pub(super) supports_fencing: bool,
+    pub(super) replaces_unpresented_render: bool,
 }
 
 impl<B: Buffer, F: Framebuffer, E> RenderFrameResult<'_, B, F, E> {
+    /// Whether this render replaced a prepared or queued frame that had not
+    /// reached a successful presentation. Such replacement resets buffer ages
+    /// so damage history cannot cross the missing frame.
+    #[inline]
+    pub fn replaces_unpresented_render(&self) -> bool {
+        self.replaces_unpresented_render
+    }
+
     /// Returns whether scan-out submission may need a host-side wait fallback.
     ///
     /// When this returns `false`, the composited primary plane can be synchronized to KMS
@@ -268,6 +280,59 @@ pub enum BlitFrameResultError<R: std::error::Error, E: std::error::Error> {
     Export(E),
 }
 
+fn render_frame_result_elements<R, E>(
+    renderer: &mut R,
+    framebuffer: &mut R::Framebuffer<'_>,
+    elements: &[&E],
+    damage: &[Rectangle<i32, Physical>],
+    size: Size<i32, Physical>,
+    transform: Transform,
+    scale: Scale<f64>,
+) -> Result<Option<SyncPoint>, R::Error>
+where
+    R: Renderer,
+    E: Element + RenderElement<R>,
+{
+    if elements.is_empty() {
+        return Ok(None);
+    }
+
+    let mut frame = renderer.render(framebuffer, size, transform)?;
+    for element in elements.iter().rev() {
+        let src = element.src();
+        let dst = element.geometry(scale);
+        let element_damage = damage
+            .iter()
+            .filter_map(|damage| {
+                damage.intersection(dst).map(|mut damage| {
+                    damage.loc -= dst.loc;
+                    damage
+                })
+            })
+            .collect::<Vec<_>>();
+        if element_damage.is_empty() {
+            continue;
+        }
+
+        tracing::trace!("drawing frame element with damage: {:#?}", element_damage);
+        element.draw(&mut frame, src, dst, &element_damage, &[])?;
+    }
+
+    frame.finish().map(Some)
+}
+
+fn extend_global_opaque_regions<E: Element>(
+    opaque_regions: &mut Vec<Rectangle<i32, Physical>>,
+    element: &E,
+    scale: Scale<f64>,
+) {
+    let location = element.geometry(scale).loc;
+    opaque_regions.extend(element.opaque_regions(scale).into_iter().map(|mut region| {
+        region.loc += location;
+        region
+    }));
+}
+
 impl<B, F, E> RenderFrameResult<'_, B, F, E>
 where
     B: Buffer,
@@ -298,20 +363,6 @@ where
             }
         }
 
-        elements.extend(
-            self.output_layer_elements
-                .iter()
-                .filter(|e| !filter_ids.contains(e.id()))
-                .map(|e| FrameResultDamageElement::Element(*e)),
-        );
-
-        elements.extend(
-            self.overlay_elements
-                .iter()
-                .filter(|e| !filter_ids.contains(e.id()))
-                .map(|e| FrameResultDamageElement::Element(*e)),
-        );
-
         let primary_render_element = match &self.primary_element {
             PrimaryPlaneElement::Swapchain(PrimarySwapchainElement {
                 slot,
@@ -330,7 +381,29 @@ where
             PrimaryPlaneElement::Element(e) => FrameResultDamageElement::Element(*e),
         };
 
-        elements.push(primary_render_element);
+        let mut primary_render_element = Some(primary_render_element);
+        for (index, element) in self.output_layer_elements.iter().enumerate() {
+            if self.output_layer_primary_index == Some(index) {
+                elements.push(primary_render_element.take().unwrap());
+            }
+            if !filter_ids.contains(element.id()) {
+                elements.push(FrameResultDamageElement::Element(*element));
+            }
+        }
+        if self.output_layer_primary_index.is_some() && primary_render_element.is_some() {
+            elements.push(primary_render_element.take().unwrap());
+        }
+
+        elements.extend(
+            self.overlay_elements
+                .iter()
+                .filter(|e| !filter_ids.contains(e.id()))
+                .map(|e| FrameResultDamageElement::Element(*e)),
+        );
+
+        if let Some(primary_render_element) = primary_render_element {
+            elements.push(primary_render_element);
+        }
 
         damage_tracker.damage_output(age, &elements)
     }
@@ -382,17 +455,16 @@ where
         if let Some(cursor_element) = self.cursor_element.as_ref() {
             if !filter_ids.contains(cursor_element.id()) {
                 elements_to_render.push(*cursor_element);
-                opaque_regions.extend(cursor_element.opaque_regions(scale));
+                extend_global_opaque_regions(&mut opaque_regions, *cursor_element, scale);
             }
         }
 
-        for element in self
-            .output_layer_elements
-            .iter()
-            .filter(|e| !filter_ids.contains(e.id()))
-        {
+        for element in &self.output_layer_elements {
+            if filter_ids.contains(element.id()) {
+                continue;
+            }
             elements_to_render.push(element);
-            opaque_regions.extend(element.opaque_regions(scale));
+            extend_global_opaque_regions(&mut opaque_regions, *element, scale);
         }
 
         for element in self
@@ -401,11 +473,12 @@ where
             .filter(|e| !filter_ids.contains(e.id()))
         {
             elements_to_render.push(element);
-            opaque_regions.extend(element.opaque_regions(scale));
+            extend_global_opaque_regions(&mut opaque_regions, *element, scale);
         }
 
         let primary_dmabuf = match &self.primary_element {
             PrimaryPlaneElement::Swapchain(PrimarySwapchainElement { slot, sync, .. }) => {
+                debug_assert!(self.output_layer_primary_index.is_none());
                 let dmabuf = match &slot.buffer {
                     ScanoutBuffer::Swapchain(slot) => slot.export().map_err(BlitFrameResultError::Export)?,
                     _ => unreachable!(),
@@ -416,8 +489,27 @@ where
                 Some((sync.clone(), dmabuf, geometry))
             }
             PrimaryPlaneElement::Element(e) => {
-                elements_to_render.push(*e);
-                opaque_regions.extend(e.opaque_regions(scale));
+                extend_global_opaque_regions(&mut opaque_regions, *e, scale);
+                if let Some(primary_index) = self.output_layer_primary_index {
+                    debug_assert!(self.overlay_elements.is_empty());
+                    let cursor_prefix = usize::from(
+                        self.cursor_element
+                            .as_ref()
+                            .is_some_and(|cursor| !filter_ids.contains(cursor.id())),
+                    );
+                    let visible_output_layer_prefix = self
+                        .output_layer_elements
+                        .iter()
+                        .take(primary_index)
+                        .filter(|element| !filter_ids.contains(element.id()))
+                        .count();
+                    elements_to_render.insert(
+                        (cursor_prefix + visible_output_layer_prefix).min(elements_to_render.len()),
+                        *e,
+                    );
+                } else {
+                    elements_to_render.push(*e);
+                }
                 None
             }
         };
@@ -440,7 +532,6 @@ where
             sync = Some(frame.finish().map_err(BlitFrameResultError::Rendering)?);
         }
 
-        // first do the potential blit
         if let Some((primary_dmabuf_sync, mut dmabuf, geometry)) = primary_dmabuf {
             let blit_damage = damage
                 .iter()
@@ -471,43 +562,21 @@ where
             }
         }
 
-        // then render the remaining elements if any
-        if !elements_to_render.is_empty() {
-            tracing::trace!("drawing {} frame element(s)", elements_to_render.len());
-
-            let mut frame = renderer
-                .render(framebuffer, size, transform)
-                .map_err(BlitFrameResultError::Rendering)?;
-
-            for element in elements_to_render.iter().rev() {
-                let src = element.src();
-                let dst = element.geometry(scale);
-                let element_damage = damage
-                    .iter()
-                    .filter_map(|d| {
-                        d.intersection(dst).map(|mut d| {
-                            d.loc -= dst.loc;
-                            d
-                        })
-                    })
-                    .collect::<Vec<_>>();
-
-                // no need to render without damage
-                if element_damage.is_empty() {
-                    continue;
-                }
-
-                tracing::trace!("drawing frame element with damage: {:#?}", element_damage);
-
-                element
-                    .draw(&mut frame, src, dst, &element_damage, &[])
-                    .map_err(BlitFrameResultError::Rendering)?;
-            }
-
-            Ok(frame.finish().map_err(BlitFrameResultError::Rendering)?)
-        } else {
-            Ok(sync.unwrap_or_default())
+        if let Some(render_sync) = render_frame_result_elements(
+            renderer,
+            framebuffer,
+            &elements_to_render,
+            &damage,
+            size,
+            transform,
+            scale,
+        )
+        .map_err(BlitFrameResultError::Rendering)?
+        {
+            sync = Some(render_sync);
         }
+
+        Ok(sync.unwrap_or_default())
     }
 }
 
@@ -527,6 +596,7 @@ impl<B: Buffer + std::fmt::Debug, F: Framebuffer + std::fmt::Debug, E: std::fmt:
                 &self.output_layer_plane_assignment,
             )
             .field("output_layer_elements", &self.output_layer_elements)
+            .field("output_layer_primary_index", &self.output_layer_primary_index)
             .field(
                 "output_layer_rendered_this_frame",
                 &self.output_layer_rendered_this_frame,
@@ -624,6 +694,34 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct DummyBuffer;
+
+    struct DummyElement {
+        id: Id,
+        geometry: Rectangle<i32, Physical>,
+        opaque: Rectangle<i32, Physical>,
+    }
+
+    impl Element for DummyElement {
+        fn id(&self) -> &Id {
+            &self.id
+        }
+
+        fn current_commit(&self) -> CommitCounter {
+            CommitCounter::default()
+        }
+
+        fn src(&self) -> Rectangle<f64, BufferCoords> {
+            Rectangle::default()
+        }
+
+        fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+            self.geometry
+        }
+
+        fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+            OpaqueRegions::from_slice(&[self.opaque])
+        }
+    }
 
     impl crate::backend::allocator::Buffer for DummyBuffer {
         fn size(&self) -> crate::utils::Size<i32, crate::utils::Buffer> {
@@ -726,6 +824,7 @@ mod tests {
             overlay_plane_assignments: Vec::new(),
             output_layer_plane_assignment: None,
             output_layer_elements: Vec::new(),
+            output_layer_primary_index: None,
             output_layer_element_count: 0,
             output_layer_rendered_this_frame: false,
             output_layer_damage_rect_count: 0,
@@ -737,7 +836,25 @@ mod tests {
             cursor_plane_assignment: None,
             primary_plane_element_id: Id::new(),
             supports_fencing,
+            replaces_unpresented_render: false,
         }
+    }
+
+    #[test]
+    fn frame_result_opaque_regions_are_translated_to_output_coordinates() {
+        let element = DummyElement {
+            id: Id::new(),
+            geometry: Rectangle::new((300, 200).into(), (800, 600).into()),
+            opaque: Rectangle::new((10, 20).into(), (100, 50).into()),
+        };
+        let mut opaque_regions = Vec::new();
+
+        extend_global_opaque_regions(&mut opaque_regions, &element, Scale::from(1.0));
+
+        assert_eq!(
+            opaque_regions,
+            vec![Rectangle::new((310, 220).into(), (100, 50).into())]
+        );
     }
 
     #[test]

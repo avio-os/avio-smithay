@@ -18,7 +18,10 @@ use crate::{
             gbm::GbmDevice,
             Allocator,
         },
-        renderer::{element::RenderElement, Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture},
+        renderer::{
+            element::{Id, RenderElement},
+            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture,
+        },
     },
     output::OutputModeSource,
 };
@@ -737,6 +740,35 @@ where
     {
         self.with_compositor(|compositor| {
             compositor.render_frame(renderer, elements, clear_color, frame_mode)
+        })
+    }
+
+    /// Render the next frame while preferring `preferred_primary` as the
+    /// primary-plane anchor when compositor-owned output-layer scanout is used.
+    /// Unsupported preferences fall back to the ordinary output-layer plan or
+    /// full composition in the same frame.
+    pub fn render_frame_with_output_layer_primary<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_mode: FrameFlags,
+        preferred_primary: Option<&Id>,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+        self.with_compositor(|compositor| {
+            compositor.render_frame_with_output_layer_primary(
+                renderer,
+                elements,
+                clear_color,
+                frame_mode,
+                preferred_primary,
+            )
         })
     }
 

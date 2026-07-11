@@ -1017,18 +1017,14 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
 /// shipped default; the verdict decides the permanent driver policy.
 fn output_layer_host_wait_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_HOST_WAIT").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_HOST_WAIT").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-07-11 H5): allocate the output-layer swapchain
 /// LINEAR instead of inheriting the primary's modifiers. Diagnostics only.
 fn output_layer_linear_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_LINEAR").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_LINEAR").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-07-11 H5): clear the output layer opaque red at
@@ -1036,18 +1032,111 @@ fn output_layer_linear_diag() -> bool {
 /// render-target import. Diagnostics only.
 fn output_layer_clear_red_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_CLEAR_RED").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_CLEAR_RED").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-07-11 H5): force age-0 full repaints of the
 /// output layer with the normal transparent clear. Diagnostics only.
 fn output_layer_full_repaint_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_FULL_REPAINT").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn element_output_region_is_opaque(
+    workhouse: &mut Vec<Rectangle<i32, Physical>>,
+    element_output_geometry: Rectangle<i32, Physical>,
+    element_location: Point<i32, Physical>,
+    element_opaque_regions: &[Rectangle<i32, Physical>],
+) -> bool {
+    let mut element_output_geometry_local = element_output_geometry;
+    element_output_geometry_local.loc -= element_location;
+    workhouse.clear();
+    workhouse.push(element_output_geometry_local);
+    *workhouse = Rectangle::subtract_rects_many_in_place(
+        std::mem::take(workhouse),
+        element_opaque_regions.iter().copied(),
+    );
+    workhouse.is_empty()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputLayerRenderItem {
+    Holepunch,
+    SceneElement(usize),
+}
+
+fn visit_output_layer_render_order(
+    scene_element_count: usize,
+    hole_index: Option<usize>,
+    mut visitor: impl FnMut(OutputLayerRenderItem),
+) {
+    debug_assert!(hole_index.is_none_or(|index| index <= scene_element_count));
+    for index in 0..scene_element_count {
+        if hole_index == Some(index) {
+            visitor(OutputLayerRenderItem::Holepunch);
+        }
+        visitor(OutputLayerRenderItem::SceneElement(index));
+    }
+    if hole_index == Some(scene_element_count) {
+        visitor(OutputLayerRenderItem::Holepunch);
+    }
+}
+
+#[cfg(test)]
+mod output_layer_tests {
+    use super::*;
+
+    #[test]
+    fn nonzero_origin_element_uses_local_opaque_regions() {
+        let mut workhouse = Vec::new();
+        let visible = Rectangle::new((300, 200).into(), (800, 600).into());
+        let opaque = [Rectangle::new((0, 0).into(), (800, 600).into())];
+
+        assert!(element_output_region_is_opaque(
+            &mut workhouse,
+            visible,
+            (300, 200).into(),
+            &opaque,
+        ));
+    }
+
+    #[test]
+    fn holepunch_preserves_scene_order_at_front_middle_and_back() {
+        let collect = |hole_index| {
+            let mut items = Vec::new();
+            visit_output_layer_render_order(3, Some(hole_index), |item| items.push(item));
+            items
+        };
+
+        assert_eq!(
+            collect(0),
+            vec![
+                OutputLayerRenderItem::Holepunch,
+                OutputLayerRenderItem::SceneElement(0),
+                OutputLayerRenderItem::SceneElement(1),
+                OutputLayerRenderItem::SceneElement(2),
+            ]
+        );
+        assert_eq!(
+            collect(1),
+            vec![
+                OutputLayerRenderItem::SceneElement(0),
+                OutputLayerRenderItem::Holepunch,
+                OutputLayerRenderItem::SceneElement(1),
+                OutputLayerRenderItem::SceneElement(2),
+            ]
+        );
+        assert_eq!(
+            collect(3),
+            vec![
+                OutputLayerRenderItem::SceneElement(0),
+                OutputLayerRenderItem::SceneElement(1),
+                OutputLayerRenderItem::SceneElement(2),
+                OutputLayerRenderItem::Holepunch,
+            ]
+        );
+    }
 }
 
 type CompositorFrameState<A, F> =
@@ -1345,6 +1434,7 @@ where
     output_layer_swapchain: Option<Swapchain<A>>,
     output_layer_damage_tracker: OutputDamageTracker,
     output_layer_element_id: Id,
+    output_layer_holepunch_element_id: Id,
     output_layer_damage_bag: DamageBag<i32, BufferCoords>,
 
     cursor_size: Size<i32, Physical>,
@@ -1575,6 +1665,7 @@ where
                         output_layer_swapchain,
                         output_layer_damage_tracker,
                         output_layer_element_id: Id::new(),
+                        output_layer_holepunch_element_id: Id::new(),
                         output_layer_damage_bag: DamageBag::new(4),
                         framebuffer_exporter,
                         cursor_size,
@@ -1743,6 +1834,7 @@ where
             output_layer_swapchain: None,
             output_layer_damage_tracker,
             output_layer_element_id: Id::new(),
+            output_layer_holepunch_element_id: Id::new(),
             output_layer_damage_bag: DamageBag::new(4),
             framebuffer_exporter,
             cursor_size,
@@ -1976,6 +2068,30 @@ where
         R: Renderer + Bind<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
+        self.render_frame_with_output_layer_primary(renderer, elements, clear_color, frame_flags, None)
+    }
+
+    /// Render the next frame while preferring a specific element as the
+    /// primary-plane anchor for compositor-owned output-layer scanout.
+    ///
+    /// The preference is only a hint. The element must still be visible,
+    /// opaque, scanout-capable, and pass the complete atomic plane test. Any
+    /// failure falls back to the ordinary output-layer anchor or composition.
+    #[instrument(level = "trace", parent = &self.span, skip_all)]
+    #[profiling::function]
+    pub fn render_frame_with_output_layer_primary<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+        preferred_output_layer_primary: Option<&Id>,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+    {
         let mut clear_color = clear_color.into();
 
         if !self.surface.is_active() {
@@ -1984,9 +2100,23 @@ where
             ));
         }
 
-        // Just reset any next state, this will put
-        // any already acquired slot back to the swapchain
+        // OutputDamageTracker records a render immediately, but swapchain ages
+        // advance only after KMS accepts a frame. Replacing an unqueued/queued
+        // render therefore invalidates the age-to-damage lineage: the discarded
+        // frame may contain a topology transition (including an output-layer
+        // hole) that never reached glass. Force the replacement to be
+        // self-contained instead of replaying damage across that missing frame.
+        let replaces_unpresented_render = self.next_frame.is_some() || self.queued_frame.is_some();
+
+        // Just reset any next state, this will put any already acquired slot
+        // back to the swapchain.
         std::mem::drop(self.next_frame.take());
+        if replaces_unpresented_render {
+            self.swapchain.reset_buffer_ages();
+            if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+                output_layer_swapchain.reset_buffer_ages();
+            }
+        }
 
         // If a commit is pending we may still be able to just use a previous
         // state, but we want to queue a frame so we just fake the damage to
@@ -2168,13 +2298,12 @@ where
             }
 
             let element_opaque_regions = element.opaque_regions(output_scale);
-            element_opaque_regions_workhouse.clear();
-            element_opaque_regions_workhouse.push(element_output_geometry);
-            element_opaque_regions_workhouse = Rectangle::subtract_rects_many_in_place(
-                element_opaque_regions_workhouse,
-                element_opaque_regions.iter().copied(),
+            let element_is_opaque = element_output_region_is_opaque(
+                &mut element_opaque_regions_workhouse,
+                element_output_geometry,
+                element_loc,
+                &element_opaque_regions,
             );
-            let element_is_opaque = element_opaque_regions_workhouse.is_empty();
 
             opaque_regions.extend(
                 element_opaque_regions
@@ -2262,6 +2391,8 @@ where
         let mut output_layer_plane_assignment: Option<PlaneAssignmentInfo> = None;
         let mut output_layer_plane: Option<plane::Handle> = None;
         let mut output_layer_elements: Vec<&'a E> = Vec::new();
+        let mut output_layer_primary_index: Option<usize> = None;
+        let mut output_layer_holepunch: Option<(usize, &'a E)> = None;
 
         let output_elements_len = output_elements.len();
         for (index, (element, element_geometry, element_visible_area, element_is_opaque)) in
@@ -2360,23 +2491,99 @@ where
             && overlay_plane_elements.is_empty()
             && primary_plane_elements.len() >= 2
         {
-            let split_at = primary_plane_elements.len() - 1;
-            let scene_elements = &primary_plane_elements[..split_at];
-            let candidate = primary_plane_elements[split_at];
-            let scene_has_cursor = scene_elements
-                .iter()
-                .any(|element| element.kind() == Kind::Cursor);
+            // Candidate tuples contain the index in the primary render list,
+            // the original output z-index, geometry, visible area, and whether
+            // selecting the candidate requires a transparent hole at its
+            // original scene position.
+            let mut candidates: SmallVec<[(usize, usize, &'a E, Rectangle<i32, Physical>, usize, bool); 2]> =
+                SmallVec::new();
 
-            if !scene_has_cursor && candidate.kind() == Kind::ScanoutCandidate {
-                let candidate_geometry = candidate.geometry(output_scale);
-                let visible_area = candidate_geometry
-                    .intersection(output_geometry)
-                    .map(|geometry| (geometry.size.w * geometry.size.h).max(0) as usize)
-                    .unwrap_or_default();
+            if let Some(preferred_id) = preferred_output_layer_primary {
+                let preferred = primary_plane_elements
+                    .iter()
+                    .enumerate()
+                    .find(|(_, element)| element.id() == preferred_id)
+                    .map(|(index, element)| (index, *element));
+                if let Some((primary_index, candidate)) = preferred {
+                    if let Some((output_index, (_, geometry, visible_area, element_is_opaque))) =
+                        output_elements
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (element, _, _, _))| std::ptr::eq(*element, candidate))
+                    {
+                        let candidate_area = geometry
+                            .intersection(output_geometry)
+                            .map(|geometry| (geometry.size.w * geometry.size.h).max(0) as usize)
+                            .unwrap_or_default();
+                        let output_area = (output_geometry.size.w * output_geometry.size.h).max(0) as usize;
+                        let worthwhile = visible_area.saturating_mul(4) >= output_area
+                            && visible_area.saturating_mul(2) >= candidate_area;
+                        if *element_is_opaque && worthwhile && candidate.kind() == Kind::ScanoutCandidate {
+                            candidates.push((
+                                primary_index,
+                                output_index,
+                                candidate,
+                                *geometry,
+                                *visible_area,
+                                true,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Preserve the existing full-screen/background anchor as the
+            // immediate fallback. This keeps output-layer scanout active when
+            // a preferred rounded candidate is moving, too small, unsupported,
+            // or rejected by an atomic test.
+            if let Some((primary_index, candidate)) = primary_plane_elements
+                .len()
+                .checked_sub(1)
+                .map(|index| (index, primary_plane_elements[index]))
+            {
+                if candidate.kind() == Kind::ScanoutCandidate
+                    && candidates
+                        .first()
+                        .is_none_or(|(_, _, preferred, _, _, _)| {
+                            !std::ptr::eq(*preferred, candidate)
+                        })
+                {
+                    let candidate_geometry = candidate.geometry(output_scale);
+                    let visible_area = candidate_geometry
+                        .intersection(output_geometry)
+                        .map(|geometry| (geometry.size.w * geometry.size.h).max(0) as usize)
+                        .unwrap_or_default();
+                    let output_index = output_elements
+                        .iter()
+                        .rposition(|(element, _, _, _)| std::ptr::eq(*element, candidate))
+                        .unwrap_or_else(|| output_elements_len.saturating_sub(1));
+                    candidates.push((
+                        primary_index,
+                        output_index,
+                        candidate,
+                        candidate_geometry,
+                        visible_area,
+                        false,
+                    ));
+                }
+            }
+
+            for (primary_index, output_index, candidate, candidate_geometry, visible_area, needs_hole) in
+                candidates
+            {
+                if primary_plane_elements
+                    .iter()
+                    .enumerate()
+                    .any(|(index, element)| index != primary_index && element.kind() == Kind::Cursor)
+                {
+                    continue;
+                }
+
+                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
                 match self.try_assign_primary_plane(
                     renderer,
                     candidate,
-                    output_elements_len.saturating_sub(1),
+                    output_index,
                     candidate_geometry,
                     &mut element_states,
                     output_scale,
@@ -2392,7 +2599,15 @@ where
                                 primary_plane_assignment = Some(primary_assignment);
                                 output_layer_plane = Some(layer_assignment.handle);
                                 output_layer_plane_assignment = Some(layer_assignment);
-                                output_layer_elements = scene_elements.to_vec();
+                                output_layer_elements = primary_plane_elements
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(index, element)| {
+                                        (index != primary_index).then_some(*element)
+                                    })
+                                    .collect();
+                                output_layer_primary_index = Some(primary_index);
+                                output_layer_holepunch = needs_hole.then_some((primary_index, candidate));
                                 primary_plane_elements.clear();
                                 render_element_states.states.insert(
                                     candidate.id().clone(),
@@ -2401,14 +2616,14 @@ where
                                 trace!(
                                     candidate = ?candidate.id(),
                                     scene_element_count = output_layer_elements.len(),
+                                    holepunch = needs_hole,
                                     overlay_plane = ?layer_assignment.handle,
                                     "assigned primary direct scanout with compositor output layer"
                                 );
+                                break;
                             }
                             Err(reason) => {
                                 next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
-                                primary_plane_scanout_element = None;
-                                primary_plane_assignment = None;
                                 if let Some(reason) = reason {
                                     render_element_states
                                         .states
@@ -2540,6 +2755,8 @@ where
                 output_layer_plane = None;
                 output_layer_plane_assignment = None;
                 output_layer_elements.clear();
+                output_layer_primary_index = None;
+                output_layer_holepunch = None;
                 primary_plane_scanout_element = None;
                 primary_plane_assignment = None;
                 next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
@@ -2585,9 +2802,34 @@ where
                 .unwrap_or(false);
 
             if output_layer_render {
-                trace!(
-                    "rendering {} elements on output-layer overlay {:?}",
+                let mut output_layer_render_elements: SmallVec<[DrmRenderElements<'_, R, E>; 16]> =
+                    SmallVec::new();
+                visit_output_layer_render_order(
                     output_layer_elements.len(),
+                    output_layer_holepunch.as_ref().map(|(index, _)| *index),
+                    |item| match item {
+                        OutputLayerRenderItem::Holepunch => {
+                            let (_, candidate) = output_layer_holepunch.as_ref().unwrap();
+                            output_layer_render_elements.push(
+                                HolepunchRenderElement::from_render_element(
+                                    self.output_layer_holepunch_element_id.clone(),
+                                    *candidate,
+                                    output_scale,
+                                )
+                                .into(),
+                            );
+                        }
+                        OutputLayerRenderItem::SceneElement(index) => {
+                            output_layer_render_elements
+                                .push(DrmRenderElements::Other(output_layer_elements[index]));
+                        }
+                    },
+                );
+
+                trace!(
+                    "rendering {} elements (holepunch: {}) on output-layer overlay {:?}",
+                    output_layer_render_elements.len(),
+                    output_layer_holepunch.is_some(),
                     layer_plane,
                 );
                 let (mut dmabuf, age) = {
@@ -2639,7 +2881,7 @@ where
                     renderer,
                     &mut framebuffer,
                     age,
-                    &output_layer_elements,
+                    &output_layer_render_elements,
                     clear_color,
                 );
 
@@ -2671,8 +2913,7 @@ where
                             // layer bands: old frames interleaving on an
                             // idle output where most layer renders carry no
                             // damage).
-                            let layer_plane_state =
-                                next_frame_state.plane_state_mut(layer_plane).unwrap();
+                            let layer_plane_state = next_frame_state.plane_state_mut(layer_plane).unwrap();
                             layer_plane_state.skip = true;
                             let restored_config = previous_state
                                 .plane_state(layer_plane)
@@ -2691,6 +2932,9 @@ where
                         }
 
                         for (id, state) in render_output_result.states.states.into_iter() {
+                            if id == self.output_layer_holepunch_element_id {
+                                continue;
+                            }
                             if let Some(existing_state) = render_element_states.states.get_mut(&id) {
                                 if matches!(
                                     existing_state.presentation_state,
@@ -3076,6 +3320,7 @@ where
             overlay_elements,
             overlay_plane_assignments,
             output_layer_plane_assignment,
+            output_layer_primary_index,
             output_layer_element_count: output_layer_elements.len(),
             output_layer_elements,
             output_layer_rendered_this_frame,
@@ -3089,6 +3334,7 @@ where
             states: render_element_states,
             primary_plane_element_id: self.primary_plane_element_id.clone(),
             supports_fencing: self.supports_fencing,
+            replaces_unpresented_render,
         };
 
         // We only store the next frame if it acutaly contains any changes or if a commit is pending
@@ -3235,6 +3481,15 @@ where
         user_data: Option<U>,
         flip: Result<(), crate::backend::drm::error::Error>,
     ) -> FrameResult<(), A, F> {
+        if flip.is_err() {
+            // Damage history was advanced by render_frame, but a failed atomic
+            // submit did not advance swapchain ages or glass. Force the next
+            // render to repaint independently of that rejected history.
+            self.swapchain.reset_buffer_ages();
+            if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+                output_layer_swapchain.reset_buffer_ages();
+            }
+        }
         match flip {
             Ok(_) => {
                 // Buffer ages may only advance for frames the device accepted:
@@ -3300,7 +3555,7 @@ where
     /// full frame: a replaced [`QueuedFrame`] is dropped silently together
     /// with its `user_data`.
     pub fn is_frame_pipeline_idle(&self) -> bool {
-        self.pending_frame.is_none() && self.queued_frame.is_none()
+        self.pending_frame.is_none() && self.queued_frame.is_none() && self.next_frame.is_none()
     }
 
     /// Queue a cursor-plane-only reposition of the currently presented frame.
@@ -3325,7 +3580,7 @@ where
         element_location: Point<i32, Physical>,
         user_data: U,
     ) -> FrameResult<CursorRepositionOutcome, A, F> {
-        if self.pending_frame.is_some() || self.queued_frame.is_some() {
+        if self.pending_frame.is_some() || self.queued_frame.is_some() || self.next_frame.is_some() {
             return Ok(CursorRepositionOutcome::Unavailable);
         }
         // A pending mode/connector change must go through the full commit
@@ -3333,11 +3588,10 @@ where
         if self.surface.commit_pending() {
             return Ok(CursorRepositionOutcome::Unavailable);
         }
-        // `next_frame` is a staging slot that every `render_frame` overwrites;
-        // an entry left behind by a frame that was never queued (an empty
-        // render) is abandoned by construction and must not block — or leak
-        // into — the reposition commit built below.
-        self.next_frame = None;
+        // A staged full frame cannot be replaced by a cursor-only commit: its
+        // damage history has already advanced. Avio renders and queues within
+        // one worker turn, so this should be unreachable in steady state; the
+        // guard above keeps the invariant explicit for other callers too.
         let Some(cursor_handle) = self.planes.cursor.iter().map(|info| info.handle).find(|handle| {
             self.current_frame
                 .plane_state(*handle)
@@ -3403,7 +3657,7 @@ where
     ///
     /// [`queue_cursor_position`]: Self::queue_cursor_position
     pub fn queue_cursor_clear(&mut self, user_data: U) -> FrameResult<CursorRepositionOutcome, A, F> {
-        if self.pending_frame.is_some() || self.queued_frame.is_some() {
+        if self.pending_frame.is_some() || self.queued_frame.is_some() || self.next_frame.is_some() {
             return Ok(CursorRepositionOutcome::Unavailable);
         }
         if self.surface.commit_pending() {
@@ -3927,7 +4181,26 @@ where
                     })
                 )
         });
-        if !layer_was_active {
+        let output_layer_anchor_changed = match (
+            previous_frame.plane_state(primary_plane),
+            frame_state.plane_state(primary_plane),
+        ) {
+            (Some(previous), Some(next)) => {
+                let same_element = previous
+                    .element_state
+                    .as_ref()
+                    .zip(next.element_state.as_ref())
+                    .is_some_and(|(previous, next)| previous.id == next.id);
+                let same_properties = previous
+                    .config
+                    .as_ref()
+                    .zip(next.config.as_ref())
+                    .is_some_and(|(previous, next)| previous.properties.is_compatible(&next.properties));
+                !same_element || !same_properties
+            }
+            _ => true,
+        };
+        if !layer_was_active || output_layer_anchor_changed {
             if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
                 output_layer_swapchain.reset_buffer_ages();
             }
