@@ -3026,8 +3026,6 @@ where
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
 
-        self.mark_submitted_swapchain_slots(&prepared_frame.frame);
-
         self.queued_frame = Some(QueuedFrame {
             prepared_frame,
             user_data,
@@ -3060,8 +3058,6 @@ where
         if prepared_frame.is_empty() {
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
-
-        self.mark_submitted_swapchain_slots(&prepared_frame.frame);
 
         let flip = prepared_frame
             .frame
@@ -3139,6 +3135,16 @@ where
     ) -> FrameResult<(), A, F> {
         match flip {
             Ok(_) => {
+                // Buffer ages may only advance for frames the device accepted:
+                // an age says "this slot's content is N accepted frames old",
+                // and the damage-since-age replay repaints exactly those N
+                // frames' damage. Marking before the commit let a failed flip
+                // advance the ages anyway — glass kept the old frame while
+                // the bookkeeping claimed the new one landed, so the dropped
+                // frame's damage region was never repainted again (stale
+                // wallpaper patches / uninitialized-layer garbage that only
+                // healed under fresh damage).
+                self.mark_submitted_swapchain_slots(&prepared_frame.frame);
                 if let Some(out_fence) = self.surface.take_out_fence() {
                     self.current_frame
                         .signal_displaced_release_points_with_fence(&prepared_frame.frame, &out_fence);
@@ -3793,6 +3799,36 @@ where
     ) -> Result<PlaneAssignmentInfo, Option<RenderingReason>> {
         if self.output_layer_swapchain.is_none() {
             return Err(None);
+        }
+
+        // Slot content is only meaningful within one continuous lifetime of
+        // the output layer: while the layer is unassigned its slot ages and
+        // the layer damage tracker's history freeze, but the scene moves on
+        // without them. Trusting a frozen age across that gap partially
+        // repaints over another lifetime's pixels (stale layer content
+        // occluding the direct-scanout primary). The first frame of every
+        // lifetime repaints fully instead — activation is rare, one full
+        // layer paint is cheap.
+        let previous_frame = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame);
+        let primary_plane = self.surface.plane();
+        let layer_was_active = previous_frame.planes.iter().any(|(handle, state)| {
+            *handle != primary_plane
+                && matches!(
+                    state.buffer(),
+                    Some(DrmScanoutBuffer {
+                        buffer: ScanoutBuffer::Swapchain(_),
+                        ..
+                    })
+                )
+        });
+        if !layer_was_active {
+            if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
+                output_layer_swapchain.reset_buffer_ages();
+            }
         }
 
         let candidate_planes = self
