@@ -1031,6 +1031,16 @@ fn output_layer_linear_diag() -> bool {
     })
 }
 
+/// Diag bisect toggle (2026-07-11 H5): clear the output layer opaque red at
+/// age 0 every frame, splitting element-content corruption from a broken
+/// render-target import. Diagnostics only.
+fn output_layer_clear_red_diag() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AVIO_DIAG_OUTPUT_LAYER_CLEAR_RED").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
@@ -2598,12 +2608,23 @@ where
                 let mut framebuffer = renderer
                     .bind(&mut dmabuf)
                     .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
+                // Diag bisect (2026-07-11 H5): clearing opaque red with a
+                // forced age-0 (full-repaint) pass splits the remaining
+                // suspects. Stable solid red on glass = target import and
+                // scanout are sound, the corruption comes from element
+                // drawing; corrupted red = the render-target import of the
+                // layer dmabuf is broken regardless of content.
+                let (clear_color, age) = if output_layer_clear_red_diag() {
+                    (Color32F::new(1.0, 0.0, 0.0, 1.0), 0)
+                } else {
+                    (Color32F::TRANSPARENT, age)
+                };
                 let render_res = self.output_layer_damage_tracker.render_output(
                     renderer,
                     &mut framebuffer,
                     age,
                     &output_layer_elements,
-                    Color32F::TRANSPARENT,
+                    clear_color,
                 );
 
                 renderer.set_debug_flags(renderer_debug_flags);
