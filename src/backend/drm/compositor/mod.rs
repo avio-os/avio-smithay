@@ -2593,6 +2593,25 @@ where
 
                         if render_output_result.damage.is_none() {
                             let _ = renderer.cleanup_texture_cache();
+                            // Same contract as the primary plane's no-damage
+                            // arm below: keep the last-committed buffer on
+                            // the plane. The freshly-acquired slot holds
+                            // content from two submissions ago — committing
+                            // it regresses glass while the damage tracker's
+                            // books stay "consistent", so the regression is
+                            // never repainted (observed as shuffling stale
+                            // layer bands: old frames interleaving on an
+                            // idle output where most layer renders carry no
+                            // damage).
+                            let layer_plane_state =
+                                next_frame_state.plane_state_mut(layer_plane).unwrap();
+                            layer_plane_state.skip = true;
+                            let restored_config = previous_state
+                                .plane_state(layer_plane)
+                                .and_then(|state| state.config.as_ref().cloned());
+                            if let Some(restored_config) = restored_config {
+                                layer_plane_state.config = Some(restored_config);
+                            }
                         } else {
                             for buffer in &output_layer_wayland_buffers {
                                 if let Some(sync_file) = shared_render_sync_file.as_ref() {
