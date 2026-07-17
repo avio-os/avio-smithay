@@ -147,6 +147,7 @@ impl<D: SeatHandler> Inner<D> {
 /// Global data of WlSeat
 pub struct SeatGlobalData<D: SeatHandler> {
     arc: Arc<SeatRc<D>>,
+    visibility: Arc<dyn Fn(&Client) -> bool + Send + Sync>,
 }
 
 impl<D: SeatHandler> fmt::Debug for SeatGlobalData<D> {
@@ -171,9 +172,33 @@ impl<D: SeatHandler + 'static> SeatState<D> {
         <D as SeatHandler>::KeyboardFocus: WaylandFocus,
         N: Into<String>,
     {
+        self.new_wl_seat_with_filter(display, name, |_: &Client| true)
+    }
+
+    /// Create a new seat global advertised only to clients accepted by
+    /// `visibility`.
+    pub fn new_wl_seat_with_filter<N, F>(
+        &mut self,
+        display: &DisplayHandle,
+        name: N,
+        visibility: F,
+    ) -> Seat<D>
+    where
+        D: GlobalDispatch<WlSeat, SeatGlobalData<D>> + SeatHandler + 'static,
+        <D as SeatHandler>::PointerFocus: WaylandFocus,
+        <D as SeatHandler>::KeyboardFocus: WaylandFocus,
+        N: Into<String>,
+        F: Fn(&Client) -> bool + Send + Sync + 'static,
+    {
         let Seat { arc } = self.new_seat(name);
 
-        let global_id = display.create_global::<D, _, _>(9, SeatGlobalData { arc: arc.clone() });
+        let global_id = display.create_global::<D, _, _>(
+            9,
+            SeatGlobalData {
+                arc: arc.clone(),
+                visibility: Arc::new(visibility),
+            },
+        );
         arc.inner.lock().unwrap().global = Some(global_id);
 
         Seat { arc }
@@ -371,6 +396,10 @@ where
     D: SeatHandler,
     D: 'static,
 {
+    fn can_view(client: wayland_server::Client, global_data: &SeatGlobalData<D>) -> bool {
+        (global_data.visibility)(&client)
+    }
+
     fn bind(
         _state: &mut D,
         _dh: &DisplayHandle,
