@@ -108,6 +108,11 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RescaleRenderElement
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.element.underlying_storage(renderer)
     }
+
+    #[inline]
+    fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.element.sampled_storage(renderer)
+    }
 }
 
 /// A element that allows to crop another element
@@ -297,6 +302,11 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for CropRenderElement<E>
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.element.underlying_storage(renderer)
     }
+
+    #[inline]
+    fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.element.sampled_storage(renderer)
+    }
 }
 
 /// Defines how the location parameter should apply in [`RelocateRenderElement::from_element`]
@@ -403,6 +413,11 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RelocateRenderElemen
     #[inline]
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.element.underlying_storage(renderer)
+    }
+
+    #[inline]
+    fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.element.sampled_storage(renderer)
     }
 }
 

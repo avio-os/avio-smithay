@@ -112,101 +112,6 @@ pub struct DrmSyncPoint {
     pub(super) point: u64,
 }
 
-#[derive(Debug)]
-struct ClaimableReleasePointInner {
-    release_point: DrmSyncPoint,
-    claimed: AtomicBool,
-    signal_lock: Mutex<()>,
-}
-
-/// A release point that can be claimed by exactly one signaling path.
-#[derive(Clone, Debug)]
-pub struct ClaimableReleasePoint {
-    inner: Arc<ClaimableReleasePointInner>,
-}
-
-impl ClaimableReleasePoint {
-    /// Wrap a release point for one-shot signaling.
-    pub fn new(release_point: DrmSyncPoint) -> Self {
-        Self {
-            inner: Arc::new(ClaimableReleasePointInner {
-                release_point,
-                claimed: AtomicBool::new(false),
-                signal_lock: Mutex::new(()),
-            }),
-        }
-    }
-
-    fn try_claim_locked(&self) -> Option<DrmSyncPoint> {
-        self.inner
-            .claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| self.inner.release_point.clone())
-    }
-
-    /// Returns a weak handle for the Arc-drop fallback path.
-    pub fn weak(&self) -> WeakClaimableReleasePoint {
-        WeakClaimableReleasePoint {
-            inner: Arc::downgrade(&self.inner),
-        }
-    }
-
-    /// Signal the wrapped release point if it has not already been claimed.
-    pub fn signal(&self) -> io::Result<bool> {
-        let _signal_guard = self.inner.signal_lock.lock().unwrap();
-        let Some(release_point) = self.try_claim_locked() else {
-            return Ok(false);
-        };
-
-        if let Err(err) = release_point.signal() {
-            self.inner.claimed.store(false, Ordering::Release);
-            return Err(err);
-        }
-
-        Ok(true)
-    }
-
-    /// Signal the wrapped release point when the provided sync_file fence fires.
-    pub fn signal_with_sync_file(&self, sync_file: OwnedFd) -> io::Result<bool> {
-        let _signal_guard = self.inner.signal_lock.lock().unwrap();
-        let Some(release_point) = self.try_claim_locked() else {
-            return Ok(false);
-        };
-
-        if let Err(err) = release_point.signal_with_sync_file(sync_file) {
-            self.inner.claimed.store(false, Ordering::Release);
-            return Err(err);
-        }
-
-        Ok(true)
-    }
-}
-
-impl Drop for ClaimableReleasePoint {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) == 1 && !self.inner.claimed.load(Ordering::Acquire) {
-            let _ = self.signal();
-        }
-    }
-}
-
-/// Weak handle used by `Buffer` drop fallback.
-#[derive(Clone, Debug)]
-pub struct WeakClaimableReleasePoint {
-    inner: Weak<ClaimableReleasePointInner>,
-}
-
-impl WeakClaimableReleasePoint {
-    /// Signal the release point iff it has not already been claimed by another path.
-    pub fn signal_if_unclaimed(&self) {
-        if let Some(inner) = self.inner.upgrade() {
-            let claimable = ClaimableReleasePoint { inner };
-            let _ = claimable.signal();
-        }
-    }
-}
-
 impl DrmSyncPoint {
     /// Create an eventfd that will be signaled by the syncpoint
     pub fn eventfd(&self) -> io::Result<Arc<OwnedFd>> {
@@ -247,11 +152,19 @@ impl DrmSyncPoint {
         let transfer_result = device.syncobj_timeline_transfer(imported_syncobj, ctx.syncobj, 0, self.point);
         let destroy_result = device.destroy_syncobj(imported_syncobj);
 
-        match (transfer_result, destroy_result) {
-            (Err(err), _) => Err(err),
-            (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(())) => Ok(()),
+        if let Err(err) = transfer_result {
+            return Err(err);
         }
+        // The transfer is the release-semantic operation. Failure to destroy
+        // its temporary source handle must not make callers retry by manually
+        // signaling a point whose completion dependency was already installed.
+        if let Err(err) = destroy_result {
+            tracing::warn!(
+                ?err,
+                "failed to destroy temporary syncobj after successful timeline transfer"
+            );
+        }
+        Ok(())
     }
 
     /// Wait for sync point.
@@ -291,12 +204,27 @@ impl DrmSyncPoint {
         let signal = Arc::new(AtomicBool::new(false));
         let blocker = DrmSyncPointBlocker {
             signal: signal.clone(),
+            sync_point: self.clone(),
         };
         let source = DrmSyncPointSource {
             source: Generic::new(fd, Interest::READ, Mode::Level),
             signal,
         };
         Ok((blocker, source))
+    }
+
+    /// Create an authoritative blocker without an event-source fast path.
+    ///
+    /// [`DrmSyncPointBlocker::state`] queries the DRM timeline point itself,
+    /// so readiness does not depend on successful eventfd creation or calloop
+    /// registration. Compositors using this constructor must arrange a
+    /// deterministic transaction-queue re-evaluation when the blocker is
+    /// pending.
+    pub fn blocker(&self) -> DrmSyncPointBlocker {
+        DrmSyncPointBlocker {
+            signal: Arc::new(AtomicBool::new(false)),
+            sync_point: self.clone(),
+        }
     }
 }
 
@@ -414,11 +342,15 @@ impl EventSource for DrmSyncPointSource {
 #[derive(Debug)]
 pub struct DrmSyncPointBlocker {
     signal: Arc<AtomicBool>,
+    sync_point: DrmSyncPoint,
 }
 
 impl Blocker for DrmSyncPointBlocker {
     fn state(&self) -> BlockerState {
-        if self.signal.load(Ordering::SeqCst) {
+        // The eventfd callback is the fast path. Querying the timeline point
+        // makes blocker state authoritative even if that one-shot wakeup is
+        // lost before the compositor re-enters its transaction queue.
+        if self.signal.load(Ordering::SeqCst) || self.sync_point.is_signaled() {
             BlockerState::Released
         } else {
             BlockerState::Pending

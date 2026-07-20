@@ -13,7 +13,7 @@ use std::{
 use ash::{ext, khr, vk};
 use tracing::{instrument, trace, warn};
 
-use crate::backend::vulkan::{version::Version, PhysicalDevice};
+use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
 
 use super::{
     dmabuf::ImportedDmabufImage,
@@ -37,8 +37,65 @@ struct InFlightSubmission {
     command_buffer: vk::CommandBuffer,
     framebuffers: Vec<vk::Framebuffer>,
     retained_images: Vec<Arc<ImportedDmabufImage>>,
+    transient_buffers: Vec<TransientBufferAllocation>,
     wait_semaphores: Vec<vk::Semaphore>,
     submitted_at: Instant,
+}
+
+/// Buffer allocation whose lifetime is exactly one GPU submission.
+///
+/// Upload staging must survive `vkQueueSubmit`, but retaining it until a
+/// host-side wait defeats asynchronous queueing. The tracked submission owns
+/// these handles and destroys them only after its real VkFence signals.
+pub(crate) struct TransientBufferAllocation {
+    device: Arc<DeviceHandle>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl TransientBufferAllocation {
+    pub(crate) fn new(device: &DeviceState, buffer: vk::Buffer, memory: vk::DeviceMemory) -> Self {
+        Self {
+            device: device.shared_device(),
+            buffer,
+            memory,
+        }
+    }
+}
+
+impl Drop for TransientBufferAllocation {
+    fn drop(&mut self) {
+        self.device.destroy_with(|device| {
+            // SAFETY: This allocation is constructed only after both handles
+            // exist and is dropped either before submission or after its
+            // tracked fence signals.
+            unsafe {
+                device.destroy_buffer(self.buffer, None);
+                device.free_memory(self.memory, None);
+            }
+        });
+    }
+}
+
+/// The two legal queue-submission contracts.
+///
+/// An enum keeps acquire-wait consumption and completion export coupled to
+/// the operation that owns them; callers cannot construct a mixed policy
+/// that silently steals synchronization from a later render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionKind {
+    Render,
+    Upload,
+}
+
+impl SubmissionKind {
+    fn consumes_pending_waits(self) -> bool {
+        matches!(self, Self::Render)
+    }
+
+    fn exports_completion(self) -> bool {
+        matches!(self, Self::Render)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -76,6 +133,7 @@ impl DeviceCapabilities {
 pub(crate) struct DeviceDiagnostics {
     pub(crate) total_submissions: u64,
     pub(crate) blocking_submissions: u64,
+    pub(crate) upload_submissions: u64,
     pub(crate) reclaimed_submissions: u64,
     pub(crate) total_submit_cpu_ns: u64,
     pub(crate) max_submit_cpu_ns: u64,
@@ -124,6 +182,7 @@ impl fmt::Debug for DeviceState {
             .field("debug_markers_enabled", &self.diagnostics.debug_markers_enabled)
             .field("total_submissions", &self.diagnostics.total_submissions)
             .field("blocking_submissions", &self.diagnostics.blocking_submissions)
+            .field("upload_submissions", &self.diagnostics.upload_submissions)
             .field("reclaimed_submissions", &self.diagnostics.reclaimed_submissions)
             .finish()
     }
@@ -131,6 +190,15 @@ impl fmt::Debug for DeviceState {
 
 pub(super) struct DeviceHandle {
     device: ash::Device,
+    /// Keeps the Vulkan parent instance alive until the logical device and
+    /// every child object sharing this handle have been destroyed.
+    ///
+    /// `DeviceState` is only one owner of this handle: descriptor, pipeline,
+    /// image, fence, and transient-allocation state can outlive it during
+    /// renderer field teardown. Retaining only the instance-loss flag allowed
+    /// the last `PhysicalDevice`/`Instance` owner to drop before these device
+    /// children, violating Vulkan's parent-before-child lifetime contract.
+    _instance: Instance,
     /// Set once the device has been observed to be lost (any Vulkan call returning
     /// `VK_ERROR_DEVICE_LOST`). Owned by the device abstraction so that teardown paths
     /// can consult a single source of truth instead of scattering guards at call sites.
@@ -288,6 +356,7 @@ impl DeviceState {
 
         let device = Arc::new(DeviceHandle {
             device: raw_device,
+            _instance: physical_device.instance().clone(),
             lost: AtomicBool::new(false),
             instance_lost: physical_device.instance().lost_flag(),
             pending_submissions: std::sync::atomic::AtomicUsize::new(0),
@@ -568,13 +637,54 @@ impl DeviceState {
         self.submit_with_resources_and_fence(command_buffer, framebuffers, Vec::new())
     }
 
-    #[instrument(level = "trace", skip(self, command_buffer, framebuffers, retained_images))]
-    #[profiling::function]
     pub(crate) fn submit_with_resources_and_fence(
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
         retained_images: Vec<Arc<ImportedDmabufImage>>,
+    ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
+        self.submit_tracked(
+            command_buffer,
+            framebuffers,
+            retained_images,
+            Vec::new(),
+            SubmissionKind::Render,
+        )
+    }
+
+    /// Submit a staging upload without consuming render acquire waits or
+    /// blocking the worker thread. Queue order makes every later render see
+    /// the upload; the tracked VkFence owns the staging allocation and target
+    /// image until execution really completes.
+    pub(crate) fn submit_upload(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        retained_image: Arc<ImportedDmabufImage>,
+        staging: TransientBufferAllocation,
+    ) -> Result<SubmissionId, VulkanRendererError> {
+        let (id, _) = self.submit_tracked(
+            command_buffer,
+            Vec::new(),
+            vec![retained_image],
+            vec![staging],
+            SubmissionKind::Upload,
+        )?;
+        self.diagnostics.upload_submissions = self.diagnostics.upload_submissions.saturating_add(1);
+        Ok(id)
+    }
+
+    #[instrument(
+        level = "trace",
+        skip(self, command_buffer, framebuffers, retained_images, transient_buffers)
+    )]
+    #[profiling::function]
+    fn submit_tracked(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        framebuffers: Vec<vk::Framebuffer>,
+        retained_images: Vec<Arc<ImportedDmabufImage>>,
+        transient_buffers: Vec<TransientBufferAllocation>,
+        kind: SubmissionKind,
     ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
@@ -588,7 +698,7 @@ impl DeviceState {
         // VkFence instead (vkGetFenceFdKHR has move semantics) was observed
         // racing fence completion on NVIDIA, yielding valid fds bound to a
         // consumed payload — sync_files that never signal.
-        let export_semaphore = if self.supports_sync_file_export() {
+        let export_semaphore = if kind.exports_completion() && self.supports_sync_file_export() {
             match self.create_export_semaphore() {
                 Ok(semaphore) => Some(semaphore),
                 Err(err) => {
@@ -603,7 +713,11 @@ impl DeviceState {
             None
         };
 
-        let pending_waits = std::mem::take(&mut self.pending_waits);
+        let pending_waits = if kind.consumes_pending_waits() {
+            std::mem::take(&mut self.pending_waits)
+        } else {
+            Vec::new()
+        };
         let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
             pending_waits.into_iter().unzip();
 
@@ -674,6 +788,7 @@ impl DeviceState {
             command_buffer,
             framebuffers,
             retained_images,
+            transient_buffers,
             wait_semaphores,
             submitted_at: submit_started_at,
         });
@@ -703,12 +818,12 @@ impl DeviceState {
             .device
             .observe_result(unsafe { self.device.handle().create_fence(&fence_info, None) })?;
 
-        // Blocking submissions are upload/transfer helpers: they write fresh
-        // data and sample no externally-fenced buffers, so they must not
-        // consume `pending_waits`. Those waits belong to the next render
-        // submission (the first pass that samples the fenced buffers);
-        // draining them here would both host-block this call on unrelated
-        // fences and strip synchronization from the render they guard.
+        // Blocking submission remains only for synchronous GPU-to-CPU
+        // readback. It must not consume `pending_waits`: those waits belong to
+        // the next render submission, the first pass that samples the fenced
+        // client buffers. Draining them here would both host-block readback on
+        // unrelated producers and strip synchronization from the guarded
+        // render.
         let command_buffers = [command_buffer];
         let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
 
@@ -883,6 +998,7 @@ impl DeviceState {
             export_semaphore,
             command_buffer,
             framebuffers,
+            transient_buffers,
             wait_semaphores,
             submitted_at,
             ..
@@ -924,6 +1040,10 @@ impl DeviceState {
                 unsafe { device.destroy_semaphore(semaphore, None) };
             }
         });
+
+        // Each transient allocation owns its teardown capability. The fence
+        // is signaled, so dropping now is the exact staging-resource edge.
+        drop(transient_buffers);
 
         // SAFETY: Command buffer belongs to `self.command_pool` and can be reset because the associated fence
         // is known to be signaled before this method is called.
@@ -1065,6 +1185,19 @@ impl DeviceState {
             sync_file_semaphore_import,
             sync_file_semaphore_export,
         }
+    }
+}
+
+#[cfg(test)]
+mod submission_kind_tests {
+    use super::SubmissionKind;
+
+    #[test]
+    fn render_and_upload_submission_contracts_cannot_be_mixed() {
+        assert!(SubmissionKind::Render.consumes_pending_waits());
+        assert!(SubmissionKind::Render.exports_completion());
+        assert!(!SubmissionKind::Upload.consumes_pending_waits());
+        assert!(!SubmissionKind::Upload.exports_completion());
     }
 }
 

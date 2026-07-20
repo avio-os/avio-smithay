@@ -1,7 +1,5 @@
 #[cfg(feature = "backend_drm")]
-use crate::wayland::drm_syncobj::{
-    ClaimableReleasePoint, DrmSyncPoint, DrmSyncobjCachedState, WeakClaimableReleasePoint,
-};
+use crate::wayland::drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState};
 use crate::{
     backend::renderer::{
         buffer_dimensions, buffer_has_alpha, element::RenderElement, ContextId, ErasedContextId, ImportAll,
@@ -18,16 +16,22 @@ use crate::{
     },
 };
 
+#[cfg(feature = "backend_drm")]
+use std::os::fd::OwnedFd;
 use std::{
     any::Any,
     collections::HashMap,
-    os::fd::OwnedFd,
     sync::{Arc, Mutex},
 };
 
 use super::{CommitCounter, DamageBag, DamageSet, DamageSnapshot, SurfaceView};
 use tracing::{error, instrument, warn};
 use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
+
+#[cfg(feature = "backend_drm")]
+mod release;
+#[cfg(feature = "backend_drm")]
+use release::BufferReleaseMerger;
 
 /// Type stored in WlSurface states data_map
 ///
@@ -59,52 +63,38 @@ pub struct RendererSurfaceState {
 unsafe impl Send for RendererSurfaceState {}
 unsafe impl Sync for RendererSurfaceState {}
 
-#[derive(Debug, Clone)]
-enum LastRenderSync {
-    Pending(crate::backend::renderer::sync::SyncPoint),
-    Exported(Arc<OwnedFd>),
-}
-
 #[derive(Debug)]
 struct InnerBuffer {
     buffer: WlBuffer,
     #[cfg(feature = "backend_drm")]
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
-    release_point: Mutex<Option<DrmSyncPoint>>,
-    #[cfg(feature = "backend_drm")]
-    has_explicit_release_point: bool,
-    #[cfg(feature = "backend_drm")]
-    release_fallback: Mutex<Option<WeakClaimableReleasePoint>>,
-    #[cfg(feature = "backend_drm")]
-    superseded_release: Mutex<Option<ClaimableReleasePoint>>,
-    #[cfg(feature = "backend_drm")]
-    last_render_sync: Mutex<Option<LastRenderSync>>,
+    release: BufferReleaseMerger,
+}
+
+#[cfg(feature = "backend_drm")]
+enum AttachmentSynchronization {
+    Implicit,
+    Explicit {
+        acquire: DrmSyncPoint,
+        release: DrmSyncPoint,
+    },
+}
+
+#[cfg(feature = "backend_drm")]
+impl AttachmentSynchronization {
+    fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit { .. })
+    }
 }
 
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
         #[cfg(feature = "backend_drm")]
-        if !self.has_explicit_release_point {
-            self.buffer.release();
-        }
+        self.release.retire();
         #[cfg(not(feature = "backend_drm"))]
         self.buffer.release();
-        #[cfg(feature = "backend_drm")]
-        if let Ok(release_fallback) = self.release_fallback.get_mut() {
-            if let Some(release_fallback) = release_fallback.take() {
-                release_fallback.signal_if_unclaimed();
-            }
-        }
-        #[cfg(feature = "backend_drm")]
-        if let Ok(release_point) = self.release_point.get_mut() {
-            if let Some(release_point) = release_point.take() {
-                if let Err(err) = release_point.signal() {
-                    tracing::error!("Failed to signal syncobj release point: {}", err);
-                }
-            }
-        }
     }
 }
 
@@ -117,21 +107,15 @@ pub struct Buffer {
 impl Buffer {
     /// Create a buffer with implicit sync
     pub fn with_implicit(buffer: WlBuffer) -> Self {
+        #[cfg(feature = "backend_drm")]
+        let release = BufferReleaseMerger::implicit(buffer.clone());
         Self {
             inner: Arc::new(InnerBuffer {
                 buffer,
                 #[cfg(feature = "backend_drm")]
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
-                release_point: Mutex::new(None),
-                #[cfg(feature = "backend_drm")]
-                has_explicit_release_point: false,
-                #[cfg(feature = "backend_drm")]
-                release_fallback: Mutex::new(None),
-                #[cfg(feature = "backend_drm")]
-                superseded_release: Mutex::new(None),
-                #[cfg(feature = "backend_drm")]
-                last_render_sync: Mutex::new(None),
+                release,
             }),
         }
     }
@@ -141,13 +125,9 @@ impl Buffer {
     pub fn with_explicit(buffer: WlBuffer, acquire_point: DrmSyncPoint, release_point: DrmSyncPoint) -> Self {
         Self {
             inner: Arc::new(InnerBuffer {
+                release: BufferReleaseMerger::explicit(release_point),
                 buffer,
                 acquire_point: Some(acquire_point),
-                release_point: Mutex::new(Some(release_point)),
-                has_explicit_release_point: true,
-                release_fallback: Mutex::new(None),
-                superseded_release: Mutex::new(None),
-                last_render_sync: Mutex::new(None),
             }),
         }
     }
@@ -158,184 +138,18 @@ impl Buffer {
     }
 
     #[cfg(feature = "backend_drm")]
-    pub(crate) fn take_release_point(&self) -> Option<DrmSyncPoint> {
-        self.inner.release_point.lock().unwrap().take()
+    fn has_explicit_release(&self) -> bool {
+        self.inner.release.is_explicit()
     }
 
     #[cfg(feature = "backend_drm")]
-    pub(crate) fn set_release_fallback(&self, release_fallback: WeakClaimableReleasePoint) {
-        *self.inner.release_fallback.lock().unwrap() = Some(release_fallback);
+    pub(crate) fn record_render_completion(&self, exported_sync_file: Arc<OwnedFd>) {
+        self.inner.release.add_render_completion(exported_sync_file);
     }
 
     #[cfg(feature = "backend_drm")]
-    pub(crate) fn set_superseded_release(&self, superseded_release: ClaimableReleasePoint) {
-        *self.inner.superseded_release.lock().unwrap() = Some(superseded_release);
-    }
-
-    #[cfg(feature = "backend_drm")]
-    fn has_pending_explicit_release(&self) -> bool {
-        if !self.inner.has_explicit_release_point {
-            return false;
-        }
-
-        if self.inner.release_point.lock().unwrap().is_some() {
-            return true;
-        }
-
-        self.inner.superseded_release.lock().unwrap().is_some()
-    }
-
-    #[cfg(feature = "backend_drm")]
-    fn clear_last_render_sync(&self) {
-        *self.inner.last_render_sync.lock().unwrap() = None;
-    }
-
-    /// Record the compositor's render-completion sync point for this buffer.
-    ///
-    /// Used by `try_signal_superseded_release_with_last_render_sync` to
-    /// signal the explicit sync release point only after the GPU finishes
-    /// reading the buffer.
-    #[cfg(feature = "backend_drm")]
-    pub fn set_last_render_sync(&self, sync: crate::backend::renderer::sync::SyncPoint) {
-        if !self.has_pending_explicit_release() {
-            self.clear_last_render_sync();
-            return;
-        }
-        *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Pending(sync));
-    }
-
-    /// Record the compositor's render-completion sync file for this buffer.
-    ///
-    /// Preferred over [`set_last_render_sync`] when the sync point has
-    /// already been exported to an fd (avoids double-export).
-    ///
-    /// Explicit-sync buffers keep the fd to signal their release point.
-    /// Implicit-sync dmabufs instead import the fd into the buffer
-    /// reservation as a shared READ fence right away: after
-    /// `wl_buffer.release` the client's next GPU writes then wait on the
-    /// compositor's in-flight reads instead of racing them (Vulkan reads
-    /// never reach the reservation on their own). Best-effort — kernels
-    /// without `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` fall back to plain
-    /// release-ordering semantics.
-    #[cfg(feature = "backend_drm")]
-    pub fn set_last_render_sync_file(&self, sync_file: Arc<OwnedFd>) {
-        if !self.has_pending_explicit_release() {
-            self.clear_last_render_sync();
-            if let Ok(dmabuf) = crate::wayland::dmabuf::get_dmabuf(&self.inner.buffer) {
-                use std::os::fd::AsFd;
-                if let Err(err) = dmabuf.import_sync_file_read(sync_file.as_ref().as_fd()) {
-                    tracing::trace!(
-                        error = %err,
-                        "failed to import render sync file into implicit-sync buffer reservation"
-                    );
-                }
-            }
-            return;
-        }
-        *self.inner.last_render_sync.lock().unwrap() = Some(LastRenderSync::Exported(sync_file));
-    }
-
-    #[cfg(feature = "backend_drm")]
-    pub(crate) fn try_signal_superseded_release_with_last_render_sync(&self) -> bool {
-        let Some(last_render_sync) = self.inner.last_render_sync.lock().unwrap().clone() else {
-            return false;
-        };
-
-        let mut superseded_release = self.inner.superseded_release.lock().unwrap();
-        let Some(claimable) = superseded_release.as_ref() else {
-            return false;
-        };
-
-        match last_render_sync {
-            LastRenderSync::Pending(sync) => {
-                // Only signal immediately if the render sync is already reached.
-                // Do NOT call sync.export() here — for VkFence-based sync points,
-                // SYNC_FD export resets the fence per Vulkan spec. If the fence was
-                // already exported elsewhere (e.g. for KMS IN_FENCE_FD), re-exporting
-                // produces an invalid fd and causes ENOENT in signal_with_sync_file.
-                // If the sync isn't reached yet, return false and let the caller retry
-                // or rely on the drop fallback in ClaimableReleasePoint.
-                if sync.is_reached() {
-                    let signaled = claimable.signal().map_or_else(
-                        |err| {
-                            warn!(?err, "Failed to signal superseded release point immediately");
-                            false
-                        },
-                        |_| true,
-                    );
-                    if signaled {
-                        superseded_release.take();
-                        drop(superseded_release);
-                        self.clear_last_render_sync();
-                    }
-                    return signaled;
-                }
-
-                false
-            }
-            LastRenderSync::Exported(sync_file) => {
-                let sync_file = match sync_file.try_clone() {
-                    Ok(sync_file) => sync_file,
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            "Failed to clone exported render sync for superseded release point"
-                        );
-                        return false;
-                    }
-                };
-
-                match claimable.signal_with_sync_file(sync_file) {
-                    Ok(signaled) => {
-                        if signaled {
-                            superseded_release.take();
-                            drop(superseded_release);
-                            self.clear_last_render_sync();
-                        }
-                        true
-                    }
-                    Err(err) => {
-                        // sync_file was invalid or DRM ioctl failed — fall back to
-                        // immediate signaling so the release point doesn't stay orphaned.
-                        warn!(
-                            ?err,
-                            "Failed to attach superseded release to render sync, signaling immediately"
-                        );
-                        let fallback_ok = claimable.signal().unwrap_or(false);
-                        if fallback_ok {
-                            superseded_release.take();
-                            drop(superseded_release);
-                            self.clear_last_render_sync();
-                        }
-                        fallback_ok
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "backend_drm")]
-    pub(crate) fn signal_superseded_release_with_sync_file(
-        &self,
-        sync_file: std::os::fd::OwnedFd,
-    ) -> std::io::Result<bool> {
-        let mut superseded_release = self.inner.superseded_release.lock().unwrap();
-        let Some(claimable) = superseded_release.as_ref() else {
-            return Ok(false);
-        };
-
-        let signaled = claimable.signal_with_sync_file(sync_file)?;
-        if signaled {
-            superseded_release.take();
-            drop(superseded_release);
-            self.clear_last_render_sync();
-        }
-        Ok(true)
-    }
-
-    #[cfg(feature = "backend_drm")]
-    pub(crate) fn same_resource(&self, other: &Self) -> bool {
-        self.inner.buffer == other.inner.buffer
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -387,34 +201,59 @@ impl RendererSurfaceState {
                 self.buffer_scale = attrs.buffer_scale;
                 self.buffer_transform = attrs.buffer_transform.into();
 
-                if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
-                    if let Some(previous_buffer) = self.buffer.take() {
-                        if let Some(release_point) = previous_buffer.take_release_point() {
-                            let claimable = ClaimableReleasePoint::new(release_point);
-                            previous_buffer.set_release_fallback(claimable.weak());
-                            previous_buffer.set_superseded_release(claimable);
-                            let _ = previous_buffer.try_signal_superseded_release_with_last_render_sync();
-                        }
-                    }
+                let same_resource = self.buffer.as_ref().is_some_and(|b| b == buffer);
 
-                    let release_point = syncobj_state.release_point.take();
-                    self.buffer = Some(Buffer {
-                        inner: Arc::new(InnerBuffer {
-                            buffer,
-                            #[cfg(feature = "backend_drm")]
-                            acquire_point: syncobj_state.acquire_point.take(),
-                            #[cfg(feature = "backend_drm")]
-                            release_point: Mutex::new(release_point.clone()),
-                            #[cfg(feature = "backend_drm")]
-                            has_explicit_release_point: release_point.is_some(),
-                            #[cfg(feature = "backend_drm")]
-                            release_fallback: Mutex::new(None),
-                            #[cfg(feature = "backend_drm")]
-                            superseded_release: Mutex::new(None),
-                            #[cfg(feature = "backend_drm")]
-                            last_render_sync: Mutex::new(None),
-                        }),
-                    });
+                #[cfg(feature = "backend_drm")]
+                {
+                    let synchronization = match (
+                        syncobj_state.acquire_point.take(),
+                        syncobj_state.release_point.take(),
+                    ) {
+                        (None, None) => AttachmentSynchronization::Implicit,
+                        (Some(acquire), Some(release)) => {
+                            AttachmentSynchronization::Explicit { acquire, release }
+                        }
+                        (acquire, release) => {
+                            // The drm-syncobj pre-commit hook has already
+                            // rejected this client. Do not reinterpret a
+                            // malformed explicit attachment as implicit.
+                            error!(
+                                has_acquire = acquire.is_some(),
+                                has_release = release.is_some(),
+                                "validated DRM syncobj attachment reached renderer with an incomplete point pair"
+                            );
+                            if let Some(release) = release {
+                                let _ = release.signal();
+                            }
+                            self.reset();
+                            return;
+                        }
+                    };
+
+                    // Explicit synchronization defines a new ownership
+                    // generation for every attachment, even when the same
+                    // wl_buffer resource is reused. Switching back to implicit
+                    // sync must likewise retire the preceding explicit
+                    // generation. Only a repeated implicit attachment of the
+                    // already-current resource shares its existing owner.
+                    let replace_generation = !same_resource
+                        || synchronization.is_explicit()
+                        || self.buffer.as_ref().is_some_and(Buffer::has_explicit_release);
+                    if replace_generation {
+                        self.buffer = Some(match synchronization {
+                            AttachmentSynchronization::Implicit => Buffer::with_implicit(buffer),
+                            AttachmentSynchronization::Explicit { acquire, release } => {
+                                Buffer::with_explicit(buffer, acquire, release)
+                            }
+                        });
+                    }
+                }
+
+                #[cfg(not(feature = "backend_drm"))]
+                if !same_resource {
+                    self.buffer = Some(Buffer::with_implicit(buffer));
+                }
+                if !same_resource {
                     self.textures.clear();
                 }
             }

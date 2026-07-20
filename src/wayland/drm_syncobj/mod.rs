@@ -11,9 +11,11 @@
 //! implementations.
 //!
 //! The release fence is signalled when the compositor is done using the buffer.
-//! Superseded explicit-sync buffers may be released as soon as the last sampled
-//! frame completes; other buffers fall back to signaling when all references to
-//! a [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
+//! One [`Buffer`][crate::backend::renderer::utils::Buffer] represents one
+//! attachment generation and joins every render-completion fence recorded by
+//! Smithay's output damage renderer. Direct-scanout state retains the same
+//! generation until KMS displaces it. The final owner therefore signals the
+//! release point only after all GPU and KMS readers are complete.
 //!
 //! ```no_run
 //! # use smithay::delegate_drm_syncobj;
@@ -187,6 +189,32 @@ impl DrmSyncobjState {
     }
 }
 
+/// Point-pair invariant violated by one explicit-sync surface commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrmSyncobjCommitPointError {
+    /// One or both points were supplied without a new non-null buffer.
+    NoBuffer,
+    /// A new non-null buffer was attached without an acquire point.
+    NoAcquirePoint,
+    /// A new non-null buffer and acquire point lacked a release point.
+    NoReleasePoint,
+}
+
+/// Validate the protocol's "both points iff a non-null buffer is attached"
+/// rule without depending on compositor policy or hook ordering.
+pub fn validate_commit_point_pair(
+    has_new_buffer: bool,
+    has_acquire_point: bool,
+    has_release_point: bool,
+) -> Result<(), DrmSyncobjCommitPointError> {
+    match (has_new_buffer, has_acquire_point, has_release_point) {
+        (false, false, false) | (true, true, true) => Ok(()),
+        (false, _, _) => Err(DrmSyncobjCommitPointError::NoBuffer),
+        (true, false, _) => Err(DrmSyncobjCommitPointError::NoAcquirePoint),
+        (true, true, false) => Err(DrmSyncobjCommitPointError::NoReleasePoint),
+    }
+}
+
 impl<D> GlobalDispatch<WpLinuxDrmSyncobjManagerV1, DrmSyncobjGlobalData, D> for DrmSyncobjState
 where
     D: Dispatch<WpLinuxDrmSyncobjManagerV1, ()>,
@@ -222,21 +250,27 @@ fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface
             if let Some(syncobj_surface) = data.borrow().as_ref() {
                 let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
                 let pending = cached.pending();
-                if pending.acquire_point.is_some() && new_buffer.is_none() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoBuffer as u32,
-                        "acquire point without buffer".to_string(),
-                    );
-                } else if pending.acquire_point.is_some() && pending.release_point.is_none() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoReleasePoint as u32,
-                        "acquire point without release point".to_string(),
-                    );
-                } else if pending.acquire_point.is_none() && pending.release_point.is_some() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoAcquirePoint as u32,
-                        "release point without acquire point".to_string(),
-                    );
+                let point_pair = validate_commit_point_pair(
+                    new_buffer.is_some(),
+                    pending.acquire_point.is_some(),
+                    pending.release_point.is_some(),
+                );
+                if let Err(error) = point_pair {
+                    let (code, message) = match error {
+                        DrmSyncobjCommitPointError::NoBuffer => (
+                            wp_linux_drm_syncobj_surface_v1::Error::NoBuffer,
+                            "sync points without a newly attached buffer",
+                        ),
+                        DrmSyncobjCommitPointError::NoAcquirePoint => (
+                            wp_linux_drm_syncobj_surface_v1::Error::NoAcquirePoint,
+                            "newly attached buffer without an acquire point",
+                        ),
+                        DrmSyncobjCommitPointError::NoReleasePoint => (
+                            wp_linux_drm_syncobj_surface_v1::Error::NoReleasePoint,
+                            "newly attached buffer without a release point",
+                        ),
+                    };
+                    syncobj_surface.post_error(code as u32, message.to_string());
                 } else if let (Some(acquire), Some(release)) =
                     (pending.acquire_point.as_ref(), pending.release_point.as_ref())
                 {
@@ -492,6 +526,38 @@ impl<D: DrmSyncobjHandler> Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimel
                 .known_timelines
                 .retain(|t| t.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, &data.timeline.0)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_commit_point_pair, DrmSyncobjCommitPointError};
+
+    #[test]
+    fn explicit_sync_points_are_required_exactly_with_a_new_buffer() {
+        assert_eq!(validate_commit_point_pair(false, false, false), Ok(()));
+        assert_eq!(validate_commit_point_pair(true, true, true), Ok(()));
+
+        assert_eq!(
+            validate_commit_point_pair(false, true, false),
+            Err(DrmSyncobjCommitPointError::NoBuffer)
+        );
+        assert_eq!(
+            validate_commit_point_pair(false, false, true),
+            Err(DrmSyncobjCommitPointError::NoBuffer)
+        );
+        assert_eq!(
+            validate_commit_point_pair(true, false, false),
+            Err(DrmSyncobjCommitPointError::NoAcquirePoint)
+        );
+        assert_eq!(
+            validate_commit_point_pair(true, false, true),
+            Err(DrmSyncobjCommitPointError::NoAcquirePoint)
+        );
+        assert_eq!(
+            validate_commit_point_pair(true, true, false),
+            Err(DrmSyncobjCommitPointError::NoReleasePoint)
+        );
     }
 }
 

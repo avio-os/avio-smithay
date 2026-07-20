@@ -97,6 +97,8 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
 };
+#[cfg(feature = "backend_drm")]
+use std::{os::fd::OwnedFd, sync::Arc};
 
 use indexmap::IndexMap;
 use smallvec::{smallvec, SmallVec};
@@ -108,6 +110,8 @@ use crate::{
     utils::{Buffer as BufferCoords, Physical, Rectangle, Scale, Size, Transform},
 };
 
+#[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
+use super::{element::UnderlyingStorage, utils::Buffer as WaylandBuffer};
 use super::{
     element::{Element, Id, Kind, RenderElement, RenderElementState, RenderElementStates},
     sync::SyncPoint,
@@ -243,6 +247,10 @@ impl<E: std::error::Error + MaybeDeviceLost> Error<E> {
 pub struct RenderOutputResult<'a> {
     /// Holds the sync point of the rendering operation
     pub sync: SyncPoint,
+    /// The render completion exported exactly once for all asynchronous
+    /// consumers (KMS and Wayland buffer-release ownership).
+    #[cfg(feature = "backend_drm")]
+    shared_sync_file: Option<Arc<OwnedFd>>,
     /// Holds the damage from the rendering operation
     pub damage: Option<&'a Vec<Rectangle<i32, Physical>>>,
     /// Explains why the damage tracker decided this output needed repainting.
@@ -309,10 +317,20 @@ impl RenderOutputResult<'_> {
     fn skipped(states: RenderElementStates, damage_summary: OutputDamageSummary) -> Self {
         Self {
             sync: SyncPoint::signaled(),
+            #[cfg(feature = "backend_drm")]
+            shared_sync_file: None,
             damage: None,
             damage_summary,
             states,
         }
+    }
+
+    /// Share the one cached sync_file export for this render operation.
+    /// Re-exporting some renderer fences is destructive, so all consumers
+    /// clone this descriptor instead of independently exporting `sync`.
+    #[cfg(feature = "backend_drm")]
+    pub(crate) fn shared_sync_file(&self) -> Option<Arc<OwnedFd>> {
+        self.shared_sync_file.clone()
     }
 }
 
@@ -468,6 +486,20 @@ impl OutputDamageTracker {
             self.opaque_regions
         );
 
+        #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
+        let rendered_wayland_buffers = {
+            let mut buffers = Vec::<WaylandBuffer>::new();
+            for element in &render_elements {
+                let Some(UnderlyingStorage::Wayland(buffer)) = element.sampled_storage(renderer) else {
+                    continue;
+                };
+                if !buffers.iter().any(|existing| existing.same_instance(buffer)) {
+                    buffers.push(buffer.clone());
+                }
+            }
+            buffers
+        };
+
         let render_res = (|| {
             // we have to take the element damage to be able to move it around
             let mut element_damage = std::mem::take(&mut self.element_damage);
@@ -548,12 +580,46 @@ impl OutputDamageTracker {
         })();
 
         match render_res {
-            Ok(sync) => Ok(RenderOutputResult {
-                sync,
-                damage: Some(&self.damage),
-                damage_summary: self.damage_summary,
-                states,
-            }),
+            Ok(sync) => {
+                #[cfg(feature = "backend_drm")]
+                let shared_sync_file = sync.export().map(Arc::new);
+                #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
+                let completion_was_host_waited = if !rendered_wayland_buffers.is_empty()
+                    && !sync.is_reached()
+                    && shared_sync_file.is_none()
+                {
+                    // An asynchronous Wayland-buffer read must leave one
+                    // pollable completion identity for release ownership. If
+                    // the renderer cannot export one, finish the producer work
+                    // here rather than creating a periodic release poller or
+                    // allowing the attachment to retire without evidence.
+                    renderer.wait(&sync).map_err(Error::Rendering)?;
+                    true
+                } else {
+                    false
+                };
+                #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
+                for buffer in rendered_wayland_buffers {
+                    if !completion_was_host_waited && !sync.is_reached() {
+                        buffer.record_render_completion(
+                            shared_sync_file
+                                .as_ref()
+                                .expect(
+                                    "pending Wayland render completion lacked an export after host-wait gate",
+                                )
+                                .clone(),
+                        );
+                    }
+                }
+                Ok(RenderOutputResult {
+                    sync,
+                    #[cfg(feature = "backend_drm")]
+                    shared_sync_file,
+                    damage: Some(&self.damage),
+                    damage_summary: self.damage_summary,
+                    states,
+                })
+            }
             Err(err) => {
                 // if the rendering errors on us, we need to be prepared, that this whole buffer was partially updated and thus now unusable.
                 // thus clean our old states before returning

@@ -17,8 +17,10 @@ use crate::{
 };
 
 use super::{
-    device::DeviceState, dmabuf::ImportedDmabufImage, format::texture_view_components, VulkanRenderer,
-    VulkanRendererError, VulkanTexture,
+    device::{DeviceState, TransientBufferAllocation},
+    dmabuf::ImportedDmabufImage,
+    format::texture_view_components,
+    VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
 const SUPPORTED_MEMORY_FORMATS: &[Fourcc] = &[
@@ -283,7 +285,7 @@ where
 
 fn upload_region_to_image(
     device: &mut DeviceState,
-    image: &ImportedDmabufImage,
+    image: &std::sync::Arc<ImportedDmabufImage>,
     format: Fourcc,
     data: &[u8],
     region: Rectangle<i32, BufferCoord>,
@@ -399,7 +401,15 @@ fn upload_region_to_image(
         return Err(err.into());
     }
 
-    device.submit_blocking(command_buffer)?;
+    let staging = TransientBufferAllocation::new(
+        device,
+        scopeguard::ScopeGuard::into_inner(cleanup_buffer),
+        scopeguard::ScopeGuard::into_inner(cleanup_memory),
+    );
+    if let Err(err) = device.submit_upload(command_buffer, std::sync::Arc::clone(image), staging) {
+        let _ = device.discard_command_buffer(command_buffer);
+        return Err(err);
+    }
     image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     Ok(())
 }

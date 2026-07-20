@@ -288,7 +288,11 @@ impl Dmabuf {
         interest: Interest,
     ) -> Result<(DmabufBlocker, DmabufSource), AlreadyReady> {
         let source = DmabufSource::new(self.clone(), interest)?;
-        let blocker = DmabufBlocker(source.signal.clone());
+        let blocker = DmabufBlocker {
+            signal: source.signal.clone(),
+            dmabuf: self.weak(),
+            interest,
+        };
         Ok((blocker, source))
     }
 
@@ -577,17 +581,62 @@ where
 /// [`Blocker`] implementation for an accompaning [`DmabufSource`]
 #[cfg(feature = "wayland_frontend")]
 #[derive(Debug)]
-pub struct DmabufBlocker(Arc<AtomicBool>);
+pub struct DmabufBlocker {
+    signal: Arc<AtomicBool>,
+    dmabuf: WeakDmabuf,
+    interest: Interest,
+}
 
 #[cfg(feature = "wayland_frontend")]
 impl Blocker for DmabufBlocker {
     fn state(&self) -> BlockerState {
-        if self.0.load(Ordering::SeqCst) {
+        if self.signal.load(Ordering::SeqCst) {
+            return BlockerState::Released;
+        }
+        let Some(dmabuf) = self.dmabuf.upgrade() else {
+            return BlockerState::Cancelled;
+        };
+        if dmabuf
+            .handles()
+            .all(|handle| dmabuf_plane_ready(handle, self.interest))
+        {
             BlockerState::Released
         } else {
             BlockerState::Pending
         }
     }
+}
+
+fn dmabuf_plane_ready(handle: BorrowedFd<'_>, interest: Interest) -> bool {
+    if !interest.readable && !interest.writable {
+        return true;
+    }
+    let ready_flag = if interest.writable {
+        rustix::event::PollFlags::OUT
+    } else {
+        rustix::event::PollFlags::IN
+    };
+    let requested = ready_flag
+        | rustix::event::PollFlags::ERR
+        | rustix::event::PollFlags::HUP
+        | rustix::event::PollFlags::NVAL;
+    let mut poll_fd = [rustix::event::PollFd::new(&handle, requested)];
+    let Ok(ready) = rustix::event::poll(
+        &mut poll_fd,
+        Some(&rustix::time::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    ) else {
+        return false;
+    };
+    if ready == 0 {
+        return false;
+    }
+    let returned = poll_fd[0].revents();
+    !returned.intersects(
+        rustix::event::PollFlags::ERR | rustix::event::PollFlags::HUP | rustix::event::PollFlags::NVAL,
+    ) && returned.contains(ready_flag)
 }
 
 #[derive(Debug)]
@@ -647,23 +696,7 @@ impl DmabufSource {
             Subsource::Empty,
         ];
         for (idx, handle) in dmabuf.handles().enumerate() {
-            if matches!(
-                rustix::event::poll(
-                    &mut [rustix::event::PollFd::new(
-                        &handle,
-                        if interest.writable {
-                            rustix::event::PollFlags::OUT
-                        } else {
-                            rustix::event::PollFlags::IN
-                        },
-                    )],
-                    Some(&rustix::time::Timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0
-                    })
-                ),
-                Ok(1)
-            ) {
+            if dmabuf_plane_ready(handle, interest) {
                 continue;
             }
             let fd = PlaneRef {
@@ -684,6 +717,41 @@ impl DmabufSource {
                 signal: Arc::new(AtomicBool::new(false)),
             })
         }
+    }
+}
+
+#[cfg(all(test, feature = "wayland_frontend"))]
+mod blocker_tests {
+    use super::*;
+
+    fn eventfd_dmabuf(initial: u32) -> Dmabuf {
+        let fd = rustix::event::eventfd(
+            initial,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .unwrap();
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(fd, 0, 0, 4));
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn blocker_repolls_real_plane_readiness_after_a_lost_wakeup() {
+        let dmabuf = eventfd_dmabuf(0);
+        let (blocker, _source) = dmabuf.generate_blocker(Interest::READ).unwrap();
+        assert_eq!(blocker.state(), BlockerState::Pending);
+
+        rustix::io::write(dmabuf.handles().next().unwrap(), &1_u64.to_ne_bytes()).unwrap();
+        assert_eq!(blocker.state(), BlockerState::Released);
+    }
+
+    #[test]
+    fn blocker_cancels_when_its_buffer_no_longer_exists() {
+        let dmabuf = eventfd_dmabuf(0);
+        let (blocker, source) = dmabuf.generate_blocker(Interest::READ).unwrap();
+        drop(source);
+        drop(dmabuf);
+        assert_eq!(blocker.state(), BlockerState::Cancelled);
     }
 }
 

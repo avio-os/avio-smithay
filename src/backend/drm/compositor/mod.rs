@@ -134,8 +134,8 @@ use std::{
 };
 
 use drm::{
-    control::{connector, crtc, framebuffer, plane, Mode},
-    Device, DriverCapability,
+    control::{connector, crtc, framebuffer, plane, Device as ControlDevice, Mode},
+    Device, DriverCapability, VblankWaitFlags, VblankWaitTarget,
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use indexmap::{IndexMap, IndexSet};
@@ -287,16 +287,6 @@ impl<B: Buffer> ScanoutBuffer<B> {
             }
         }
         None
-    }
-
-    fn same_storage(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Wayland(lhs), Self::Wayland(rhs)) => lhs.same_resource(rhs),
-            (Self::Dmabuf(lhs), Self::Dmabuf(rhs)) => lhs == rhs,
-            (Self::Swapchain(lhs), Self::Swapchain(rhs)) => Arc::ptr_eq(lhs, rhs),
-            (Self::Cursor(lhs), Self::Cursor(rhs)) => Arc::ptr_eq(lhs, rhs),
-            _ => false,
-        }
     }
 }
 
@@ -696,73 +686,6 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         self.plane_state(handle)
             .and_then(|state| state.config.as_ref().map(|config| &config.buffer))
     }
-
-    #[cfg(feature = "backend_drm")]
-    fn contains_buffer(&self, candidate: &ScanoutBuffer<B>) -> bool {
-        self.planes.iter().any(|(_, state)| {
-            state
-                .config
-                .as_ref()
-                .is_some_and(|config| config.buffer.buffer.same_storage(candidate))
-        })
-    }
-
-    #[cfg(feature = "backend_drm")]
-    fn signal_displaced_release_points_with_fence(&self, next_frame: &Self, out_fence: &OwnedFd) {
-        for (_, state) in &self.planes {
-            let Some(config) = state.config.as_ref() else {
-                continue;
-            };
-            if next_frame.contains_buffer(&config.buffer.buffer) {
-                continue;
-            }
-            let ScanoutBuffer::Wayland(buffer) = &config.buffer.buffer else {
-                continue;
-            };
-
-            match out_fence.try_clone() {
-                Ok(sync_file) => match buffer.signal_superseded_release_with_sync_file(sync_file) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            "Failed to import DRM out-fence into superseded release point; falling back to drop-time release"
-                        );
-                        continue;
-                    }
-                },
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "Failed to clone DRM out-fence for superseded release point; falling back to drop-time release"
-                    );
-                    continue;
-                }
-            }
-
-            let Some(release_point) = buffer.take_release_point() else {
-                continue;
-            };
-
-            match out_fence.try_clone() {
-                Ok(sync_file) => {
-                    if let Err(err) = release_point.signal_with_sync_file(sync_file) {
-                        warn!(?err, "Failed to import DRM out-fence into syncobj release point");
-                        if let Err(fallback_err) = release_point.signal() {
-                            warn!(?fallback_err, "Failed to signal syncobj release point fallback");
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(?err, "Failed to clone DRM out-fence for syncobj release point");
-                    if let Err(fallback_err) = release_point.signal() {
-                        warn!(?fallback_err, "Failed to signal syncobj release point fallback");
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
@@ -1017,18 +940,14 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
 /// shipped default; the verdict decides the permanent driver policy.
 fn output_layer_host_wait_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_HOST_WAIT").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_HOST_WAIT").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-07-11 H5): allocate the output-layer swapchain
 /// LINEAR instead of inheriting the primary's modifiers. Diagnostics only.
 fn output_layer_linear_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_LINEAR").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_LINEAR").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-07-11 H5): clear the output layer opaque red at
@@ -1036,30 +955,61 @@ fn output_layer_linear_diag() -> bool {
 /// render-target import. Diagnostics only.
 fn output_layer_clear_red_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_CLEAR_RED").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_CLEAR_RED").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-07-11 H5): force age-0 full repaints of the
 /// output layer with the normal transparent clear. Diagnostics only.
 fn output_layer_full_repaint_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AVIO_DIAG_OUTPUT_LAYER_FULL_REPAINT").is_ok_and(|v| v.trim() == "1")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
 }
 
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
-type FrameErrorType<A, F> = FrameError<
+pub(crate) type FrameErrorType<A, F> = FrameError<
     <A as Allocator>::Error,
     <<A as Allocator>::Buffer as AsDmabuf>::Error,
     <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Error,
 >;
 
 pub(crate) type FrameResult<T, A, F> = Result<T, FrameErrorType<A, F>>;
+
+/// Result of attempting to submit the userspace-queued frame while retiring
+/// the frame which produced the current page-flip event.
+///
+/// A failed queued submission must return its user data to the caller. Dropping
+/// that data would break any caller-side custody ledger: the completed frame's
+/// token and the rejected queued frame's token are two independent outcomes.
+#[derive(Debug)]
+pub enum QueuedFrameSubmission<U, E> {
+    /// No userspace-queued frame existed.
+    None,
+    /// The queued frame was accepted by KMS and is now pending.
+    Submitted,
+    /// KMS rejected the queued frame before it became pending.
+    Failed {
+        /// User data attached to the frame KMS rejected.
+        user_data: U,
+        /// Atomic commit/page-flip failure for that frame.
+        error: E,
+    },
+}
+
+/// Atomic outcome of processing one page-flip event.
+///
+/// `completed` identifies the frame retired by the event. `queued_submission`
+/// independently reports what happened to the replacement which Smithay may
+/// submit from its userspace queue at the same transition.
+#[derive(Debug)]
+pub struct FrameSubmissionOutcome<U, E> {
+    /// User data for the frame retired by the page-flip event, if any.
+    pub completed: Option<U>,
+    /// Disposition of the userspace-queued replacement at the same transition.
+    pub queued_submission: QueuedFrameSubmission<U, E>,
+}
 
 pub(crate) type RenderFrameErrorType<A, F, R> = RenderFrameError<
     <A as Allocator>::Error,
@@ -1169,6 +1119,13 @@ impl From<&PlaneInfo> for PlaneAssignmentInfo {
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: CompositorFrameState<A, F>,
     user_data: U,
+    /// The atomic commit's OUT-fence, retained for the pending flip's
+    /// lifetime. The kernel signals it exactly when the flip completes, so
+    /// polling it distinguishes "flip done, vblank event lost" (recoverable
+    /// by force-retiring) from "flip genuinely stuck" (force-retiring would
+    /// fabricate an on-glass edge and release buffers still being scanned
+    /// out). `None` when the commit carried no out-fence.
+    flip_out_fence: Option<OwnedFd>,
 }
 
 /// Outcome of [`DrmCompositor::queue_cursor_position`].
@@ -1193,16 +1150,38 @@ pub enum CursorRepositionOutcome {
 /// [`DrmCompositor::frame_pipeline_diagnostics`].
 #[derive(Debug, Clone, Copy)]
 pub struct FramePipelineDiagnostics {
-    /// A commit has been handed to the kernel and its page-flip has not
-    /// completed yet.
-    pub commit_pending: bool,
+    /// Smithay still retains a userspace `PendingFrame` record.
+    ///
+    /// This is topology/bookkeeping, not kernel completion evidence: it stays
+    /// true when the page flip completed but its event was lost. Only
+    /// `flip_out_fence` distinguishes that case from a genuinely pending flip.
+    pub pending_frame_retained: bool,
     /// A rendered frame is held in userspace behind the pending commit.
     pub frame_queued: bool,
-    /// State of the pending commit's primary-plane in-fence: `None` when no
-    /// pending commit or no fence fd is attached; `Some(false)` means the
-    /// kernel is still waiting on the fence — for a long-stuck flip this
-    /// names a dead fence producer.
-    pub primary_in_fence_signaled: Option<bool>,
+    /// State of the pending commit's primary-plane in-fence. A long-lived
+    /// [`FenceSignalState::Pending`] names a producer-side stall.
+    pub primary_in_fence: FenceSignalState,
+    /// Kernel-confirmed completion state of the pending flip, from polling
+    /// the atomic commit's retained OUT-fence. Only
+    /// [`FenceSignalState::Signaled`] permits event-loss recovery.
+    pub flip_out_fence: FenceSignalState,
+}
+
+/// Non-blocking readiness of a KMS sync-file fence.
+///
+/// `Missing` means the driver or commit supplied no fence. `Invalid` is kept
+/// distinct from both absence and readiness: poll errors are not completion
+/// evidence and callers must fail closed rather than retire a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceSignalState {
+    /// No fence exists for the pending frame or no frame is pending.
+    Missing,
+    /// The fence exists and has not signaled.
+    Pending,
+    /// The fence exists and has signaled.
+    Signaled,
+    /// Polling failed or returned events that cannot prove completion.
+    Invalid,
 }
 
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
@@ -2603,14 +2582,6 @@ where
                     (dmabuf, age)
                 };
 
-                let output_layer_wayland_buffers = output_layer_elements
-                    .iter()
-                    .filter_map(|element| match element.underlying_storage(renderer) {
-                        Some(UnderlyingStorage::Wayland(buffer)) => Some(buffer.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-
                 let renderer_debug_flags = renderer.debug_flags();
                 renderer.set_debug_flags(self.debug_flags);
 
@@ -2651,7 +2622,7 @@ where
                         let shared_render_sync_file = if render_output_result.damage.is_some() {
                             output_layer_rendered_this_frame = true;
                             if self.supports_fencing {
-                                render_output_result.sync.export().map(Arc::new)
+                                render_output_result.shared_sync_file()
                             } else {
                                 None
                             }
@@ -2671,22 +2642,13 @@ where
                             // layer bands: old frames interleaving on an
                             // idle output where most layer renders carry no
                             // damage).
-                            let layer_plane_state =
-                                next_frame_state.plane_state_mut(layer_plane).unwrap();
+                            let layer_plane_state = next_frame_state.plane_state_mut(layer_plane).unwrap();
                             layer_plane_state.skip = true;
                             let restored_config = previous_state
                                 .plane_state(layer_plane)
                                 .and_then(|state| state.config.as_ref().cloned());
                             if let Some(restored_config) = restored_config {
                                 layer_plane_state.config = Some(restored_config);
-                            }
-                        } else {
-                            for buffer in &output_layer_wayland_buffers {
-                                if let Some(sync_file) = shared_render_sync_file.as_ref() {
-                                    buffer.set_last_render_sync_file(sync_file.clone());
-                                } else {
-                                    buffer.set_last_render_sync(render_output_result.sync.clone());
-                                }
                             }
                         }
 
@@ -2848,13 +2810,6 @@ where
                                 .map(DrmRenderElements::from)
                         }
                     });
-            let primary_plane_wayland_buffers = primary_plane_elements
-                .iter()
-                .filter_map(|element| match element.underlying_storage(renderer) {
-                    Some(UnderlyingStorage::Wayland(buffer)) => Some(buffer.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
             // Then render all remaining elements assigned to the primary plane
             let elements = overlay_plane_elements
                 .chain(
@@ -2892,10 +2847,10 @@ where
                     let shared_render_sync_file =
                         if render_output_result.damage.is_some() && self.supports_fencing {
                             primary_rendered_this_frame = true;
-                            // Export once and fan out duplicated fds to KMS and superseded-release
-                            // consumers. When KMS fencing is unavailable, keep the sync point
-                            // unexported so the submit path can still fall back to a host wait.
-                            let exported = render_output_result.sync.export().map(Arc::new);
+                            // Export once for KMS. Source-buffer release is
+                            // ownership-driven by compositor use tokens rather
+                            // than attached to one arbitrarily selected fence.
+                            let exported = render_output_result.shared_sync_file();
                             trace!(
                                 exported_ok = exported.is_some(),
                                 sync_reached = render_output_result.sync.is_reached(),
@@ -2910,17 +2865,7 @@ where
                         // if we receive no damage we can assume no rendering took place
                         // and we should trigger a cleanup of the renderer texture cache
                         // to prevent holding textures longer then necessary.
-                        // In this case we intentionally keep the previous last_render_sync on
-                        // sampled wayland buffers because no new compositor read happened.
                         let _ = renderer.cleanup_texture_cache();
-                    } else {
-                        for buffer in &primary_plane_wayland_buffers {
-                            if let Some(sync_file) = shared_render_sync_file.as_ref() {
-                                buffer.set_last_render_sync_file(sync_file.clone());
-                            } else {
-                                buffer.set_last_render_sync(render_output_result.sync.clone());
-                            }
-                        }
                     }
 
                     for (id, state) in render_output_result.states.states.into_iter() {
@@ -3133,7 +3078,7 @@ where
             user_data,
         });
         if self.pending_frame.is_none() {
-            self.submit()?;
+            self.submit().map_err(|(_user_data, error)| error)?;
         }
         Ok(())
     }
@@ -3171,6 +3116,7 @@ where
         }
 
         self.handle_flip(prepared_frame, None, flip)
+            .map_err(|(_user_data, error)| error)
     }
 
     /// Re-evaluates the current state of the crtc and forces calls to [`render_frame`](DrmCompositor::render_frame)
@@ -3189,7 +3135,7 @@ where
     }
 
     #[profiling::function]
-    fn submit(&mut self) -> FrameResult<(), A, F> {
+    fn submit(&mut self) -> Result<(), (U, FrameErrorType<A, F>)> {
         let QueuedFrame {
             mut prepared_frame,
             user_data,
@@ -3207,6 +3153,12 @@ where
         };
 
         self.handle_flip(prepared_frame, Some(user_data), flip)
+            .map_err(|(user_data, error)| {
+                (
+                    user_data.expect("queued DRM submission lost its user data"),
+                    error,
+                )
+            })
     }
 
     fn mark_submitted_swapchain_slots(&mut self, frame: &CompositorFrameState<A, F>) {
@@ -3234,9 +3186,9 @@ where
         prepared_frame: PreparedFrame<A, F>,
         user_data: Option<U>,
         flip: Result<(), crate::backend::drm::error::Error>,
-    ) -> FrameResult<(), A, F> {
+    ) -> Result<(), (Option<U>, FrameErrorType<A, F>)> {
         match flip {
-            Ok(_) => {
+            Ok(()) => {
                 // Buffer ages may only advance for frames the device accepted:
                 // an age says "this slot's content is N accepted frames old",
                 // and the damage-since-age replay repaints exactly those N
@@ -3247,10 +3199,7 @@ where
                 // wallpaper patches / uninitialized-layer garbage that only
                 // healed under fresh damage).
                 self.mark_submitted_swapchain_slots(&prepared_frame.frame);
-                if let Some(out_fence) = self.surface.take_out_fence() {
-                    self.current_frame
-                        .signal_displaced_release_points_with_fence(&prepared_frame.frame, &out_fence);
-                }
+                let flip_out_fence = self.surface.take_out_fence();
                 if prepared_frame.kind == PreparedFrameKind::Full {
                     self.reset_pending = false;
                 }
@@ -3258,37 +3207,41 @@ where
                 self.pending_frame = user_data.map(|user_data| PendingFrame {
                     frame: prepared_frame.frame,
                     user_data,
+                    flip_out_fence,
                 });
+                Ok(())
             }
-            Err(crate::backend::drm::error::Error::Access(ref access))
-                if access.source.kind() == ErrorKind::InvalidInput =>
-            {
-                // In case the commit/flip failed while we tried to directly scan-out
-                // something on the primary plane we can try to mark this as failed for
-                // the next call to render_frame
-                let primary_plane_element_state = prepared_frame
-                    .frame
-                    .plane_state(self.surface.plane())
-                    .and_then(|plane_state| {
-                        plane_state
-                            .element_state
-                            .as_ref()
-                            .map(|element_state| &element_state.id)
-                    })
-                    .and_then(|primary_plane_element_id| {
-                        self.element_states.get_mut(primary_plane_element_id)
-                    });
+            Err(error) => {
+                if matches!(
+                    &error,
+                    crate::backend::drm::error::Error::Access(access)
+                        if access.source.kind() == ErrorKind::InvalidInput
+                ) {
+                    // In case the commit/flip failed while we tried to directly scan-out
+                    // something on the primary plane we can try to mark this as failed for
+                    // the next call to render_frame.
+                    let primary_plane_element_state = prepared_frame
+                        .frame
+                        .plane_state(self.surface.plane())
+                        .and_then(|plane_state| {
+                            plane_state
+                                .element_state
+                                .as_ref()
+                                .map(|element_state| &element_state.id)
+                        })
+                        .and_then(|primary_plane_element_id| {
+                            self.element_states.get_mut(primary_plane_element_id)
+                        });
 
-                if let Some(primary_plane_element_state) = primary_plane_element_state {
-                    for instance in primary_plane_element_state.instances.iter_mut() {
-                        instance.failed_planes.primary = true;
+                    if let Some(primary_plane_element_state) = primary_plane_element_state {
+                        for instance in primary_plane_element_state.instances.iter_mut() {
+                            instance.failed_planes.primary = true;
+                        }
                     }
                 }
+                Err((user_data, FrameError::DrmError(error)))
             }
-            Err(_) => {}
-        };
-
-        flip.map_err(FrameError::DrmError)
+        }
     }
 
     /// Returns `true` when no commit is awaiting its page-flip and no frame
@@ -3459,22 +3412,85 @@ where
             .and_then(|pending| pending.frame.plane_state(self.surface.plane()))
             .and_then(|state| state.config.as_ref())
             .and_then(|config| config.sync.as_ref());
+        let poll_fence = |fd: Option<&OwnedFd>| {
+            let Some(fd) = fd else {
+                return FenceSignalState::Missing;
+            };
+            let requested = rustix::event::PollFlags::IN
+                | rustix::event::PollFlags::ERR
+                | rustix::event::PollFlags::HUP
+                | rustix::event::PollFlags::NVAL;
+            let mut poll_fd = [rustix::event::PollFd::new(fd, requested)];
+            let result = rustix::event::poll(
+                &mut poll_fd,
+                Some(&rustix::time::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                }),
+            );
+            let Ok(ready) = result else {
+                return FenceSignalState::Invalid;
+            };
+            if ready == 0 {
+                return FenceSignalState::Pending;
+            }
+            let returned = poll_fd[0].revents();
+            if returned.intersects(
+                rustix::event::PollFlags::ERR
+                    | rustix::event::PollFlags::HUP
+                    | rustix::event::PollFlags::NVAL,
+            ) {
+                return FenceSignalState::Invalid;
+            }
+            if returned.contains(rustix::event::PollFlags::IN) {
+                FenceSignalState::Signaled
+            } else {
+                FenceSignalState::Invalid
+            }
+        };
         FramePipelineDiagnostics {
-            commit_pending: self.pending_frame.is_some(),
+            pending_frame_retained: self.pending_frame.is_some(),
             frame_queued: self.queued_frame.is_some(),
-            primary_in_fence_signaled: pending_primary_sync.and_then(|(_, fd)| fd.as_deref()).map(|fd| {
-                let mut poll_fd = [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
-                rustix::event::poll(
-                    &mut poll_fd,
-                    Some(&rustix::time::Timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0,
-                    }),
-                )
-                .ok()
-                .is_some_and(|ready| ready > 0)
-            }),
+            primary_in_fence: poll_fence(pending_primary_sync.and_then(|(_, fd)| fd.as_deref())),
+            flip_out_fence: poll_fence(
+                self.pending_frame
+                    .as_ref()
+                    .and_then(|pending| pending.flip_out_fence.as_ref()),
+            ),
         }
+    }
+
+    /// Query the kernel's most recent vblank sequence for this compositor's
+    /// CRTC.
+    ///
+    /// This is the correlation watermark required when a caller retires a
+    /// pending frame from its KMS OUT-fence before the corresponding page-flip
+    /// event is delivered. Events at or before the returned sequence cannot be
+    /// applied to a newer pending frame.
+    pub fn current_vblank_sequence(&self) -> std::io::Result<u32> {
+        let resources = self.surface.device_fd().resource_handles()?;
+        let pipe_index = resources
+            .crtcs()
+            .iter()
+            .position(|crtc| *crtc == self.surface.crtc())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::NotFound,
+                    "DRM compositor CRTC is absent from device resources",
+                )
+            })?;
+        let pipe_index = u32::try_from(pipe_index)
+            .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "DRM CRTC pipe index exceeds u32"))?;
+
+        self.surface
+            .device_fd()
+            .wait_vblank(
+                VblankWaitTarget::Relative(0),
+                VblankWaitFlags::empty(),
+                pipe_index,
+                0,
+            )
+            .map(|reply| reply.frame())
     }
 
     /// Marks the current frame as submitted.
@@ -3482,16 +3498,36 @@ where
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`](super::DrmDevice)
     /// was received after calling [`DrmCompositor::queue_frame`] on this surface.
     /// Otherwise the underlying swapchain will run out of buffers eventually.
+    ///
+    /// The outcome reports the completed frame and the independent disposition
+    /// of a userspace-queued replacement. Callers must retire both user-data
+    /// tokens when the replacement submission fails.
     #[profiling::function]
-    pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
+    pub fn frame_submitted(&mut self) -> FrameSubmissionOutcome<U, FrameErrorType<A, F>> {
+        let completed = if let Some(PendingFrame {
+            mut frame,
+            user_data,
+            flip_out_fence: _,
+        }) = self.pending_frame.take()
+        {
             std::mem::swap(&mut frame, &mut self.current_frame);
-            if self.queued_frame.is_some() {
-                self.submit()?;
-            }
-            Ok(Some(user_data))
+            Some(user_data)
         } else {
-            Ok(None)
+            None
+        };
+
+        let queued_submission = if completed.is_some() && self.queued_frame.is_some() {
+            match self.submit() {
+                Ok(()) => QueuedFrameSubmission::Submitted,
+                Err((user_data, error)) => QueuedFrameSubmission::Failed { user_data, error },
+            }
+        } else {
+            QueuedFrameSubmission::None
+        };
+
+        FrameSubmissionOutcome {
+            completed,
+            queued_submission,
         }
     }
 
@@ -5532,6 +5568,26 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+#[test]
+fn frame_submission_outcome_preserves_completed_and_rejected_tokens() {
+    let outcome = FrameSubmissionOutcome {
+        completed: Some(41_u64),
+        queued_submission: QueuedFrameSubmission::Failed {
+            user_data: 42_u64,
+            error: "atomic commit rejected",
+        },
+    };
+
+    assert_eq!(outcome.completed, Some(41));
+    assert!(matches!(
+        outcome.queued_submission,
+        QueuedFrameSubmission::Failed {
+            user_data: 42,
+            error: "atomic commit rejected",
+        }
+    ));
 }
 
 #[test]

@@ -34,7 +34,7 @@ use smithay::{
             Fourcc, Modifier,
         },
         drm::{
-            compositor::{DrmCompositor, FrameFlags},
+            compositor::{DrmCompositor, FrameFlags, QueuedFrameSubmission},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
             CreateDrmNodeError, DrmAccessError, DrmDevice, DrmDeviceFd, DrmError, DrmEvent, DrmEventMetadata,
@@ -1274,20 +1274,18 @@ impl AnvilState<UdevData> {
         }
         surface.last_presentation_time = Some(clock);
 
-        let submit_result = surface
-            .drm_output
-            .frame_submitted()
-            .map_err(Into::<SwapBuffersError>::into);
+        let submission = surface.drm_output.frame_submitted();
+        if let Some(mut feedback) = submission.completed.flatten() {
+            feedback.presented(clock, Refresh::fixed(frame_duration), seq as u64, flags);
+        }
 
-        let schedule_render = match submit_result {
-            Ok(user_data) => {
-                if let Some(mut feedback) = user_data.flatten() {
-                    feedback.presented(clock, Refresh::fixed(frame_duration), seq as u64, flags);
+        let schedule_render = match submission.queued_submission {
+            QueuedFrameSubmission::None | QueuedFrameSubmission::Submitted => true,
+            QueuedFrameSubmission::Failed { mut user_data, error } => {
+                if let Some(feedback) = user_data.as_mut() {
+                    feedback.discarded();
                 }
-
-                true
-            }
-            Err(err) => {
+                let err = Into::<SwapBuffersError>::into(error);
                 warn!("Error during rendering: {:?}", err);
                 match err {
                     SwapBuffersError::AlreadySwapped => true,

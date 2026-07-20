@@ -791,6 +791,22 @@ mod tests {
         }
     }
 
+    fn assert_clear_pixel_matches_unorm_quantization(actual: &[u8], format: Fourcc) {
+        let expected = expected_clear_pixel(format);
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().copied().zip(expected) {
+            // 0.5 * 255 is exactly halfway between 127 and 128. Vulkan asks
+            // implementations to round normalized fixed-point conversions to
+            // nearest but does not prescribe the halfway direction. All other
+            // components in this clear have one exact expected encoding.
+            if expected == 128 {
+                assert!(matches!(actual, 127 | 128));
+            } else {
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
     fn expected_red_pixel(format: Fourcc) -> [u8; 4] {
         match format {
             Fourcc::Argb8888 | Fourcc::Xrgb8888 => [0, 0, 255, 255],
@@ -863,7 +879,7 @@ mod tests {
             .expect("map_texture should expose readback bytes");
 
         assert_eq!(bytes.len(), (buffer_size.w * buffer_size.h * 4) as usize);
-        assert_eq!(&bytes[0..4], &expected_clear_pixel(format));
+        assert_clear_pixel_matches_unorm_quantization(&bytes[0..4], format);
 
         let fallback_format = match format {
             Fourcc::Argb8888 => Fourcc::Xrgb8888,

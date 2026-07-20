@@ -518,6 +518,18 @@ pub trait RenderElement<R: Renderer>: Element {
         let _ = renderer;
         None
     }
+
+    /// Return the storage whose pixels this element may sample while drawing.
+    ///
+    /// This is deliberately separate from [`Self::underlying_storage`]. The
+    /// latter advertises storage which may be handed to an optimization such
+    /// as a DRM plane; an element with a crop, effect, or compositor transform
+    /// can be ineligible for that optimization while still reading the client
+    /// buffer during composition.
+    #[inline]
+    fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.underlying_storage(renderer)
+    }
 }
 
 /// Types that can be converted into [`RenderElement`]s
@@ -590,6 +602,11 @@ where
     #[inline]
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         (*self).underlying_storage(renderer)
+    }
+
+    #[inline]
+    fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        (*self).sampled_storage(renderer)
     }
 
     fn draw(
@@ -930,6 +947,22 @@ macro_rules! render_elements_internal {
                 Self::_GenericCatcher(_) => unreachable!(),
             }
         }
+
+
+        #[inline]
+        fn sampled_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage<'_>>
+        {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; sampled_storage; x, renderer)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
     };
     (@draw $renderer:ty; $($(#[$meta:meta])* $body:ident=$field:ty $(as <$other_renderer:ty>)?),* $(,)?) => {
         fn draw(
@@ -963,6 +996,22 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; underlying_storage; x, renderer)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+
+        #[inline]
+        fn sampled_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage<'_>>
+        {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; sampled_storage; x, renderer)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1536,6 +1585,11 @@ where
     #[inline]
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.0.underlying_storage(renderer)
+    }
+
+    #[inline]
+    fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.0.sampled_storage(renderer)
     }
 }
 

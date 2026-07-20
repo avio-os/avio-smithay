@@ -61,29 +61,49 @@ impl_downcast!(Fence);
 
 impl Fence for SyncFileFence {
     fn is_signaled(&self) -> bool {
-        let mut poll_fd = [rustix::event::PollFd::new(
-            &self.sync_file,
-            rustix::event::PollFlags::IN,
-        )];
-        rustix::event::poll(
+        let requested = rustix::event::PollFlags::IN
+            | rustix::event::PollFlags::ERR
+            | rustix::event::PollFlags::HUP
+            | rustix::event::PollFlags::NVAL;
+        let mut poll_fd = [rustix::event::PollFd::new(&self.sync_file, requested)];
+        let Ok(ready) = rustix::event::poll(
             &mut poll_fd,
             Some(&rustix::time::Timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
             }),
-        )
-        .ok()
-        .is_some_and(|ready| ready > 0)
+        ) else {
+            return false;
+        };
+        ready > 0
+            && !poll_fd[0].revents().intersects(
+                rustix::event::PollFlags::ERR
+                    | rustix::event::PollFlags::HUP
+                    | rustix::event::PollFlags::NVAL,
+            )
+            && poll_fd[0].revents().contains(rustix::event::PollFlags::IN)
     }
 
     fn wait(&self) -> Result<(), Interrupted> {
         loop {
-            let mut poll_fd = [rustix::event::PollFd::new(
-                &self.sync_file,
-                rustix::event::PollFlags::IN,
-            )];
+            let requested = rustix::event::PollFlags::IN
+                | rustix::event::PollFlags::ERR
+                | rustix::event::PollFlags::HUP
+                | rustix::event::PollFlags::NVAL;
+            let mut poll_fd = [rustix::event::PollFd::new(&self.sync_file, requested)];
             match rustix::event::poll(&mut poll_fd, None) {
-                Ok(ready) if ready > 0 => return Ok(()),
+                Ok(ready)
+                    if ready > 0
+                        && poll_fd[0].revents().contains(rustix::event::PollFlags::IN)
+                        && !poll_fd[0].revents().intersects(
+                            rustix::event::PollFlags::ERR
+                                | rustix::event::PollFlags::HUP
+                                | rustix::event::PollFlags::NVAL,
+                        ) =>
+                {
+                    return Ok(())
+                }
+                Ok(ready) if ready > 0 => return Err(Interrupted),
                 Ok(_) => continue,
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(_) => return Err(Interrupted),
@@ -179,5 +199,26 @@ impl<T: Fence + 'static> From<T> for SyncPoint {
         SyncPoint {
             fence: Some(Arc::new(value)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Fence, SyncFileFence};
+
+    #[test]
+    fn sync_file_fence_requires_the_requested_ready_event() {
+        let sync_file = rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .unwrap();
+        let signal_fd = rustix::io::fcntl_dupfd_cloexec(&sync_file, 3).unwrap();
+        let fence = SyncFileFence::new(sync_file);
+
+        assert!(!fence.is_signaled());
+        rustix::io::write(&signal_fd, &1_u64.to_ne_bytes()).unwrap();
+        assert!(fence.is_signaled());
+        fence.wait().unwrap();
     }
 }
