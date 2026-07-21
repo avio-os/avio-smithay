@@ -27,6 +27,7 @@ use encoding_rs::WINDOWS_1252;
 use std::{
     borrow::Cow,
     collections::HashSet,
+    num::NonZeroU32,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, Weak,
@@ -109,6 +110,21 @@ pub(super) type Protocols = Vec<WMProtocol>;
 pub(super) enum WMProtocol {
     TakeFocus,
     DeleteWindow,
+    Ping,
+}
+
+fn wm_protocol_from_atom(
+    atom: Atom,
+    take_focus: Atom,
+    delete_window: Atom,
+    ping: Atom,
+) -> Option<WMProtocol> {
+    match atom {
+        atom if atom == take_focus => Some(WMProtocol::TakeFocus),
+        atom if atom == delete_window => Some(WMProtocol::DeleteWindow),
+        atom if atom == ping => Some(WMProtocol::Ping),
+        _ => None,
+    }
 }
 
 impl PartialEq for X11Surface {
@@ -863,10 +879,13 @@ impl X11Surface {
         let mut state = self.state.lock().unwrap();
         state.protocols = protocols
             .into_iter()
-            .filter_map(|atom| match atom {
-                x if x == self.atoms.WM_TAKE_FOCUS => Some(WMProtocol::TakeFocus),
-                x if x == self.atoms.WM_DELETE_WINDOW => Some(WMProtocol::DeleteWindow),
-                _ => None,
+            .filter_map(|atom| {
+                wm_protocol_from_atom(
+                    atom,
+                    self.atoms.WM_TAKE_FOCUS,
+                    self.atoms.WM_DELETE_WINDOW,
+                    self.atoms._NET_WM_PING,
+                )
             })
             .collect::<Vec<_>>();
         Ok(())
@@ -1002,6 +1021,45 @@ impl X11Surface {
         conn.flush()
     }
 
+    /// Returns whether this window supports the EWMH `_NET_WM_PING` protocol.
+    pub fn supports_ping(&self) -> bool {
+        self.state.lock().unwrap().protocols.contains(&WMProtocol::Ping)
+    }
+
+    /// Sends an EWMH `_NET_WM_PING` request to this window.
+    ///
+    /// `timestamp` should be the nonzero X11 event time that caused the probe.
+    /// A conforming client echoes it while forwarding the message to the root
+    /// window; the reply is delivered through
+    /// [`XwmHandler::ping_response`](super::XwmHandler::ping_response).
+    pub fn send_ping(&self, timestamp: NonZeroU32) -> Result<(), ConnectionError> {
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        let state = self.state.lock().unwrap();
+        if !state.protocols.contains(&WMProtocol::Ping) {
+            return Ok(());
+        }
+
+        let event = ClientMessageEvent::new(
+            32,
+            self.window,
+            self.atoms.WM_PROTOCOLS,
+            [self.atoms._NET_WM_PING, timestamp.get(), self.window, 0, 0],
+        );
+        conn.send_event(false, self.window, EventMask::NO_EVENT, event)?;
+        conn.flush()
+    }
+
+    /// Disconnects the X11 client that owns this window.
+    ///
+    /// This uses the X11 resource itself as the identity, so it cannot target a
+    /// recycled process id. All resources belonging to the same X11 connection
+    /// are destroyed by the X server.
+    pub fn kill_client(&self) -> Result<(), ConnectionError> {
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        conn.kill_client(self.window)?;
+        conn.flush()
+    }
+
     /// Get the client PID associated with the X11 window.
     pub fn get_client_pid(&self) -> Result<u32, Box<dyn std::error::Error>> {
         if let Some(connection) = self.conn.upgrade() {
@@ -1095,6 +1153,32 @@ impl IsAlive for X11Surface {
     #[inline]
     fn alive(&self) -> bool {
         X11Surface::alive(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wm_protocol_from_atom, WMProtocol};
+
+    #[test]
+    fn wm_protocol_classification_includes_ping() {
+        let take_focus = 11;
+        let delete_window = 12;
+        let ping = 13;
+
+        assert_eq!(
+            wm_protocol_from_atom(take_focus, take_focus, delete_window, ping),
+            Some(WMProtocol::TakeFocus)
+        );
+        assert_eq!(
+            wm_protocol_from_atom(delete_window, take_focus, delete_window, ping),
+            Some(WMProtocol::DeleteWindow)
+        );
+        assert_eq!(
+            wm_protocol_from_atom(ping, take_focus, delete_window, ping),
+            Some(WMProtocol::Ping)
+        );
+        assert_eq!(wm_protocol_from_atom(99, take_focus, delete_window, ping), None);
     }
 }
 

@@ -141,6 +141,7 @@ use rustix::fs::OFlags;
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
+    num::NonZeroU32,
     ops::Deref,
     os::unix::{
         io::{AsFd, OwnedFd},
@@ -161,10 +162,10 @@ use x11rb::{
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
         xfixes::ConnectionExt as _,
         xproto::{
-            AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux,
-            ConnectionExt, CreateGCAux, CreateWindowAux, CursorWrapper, EventMask, FontWrapper,
-            GcontextWrapper, ImageFormat, PixmapWrapper, PropMode, Property, QueryExtensionReply, Screen,
-            StackMode, WindowClass, CONFIGURE_NOTIFY_EVENT,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigWindow,
+            ConfigureNotifyEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux,
+            CursorWrapper, EventMask, FontWrapper, GcontextWrapper, ImageFormat, PixmapWrapper, PropMode,
+            Property, QueryExtensionReply, Screen, StackMode, WindowClass, CONFIGURE_NOTIFY_EVENT,
         },
         Event,
     },
@@ -433,6 +434,16 @@ pub trait XwmHandler {
         let _ = (xwm, window, timestamp, currently_active_window);
     }
 
+    /// The client replied to an EWMH `_NET_WM_PING` request.
+    ///
+    /// `timestamp` is the X11 event time supplied to
+    /// [`X11Surface::send_ping`]. Smithay validates that the reply was sent to
+    /// the X root window and names a currently managed window before invoking
+    /// this callback.
+    fn ping_response(&mut self, xwm: XwmId, window: X11Surface, timestamp: NonZeroU32) {
+        let _ = (xwm, window, timestamp);
+    }
+
     /// Window requests access to the given selection.
     fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionTarget) -> bool {
         let _ = (xwm, selection);
@@ -498,6 +509,23 @@ impl Drop for X11Wm {
     fn drop(&mut self) {
         xwm_id::remove(self.id.0);
     }
+}
+
+fn net_wm_ping_response(
+    message: &ClientMessageEvent,
+    root: X11Window,
+    wm_protocols: Atom,
+    net_wm_ping: Atom,
+) -> Option<(X11Window, NonZeroU32)> {
+    if message.format != 32 || message.window != root || message.type_ != wm_protocols {
+        return None;
+    }
+
+    let data = message.data.as_data32();
+    if data[0] != net_wm_ping {
+        return None;
+    }
+    Some((data[2], NonZeroU32::new(data[1])?))
 }
 
 /// Edge values for resizing
@@ -2080,6 +2108,24 @@ where
                 );
             }
             match msg.type_ {
+                x if x == xwm.atoms.WM_PROTOCOLS => {
+                    if let Some((client_window, timestamp)) = net_wm_ping_response(
+                        &msg,
+                        xwm.screen.root,
+                        xwm.atoms.WM_PROTOCOLS,
+                        xwm.atoms._NET_WM_PING,
+                    ) {
+                        if let Some(surface) = xwm
+                            .windows
+                            .iter()
+                            .find(|surface| surface.window_id() == client_window)
+                            .cloned()
+                        {
+                            drop(_guard);
+                            state.ping_response(xwm_id, surface, timestamp);
+                        }
+                    }
+                }
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];
                     info!(
@@ -2321,6 +2367,40 @@ where
     }
     conn.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::net_wm_ping_response;
+    use std::num::NonZeroU32;
+    use x11rb::protocol::xproto::ClientMessageEvent;
+
+    #[test]
+    fn net_wm_ping_reply_requires_protocol_type_and_root_destination() {
+        let root = 10;
+        let protocols = 20;
+        let ping = 30;
+        let client_window = 40;
+        let timestamp = 50;
+        let reply = ClientMessageEvent::new(32, root, protocols, [ping, timestamp, client_window, 0, 0]);
+
+        assert_eq!(
+            net_wm_ping_response(&reply, root, protocols, ping),
+            Some((client_window, NonZeroU32::new(timestamp).unwrap()))
+        );
+        assert_eq!(net_wm_ping_response(&reply, root + 1, protocols, ping), None);
+        assert_eq!(net_wm_ping_response(&reply, root, protocols + 1, ping), None);
+
+        let wrong_format = ClientMessageEvent::new(8, root, protocols, [0_u8; 20]);
+        assert_eq!(net_wm_ping_response(&wrong_format, root, protocols, ping), None);
+
+        let wrong_protocol =
+            ClientMessageEvent::new(32, root, protocols, [ping + 1, timestamp, client_window, 0, 0]);
+        assert_eq!(net_wm_ping_response(&wrong_protocol, root, protocols, ping), None);
+
+        let zero_timestamp = ClientMessageEvent::new(32, root, protocols, [ping, 0, client_window, 0, 0]);
+        assert_eq!(net_wm_ping_response(&zero_timestamp, root, protocols, ping), None);
+    }
 }
 
 fn send_configure_notify(
