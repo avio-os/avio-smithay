@@ -581,6 +581,145 @@ fn merge_sync_files(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "use_system_lib"))]
+    mod rust_server_egress {
+        use std::{
+            collections::HashSet,
+            io::{self, Read},
+            os::{fd::OwnedFd, unix::net::UnixStream},
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        use wayland_server::{
+            backend::{protocol::Message, ClientId, Handle, ObjectData, ObjectId},
+            protocol::{wl_buffer::WlBuffer, wl_callback::WlCallback},
+            Display, Resource,
+        };
+
+        use super::super::BufferReleaseMerger;
+
+        const EVENT_COUNT: usize = 64;
+
+        #[derive(Debug)]
+        struct InertObjectData;
+
+        impl ObjectData<()> for InertObjectData {
+            fn request(
+                self: Arc<Self>,
+                _handle: &Handle,
+                _data: &mut (),
+                _client_id: ClientId,
+                _message: Message<ObjectId, OwnedFd>,
+            ) -> Option<Arc<dyn ObjectData<()>>> {
+                None
+            }
+
+            fn destroyed(
+                self: Arc<Self>,
+                _handle: &Handle,
+                _data: &mut (),
+                _client_id: ClientId,
+                _object_id: ObjectId,
+            ) {
+            }
+        }
+
+        #[test]
+        fn concurrent_callback_and_buffer_release_preserve_wire_framing() {
+            let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let mut display = Display::<()>::new().unwrap();
+            let mut display_handle = display.handle();
+            let client = display_handle.insert_client(server_stream, Arc::new(())).unwrap();
+
+            let buffer: WlBuffer = client
+                .create_resource_from_objdata(&display_handle, 1, Arc::new(InertObjectData))
+                .unwrap();
+            let callbacks: Vec<WlCallback> = (0..EVENT_COUNT)
+                .map(|_| {
+                    client
+                        .create_resource_from_objdata(&display_handle, 1, Arc::new(InertObjectData))
+                        .unwrap()
+                })
+                .collect();
+            let buffer_id = buffer.id().protocol_id();
+            let callback_ids: HashSet<u32> = callbacks
+                .iter()
+                .map(|callback| callback.id().protocol_id())
+                .collect();
+
+            let barrier = Barrier::new(2);
+            thread::scope(|scope| {
+                let worker_barrier = &barrier;
+                let worker_buffer = buffer.clone();
+                scope.spawn(move || {
+                    worker_barrier.wait();
+                    for _ in 0..EVENT_COUNT {
+                        BufferReleaseMerger::implicit(worker_buffer.clone()).retire();
+                        thread::yield_now();
+                    }
+                });
+
+                barrier.wait();
+                for (serial, callback) in callbacks.iter().enumerate() {
+                    callback.done(serial as u32);
+                    thread::yield_now();
+                }
+            });
+
+            display.flush_clients().unwrap();
+            client_stream.set_nonblocking(true).unwrap();
+            let mut wire = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match client_stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => wire.extend_from_slice(&chunk[..read]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("failed to read test Wayland stream: {error}"),
+                }
+            }
+
+            let mut offset = 0;
+            let mut releases = 0;
+            let mut callbacks_done = 0;
+            while offset < wire.len() {
+                assert!(wire.len() - offset >= 8, "truncated Wayland header at {offset}");
+                let sender = u32::from_ne_bytes(wire[offset..offset + 4].try_into().unwrap());
+                let header = u32::from_ne_bytes(wire[offset + 4..offset + 8].try_into().unwrap());
+                let opcode = (header & 0xffff) as u16;
+                let size = (header >> 16) as usize;
+                assert!(
+                    size >= 8 && size % 4 == 0,
+                    "invalid Wayland size {size} at {offset}"
+                );
+                assert!(
+                    size <= wire.len() - offset,
+                    "Wayland message at {offset} overruns captured bytes"
+                );
+
+                if sender == buffer_id {
+                    assert_eq!((opcode, size), (0, 8));
+                    releases += 1;
+                } else if callback_ids.contains(&sender) {
+                    assert_eq!((opcode, size), (0, 12));
+                    callbacks_done += 1;
+                } else if sender == 1 {
+                    assert_eq!((opcode, size), (1, 12));
+                    let deleted = u32::from_ne_bytes(wire[offset + 8..offset + 12].try_into().unwrap());
+                    assert!(callback_ids.contains(&deleted));
+                } else {
+                    panic!("unexpected Wayland sender {sender} at {offset}");
+                }
+                offset += size;
+            }
+
+            assert_eq!(releases, EVENT_COUNT);
+            assert_eq!(callbacks_done, EVENT_COUNT);
+        }
+    }
+
     #[test]
     fn sync_file_readiness_distinguishes_pending_and_ready() {
         let sync_file = rustix::event::eventfd(

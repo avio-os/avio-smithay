@@ -63,6 +63,24 @@
 //! If you do not want to use [`tracing`] for your compositor, refer to [`log compatibility`](tracing#log-compatibility)
 //! for how to forward smithays debug output to other `log` compatible frameworks.
 
+#[cfg(all(feature = "require_rust_wayland_server", feature = "use_system_lib"))]
+compile_error!(
+    "`require_rust_wayland_server` and `use_system_lib` are mutually exclusive; \
+     a compositor requiring the Rust Wayland server must not enable the system backend"
+);
+
+// Cargo features are unified across the dependency graph, so another crate can
+// activate wayland-backend/server_system without going through Smithay's
+// use_system_lib feature. Prove that the selected public backend is still the
+// Rust implementation whenever the compositor requires that ownership model.
+#[cfg(all(feature = "require_rust_wayland_server", not(feature = "use_system_lib")))]
+#[allow(dead_code)]
+fn require_rust_wayland_server_backend(
+    backend: wayland_backend::server::Backend<()>,
+) -> wayland_backend::rs::server::Backend<()> {
+    backend
+}
+
 pub mod backend;
 #[cfg(feature = "desktop")]
 pub mod desktop;
