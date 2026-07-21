@@ -17,6 +17,7 @@ use wayland_server::{
 
 use crate::utils::{
     alive_tracker::{AliveTracker, IsAlive},
+    user_data::UserDataMap,
     Client, Logical, Point,
 };
 
@@ -80,6 +81,7 @@ where
                     SurfaceUserData {
                         inner: PrivateSurfaceData::new(),
                         alive_tracker: Default::default(),
+                        user_data: UserDataMap::new(),
                         user_state_type: (std::any::TypeId::of::<D>(), std::any::type_name::<D>()),
                     },
                 );
@@ -153,7 +155,20 @@ impl Cacheable for SurfaceAttributes {
 pub struct SurfaceUserData {
     pub(crate) inner: Mutex<PrivateSurfaceData>,
     alive_tracker: AliveTracker,
+    user_data: UserDataMap,
     pub(super) user_state_type: (std::any::TypeId, &'static str),
+}
+
+impl SurfaceUserData {
+    /// Returns compositor-specific data tied to this `wl_surface` resource.
+    ///
+    /// Unlike [`SurfaceData`](super::SurfaceData), accessing this map does not
+    /// lock Smithay's private surface state. The map remains available through
+    /// retained [`WlSurface`] handles while role teardown callbacks run, even
+    /// if the protocol resource itself has already been destroyed.
+    pub fn user_data(&self) -> &UserDataMap {
+        &self.user_data
+    }
 }
 
 impl<D> Dispatch<WlSurface, SurfaceUserData, D> for CompositorState
@@ -666,5 +681,85 @@ where
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::unix::net::UnixStream, sync::Arc};
+    use wayland_server::{backend::ClientData, Display};
+
+    struct TestState;
+    struct TestClientData;
+
+    impl ClientData for TestClientData {}
+
+    impl Dispatch<WlSurface, SurfaceUserData> for TestState {
+        fn request(
+            _state: &mut Self,
+            _client: &wayland_server::Client,
+            _resource: &WlSurface,
+            _request: wl_surface::Request,
+            _data: &SurfaceUserData,
+            _handle: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
+        }
+    }
+
+    fn test_surface_user_data() -> SurfaceUserData {
+        SurfaceUserData {
+            inner: PrivateSurfaceData::new(),
+            alive_tracker: Default::default(),
+            user_data: UserDataMap::new(),
+            user_state_type: (
+                std::any::TypeId::of::<TestState>(),
+                std::any::type_name::<TestState>(),
+            ),
+        }
+    }
+
+    #[test]
+    fn surface_user_data_does_not_reenter_private_surface_state() {
+        let surface_data = test_surface_user_data();
+        surface_data.user_data().insert_if_missing_threadsafe(|| 41_u64);
+
+        let _private_state_guard = surface_data.inner.lock().unwrap();
+        assert_eq!(surface_data.user_data().get::<u64>(), Some(&41));
+    }
+
+    #[test]
+    fn retained_surface_keeps_user_data_after_resource_destruction() {
+        let display = Display::<TestState>::new().unwrap();
+        let mut handle = display.handle();
+        let (server_stream, _client_stream) = UnixStream::pair().unwrap();
+        let client = handle
+            .insert_client(server_stream, Arc::new(TestClientData))
+            .unwrap();
+        let surface = client
+            .create_resource::<WlSurface, SurfaceUserData, TestState>(&handle, 1, test_surface_user_data())
+            .unwrap();
+        surface
+            .data::<SurfaceUserData>()
+            .unwrap()
+            .user_data()
+            .insert_if_missing_threadsafe(|| 73_u64);
+        let retained_surface = surface.clone();
+
+        handle
+            .backend_handle()
+            .destroy_object::<TestState>(&surface.id())
+            .unwrap();
+
+        assert!(!retained_surface.is_alive());
+        assert_eq!(
+            retained_surface
+                .data::<SurfaceUserData>()
+                .unwrap()
+                .user_data()
+                .get::<u64>(),
+            Some(&73)
+        );
     }
 }
