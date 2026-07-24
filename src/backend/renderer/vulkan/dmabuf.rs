@@ -683,6 +683,11 @@ impl ImportedDmabufImage {
     pub(crate) fn set_foreign_ownership(&self) {
         self.owned_by_foreign.store(true, Ordering::Release);
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_owned_by_foreign(&self) -> bool {
+        self.owned_by_foreign.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for ImportedDmabufImage {

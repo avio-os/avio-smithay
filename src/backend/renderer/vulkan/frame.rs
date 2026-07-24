@@ -51,6 +51,12 @@ struct FrameRecording {
     output_size: Size<i32, Physical>,
     size: Size<i32, Physical>,
     pending_layouts: IndexMap<u64, (Arc<ImportedDmabufImage>, vk::ImageLayout)>,
+    /// Imported images that must return to their external owner after the
+    /// frame's final access. This spans flushed command-buffer segments.
+    foreign_release_images: IndexMap<u64, Arc<ImportedDmabufImage>>,
+    /// FOREIGN acquisitions encoded only in the current, unsubmitted command
+    /// buffer. Abort paths restore their CPU-side ownership bookkeeping.
+    unsubmitted_foreign_acquires: IndexMap<u64, Arc<ImportedDmabufImage>>,
 }
 
 #[derive(Debug)]
@@ -183,17 +189,20 @@ impl Renderer for VulkanRenderer {
                 output_size,
                 size: transformed_size,
                 pending_layouts: IndexMap::new(),
+                foreign_release_images: IndexMap::new(),
+                unsubmitted_foreign_acquires: IndexMap::new(),
             }),
         };
 
         {
-            let target = frame
-                .recording
-                .as_ref()
-                .expect("recording initialized")
-                .target
-                .clone();
-            frame.transition_image_layout(&target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
+            let recording = frame.recording.as_ref().expect("recording initialized");
+            let target = recording.target.clone();
+            let release_target_to_foreign = recording.release_target_to_foreign;
+            frame.transition_image_layout(
+                &target,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                release_target_to_foreign,
+            )?;
         }
 
         let render_pass_begin_info = {
@@ -683,9 +692,16 @@ impl VulkanFrame<'_> {
         &mut self,
         image: &Arc<ImportedDmabufImage>,
         new_layout: vk::ImageLayout,
+        release_to_foreign_after_frame: bool,
     ) -> Result<(), VulkanRendererError> {
         let (command_buffer, old_layout) = {
             let recording = self.recording_mut()?;
+            if release_to_foreign_after_frame {
+                recording
+                    .foreign_release_images
+                    .entry(image.id())
+                    .or_insert_with(|| image.clone());
+            }
             let old_layout = recording
                 .pending_layouts
                 .get(&image.id())
@@ -694,6 +710,12 @@ impl VulkanFrame<'_> {
             (recording.command_buffer, old_layout)
         };
         let acquire_from_foreign = image.take_foreign_ownership();
+        if acquire_from_foreign {
+            self.recording_mut()?
+                .unsubmitted_foreign_acquires
+                .entry(image.id())
+                .or_insert_with(|| image.clone());
+        }
 
         if old_layout == new_layout && !acquire_from_foreign {
             self.recording_mut()?
@@ -753,54 +775,68 @@ impl VulkanFrame<'_> {
         Ok(())
     }
 
-    fn release_recording_target_to_foreign(&mut self, recording: &mut FrameRecording) {
-        if !recording.release_target_to_foreign {
+    fn release_recording_images_to_foreign(&mut self, recording: &mut FrameRecording) {
+        if recording.foreign_release_images.is_empty() {
             return;
         }
 
-        let old_layout = recording
-            .pending_layouts
-            .get(&recording.target.id())
-            .map(|(_, layout)| *layout)
-            .unwrap_or_else(|| recording.target.current_layout());
         let new_layout = vk::ImageLayout::GENERAL;
-        let (src_stage_mask, src_access_mask) = stage_access_for_layout(old_layout);
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .src_queue_family_index(self.renderer.device.queue_family_index())
-            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .image(recording.target.image())
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            )
-            .src_access_mask(src_access_mask)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
+        let barriers = recording
+            .foreign_release_images
+            .values()
+            .map(|image| {
+                let old_layout = recording
+                    .pending_layouts
+                    .get(&image.id())
+                    .map(|(_, layout)| *layout)
+                    .unwrap_or_else(|| image.current_layout());
+                let (_, src_access_mask) = stage_access_for_layout(old_layout);
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(old_layout)
+                    .new_layout(new_layout)
+                    .src_queue_family_index(self.renderer.device.queue_family_index())
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                    .image(image.image())
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_access_mask(src_access_mask)
+                    .dst_access_mask(vk::AccessFlags::empty())
+            })
+            .collect::<Vec<_>>();
 
         // SAFETY: Command buffer recording is active after the render pass has ended.
-        // The target image is a DMA-BUF imported for render-target usage; releasing it
-        // to FOREIGN makes the color attachment writes visible to cross-process
-        // consumers before the completion fence is signaled.
+        // All imported images remain alive through submission. The release
+        // barriers return exclusive queue-family ownership after this frame's
+        // final compositor access.
         unsafe {
             self.renderer.device.device_handle().cmd_pipeline_barrier(
                 recording.command_buffer,
-                src_stage_mask,
                 vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &barrier,
+                &barriers,
             );
         }
 
-        recording
-            .pending_layouts
-            .insert(recording.target.id(), (recording.target.clone(), new_layout));
+        for image in recording.foreign_release_images.values() {
+            recording
+                .pending_layouts
+                .insert(image.id(), (image.clone(), new_layout));
+        }
+    }
+
+    fn restore_unsubmitted_foreign_acquires(recording: &mut FrameRecording) {
+        for (_, image) in recording.unsubmitted_foreign_acquires.drain(..) {
+            image.set_foreign_ownership();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -826,7 +862,7 @@ impl VulkanFrame<'_> {
             ));
         };
 
-        self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
+        self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, true)?;
 
         let (command_buffer, pipelines, transform, size) = {
             let recording = self.recording()?;
@@ -1092,7 +1128,7 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .cmd_end_render_pass(recording.command_buffer);
         }
-        self.release_recording_target_to_foreign(&mut recording);
+        self.release_recording_images_to_foreign(&mut recording);
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
         if let Err(err) = self.renderer.device.shared_device().observe_result(unsafe {
@@ -1110,6 +1146,7 @@ impl VulkanFrame<'_> {
                 .renderer
                 .device
                 .discard_command_buffer(recording.command_buffer);
+            Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
             return Err(err.into());
@@ -1127,6 +1164,7 @@ impl VulkanFrame<'_> {
                     .renderer
                     .device
                     .discard_command_buffer(recording.command_buffer);
+                Self::restore_unsubmitted_foreign_acquires(&mut recording);
                 self.renderer.device.clear_pending_wait_semaphores();
                 self.state = VulkanFrameState::Aborted;
                 return Err(err);
@@ -1136,9 +1174,10 @@ impl VulkanFrame<'_> {
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
             image.set_layout(layout);
         }
-        if recording.release_target_to_foreign {
-            recording.target.set_foreign_ownership();
+        for (_, image) in recording.foreign_release_images.drain(..) {
+            image.set_foreign_ownership();
         }
+        recording.unsubmitted_foreign_acquires.clear();
 
         self.state = VulkanFrameState::Finished;
         Ok(SyncPoint::from(submission_fence))
@@ -1164,6 +1203,11 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .cmd_end_render_pass(recording.command_buffer);
         }
+        // A flushed segment is a complete queue submission. Return every
+        // imported image to FOREIGN here rather than carrying local ownership
+        // across the standalone blit between segments. This makes every
+        // submitted segment independently safe if the blit or resume fails.
+        self.release_recording_images_to_foreign(&mut recording);
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
         if let Err(err) = self.renderer.device.shared_device().observe_result(unsafe {
@@ -1181,6 +1225,7 @@ impl VulkanFrame<'_> {
                 .renderer
                 .device
                 .discard_command_buffer(recording.command_buffer);
+            Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
             return Err(err.into());
@@ -1196,6 +1241,7 @@ impl VulkanFrame<'_> {
                 .renderer
                 .device
                 .discard_command_buffer(recording.command_buffer);
+            Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
             return Err(err);
@@ -1204,6 +1250,10 @@ impl VulkanFrame<'_> {
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
             image.set_layout(layout);
         }
+        for (_, image) in recording.foreign_release_images.drain(..) {
+            image.set_foreign_ownership();
+        }
+        recording.unsubmitted_foreign_acquires.clear();
 
         self.state = VulkanFrameState::Idle;
         Ok(FrameResumeContext {
@@ -1263,12 +1313,16 @@ impl VulkanFrame<'_> {
             output_size: context.output_size,
             size: context.size,
             pending_layouts: IndexMap::new(),
+            foreign_release_images: IndexMap::new(),
+            unsubmitted_foreign_acquires: IndexMap::new(),
         });
         self.state = VulkanFrameState::Recording;
 
-        if let Err(err) =
-            self.transition_image_layout(&context.target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        {
+        if let Err(err) = self.transition_image_layout(
+            &context.target,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            context.release_target_to_foreign,
+        ) {
             self.abort_recording();
             return Err(err);
         }
@@ -1307,7 +1361,7 @@ impl VulkanFrame<'_> {
     fn abort_recording(&mut self) {
         self.renderer.device.clear_pending_wait_semaphores();
 
-        if let Some(recording) = self.recording.take() {
+        if let Some(mut recording) = self.recording.take() {
             // SAFETY: Framebuffer was created by this device and command buffer is not submitted on abort.
             // Skipped on a lost device: destroying it on a lost VkDevice faults on NVIDIA. `destroy_with`
             // is the single ownership-encoded teardown gate; a no-op when lost.
@@ -1323,6 +1377,7 @@ impl VulkanFrame<'_> {
             {
                 warn!(?err, "failed to discard Vulkan frame command buffer during abort");
             }
+            Self::restore_unsubmitted_foreign_acquires(&mut recording);
         }
 
         self.state = VulkanFrameState::Aborted;
@@ -1341,9 +1396,16 @@ impl Drop for VulkanFrame<'_> {
 }
 
 fn retained_recording_images(recording: &FrameRecording) -> Vec<Arc<ImportedDmabufImage>> {
-    let mut images = Vec::with_capacity(recording.pending_layouts.len().saturating_add(1));
+    let mut images = Vec::with_capacity(
+        recording
+            .pending_layouts
+            .len()
+            .saturating_add(recording.foreign_release_images.len())
+            .saturating_add(1),
+    );
     images.push(recording.target.clone());
     images.extend(recording.pending_layouts.values().map(|(image, _)| image.clone()));
+    images.extend(recording.foreign_release_images.values().cloned());
     images
 }
 
@@ -1750,11 +1812,17 @@ mod tests {
         let mut target = renderer
             .bind_dmabuf_target(&dmabuf)
             .expect("binding dmabuf target should succeed");
+        let target_image = target
+            .imported_image()
+            .expect("dmabuf target should retain its imported image")
+            .clone();
+        assert!(target_image.is_owned_by_foreign());
 
         {
             let mut frame = renderer
                 .render(&mut target, Size::from((64, 64)), Transform::Normal)
                 .expect("frame creation should succeed");
+            assert!(!target_image.is_owned_by_foreign());
 
             frame
                 .draw_solid(
@@ -1766,6 +1834,10 @@ mod tests {
 
             // drop without finish
         }
+        assert!(
+            target_image.is_owned_by_foreign(),
+            "an unsubmitted acquire must restore foreign ownership"
+        );
 
         assert_eq!(
             renderer.device.in_flight_submission_count(),
@@ -1937,6 +2009,10 @@ mod tests {
             Ok(texture) => texture,
             Err(_) => return,
         };
+        let texture_image = texture
+            .imported_image()
+            .expect("dmabuf texture should retain its imported image")
+            .clone();
 
         let target_buffer = match allocator.create_buffer(96, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
@@ -1968,7 +2044,12 @@ mod tests {
                     1.0,
                 )
                 .expect("texture rendering should succeed");
+            assert!(!texture_image.is_owned_by_foreign());
             let sync = frame.finish().expect("finish should submit the frame");
+            assert!(
+                texture_image.is_owned_by_foreign(),
+                "a sampled DMA-BUF must be released to FOREIGN after final access"
+            );
             let _ = sync.wait();
         }
 
@@ -2087,6 +2168,86 @@ mod tests {
         let sync = frame
             .finish()
             .expect("finish should submit frame after frame blits");
+        let _ = sync.wait();
+    }
+
+    #[test]
+    fn flushed_segment_releases_sampled_dmabuf_before_blit() {
+        let Some((mut renderer, mut allocator)) = init_renderer_and_allocator() else {
+            return;
+        };
+        let Some(format) = renderer
+            .dmabuf_render_formats()
+            .iter()
+            .copied()
+            .find(|format| renderer.has_dmabuf_import_format(*format))
+        else {
+            return;
+        };
+
+        let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+        let texture_dmabuf = match texture_buffer.export() {
+            Ok(dmabuf) => dmabuf,
+            Err(_) => return,
+        };
+        let texture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+        let texture_image = texture
+            .imported_image()
+            .expect("dmabuf texture should retain its imported image")
+            .clone();
+
+        let size = Size::from((32, 32));
+        let physical_size = Size::<i32, Physical>::from((32, 32));
+        let full_damage = Rectangle::from_size(physical_size);
+        let mut frame_tex = match renderer.create_buffer(format.code, size) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+        let mut aux_tex = match renderer.create_buffer(format.code, size) {
+            Ok(buffer) => buffer,
+            Err(_) => return,
+        };
+        let mut frame_target = match renderer.bind(&mut frame_tex) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+        let mut aux_target = match renderer.bind(&mut aux_tex) {
+            Ok(target) => target,
+            Err(_) => return,
+        };
+
+        let mut frame = match renderer.render(&mut frame_target, physical_size, Transform::Normal) {
+            Ok(frame) => frame,
+            Err(_) => return,
+        };
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::new((0.0, 0.0).into(), texture.size().to_f64()),
+                full_damage,
+                &[full_damage],
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("sampled DMA-BUF should record before the segment flush");
+        assert!(!texture_image.is_owned_by_foreign());
+
+        frame
+            .blit_to(&mut aux_target, full_damage, full_damage, TextureFilter::Nearest)
+            .expect("segment blit should flush and resume the frame");
+        assert!(
+            texture_image.is_owned_by_foreign(),
+            "a completed segment must not strand sampled DMA-BUF ownership"
+        );
+
+        let sync = frame.finish().expect("resumed frame should remain finishable");
         let _ = sync.wait();
     }
 }

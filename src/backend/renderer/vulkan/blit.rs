@@ -146,6 +146,12 @@ impl BlitState {
             return Err(err.into());
         }
         device.insert_debug_label(command_buffer, c"vulkan.blit", [0.92, 0.74, 0.13, 1.0]);
+        let mut foreign_images = acquire_images_from_foreign(
+            vk_device,
+            command_buffer,
+            device.queue_family_index(),
+            [(from.clone(), from_layout), (to.clone(), to_layout)],
+        );
 
         transition_image_layout(
             vk_device,
@@ -178,10 +184,23 @@ impl BlitState {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             restore_to_layout,
         );
+        if let Some((_, layout)) = foreign_images.get_mut(&from.id()) {
+            *layout = from_layout;
+        }
+        if let Some((_, layout)) = foreign_images.get_mut(&to.id()) {
+            *layout = restore_to_layout;
+        }
+        release_images_to_foreign(
+            vk_device,
+            command_buffer,
+            device.queue_family_index(),
+            &foreign_images,
+        );
 
         // SAFETY: Command buffer recording is valid and all commands were encoded above.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
             let _ = device.discard_command_buffer(command_buffer);
+            restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err.into());
         }
 
@@ -193,12 +212,14 @@ impl BlitState {
             Ok(submission) => submission,
             Err(err) => {
                 let _ = device.discard_command_buffer(command_buffer);
+                restore_unsubmitted_foreign_acquires(&foreign_images);
                 return Err(err);
             }
         };
 
         from.set_layout(from_layout);
         to.set_layout(restore_to_layout);
+        commit_foreign_releases(&foreign_images);
 
         Ok(SyncPoint::from(submission_fence))
     }
@@ -256,6 +277,17 @@ impl BlitState {
             return Err(err.into());
         }
         device.insert_debug_label(command_buffer, c"vulkan.blit_chain", [0.94, 0.56, 0.18, 1.0]);
+        let mut foreign_images = acquire_images_from_foreign(
+            vk_device,
+            command_buffer,
+            device.queue_family_index(),
+            resolved_steps.iter().flat_map(|step| {
+                [
+                    (step.source.clone(), step.source.current_layout()),
+                    (step.destination.clone(), step.destination.current_layout()),
+                ]
+            }),
+        );
 
         let mut layouts = IndexMap::new();
         for step in &resolved_steps {
@@ -294,10 +326,22 @@ impl BlitState {
             );
             tracked.current_layout = tracked.restore_layout;
         }
+        for (id, (_, layout)) in foreign_images.iter_mut() {
+            if let Some(tracked) = layouts.get(id) {
+                *layout = tracked.current_layout;
+            }
+        }
+        release_images_to_foreign(
+            vk_device,
+            command_buffer,
+            device.queue_family_index(),
+            &foreign_images,
+        );
 
         // SAFETY: Command buffer recording is valid and all commands were encoded above.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
             let _ = device.discard_command_buffer(command_buffer);
+            restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err.into());
         }
 
@@ -310,6 +354,7 @@ impl BlitState {
                 Ok(submission) => submission,
                 Err(err) => {
                     let _ = device.discard_command_buffer(command_buffer);
+                    restore_unsubmitted_foreign_acquires(&foreign_images);
                     return Err(err);
                 }
             };
@@ -317,6 +362,7 @@ impl BlitState {
         for tracked in layouts.values() {
             tracked.image.set_layout(tracked.restore_layout);
         }
+        commit_foreign_releases(&foreign_images);
 
         Ok(SyncPoint::from(submission_fence))
     }
@@ -639,6 +685,132 @@ fn record_image_blit(
     }
 }
 
+type ForeignBlitImages = IndexMap<u64, (Arc<ImportedDmabufImage>, vk::ImageLayout)>;
+
+fn acquire_images_from_foreign(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    queue_family_index: u32,
+    images: impl IntoIterator<Item = (Arc<ImportedDmabufImage>, vk::ImageLayout)>,
+) -> ForeignBlitImages {
+    let mut acquired = ForeignBlitImages::new();
+    for (image, layout) in images {
+        if acquired.contains_key(&image.id()) || !image.take_foreign_ownership() {
+            continue;
+        }
+        acquired.insert(image.id(), (image, layout));
+    }
+    if acquired.is_empty() {
+        return acquired;
+    }
+
+    let mut dst_stage_mask = vk::PipelineStageFlags::empty();
+    let barriers = acquired
+        .values()
+        .map(|(image, layout)| {
+            let (dst_stage, dst_access) = stage_access_for_layout(*layout);
+            dst_stage_mask |= dst_stage;
+            vk::ImageMemoryBarrier::default()
+                .old_layout(*layout)
+                .new_layout(*layout)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(queue_family_index)
+                .image(image.image())
+                .subresource_range(color_subresource_range())
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(dst_access)
+        })
+        .collect::<Vec<_>>();
+
+    // SAFETY: The command buffer is recording and every imported image is
+    // retained through submission by its caller.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            if dst_stage_mask.is_empty() {
+                vk::PipelineStageFlags::ALL_COMMANDS
+            } else {
+                dst_stage_mask
+            },
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+    }
+    acquired
+}
+
+fn release_images_to_foreign(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    queue_family_index: u32,
+    images: &ForeignBlitImages,
+) {
+    if images.is_empty() {
+        return;
+    }
+
+    let mut src_stage_mask = vk::PipelineStageFlags::empty();
+    let barriers = images
+        .values()
+        .map(|(image, layout)| {
+            let (src_stage, src_access) = stage_access_for_layout(*layout);
+            src_stage_mask |= src_stage;
+            vk::ImageMemoryBarrier::default()
+                .old_layout(*layout)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(queue_family_index)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .image(image.image())
+                .subresource_range(color_subresource_range())
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::empty())
+        })
+        .collect::<Vec<_>>();
+
+    // SAFETY: The barrier follows the final blit access in this command
+    // buffer and returns exclusive ownership to the external producer.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            if src_stage_mask.is_empty() {
+                vk::PipelineStageFlags::ALL_COMMANDS
+            } else {
+                src_stage_mask
+            },
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+    }
+}
+
+fn restore_unsubmitted_foreign_acquires(images: &ForeignBlitImages) {
+    for (image, _) in images.values() {
+        image.set_foreign_ownership();
+    }
+}
+
+fn commit_foreign_releases(images: &ForeignBlitImages) {
+    for (image, _) in images.values() {
+        image.set_layout(vk::ImageLayout::GENERAL);
+        image.set_foreign_ownership();
+    }
+}
+
+fn color_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1)
+}
+
 pub(crate) fn transition_image_layout(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -710,6 +882,8 @@ fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, 
 
 #[cfg(test)]
 mod tests {
+    use ash::vk;
+
     use crate::{
         backend::{
             allocator::Fourcc,
@@ -722,7 +896,10 @@ mod tests {
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
 
-    use super::{VulkanRenderer, VulkanRendererError};
+    use super::{
+        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign, VulkanRenderer,
+        VulkanRendererError,
+    };
 
     fn init_renderer() -> Option<VulkanRenderer> {
         let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
@@ -747,6 +924,72 @@ mod tests {
             Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [255, 0, 0, 255],
             _ => [255, 0, 0, 255],
         }
+    }
+
+    #[test]
+    fn ownership_barriers_round_trip_an_imported_image() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+        let texture = match renderer.create_buffer(format, Size::from((8, 8))) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+        let image = texture
+            .imported_image()
+            .expect("offscreen allocation should retain its imported image")
+            .clone();
+        assert!(image.is_owned_by_foreign());
+
+        let command_buffer = renderer
+            .device
+            .acquire_command_buffer()
+            .expect("test command buffer should be available");
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: The command buffer belongs to this renderer and is not in use.
+        unsafe {
+            renderer
+                .device
+                .device_handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+                .expect("test command buffer should begin");
+        }
+        let acquired = acquire_images_from_foreign(
+            renderer.device.device_handle(),
+            command_buffer,
+            renderer.device.queue_family_index(),
+            [(image.clone(), image.current_layout())],
+        );
+        assert!(!image.is_owned_by_foreign());
+        release_images_to_foreign(
+            renderer.device.device_handle(),
+            command_buffer,
+            renderer.device.queue_family_index(),
+            &acquired,
+        );
+        // SAFETY: The ownership barriers above form a complete command buffer.
+        unsafe {
+            renderer
+                .device
+                .device_handle()
+                .end_command_buffer(command_buffer)
+                .expect("test command buffer should end");
+        }
+        renderer
+            .device
+            .submit_with_resources_and_fence(command_buffer, Vec::new(), vec![image.clone()])
+            .expect("ownership transfer should submit");
+        commit_foreign_releases(&acquired);
+        assert!(image.is_owned_by_foreign());
+        assert_eq!(image.current_layout(), vk::ImageLayout::GENERAL);
+        renderer
+            .device
+            .wait_for_all_submissions()
+            .expect("ownership transfer should complete");
     }
 
     #[test]
