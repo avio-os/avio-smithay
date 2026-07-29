@@ -136,6 +136,10 @@ required-features = ["backend_vulkan"]
 name = "buffer_test"
 required-features = ["backend_drm", "backend_gbm", "backend_egl", "backend_vulkan", "renderer_gl"]
 
+[[example]]
+name = "venus_scanout_probe"
+required-features = ["backend_drm", "backend_vulkan"]
+
 [[bench]]
 name = "benchmark"
 harness = false

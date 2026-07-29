@@ -18,6 +18,8 @@ use super::{DrmDeviceFd, Framebuffer};
 
 #[cfg(feature = "backend_drm")]
 pub mod dumb;
+#[cfg(feature = "backend_drm")]
+pub mod prime;
 #[cfg(feature = "backend_gbm")]
 pub mod gbm;
 
