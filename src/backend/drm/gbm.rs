@@ -352,7 +352,16 @@ where
                 });
             }
 
-            let fourcc = bo.format();
+            // Honor `use_opaque` here like the AddFB2 path does: the caller may
+            // have negotiated the opaque variant precisely because the plane
+            // rejects the alpha fourcc (e.g. virtio-gpu primary planes accept
+            // XR24 but not AR24). Falling back with the raw buffer format
+            // would create a framebuffer the plane refuses to scan out.
+            let fourcc = if use_opaque {
+                get_opaque(bo.format()).unwrap_or_else(|| bo.format())
+            } else {
+                bo.format()
+            };
             let (depth, bpp) = get_depth(fourcc)
                 .and_then(|d| get_bpp(fourcc).map(|b| (d, b)))
                 .ok_or_else(|| AccessError {
