@@ -24,6 +24,13 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SubmissionId(u64);
 
+impl SubmissionId {
+    #[cfg(test)]
+    pub(crate) fn for_tests(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 struct InFlightSubmission {
     id: SubmissionId,
     fence: VulkanFence,
@@ -211,6 +218,22 @@ pub(super) struct DeviceHandle {
     lost: AtomicBool,
     instance_lost: Arc<AtomicBool>,
     pending_submissions: std::sync::atomic::AtomicUsize,
+    /// Ids strictly below this watermark have completed on the queue.
+    /// Submissions retire in FIFO order, so a single monotonic frontier is
+    /// total. Written only by submission reclaim; read by the descriptor
+    /// cache to prove a cached set is no longer referenced by pending work.
+    completed_submission_watermark: std::sync::atomic::AtomicU64,
+    /// The id the next queue submission will carry. Consumers stamping
+    /// resources "used by the recording frame" use this id; the stamp
+    /// completes when that submission (or any later one) retires.
+    upcoming_submission: std::sync::atomic::AtomicU64,
+    /// Image views destroyed since the descriptor cache last drained. A
+    /// dead view's descriptor set must leave the cache promptly — leaving
+    /// it to capacity-triggered eviction let ordinary client-buffer churn
+    /// fill the cache in under a minute and then refuse under load, and a
+    /// driver reusing the raw handle value could even alias a stale set
+    /// onto a new texture.
+    retired_texture_views: std::sync::Mutex<Vec<vk::ImageView>>,
 }
 
 impl fmt::Debug for DeviceHandle {
@@ -255,6 +278,44 @@ impl DeviceHandle {
 
     pub(super) fn has_pending_submissions(&self) -> bool {
         self.pending_submissions.load(Ordering::Acquire) != 0
+    }
+
+    /// Record one destroyed (or about-to-be-destroyed) sampled image view so
+    /// the descriptor cache can retire its set on the next drain. Views that
+    /// never had a cached set drain as no-ops.
+    pub(super) fn note_view_retired(&self, view: vk::ImageView) {
+        self.retired_texture_views
+            .lock()
+            .expect("retired-view queue poisoned")
+            .push(view);
+    }
+
+    pub(super) fn take_retired_views(&self) -> Vec<vk::ImageView> {
+        std::mem::take(
+            &mut *self
+                .retired_texture_views
+                .lock()
+                .expect("retired-view queue poisoned"),
+        )
+    }
+
+    pub(super) fn note_submission_completed(&self, id: SubmissionId) {
+        // FIFO retirement makes this monotonic; max() guards the
+        // wait-for-all path racing an ordinary reclaim.
+        self.completed_submission_watermark
+            .fetch_max(id.0.wrapping_add(1), Ordering::AcqRel);
+    }
+
+    pub(super) fn submission_completed(&self, id: SubmissionId) -> bool {
+        id.0 < self.completed_submission_watermark.load(Ordering::Acquire)
+    }
+
+    pub(super) fn upcoming_submission(&self) -> SubmissionId {
+        SubmissionId(self.upcoming_submission.load(Ordering::Acquire))
+    }
+
+    fn store_upcoming_submission(&self, next: u64) {
+        self.upcoming_submission.store(next, Ordering::Release);
     }
 
     fn mark_submission_pending(&self) {
@@ -360,6 +421,9 @@ impl DeviceState {
             lost: AtomicBool::new(false),
             instance_lost: physical_device.instance().lost_flag(),
             pending_submissions: std::sync::atomic::AtomicUsize::new(0),
+            completed_submission_watermark: std::sync::atomic::AtomicU64::new(0),
+            upcoming_submission: std::sync::atomic::AtomicU64::new(0),
+            retired_texture_views: std::sync::Mutex::new(Vec::new()),
         });
         let external_fence_fd = enabled_extensions
             .contains(&khr::external_fence_fd::NAME)
@@ -780,6 +844,7 @@ impl DeviceState {
 
         let id = SubmissionId(self.next_submission_id);
         self.next_submission_id = self.next_submission_id.wrapping_add(1);
+        self.device.store_upcoming_submission(self.next_submission_id);
         self.device.mark_submission_pending();
         self.in_flight_submissions.push_back(InFlightSubmission {
             id,
@@ -1015,6 +1080,7 @@ impl DeviceState {
 
         let completion_ns = duration_to_ns(submitted_at.elapsed());
         self.device.mark_submission_completed();
+        self.device.note_submission_completed(id);
         self.diagnostics.reclaimed_submissions = self.diagnostics.reclaimed_submissions.saturating_add(1);
         self.diagnostics.total_completion_ns =
             self.diagnostics.total_completion_ns.saturating_add(completion_ns);

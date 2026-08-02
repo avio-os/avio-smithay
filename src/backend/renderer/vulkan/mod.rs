@@ -163,6 +163,10 @@ pub struct VulkanCacheStats {
     pub misses: u64,
     /// Number of entries evicted from the cache.
     pub evictions: u64,
+    /// Number of entries retired because their texture's image view was
+    /// destroyed (the death-edge reclaim; these free capacity without any
+    /// quiescence requirement beyond their own last use).
+    pub dead_view_reclaims: u64,
 }
 
 /// Submission and timing diagnostics for renderer command dispatch.

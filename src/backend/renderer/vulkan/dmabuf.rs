@@ -692,6 +692,9 @@ impl ImportedDmabufImage {
 
 impl Drop for ImportedDmabufImage {
     fn drop(&mut self) {
+        // The descriptor cache retires this view's set on its next drain —
+        // the death edge that keeps the cache tracking the live working set.
+        self.device.note_view_retired(self.sampled_view);
         // Skipped on a lost device: destroying these objects on a lost VkDevice faults on NVIDIA.
         // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
         self.device.destroy_with(|device| unsafe {
