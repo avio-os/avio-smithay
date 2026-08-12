@@ -1,12 +1,12 @@
 use std::{
-    os::fd::{AsRawFd, IntoRawFd},
+    os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
     },
 };
 
-use ash::vk;
+use ash::{khr, vk};
 use indexmap::IndexMap;
 use scopeguard::ScopeGuard;
 use tracing::{info, trace};
@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     device::{DeviceHandle, DeviceState},
-    format::{texture_view_components, FormatCapabilities},
+    format::{texture_view_components, FormatCapabilities, ModifierCapability},
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
@@ -56,6 +56,13 @@ impl DmabufRole {
             DmabufRole::RenderTarget => formats.supports_implicit_render_modifier(code),
         }
     }
+
+    fn supports_disjoint(self, capability: &ModifierCapability) -> bool {
+        match self {
+            DmabufRole::Texture => capability.supports_disjoint_import,
+            DmabufRole::RenderTarget => capability.supports_disjoint_render,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +72,7 @@ struct DmabufSignature {
     num_planes: usize,
     offsets: Vec<u32>,
     strides: Vec<u32>,
+    disjoint: bool,
     y_inverted: bool,
 }
 
@@ -99,6 +107,23 @@ const MAX_DMABUF_CACHE_ENTRIES: usize = 256;
 const DMABUF_CLEANUP_INTERVAL_IMPORTS: u32 = 64;
 const DMABUF_CLEANUP_SCAN_LIMIT: usize = 64;
 const DMABUF_DIAG_LOG_INTERVAL_IMPORTS: u64 = 256;
+
+fn dmabuf_is_disjoint(dmabuf: &Dmabuf) -> Result<bool, VulkanRendererError> {
+    let mut handles = dmabuf.handles();
+    let first = handles
+        .next()
+        .ok_or(VulkanRendererError::InvalidDmabuf("dma-buf has no fds"))?;
+    let first_stat = rustix::fs::fstat(first).map_err(std::io::Error::from)?;
+
+    for handle in handles {
+        let stat = rustix::fs::fstat(handle).map_err(std::io::Error::from)?;
+        if (stat.st_dev, stat.st_ino) != (first_stat.st_dev, first_stat.st_ino) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
 
 impl DmabufState {
     pub(crate) fn import_texture(
@@ -150,12 +175,14 @@ impl DmabufState {
         self.import_attempts_total = self.import_attempts_total.saturating_add(1);
         self.maybe_cleanup();
 
-        let descriptor = Self::validate_dmabuf(dmabuf, formats, role)?;
         let requested_usage = role.required_usage();
         let key = dmabuf.weak();
 
         if let Some(cached) = self.cache.get(&key) {
-            if cached.signature == descriptor.signature && cached.imported.usage().contains(requested_usage) {
+            // Dmabuf plane metadata is immutable after construction and the weak key
+            // identifies that exact allocation. Avoid repeating fstat topology checks
+            // for every frame once this buffer and usage have been validated.
+            if cached.imported.usage().contains(requested_usage) {
                 let imported = cached.imported.clone();
                 self.promote_entry(&key);
                 self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
@@ -170,6 +197,7 @@ impl DmabufState {
             }
         }
 
+        let descriptor = Self::validate_dmabuf(dmabuf, formats, role)?;
         self.cache_stats.misses = self.cache_stats.misses.saturating_add(1);
         let usage = self
             .cache
@@ -312,25 +340,27 @@ impl DmabufState {
             ));
         }
 
-        if strides.iter().any(|stride| *stride == 0) {
+        if strides.contains(&0) {
             return Err(VulkanRendererError::InvalidDmabuf(
                 "dma-buf stride must be non-zero for all planes",
             ));
         }
 
-        let raw_fds = dmabuf.handles().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>();
-        if raw_fds.len() != num_planes {
+        if dmabuf.handles().count() != num_planes {
             return Err(VulkanRendererError::InvalidDmabuf(
                 "dma-buf fd count does not match plane count",
             ));
         }
-        if raw_fds.iter().skip(1).any(|fd| *fd != raw_fds[0]) {
-            return Err(VulkanRendererError::UnsupportedDmabufDisjoint);
-        }
+        let disjoint = dmabuf_is_disjoint(dmabuf)?;
 
         if format.modifier == Modifier::Invalid {
             if !role.supports_implicit_modifier(formats, format.code) {
                 return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
+            }
+            if num_planes != 1 {
+                return Err(VulkanRendererError::InvalidDmabuf(
+                    "implicit-modifier dma-bufs must contain exactly one memory plane",
+                ));
             }
         } else {
             let modifier_caps = formats.modifier_capabilities(format.code);
@@ -345,6 +375,10 @@ impl DmabufState {
                     actual: num_planes,
                 });
             }
+
+            if disjoint && !role.supports_disjoint(modifier_cap) {
+                return Err(VulkanRendererError::UnsupportedDmabufDisjoint);
+            }
         }
 
         let Some(vk_format) = crate::backend::allocator::vulkan::format::get_vk_format(format.code) else {
@@ -358,6 +392,7 @@ impl DmabufState {
                 num_planes,
                 offsets,
                 strides,
+                disjoint,
                 y_inverted: dmabuf.y_inverted(),
             },
             vk_format,
@@ -375,6 +410,9 @@ impl DmabufState {
         let vk_device = device_handle.handle();
         let format = descriptor.signature.format;
         let size = descriptor.signature.size;
+        let disjoint = descriptor.signature.disjoint;
+        let external_memory_fd =
+            khr::external_memory_fd::Device::new(device.physical_device().instance().handle(), vk_device);
 
         let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -393,6 +431,11 @@ impl DmabufState {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .usage(usage)
+            .flags(if disjoint {
+                vk::ImageCreateFlags::DISJOINT
+            } else {
+                vk::ImageCreateFlags::empty()
+            })
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -431,49 +474,81 @@ impl DmabufState {
                 Err(err) => return Err(err.into()),
             };
 
-        let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
-        let memory_type_index = Self::pick_memory_type(memory_requirements.memory_type_bits)?;
+        let handles = dmabuf.handles().collect::<Vec<_>>();
+        let memory_count = if disjoint {
+            descriptor.signature.num_planes
+        } else {
+            1
+        };
+        let mut memories = Vec::with_capacity(memory_count);
 
-        let import_fd = dmabuf
-            .handles()
-            .next()
-            .ok_or(VulkanRendererError::InvalidDmabuf("dma-buf has no fds"))?
-            .try_clone_to_owned()?;
-        let import_fd_raw = import_fd.into_raw_fd();
-        let import_fd_guard = scopeguard::guard(import_fd_raw, |fd| unsafe {
-            libc::close(fd);
-        });
-
-        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(*import_fd_guard);
-        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(memory_requirements.size)
-            .memory_type_index(memory_type_index)
-            .push_next(&mut import_info)
-            .push_next(&mut dedicated_info);
-
-        let memory =
-            match device_handle.observe_result(unsafe { vk_device.allocate_memory(&alloc_info, None) }) {
-                Ok(memory) => {
-                    // Ownership of the import fd has moved to Vulkan.
-                    let _ = ScopeGuard::into_inner(import_fd_guard);
-                    memory
-                }
-                Err(err) => {
-                    device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_image(image, None) });
-                    return Err(err.into());
-                }
+        for plane_index in 0..memory_count {
+            let requirements =
+                match Self::image_memory_requirements(vk_device, image, disjoint.then_some(plane_index)) {
+                    Ok(requirements) => requirements,
+                    Err(err) => {
+                        Self::destroy_image_and_memories(&device_handle, image, &memories);
+                        return Err(err);
+                    }
+                };
+            let Some(fd) = handles.get(plane_index).copied() else {
+                Self::destroy_image_and_memories(&device_handle, image, &memories);
+                return Err(VulkanRendererError::InvalidDmabuf(
+                    "dma-buf fd count does not match memory binding count",
+                ));
             };
 
-        if let Err(err) =
-            device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memory, 0) })
-        {
-            device_handle.destroy_with(|vk_device| unsafe {
-                vk_device.free_memory(memory, None);
-                vk_device.destroy_image(image, None);
-            });
+            match Self::allocate_imported_memory(&device_handle, &external_memory_fd, image, fd, requirements)
+            {
+                Ok(memory) => memories.push(memory),
+                Err(err) => {
+                    Self::destroy_image_and_memories(&device_handle, image, &memories);
+                    return Err(err);
+                }
+            }
+        }
+
+        trace!(
+            plane_count = descriptor.signature.num_planes,
+            memory_bindings = memories.len(),
+            disjoint,
+            ?format,
+            ?usage,
+            "binding imported dma-buf memory to Vulkan image"
+        );
+
+        let bind_result = if disjoint {
+            let mut plane_infos = match (0..memories.len())
+                .map(|plane_index| {
+                    Self::memory_plane_aspect(plane_index)
+                        .map(|aspect| vk::BindImagePlaneMemoryInfo::default().plane_aspect(aspect))
+                })
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(plane_infos) => plane_infos,
+                Err(err) => {
+                    Self::destroy_image_and_memories(&device_handle, image, &memories);
+                    return Err(err);
+                }
+            };
+            let bind_infos = plane_infos
+                .iter_mut()
+                .zip(memories.iter().copied())
+                .map(|(plane_info, memory)| {
+                    vk::BindImageMemoryInfo::default()
+                        .image(image)
+                        .memory(memory)
+                        .memory_offset(0)
+                        .push_next(plane_info)
+                })
+                .collect::<Vec<_>>();
+            device_handle.observe_result(unsafe { vk_device.bind_image_memory2(&bind_infos) })
+        } else {
+            device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memories[0], 0) })
+        };
+
+        if let Err(err) = bind_result {
+            Self::destroy_image_and_memories(&device_handle, image, &memories);
             return Err(err.into());
         }
 
@@ -496,10 +571,7 @@ impl DmabufState {
         {
             Ok(view) => view,
             Err(err) => {
-                device_handle.destroy_with(|vk_device| unsafe {
-                    vk_device.free_memory(memory, None);
-                    vk_device.destroy_image(image, None);
-                });
+                Self::destroy_image_and_memories(&device_handle, image, &memories);
                 return Err(err.into());
             }
         };
@@ -524,9 +596,8 @@ impl DmabufState {
             Err(err) => {
                 device_handle.destroy_with(|vk_device| unsafe {
                     vk_device.destroy_image_view(sampled_view, None);
-                    vk_device.free_memory(memory, None);
-                    vk_device.destroy_image(image, None);
                 });
+                Self::destroy_image_and_memories(&device_handle, image, &memories);
                 return Err(err.into());
             }
         };
@@ -534,10 +605,10 @@ impl DmabufState {
         let import_id = self.next_import_id;
         self.next_import_id = self.next_import_id.wrapping_add(1);
 
-        Ok(Arc::new(ImportedDmabufImage::new(
+        Ok(Arc::new(ImportedDmabufImage::new_with_memories(
             import_id,
             image,
-            memory,
+            memories,
             sampled_view,
             render_view,
             size,
@@ -548,6 +619,86 @@ impl DmabufState {
             vk::ImageLayout::UNDEFINED,
             device_handle,
         )))
+    }
+
+    fn image_memory_requirements(
+        device: &ash::Device,
+        image: vk::Image,
+        plane_index: Option<usize>,
+    ) -> Result<vk::MemoryRequirements, VulkanRendererError> {
+        let Some(plane_index) = plane_index else {
+            return Ok(unsafe { device.get_image_memory_requirements(image) });
+        };
+
+        let mut plane_info = vk::ImagePlaneMemoryRequirementsInfo::default()
+            .plane_aspect(Self::memory_plane_aspect(plane_index)?);
+        let image_info = vk::ImageMemoryRequirementsInfo2::default()
+            .image(image)
+            .push_next(&mut plane_info);
+        let mut requirements = vk::MemoryRequirements2::default();
+        unsafe { device.get_image_memory_requirements2(&image_info, &mut requirements) };
+        Ok(requirements.memory_requirements)
+    }
+
+    fn allocate_imported_memory(
+        device: &DeviceHandle,
+        external_memory_fd: &khr::external_memory_fd::Device,
+        image: vk::Image,
+        fd: BorrowedFd<'_>,
+        requirements: vk::MemoryRequirements,
+    ) -> Result<vk::DeviceMemory, VulkanRendererError> {
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        device.observe_result(unsafe {
+            external_memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_properties,
+            )
+        })?;
+
+        let memory_type_index =
+            Self::pick_memory_type(requirements.memory_type_bits & fd_properties.memory_type_bits)?;
+        let import_fd = fd.try_clone_to_owned()?;
+        let import_fd_raw = import_fd.into_raw_fd();
+        let import_fd_guard = scopeguard::guard(import_fd_raw, |raw_fd| unsafe {
+            libc::close(raw_fd);
+        });
+
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(*import_fd_guard);
+        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated_info);
+
+        let memory = device.observe_result(unsafe { device.handle().allocate_memory(&alloc_info, None) })?;
+        // A successful import transfers ownership of the duplicated FD to Vulkan.
+        let _ = ScopeGuard::into_inner(import_fd_guard);
+        Ok(memory)
+    }
+
+    fn memory_plane_aspect(plane_index: usize) -> Result<vk::ImageAspectFlags, VulkanRendererError> {
+        match plane_index {
+            0 => Ok(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT),
+            1 => Ok(vk::ImageAspectFlags::MEMORY_PLANE_1_EXT),
+            2 => Ok(vk::ImageAspectFlags::MEMORY_PLANE_2_EXT),
+            3 => Ok(vk::ImageAspectFlags::MEMORY_PLANE_3_EXT),
+            _ => Err(VulkanRendererError::InvalidDmabuf(
+                "dma-buf memory plane index is outside Vulkan's supported range",
+            )),
+        }
+    }
+
+    fn destroy_image_and_memories(device: &DeviceHandle, image: vk::Image, memories: &[vk::DeviceMemory]) {
+        device.destroy_with(|vk_device| unsafe {
+            vk_device.destroy_image(image, None);
+            for memory in memories {
+                vk_device.free_memory(*memory, None);
+            }
+        });
     }
 
     fn pick_memory_type(memory_type_bits: u32) -> Result<u32, VulkanRendererError> {
@@ -567,7 +718,7 @@ impl DmabufState {
 pub(crate) struct ImportedDmabufImage {
     import_id: u64,
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    memories: Vec<vk::DeviceMemory>,
     sampled_view: vk::ImageView,
     render_view: vk::ImageView,
     size: Size<i32, BufferCoord>,
@@ -585,7 +736,7 @@ impl std::fmt::Debug for ImportedDmabufImage {
         f.debug_struct("ImportedDmabufImage")
             .field("import_id", &self.import_id)
             .field("image", &self.image)
-            .field("memory", &self.memory)
+            .field("memories", &self.memories)
             .field("sampled_view", &self.sampled_view)
             .field("render_view", &self.render_view)
             .field("size", &self.size)
@@ -613,10 +764,41 @@ impl ImportedDmabufImage {
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
     ) -> Self {
+        Self::new_with_memories(
+            import_id,
+            image,
+            vec![memory],
+            sampled_view,
+            render_view,
+            size,
+            format,
+            vk_format,
+            usage,
+            y_inverted,
+            initial_layout,
+            device,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_memories(
+        import_id: u64,
+        image: vk::Image,
+        memories: Vec<vk::DeviceMemory>,
+        sampled_view: vk::ImageView,
+        render_view: vk::ImageView,
+        size: Size<i32, BufferCoord>,
+        format: Format,
+        vk_format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        y_inverted: bool,
+        initial_layout: vk::ImageLayout,
+        device: Arc<DeviceHandle>,
+    ) -> Self {
         Self {
             import_id,
             image,
-            memory,
+            memories,
             sampled_view,
             render_view,
             size,
@@ -701,48 +883,141 @@ impl Drop for ImportedDmabufImage {
             device.destroy_image_view(self.sampled_view, None);
             device.destroy_image_view(self.render_view, None);
             device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
+            for memory in &self.memories {
+                device.free_memory(*memory, None);
+            }
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+
     use crate::backend::{
         allocator::{
-            dmabuf::AsDmabuf,
+            dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
             vulkan::{ImageUsageFlags, VulkanAllocator},
-            Allocator, Modifier,
+            Allocator, Fourcc, Modifier,
         },
         renderer::vulkan::{VulkanRenderer, VulkanRendererError},
         vulkan::{version::Version, Instance, PhysicalDevice},
     };
 
-    #[test]
-    fn import_bind_reimport_stress() {
-        let instance = match Instance::new(Version::VERSION_1_3, None) {
-            Ok(instance) => instance,
-            Err(_) => return,
-        };
+    use super::{dmabuf_is_disjoint, DmabufState};
 
-        let physical_device = match PhysicalDevice::enumerate(&instance) {
-            Ok(mut iter) => match iter.next() {
-                Some(phd) => phd,
-                None => return,
-            },
-            Err(_) => return,
-        };
+    fn backing_object(name: &str) -> OwnedFd {
+        rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC).expect("temporary backing object")
+    }
 
-        let mut renderer = match VulkanRenderer::new(&physical_device) {
+    fn two_plane_dmabuf(first: OwnedFd, second: OwnedFd) -> Dmabuf {
+        let mut builder = Dmabuf::builder((64, 64), Fourcc::Xrgb8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(first, 0, 0, 256));
+        assert!(builder.add_plane(second, 1, 4096, 256));
+        builder.build().expect("two-plane dma-buf")
+    }
+
+    fn renderer_and_device() -> Option<(PhysicalDevice, VulkanRenderer)> {
+        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
+        let renderer = match VulkanRenderer::new(&physical_device) {
             Ok(renderer) => renderer,
             Err(
                 VulkanRendererError::MissingDeviceExtensions(_)
                 | VulkanRendererError::MissingDeviceFeature(_)
                 | VulkanRendererError::MissingQueueFamily { .. },
-            ) => {
-                return;
-            }
+            ) => return None,
             Err(err) => panic!("unexpected Vulkan renderer init failure: {err}"),
+        };
+        Some((physical_device, renderer))
+    }
+
+    #[test]
+    fn duplicated_descriptors_are_one_shared_allocation() {
+        let first = backing_object("smithay-vulkan-shared");
+        let second = first.as_fd().try_clone_to_owned().expect("duplicate descriptor");
+        assert_ne!(
+            first.as_raw_fd(),
+            second.as_raw_fd(),
+            "the test requires different descriptor numbers"
+        );
+
+        let dmabuf = two_plane_dmabuf(first, second);
+        assert!(!dmabuf_is_disjoint(&dmabuf).expect("inspect backing identity"));
+    }
+
+    #[test]
+    fn distinct_backing_objects_are_disjoint() {
+        let first = backing_object("smithay-vulkan-disjoint-first");
+        let second = backing_object("smithay-vulkan-disjoint-second");
+
+        let dmabuf = two_plane_dmabuf(first, second);
+        assert!(dmabuf_is_disjoint(&dmabuf).expect("inspect backing identity"));
+    }
+
+    #[test]
+    fn memory_type_selection_uses_the_image_and_fd_intersection() {
+        let image_memory_types = 0b0110;
+        let fd_memory_types = 0b1100;
+        let compatible = image_memory_types & fd_memory_types;
+        assert_eq!(DmabufState::pick_memory_type(compatible).unwrap(), 2);
+
+        let incompatible = 0b0010 & fd_memory_types;
+        assert!(matches!(
+            DmabufState::pick_memory_type(incompatible),
+            Err(VulkanRendererError::NoCompatibleMemoryType)
+        ));
+    }
+
+    #[test]
+    fn shared_multiplane_import_when_available() {
+        let Some((physical_device, mut renderer)) = renderer_and_device() else {
+            return;
+        };
+        let candidates = renderer
+            .dmabuf_import_formats()
+            .iter()
+            .copied()
+            .filter(|format| {
+                renderer.has_dmabuf_render_format(*format) && format.modifier != Modifier::Invalid
+            })
+            .collect::<Vec<_>>();
+        let mut allocator = match VulkanAllocator::new(
+            &physical_device,
+            ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
+        ) {
+            Ok(allocator) => allocator,
+            Err(_) => return,
+        };
+
+        for format in candidates {
+            let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
+                Ok(buffer) => buffer,
+                Err(_) => continue,
+            };
+            let dmabuf = match buffer.export() {
+                Ok(dmabuf) if dmabuf.num_planes() > 1 => dmabuf,
+                Ok(_) | Err(_) => continue,
+            };
+
+            assert!(
+                !dmabuf_is_disjoint(&dmabuf).expect("inspect Vulkan allocation identity"),
+                "VulkanAllocator exports modifier planes from one shared allocation"
+            );
+            renderer
+                .import_dmabuf_texture(&dmabuf)
+                .expect("shared multi-plane texture import should succeed");
+            renderer
+                .bind_dmabuf_target(&dmabuf)
+                .expect("shared multi-plane target bind should succeed");
+            return;
+        }
+    }
+
+    #[test]
+    fn import_bind_reimport_stress() {
+        let Some((physical_device, mut renderer)) = renderer_and_device() else {
+            return;
         };
 
         let candidate = renderer

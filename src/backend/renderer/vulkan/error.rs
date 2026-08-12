@@ -43,8 +43,8 @@ pub enum VulkanRendererError {
     #[error("invalid dma-buf metadata: {0}")]
     InvalidDmabuf(&'static str),
 
-    /// dma-buf multi-fd/disjoint imports are currently unsupported.
-    #[error("dma-buf disjoint/multi-fd imports are currently unsupported")]
+    /// The requested format/modifier/usage cannot bind disjoint dma-buf memory planes.
+    #[error("dma-buf format/modifier does not support disjoint memory-plane import for this usage")]
     UnsupportedDmabufDisjoint,
 
     /// dma-buf plane count does not match modifier requirements.

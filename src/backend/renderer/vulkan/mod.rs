@@ -38,6 +38,9 @@
 //!   without explicit modifier metadata.
 //! - Explicit modifier imports validate plane count, plane strides, plane offsets, and usage before
 //!   creating Vulkan images.
+//! - Plane file-descriptor numbers are not allocation identities. Imports compare dma-buf object
+//!   identity, bind duplicated descriptors once for shared allocations, and use disjoint Vulkan
+//!   plane bindings only when the modifier and requested usage explicitly support them.
 //! - Compositor integration should intersect renderer-supported modifiers with plane/allocator
 //!   capabilities instead of assuming one global modifier set.
 //!

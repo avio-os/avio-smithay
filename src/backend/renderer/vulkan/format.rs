@@ -62,6 +62,10 @@ pub(crate) struct ModifierCapability {
     pub(crate) drm_format_modifier_plane_count: u32,
     /// Vulkan tiling features advertised for this modifier.
     pub(crate) drm_format_modifier_tiling_features: vk::FormatFeatureFlags,
+    /// Whether Vulkan accepts a disjoint image with this modifier for sampling.
+    pub(crate) supports_disjoint_import: bool,
+    /// Whether Vulkan accepts a disjoint image with this modifier as a render target.
+    pub(crate) supports_disjoint_render: bool,
 }
 
 #[derive(Debug, Default)]
@@ -100,10 +104,32 @@ impl FormatCapabilities {
 
             for properties in modifier_properties {
                 let modifier = Modifier::from(properties.drm_format_modifier);
+                let supports_disjoint = properties.drm_format_modifier_plane_count > 1
+                    && properties
+                        .drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::DISJOINT);
+                let supports_disjoint_import = supports_disjoint
+                    && Self::is_explicit_modifier_supported(
+                        physical_device,
+                        vk_format,
+                        modifier,
+                        FormatUsage::Import,
+                        vk::ImageCreateFlags::DISJOINT,
+                    )?;
+                let supports_disjoint_render = supports_disjoint
+                    && Self::is_explicit_modifier_supported(
+                        physical_device,
+                        vk_format,
+                        modifier,
+                        FormatUsage::RenderTarget,
+                        vk::ImageCreateFlags::DISJOINT,
+                    )?;
                 cached_modifiers.push(ModifierCapability {
                     modifier,
                     drm_format_modifier_plane_count: properties.drm_format_modifier_plane_count,
                     drm_format_modifier_tiling_features: properties.drm_format_modifier_tiling_features,
+                    supports_disjoint_import,
+                    supports_disjoint_render,
                 });
 
                 if Self::is_explicit_modifier_supported(
@@ -111,6 +137,7 @@ impl FormatCapabilities {
                     vk_format,
                     modifier,
                     FormatUsage::Import,
+                    vk::ImageCreateFlags::empty(),
                 )? {
                     Self::insert_supported_format(
                         &mut import_formats,
@@ -125,6 +152,7 @@ impl FormatCapabilities {
                     vk_format,
                     modifier,
                     FormatUsage::RenderTarget,
+                    vk::ImageCreateFlags::empty(),
                 )? {
                     Self::insert_supported_format(
                         &mut render_formats,
@@ -272,7 +300,13 @@ impl FormatCapabilities {
         vk_format: vk::Format,
         usage: FormatUsage,
     ) -> Result<bool, VulkanRendererError> {
-        Self::query_external_format(physical_device, vk_format, usage, None)
+        Self::query_external_format(
+            physical_device,
+            vk_format,
+            usage,
+            None,
+            vk::ImageCreateFlags::empty(),
+        )
     }
 
     fn is_explicit_modifier_supported(
@@ -280,8 +314,9 @@ impl FormatCapabilities {
         vk_format: vk::Format,
         modifier: Modifier,
         usage: FormatUsage,
+        flags: vk::ImageCreateFlags,
     ) -> Result<bool, VulkanRendererError> {
-        Self::query_external_format(physical_device, vk_format, usage, Some(modifier))
+        Self::query_external_format(physical_device, vk_format, usage, Some(modifier), flags)
     }
 
     fn query_external_format(
@@ -289,6 +324,7 @@ impl FormatCapabilities {
         vk_format: vk::Format,
         usage: FormatUsage,
         modifier: Option<Modifier>,
+        flags: vk::ImageCreateFlags,
     ) -> Result<bool, VulkanRendererError> {
         let mut external_image_format_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -303,7 +339,7 @@ impl FormatCapabilities {
             .format(vk_format)
             .ty(vk::ImageType::TYPE_2D)
             .usage(usage.image_usage())
-            .flags(vk::ImageCreateFlags::empty())
+            .flags(flags)
             .push_next(&mut external_image_format_info);
 
         match drm_modifier_info.as_mut() {
