@@ -198,7 +198,7 @@ impl ExportFramebuffer<Dmabuf> for PrimeFramebufferExporter {
         match buffer {
             #[cfg(feature = "wayland_frontend")]
             ExportBuffer::Wayland(wl_buffer) => match crate::wayland::dmabuf::get_dmabuf(wl_buffer) {
-                Ok(dmabuf) => framebuffer_from_prime(drm, &dmabuf, use_opaque).map(Some),
+                Ok(dmabuf) => framebuffer_from_prime(drm, dmabuf, use_opaque).map(Some),
                 Err(_) => Ok(None),
             },
             ExportBuffer::Allocator(dmabuf) => framebuffer_from_prime(drm, dmabuf, use_opaque).map(Some),
