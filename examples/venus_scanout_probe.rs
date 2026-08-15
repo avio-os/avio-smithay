@@ -64,9 +64,7 @@ impl PlanarBuffer for ProbeFb {
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/dev/dri/card0".into());
+    let path = std::env::args().nth(1).unwrap_or_else(|| "/dev/dri/card0".into());
     let fourcc = Fourcc::Xrgb8888;
 
     let card = Card(
@@ -112,17 +110,13 @@ fn main() {
     let phd = PhysicalDevice::enumerate(&instance)
         .expect("enumerate")
         .filter(|phd| phd.has_device_extension(c"VK_EXT_physical_device_drm"))
-        .find(|phd| {
-            phd.primary_node().unwrap() == Some(node) || phd.render_node().unwrap() == Some(node)
-        })
+        .find(|phd| phd.primary_node().unwrap() == Some(node) || phd.render_node().unwrap() == Some(node))
         .expect("no vulkan device for node");
     println!("[3] vulkan device: {:?}", phd.name());
 
-    let mut allocator = VulkanAllocator::new(
-        &phd,
-        ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::SAMPLED,
-    )
-    .expect("vulkan allocator");
+    let mut allocator =
+        VulkanAllocator::new(&phd, ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::SAMPLED)
+            .expect("vulkan allocator");
     let image = allocator
         .create_buffer(w, h, fourcc, &[Modifier::Linear])
         .expect("allocate image");
