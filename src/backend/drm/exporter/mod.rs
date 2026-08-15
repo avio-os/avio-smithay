@@ -18,10 +18,10 @@ use super::{DrmDeviceFd, Framebuffer};
 
 #[cfg(feature = "backend_drm")]
 pub mod dumb;
-#[cfg(feature = "backend_drm")]
-pub mod prime;
 #[cfg(feature = "backend_gbm")]
 pub mod gbm;
+#[cfg(feature = "backend_drm")]
+pub mod prime;
 
 /// Possible buffers to export as a framebuffer using [`ExportFramebuffer`]
 #[derive(Debug)]

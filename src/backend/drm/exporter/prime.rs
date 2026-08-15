@@ -197,15 +197,11 @@ impl ExportFramebuffer<Dmabuf> for PrimeFramebufferExporter {
     ) -> Result<Option<Self::Framebuffer>, Self::Error> {
         match buffer {
             #[cfg(feature = "wayland_frontend")]
-            ExportBuffer::Wayland(wl_buffer) => {
-                match crate::wayland::dmabuf::get_dmabuf(wl_buffer) {
-                    Ok(dmabuf) => framebuffer_from_prime(drm, &dmabuf, use_opaque).map(Some),
-                    Err(_) => Ok(None),
-                }
-            }
-            ExportBuffer::Allocator(dmabuf) => {
-                framebuffer_from_prime(drm, dmabuf, use_opaque).map(Some)
-            }
+            ExportBuffer::Wayland(wl_buffer) => match crate::wayland::dmabuf::get_dmabuf(wl_buffer) {
+                Ok(dmabuf) => framebuffer_from_prime(drm, &dmabuf, use_opaque).map(Some),
+                Err(_) => Ok(None),
+            },
+            ExportBuffer::Allocator(dmabuf) => framebuffer_from_prime(drm, dmabuf, use_opaque).map(Some),
             ExportBuffer::Dmabuf(dmabuf) => framebuffer_from_prime(drm, dmabuf, use_opaque).map(Some),
         }
     }
@@ -214,9 +210,7 @@ impl ExportFramebuffer<Dmabuf> for PrimeFramebufferExporter {
     fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, Dmabuf>) -> bool {
         match buffer {
             #[cfg(feature = "wayland_frontend")]
-            ExportBuffer::Wayland(wl_buffer) => {
-                crate::wayland::dmabuf::get_dmabuf(wl_buffer).is_ok()
-            }
+            ExportBuffer::Wayland(wl_buffer) => crate::wayland::dmabuf::get_dmabuf(wl_buffer).is_ok(),
             ExportBuffer::Allocator(_) => true,
             ExportBuffer::Dmabuf(_) => true,
         }
