@@ -51,9 +51,12 @@ macro_rules! vk_format_table {
 // Vulkan classifies formats by both channel sizes and colorspace. FourCC format codes do not classify formats
 // based on colorspace.
 //
-// The compositor's current SDR render contract keeps Wayland/DRM buffers as encoded UNORM pixels. Wayland
-// specifies alpha-bearing buffers as premultiplied in electrical values, so automatic SRGB sampling would
-// linearize already-premultiplied channels before the shader can repair that relationship.
+// Buffer STORAGE stays encoded UNORM pixels: this table is what every image, copy, blit and DRM fourcc keys
+// off, and none of those bytes change meaning. Wayland specifies alpha-bearing buffers as premultiplied in
+// electrical values, so a sampled view must never linearize them behind the shader's back — the shader owns
+// that conversion, because it has to unpremultiply first. See `get_vk_srgb_format` for the one place the
+// _SRGB sibling is used: colour attachment views, where the hardware decodes the destination and re-encodes
+// the blended result so compositing arithmetic happens in linear light.
 vk_format_table! {
     Argb8888 => B8G8R8A8_UNORM,
     Xrgb8888 => B8G8R8A8_UNORM,
@@ -79,12 +82,57 @@ vk_format_table! {
     Xbgr2101010 => A2B10G10R10_UNORM_PACK32,
 }
 
+/// Returns the sRGB-transfer sibling of an encoded UNORM colour format.
+///
+/// The compositor blends in linear light. A colour attachment viewed through this
+/// sibling makes the hardware decode the destination before blending and re-encode
+/// the result on store, so the blend arithmetic is linear while the stored bytes
+/// stay exactly as sRGB-encoded as they are today. The image itself keeps the
+/// [`get_vk_format`] format; only the attachment *view* uses this one, which is why
+/// images that are both sampled and rendered are created `MUTABLE_FORMAT` with both
+/// formats in their view-format list.
+///
+/// Returns [`None`] for formats with no `_SRGB` sibling — the 2101010 family has
+/// none, so those targets keep blending in gamma space.
+pub const fn get_vk_srgb_format(format: ash::vk::Format) -> Option<ash::vk::Format> {
+    match format {
+        ash::vk::Format::B8G8R8A8_UNORM => Some(ash::vk::Format::B8G8R8A8_SRGB),
+        ash::vk::Format::R8G8B8A8_UNORM => Some(ash::vk::Format::R8G8B8A8_SRGB),
+        ash::vk::Format::A8B8G8R8_UNORM_PACK32 => Some(ash::vk::Format::A8B8G8R8_SRGB_PACK32),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ash::vk;
 
-    use super::get_vk_format;
+    use super::{get_vk_format, get_vk_srgb_format};
     use crate::backend::allocator::Fourcc;
+
+    #[test]
+    fn srgb_siblings_exist_for_every_eight_bit_storage_format() {
+        for fourcc in [
+            Fourcc::Argb8888,
+            Fourcc::Xrgb8888,
+            Fourcc::Abgr8888,
+            Fourcc::Xbgr8888,
+            Fourcc::Rgba8888,
+            Fourcc::Rgbx8888,
+        ] {
+            let storage = get_vk_format(fourcc).expect("8-bit format is mapped");
+            assert!(
+                get_vk_srgb_format(storage).is_some(),
+                "{fourcc:?} maps to {storage:?}, which has no _SRGB sibling to render through"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_bit_formats_have_no_srgb_sibling_and_stay_gamma_blended() {
+        let storage = get_vk_format(Fourcc::Argb2101010).expect("10-bit format is mapped");
+        assert_eq!(get_vk_srgb_format(storage), None);
+    }
 
     #[test]
     fn eight_bit_color_formats_are_encoded_unorm() {

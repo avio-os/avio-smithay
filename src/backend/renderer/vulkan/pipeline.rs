@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 
 use crate::backend::renderer::{TextureRenderEffect, TextureRenderEffectKind};
 
-use super::{device::DeviceHandle, VulkanRendererError};
+use super::{device::DeviceHandle, format::ColorEncoding, VulkanRendererError};
 
 const SOLID_VERTEX_SHADER_SPV: &[u8] = include_bytes!("shaders/solid.vert.spv");
 const SOLID_FRAGMENT_SHADER_SPV: &[u8] = include_bytes!("shaders/solid.frag.spv");
@@ -61,6 +61,25 @@ pub(crate) struct TexturePushConstants {
     pub(crate) clip_params: [f32; 4],
     pub(crate) effect: [f32; 4],
     pub(crate) effect_params: [f32; 4],
+    /// How the sampled texels relate to linear light, and therefore which conversion
+    /// the shader applies before the blend. See [`ColorEncoding`].
+    pub(crate) source_encoding: u32,
+}
+
+/// Shader-side spelling of [`ColorEncoding`]. Kept next to the push-constant struct so
+/// the two stay in step; `texture.frag` reads the same numbering.
+pub(crate) const SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED: u32 = 0;
+pub(crate) const SOURCE_ENCODING_LINEAR_PREMULTIPLIED: u32 = 1;
+/// The target blends in gamma space (no `_SRGB` sibling), so no conversion happens.
+pub(crate) const SOURCE_ENCODING_PASSTHROUGH: u32 = 2;
+
+impl From<ColorEncoding> for u32 {
+    fn from(encoding: ColorEncoding) -> Self {
+        match encoding {
+            ColorEncoding::ElectricalPremultiplied => SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
+            ColorEncoding::LinearPremultiplied => SOURCE_ENCODING_LINEAR_PREMULTIPLIED,
+        }
+    }
 }
 
 impl Default for TexturePushConstants {
@@ -76,6 +95,7 @@ impl Default for TexturePushConstants {
             clip_params: [0.0, 2.0, 0.5, 0.0],
             effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
             effect_params: [0.0, 0.0, 0.0, 0.0],
+            source_encoding: SOURCE_ENCODING_PASSTHROUGH,
         }
     }
 }
@@ -93,7 +113,21 @@ impl TexturePushConstants {
             clip_params: [0.0, 2.0, 0.5, 0.0],
             effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
             effect_params: [0.0, 0.0, 0.0, 0.0],
+            source_encoding: SOURCE_ENCODING_PASSTHROUGH,
         }
+    }
+
+    /// Declares how the sampled texels relate to linear light.
+    ///
+    /// `linear_blending` is a property of the bound target: when it is false the pass
+    /// blends in gamma space and texels must reach the blend exactly as stored.
+    pub(crate) fn with_source_encoding(mut self, encoding: ColorEncoding, linear_blending: bool) -> Self {
+        self.source_encoding = if linear_blending {
+            encoding.into()
+        } else {
+            SOURCE_ENCODING_PASSTHROUGH
+        };
+        self
     }
 
     pub(crate) fn with_src_rect(mut self, offset: [f32; 2], scale: [f32; 2]) -> Self {
@@ -130,17 +164,19 @@ pub(crate) struct KawasePushConstants {
     pub(crate) halfpixel: [f32; 2],
     pub(crate) offset: f32,
     pub(crate) mode: u32,
-    pub(crate) linearize: u32,
+    /// 1 when the shader must sRGB-encode its own output because the destination is
+    /// not viewed through an `_SRGB` attachment. Taps are always decoded to linear.
+    pub(crate) encode_output: u32,
     pub(crate) _pad: [u32; 3],
 }
 
 impl KawasePushConstants {
-    pub(crate) fn new(halfpixel: [f32; 2], offset: f32, upsample: bool, linearize: bool) -> Self {
+    pub(crate) fn new(halfpixel: [f32; 2], offset: f32, upsample: bool, linear_destination: bool) -> Self {
         Self {
             halfpixel,
             offset,
             mode: u32::from(upsample),
-            linearize: u32::from(linearize),
+            encode_output: u32::from(!linear_destination),
             _pad: [0; 3],
         }
     }
@@ -705,11 +741,625 @@ mod tests {
         super::device::DeviceHandle,
         super::device::DeviceState,
         push_constants_bytes, PipelineState, SolidPushConstants, TexturePushConstants, TextureTransform,
+        SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED, SOURCE_ENCODING_LINEAR_PREMULTIPLIED,
+        SOURCE_ENCODING_PASSTHROUGH,
     };
 
     const TEST_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
     const TEST_WIDTH: u32 = 64;
     const TEST_HEIGHT: u32 = 64;
+
+    fn create_mutable_test_image(
+        device: &DeviceState,
+        view_format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        extent: vk::Extent3D,
+    ) -> Result<TestImage, vk::Result> {
+        let vk_device = device.device_handle();
+        let view_formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB];
+        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let image_create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut format_list);
+
+        let image = unsafe { vk_device.create_image(&image_create_info, None) }?;
+        let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
+        let memory_type_index = pick_image_memory_type(device, memory_requirements.memory_type_bits)
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
+        let memory = unsafe { vk_device.allocate_memory(&allocate_info, None) }?;
+        unsafe { vk_device.bind_image_memory(image, memory, 0) }?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(view_format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        let view = unsafe { vk_device.create_image_view(&view_info, None) }?;
+
+        Ok(TestImage {
+            device: device.shared_device(),
+            image,
+            memory,
+            view,
+        })
+    }
+
+    fn create_upload_buffer(device: &DeviceState, bytes: &[u8]) -> Result<TestBuffer, vk::Result> {
+        let vk_device = device.device_handle();
+        let size = bytes.len();
+        let buffer_create_info = vk::BufferCreateInfo::default()
+            .size(size as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { vk_device.create_buffer(&buffer_create_info, None) }?;
+        let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
+        let (memory_type_index, coherent) =
+            pick_host_visible_memory_type(device, memory_requirements.memory_type_bits)
+                .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
+        let memory = unsafe { vk_device.allocate_memory(&allocate_info, None) }?;
+        unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) }?;
+
+        unsafe {
+            let ptr = vk_device.map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, size);
+            if !coherent {
+                let range = [vk::MappedMemoryRange::default()
+                    .memory(memory)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)];
+                vk_device.flush_mapped_memory_ranges(&range)?;
+            }
+            vk_device.unmap_memory(memory);
+        }
+
+        Ok(TestBuffer {
+            device: device.shared_device(),
+            buffer,
+            memory,
+            size,
+            coherent,
+        })
+    }
+
+    /// Composites `src_bytes` over `dst_bytes` at `draw_alpha` coverage through the
+    /// real pipeline, and returns the stored bytes.
+    ///
+    /// `source_encoding` selects the production wiring: `PASSTHROUGH` reproduces the
+    /// old gamma-space blend (UNORM everywhere), anything else uses the linear-light
+    /// configuration — an encoded UNORM sampled view feeding a shader conversion, and
+    /// an `_SRGB` colour attachment view. Both images always start from byte-identical
+    /// storage, so the encoding wiring is the only variable.
+    fn srgb_blend_probe(
+        device: &mut DeviceState,
+        descriptors: &mut DescriptorState,
+        pipelines: &mut PipelineState,
+        keepalive: &mut Vec<TestImage>,
+        source_encoding: u32,
+        dst_bytes: [u8; 4],
+        src_bytes: [u8; 4],
+        draw_alpha: f32,
+    ) -> [u8; 4] {
+        const W: u32 = 8;
+        const H: u32 = 8;
+
+        let linear = source_encoding != SOURCE_ENCODING_PASSTHROUGH;
+        let attachment_format = if linear {
+            vk::Format::R8G8B8A8_SRGB
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        // Sampled views always declare the encoded storage format; the shader owns the
+        // conversion because it has to unpremultiply first.
+        let sample_format = vk::Format::R8G8B8A8_UNORM;
+
+        let handles = pipelines
+            .pipelines_for_format(attachment_format)
+            .expect("pipelines");
+        let target = create_mutable_test_image(
+            device,
+            attachment_format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::Extent3D {
+                width: W,
+                height: H,
+                depth: 1,
+            },
+        )
+        .expect("target image");
+        let texture = create_mutable_test_image(
+            device,
+            sample_format,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::Extent3D {
+                width: W,
+                height: H,
+                depth: 1,
+            },
+        )
+        .expect("texture image");
+
+        let dst_pixels: Vec<u8> = dst_bytes
+            .iter()
+            .copied()
+            .cycle()
+            .take((W * H * 4) as usize)
+            .collect();
+        let src_pixels: Vec<u8> = src_bytes
+            .iter()
+            .copied()
+            .cycle()
+            .take((W * H * 4) as usize)
+            .collect();
+        let dst_upload = create_upload_buffer(device, &dst_pixels).expect("dst upload");
+        let src_upload = create_upload_buffer(device, &src_pixels).expect("src upload");
+        let readback = create_readback_buffer(device, (W * H * 4) as usize).expect("readback");
+
+        let framebuffer = create_framebuffer(
+            device,
+            handles.render_pass,
+            target.view,
+            vk::Extent2D { width: W, height: H },
+        )
+        .expect("framebuffer");
+        let descriptor_set = descriptors
+            .texture_descriptor_set(texture.view, TextureSampler::LINEAR)
+            .expect("descriptor set");
+        let command_buffer = device.acquire_command_buffer().expect("command buffer");
+        let vk_device = device.device_handle();
+
+        let full_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let copy_region = [vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: W,
+                height: H,
+                depth: 1,
+            })];
+
+        unsafe {
+            vk_device
+                .begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin");
+
+            for (image, upload) in [(target.image, &dst_upload), (texture.image, &src_upload)] {
+                transition_image_layout(
+                    vk_device,
+                    command_buffer,
+                    image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+                vk_device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    upload.buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copy_region,
+                );
+            }
+            let _ = full_range;
+
+            transition_image_layout(
+                vk_device,
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            );
+            transition_image_layout(
+                vk_device,
+                command_buffer,
+                texture.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            );
+
+            vk_device.cmd_begin_render_pass(
+                command_buffer,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(handles.render_pass)
+                    .framebuffer(framebuffer.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D { width: W, height: H },
+                    }),
+                vk::SubpassContents::INLINE,
+            );
+            vk_device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                handles.textured_pipeline,
+            );
+            vk_device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                handles.textured_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            vk_device.cmd_set_viewport(
+                command_buffer,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: W as f32,
+                    height: H as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            vk_device.cmd_set_scissor(
+                command_buffer,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width: W, height: H },
+                }],
+            );
+            let mut constants = TexturePushConstants::new(draw_alpha, TextureTransform::Normal, false);
+            constants.source_encoding = source_encoding;
+            vk_device.cmd_push_constants(
+                command_buffer,
+                handles.textured_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_constants_bytes(&constants),
+            );
+            vk_device.cmd_draw(command_buffer, 4, 1, 0, 0);
+            vk_device.cmd_end_render_pass(command_buffer);
+
+            transition_image_layout(
+                vk_device,
+                command_buffer,
+                target.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            vk_device.cmd_copy_image_to_buffer(
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback.buffer,
+                &copy_region,
+            );
+            vk_device.end_command_buffer(command_buffer).expect("end");
+        }
+
+        device.submit(command_buffer).expect("submit");
+        device.wait_for_all_submissions().expect("wait");
+        let pixels = readback.read().expect("readback");
+        // The descriptor cache is keyed by raw vk::ImageView handle, so dropping
+        // these images here would let Vulkan recycle a handle into a stale entry.
+        keepalive.push(target);
+        keepalive.push(texture);
+        [pixels[0], pixels[1], pixels[2], pixels[3]]
+    }
+
+    struct LinearBlendFixture {
+        device: DeviceState,
+        descriptors: DescriptorState,
+        pipelines: PipelineState,
+        keepalive: Vec<TestImage>,
+    }
+
+    impl LinearBlendFixture {
+        /// Returns `None` when no usable Vulkan device is present, so these tests are
+        /// skipped on hosted runners rather than failing there.
+        fn new() -> Option<Self> {
+            let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+            let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
+            if !format_supports_test_usage(&physical_device, vk::Format::R8G8B8A8_UNORM)
+                || !format_supports_test_usage(&physical_device, vk::Format::R8G8B8A8_SRGB)
+            {
+                return None;
+            }
+            let device = DeviceState::new(&physical_device).ok()?;
+            let descriptors = DescriptorState::new(device.shared_device()).ok()?;
+            let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout()).ok()?;
+            Some(Self {
+                device,
+                descriptors,
+                pipelines,
+                keepalive: Vec::new(),
+            })
+        }
+
+        fn composite(
+            &mut self,
+            source_encoding: u32,
+            dst: [u8; 4],
+            src: [u8; 4],
+            draw_alpha: f32,
+        ) -> [u8; 4] {
+            srgb_blend_probe(
+                &mut self.device,
+                &mut self.descriptors,
+                &mut self.pipelines,
+                &mut self.keepalive,
+                source_encoding,
+                dst,
+                src,
+                draw_alpha,
+            )
+        }
+    }
+
+    /// Invariant: switching the blend to linear light must not disturb a single byte of
+    /// opaque content composited 1:1. If it did, a directly scanned-out buffer and a
+    /// composited one would no longer match, and every screenshot would drift.
+    #[test]
+    fn opaque_one_to_one_composite_is_byte_identical_under_linear_blending() {
+        let Some(mut fixture) = LinearBlendFixture::new() else {
+            return;
+        };
+
+        for value in [0u8, 1, 26, 64, 128, 191, 204, 254, 255] {
+            let src = [value, value, value, 255];
+            let out = fixture.composite(SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED, [0, 0, 0, 255], src, 1.0);
+            assert_eq!(
+                out, src,
+                "opaque 1:1 composite of {value} must round-trip exactly through the sRGB attachment"
+            );
+        }
+    }
+
+    /// Offscreen content takes the other conversion (a plain decode, no unpremultiply)
+    /// and must round-trip just as exactly for opaque texels.
+    #[test]
+    fn linear_premultiplied_sources_also_round_trip_opaque_content() {
+        let Some(mut fixture) = LinearBlendFixture::new() else {
+            return;
+        };
+
+        for value in [0u8, 26, 128, 204, 255] {
+            let src = [value, value, value, 255];
+            let out = fixture.composite(SOURCE_ENCODING_LINEAR_PREMULTIPLIED, [0, 0, 0, 255], src, 1.0);
+            assert_eq!(out, src, "opaque offscreen texel {value} must round-trip exactly");
+        }
+    }
+
+    /// The defect this change repairs: an anti-aliased edge at 50% coverage between a
+    /// dark window (26) and a light wallpaper (204) must land near the PERCEPTUAL
+    /// midpoint, not the gamma-space average that reads as a harsh dark rim.
+    #[test]
+    fn coverage_ramp_lands_on_the_perceptual_midpoint() {
+        let Some(mut fixture) = LinearBlendFixture::new() else {
+            return;
+        };
+
+        let gamma = fixture.composite(
+            SOURCE_ENCODING_PASSTHROUGH,
+            [204, 204, 204, 255],
+            [26, 26, 26, 255],
+            0.5,
+        );
+        let linear = fixture.composite(
+            SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
+            [204, 204, 204, 255],
+            [26, 26, 26, 255],
+            0.5,
+        );
+
+        assert!(
+            (110..=120).contains(&gamma[0]),
+            "gamma-space blend should reproduce the old dark ramp, got {gamma:?}"
+        );
+        assert!(
+            (148..=154).contains(&linear[0]),
+            "linear blend should land near the perceptual midpoint (~151), got {linear:?}"
+        );
+    }
+
+    /// Translucent client content is premultiplied in ELECTRICAL values. Decoding that
+    /// product directly (what a hardware `_SRGB` sampled view would do) collapses white
+    /// glass at 50% from ~230 to ~190. The shader's unpremultiply/decode/re-premultiply
+    /// keeps it where the shell was tuned, while still blending the destination linearly.
+    #[test]
+    fn electrical_premultiplied_translucency_is_not_darkened_by_linearization() {
+        let Some(mut fixture) = LinearBlendFixture::new() else {
+            return;
+        };
+
+        // 50%-alpha white, premultiplied in gamma space: 255 * 0.502 = 128.
+        let glass = [128u8, 128, 128, 128];
+        let backdrop = [204u8, 204, 204, 255];
+
+        let gamma = fixture.composite(SOURCE_ENCODING_PASSTHROUGH, backdrop, glass, 1.0);
+        let linear = fixture.composite(SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED, backdrop, glass, 1.0);
+        // Applying the offscreen conversion (a plain decode) to electrical-premultiplied
+        // content is exactly the mistake a hardware `_SRGB` sampled view would make.
+        let decoded_without_unpremultiply =
+            fixture.composite(SOURCE_ENCODING_LINEAR_PREMULTIPLIED, backdrop, glass, 1.0);
+
+        assert!(
+            (228..=232).contains(&gamma[0]),
+            "gamma-space reference should be ~230, got {gamma:?}"
+        );
+        assert!(
+            (230..=234).contains(&linear[0]),
+            "linear-light compositing must keep premultiplied glass where the shell was \
+             tuned (~232), got {linear:?}"
+        );
+        assert!(
+            decoded_without_unpremultiply[0] < 200,
+            "sanity check: decoding a premultiplied texel without unpremultiplying should \
+             visibly darken it (~190); got {decoded_without_unpremultiply:?}, which means \
+             this test can no longer tell the two conversions apart"
+        );
+    }
+
+    /// `MUTABLE_FORMAT` plus a `[UNORM, SRGB]` view-format list has to be accepted for
+    /// external DMA-BUF imports under every DRM modifier the driver advertises, or the
+    /// attachment view could not be created for real client and shell buffers.
+    #[test]
+    fn drm_modifier_imports_accept_the_srgb_view_format_list() {
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+        let Ok(mut devices) = PhysicalDevice::enumerate(&instance) else {
+            return;
+        };
+        let Some(physical_device) = devices.next() else {
+            return;
+        };
+
+        for (storage, srgb) in [
+            (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
+            (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
+        ] {
+            let Ok(modifier_properties) = physical_device.get_format_modifier_properties(storage) else {
+                continue;
+            };
+
+            for properties in modifier_properties {
+                for usage in [
+                    vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                ] {
+                    let plain = probe_drm_modifier_import(
+                        &physical_device,
+                        storage,
+                        srgb,
+                        properties.drm_format_modifier,
+                        usage,
+                        false,
+                    );
+                    if !plain {
+                        // The driver does not support this modifier at all today, so
+                        // MUTABLE_FORMAT cannot regress it.
+                        continue;
+                    }
+                    assert!(
+                        probe_drm_modifier_import(
+                            &physical_device,
+                            storage,
+                            srgb,
+                            properties.drm_format_modifier,
+                            usage,
+                            true,
+                        ),
+                        "modifier {:#x} for {storage:?} with usage {usage:?} is supported today \
+                         but rejects MUTABLE_FORMAT + [UNORM, SRGB]; linear-light attachment \
+                         views would fail for that buffer",
+                        properties.drm_format_modifier
+                    );
+                }
+            }
+        }
+    }
+
+    fn probe_drm_modifier_import(
+        physical_device: &PhysicalDevice,
+        storage: vk::Format,
+        srgb: vk::Format,
+        drm_format_modifier: u64,
+        usage: vk::ImageUsageFlags,
+        mutable: bool,
+    ) -> bool {
+        let view_formats = [storage, srgb];
+        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut drm_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(drm_format_modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(storage)
+            .ty(vk::ImageType::TYPE_2D)
+            .usage(usage)
+            .flags(if mutable {
+                vk::ImageCreateFlags::MUTABLE_FORMAT
+            } else {
+                vk::ImageCreateFlags::empty()
+            })
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .push_next(&mut external)
+            .push_next(&mut drm_info);
+        if mutable {
+            info = info.push_next(&mut format_list);
+        }
+
+        let mut external_properties = vk::ExternalImageFormatProperties::default();
+        let mut properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+
+        // SAFETY: the physical device belongs to `instance` and every pointer in the
+        // chain refers to storage live for the duration of the call.
+        let supported = unsafe {
+            physical_device
+                .instance()
+                .handle()
+                .get_physical_device_image_format_properties2(
+                    physical_device.handle(),
+                    &info,
+                    &mut properties,
+                )
+        }
+        .is_ok();
+
+        supported
+            && external_properties
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
 
     #[test]
     fn texture_push_constants_encode_render_effect() {

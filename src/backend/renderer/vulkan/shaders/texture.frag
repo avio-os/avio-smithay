@@ -13,7 +13,49 @@ layout(push_constant) uniform TexturePushConstants {
     vec4 clip_params;
     vec4 effect;
     vec4 effect_params;
+    uint source_encoding;
 } constants;
+
+// Must match the SOURCE_ENCODING_* constants in pipeline.rs.
+const uint SOURCE_ELECTRICAL_PREMULTIPLIED = 0u;
+const uint SOURCE_LINEAR_PREMULTIPLIED = 1u;
+const uint SOURCE_PASSTHROUGH = 2u;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 lo = lessThanEqual(c, vec3(0.04045));
+    vec3 linear_lo = c / 12.92;
+    vec3 linear_hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(linear_hi, linear_lo, vec3(lo));
+}
+
+// Convert a sampled texel into the premultiplied-LINEAR value the blend expects.
+//
+// The compositor blends in linear light: the colour attachment is viewed as _SRGB, so
+// the hardware decodes the destination and re-encodes the result on store. Only the
+// source side is left, and it has two shapes:
+//
+//   ELECTRICAL_PREMULTIPLIED - client and shell buffers, premultiplied in gamma space
+//     (`encode(colour) * alpha`). Decoding that product directly is wrong: it yields
+//     roughly `linear(colour) * alpha^2.4`, which visibly darkens translucent glass.
+//     Unpremultiply first, decode, then premultiply again in linear.
+//   LINEAR_PREMULTIPLIED - our own offscreens, already premultiplied in linear and
+//     merely sRGB-encoded for 8-bit precision. A plain decode is exact here, and
+//     unpremultiplying would corrupt it.
+//
+// Both collapse to a plain decode when alpha is 1, which is the opaque fast path.
+vec4 to_linear_premultiplied(vec4 texel) {
+    if (constants.source_encoding == SOURCE_PASSTHROUGH) {
+        return texel;
+    }
+    if (constants.source_encoding == SOURCE_LINEAR_PREMULTIPLIED) {
+        return vec4(srgb_to_linear(texel.rgb), texel.a);
+    }
+    if (texel.a <= 0.0) {
+        return vec4(0.0);
+    }
+    vec3 straight = min(texel.rgb / texel.a, vec3(1.0));
+    return vec4(srgb_to_linear(straight) * texel.a, texel.a);
+}
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
@@ -182,7 +224,7 @@ void main() {
 
     uv = constants.src_offset + (uv * constants.src_scale);
 
-    vec4 sampled = texture(texture_sampler, uv);
+    vec4 sampled = to_linear_premultiplied(texture(texture_sampler, uv));
     float coverage = rounded_clip_alpha(gl_FragCoord.xy);
     out_color = vec4(sampled.rgb * constants.alpha, sampled.a * constants.alpha) * coverage * effect_coverage;
 }

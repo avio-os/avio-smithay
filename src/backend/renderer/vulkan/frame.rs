@@ -24,6 +24,7 @@ use crate::backend::renderer::ImportDmaWl;
 use super::{
     descriptor::TextureSampler,
     dmabuf::ImportedDmabufImage,
+    format::srgb_channel_to_linear,
     pipeline::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
     },
@@ -155,7 +156,12 @@ impl Renderer for VulkanRenderer {
             ));
         }
 
-        let pipelines = self.pipelines.pipelines_for_format(target_image.vk_format())?;
+        // Keyed on the attachment view's format, not the image's storage format: the
+        // render pass and pipelines must agree with the `_SRGB` view that makes the
+        // fixed-function blend operate in linear light.
+        let pipelines = self
+            .pipelines
+            .pipelines_for_format(target_image.render_format())?;
 
         let command_buffer = self.device.acquire_command_buffer()?;
         let begin_info =
@@ -290,9 +296,14 @@ impl Frame for VulkanFrame<'_> {
     #[instrument(level = "trace", skip(self, at))]
     #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
-        let (command_buffer, transform, size) = {
+        let (command_buffer, transform, size, linear_blending) = {
             let recording = self.recording()?;
-            (recording.command_buffer, recording.transform, recording.size)
+            (
+                recording.command_buffer,
+                recording.transform,
+                recording.size,
+                recording.target.blends_in_linear_light(),
+            )
         };
 
         let clear_regions = Self::transformed_damage_rects(transform, size, Rectangle::from_size(size), at);
@@ -305,7 +316,10 @@ impl Frame for VulkanFrame<'_> {
             .color_attachment(0)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: [color.r(), color.g(), color.b(), color.a()],
+                    // Vulkan treats a clear value as linear and encodes it for an `_SRGB`
+                    // attachment, so the caller's sRGB-encoded colour is linearized here
+                    // to land on exactly the same stored bytes as before.
+                    float32: encode_color_for_target(color, linear_blending),
                 },
             })];
 
@@ -374,8 +388,10 @@ impl Frame for VulkanFrame<'_> {
             pipelines.solid_pipeline
         };
 
+        // The shader premultiplies by alpha; linearizing the channels first makes that
+        // a premultiplied-*linear* value, which is what a linear-light blend expects.
         let constants = SolidPushConstants {
-            color: [color.r(), color.g(), color.b(), color.a()],
+            color: encode_color_for_target(color, self.recording()?.target.blends_in_linear_light()),
         };
 
         // SAFETY: Command buffer recording is active and all pipeline/layout handles are valid.
@@ -864,13 +880,14 @@ impl VulkanFrame<'_> {
 
         self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, true)?;
 
-        let (command_buffer, pipelines, transform, size) = {
+        let (command_buffer, pipelines, transform, size, linear_blending) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.pipelines,
                 recording.transform,
                 recording.size,
+                recording.target.blends_in_linear_light(),
             )
         };
 
@@ -926,6 +943,7 @@ impl VulkanFrame<'_> {
             texture.y_inverted(),
         )
         .with_src_rect(src_offset, src_scale)
+        .with_source_encoding(texture_image.color_encoding(), linear_blending)
         .with_effect(effect);
 
         if let Some(clip) = rounded_clip {
@@ -1437,6 +1455,30 @@ fn to_vk_rect(rect: Rectangle<i32, Physical>) -> vk::Rect2D {
             width: rect.size.w as u32,
             height: rect.size.h as u32,
         },
+    }
+}
+
+/// Cancels the `_SRGB` attachment's encode-on-store for an API-supplied colour.
+///
+/// Against a linear-blending target each colour channel is linearized, so the
+/// hardware's encode lands on exactly the byte the caller named — a pure round-trip
+/// that holds whatever colour space or premultiplication the caller meant, which is
+/// what keeps [`Frame::clear`] writing the same bytes it always did. For the solid
+/// pipeline it additionally puts the channels in linear light before the shader
+/// multiplies by alpha, so that premultiplication happens in linear too.
+///
+/// Against a gamma-blending target (formats with no `_SRGB` sibling) the channels
+/// pass through untouched. Alpha is a coverage term and is never transformed.
+fn encode_color_for_target(color: Color32F, linear_blending: bool) -> [f32; 4] {
+    if linear_blending {
+        [
+            srgb_channel_to_linear(color.r()),
+            srgb_channel_to_linear(color.g()),
+            srgb_channel_to_linear(color.b()),
+            color.a(),
+        ]
+    } else {
+        [color.r(), color.g(), color.b(), color.a()]
     }
 }
 

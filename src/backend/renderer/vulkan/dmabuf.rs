@@ -21,7 +21,10 @@ use crate::{
 
 use super::{
     device::{DeviceHandle, DeviceState},
-    format::{texture_view_components, FormatCapabilities, ModifierCapability},
+    format::{
+        render_view_format, srgb_view_format_list, texture_view_components, ColorEncoding,
+        FormatCapabilities, ModifierCapability,
+    },
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
@@ -419,6 +422,19 @@ impl DmabufState {
 
         let mut explicit_modifier_info;
         let plane_layouts;
+        // The image keeps its encoded storage format; MUTABLE_FORMAT only lets the
+        // colour attachment view reinterpret those same bytes as `_SRGB` so blending
+        // happens in linear light. Storage, stride and DRM modifier are untouched.
+        let view_formats = srgb_view_format_list(descriptor.vk_format);
+        let mut format_list_info;
+        let mut create_flags = if disjoint {
+            vk::ImageCreateFlags::DISJOINT
+        } else {
+            vk::ImageCreateFlags::empty()
+        };
+        if view_formats.is_some() {
+            create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+        }
         let mut image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(descriptor.vk_format)
@@ -431,13 +447,14 @@ impl DmabufState {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .usage(usage)
-            .flags(if disjoint {
-                vk::ImageCreateFlags::DISJOINT
-            } else {
-                vk::ImageCreateFlags::empty()
-            })
+            .flags(create_flags)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        if let Some(formats) = view_formats.as_ref() {
+            format_list_info = vk::ImageFormatListCreateInfo::default().view_formats(formats);
+            image_create_info = image_create_info.push_next(&mut format_list_info);
+        }
 
         if format.modifier == Modifier::Invalid {
             image_create_info = image_create_info.tiling(vk::ImageTiling::OPTIMAL);
@@ -579,7 +596,9 @@ impl DmabufState {
         let render_view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(descriptor.vk_format)
+            // Linear-light blending: the hardware decodes the destination through this
+            // view and re-encodes the blended result on store.
+            .format(render_view_format(descriptor.vk_format))
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -614,6 +633,9 @@ impl DmabufState {
             size,
             format,
             descriptor.vk_format,
+            // Imported buffers are authored outside the compositor: Wayland clients and
+            // the Flutter shell both premultiply in electrical values.
+            ColorEncoding::ElectricalPremultiplied,
             usage,
             descriptor.signature.y_inverted,
             vk::ImageLayout::UNDEFINED,
@@ -724,6 +746,7 @@ pub(crate) struct ImportedDmabufImage {
     size: Size<i32, BufferCoord>,
     format: Format,
     vk_format: vk::Format,
+    color_encoding: ColorEncoding,
     usage: vk::ImageUsageFlags,
     y_inverted: bool,
     layout: AtomicI32,
@@ -759,6 +782,7 @@ impl ImportedDmabufImage {
         size: Size<i32, BufferCoord>,
         format: Format,
         vk_format: vk::Format,
+        color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
@@ -773,6 +797,7 @@ impl ImportedDmabufImage {
             size,
             format,
             vk_format,
+            color_encoding,
             usage,
             y_inverted,
             initial_layout,
@@ -790,6 +815,7 @@ impl ImportedDmabufImage {
         size: Size<i32, BufferCoord>,
         format: Format,
         vk_format: vk::Format,
+        color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
@@ -804,6 +830,7 @@ impl ImportedDmabufImage {
             size,
             format,
             vk_format,
+            color_encoding,
             usage,
             y_inverted,
             layout: AtomicI32::new(initial_layout.as_raw()),
@@ -824,6 +851,27 @@ impl ImportedDmabufImage {
 
     pub(crate) fn view(&self) -> vk::ImageView {
         self.sampled_view
+    }
+
+    /// Format of the colour attachment view — the `_SRGB` sibling of the storage
+    /// format wherever one exists, so blending happens in linear light. Render passes
+    /// and pipelines must be keyed on this, not on [`Self::vk_format`].
+    pub(crate) fn render_format(&self) -> vk::Format {
+        render_view_format(self.vk_format)
+    }
+
+    /// How this image's stored channels relate to linear light. See [`ColorEncoding`].
+    pub(crate) fn color_encoding(&self) -> ColorEncoding {
+        self.color_encoding
+    }
+
+    /// Whether a render pass targeting this image blends in linear light.
+    ///
+    /// True whenever the storage format has an `_SRGB` sibling to view the attachment
+    /// through. Formats without one — the 2101010 family — keep blending in gamma
+    /// space, and every colour entering such a pass must stay encoded to match.
+    pub(crate) fn blends_in_linear_light(&self) -> bool {
+        self.render_format() != self.vk_format
     }
 
     pub(crate) fn render_view(&self) -> vk::ImageView {

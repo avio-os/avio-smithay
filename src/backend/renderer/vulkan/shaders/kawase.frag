@@ -1,9 +1,15 @@
 #version 450
 
 // Dual-Kawase blur pass (KWin formulation). One module serves both pyramid
-// directions via `mode`; `linearize` decodes sRGB-encoded storage to linear
-// before averaging and re-encodes on write, so 8-bit storage keeps sRGB
-// precision while the blur itself averages physically-linear light.
+// directions via `mode`. Taps are always decoded to linear before averaging, so
+// the blur averages physically-linear light while 8-bit storage keeps sRGB
+// precision. `encode_output` re-encodes on write only when the destination is not
+// an _SRGB attachment doing that for us — encoding in both places would darken
+// every pyramid level.
+//
+// Blur inputs are the compositor's own offscreens, which store premultiplied-linear
+// values in sRGB encoding, so a plain decode is exact; there is no unpremultiply
+// step here, unlike texture.frag's electrical-premultiplied client buffers.
 
 layout(set = 0, binding = 0) uniform sampler2D texture_sampler;
 
@@ -11,7 +17,7 @@ layout(push_constant) uniform KawasePushConstants {
     vec2 halfpixel; // 0.5 / size of the SMALLER pyramid level, in UV units
     float offset;   // kawase spread multiplier
     uint mode;      // 0 = downsample (5 taps), 1 = upsample (8 taps)
-    uint linearize; // 1 = average in linear space
+    uint encode_output; // 1 = shader must sRGB-encode; 0 = the _SRGB attachment does
     uint _pad0;
     uint _pad1;
     uint _pad2;
@@ -36,9 +42,7 @@ vec3 linear_to_srgb(vec3 c) {
 
 vec4 tap(vec2 uv) {
     vec4 s = texture(texture_sampler, uv);
-    if (constants.linearize != 0u) {
-        s.rgb = srgb_to_linear(s.rgb);
-    }
+    s.rgb = srgb_to_linear(s.rgb);
     return s;
 }
 
@@ -63,7 +67,7 @@ void main() {
         sum += tap(in_uv + vec2(-hp.x, -hp.y)) * 2.0;
         sum /= 12.0;
     }
-    if (constants.linearize != 0u) {
+    if (constants.encode_output != 0u) {
         sum.rgb = linear_to_srgb(sum.rgb);
     }
     out_color = sum;

@@ -19,7 +19,7 @@ use crate::{
 use super::{
     device::{DeviceState, TransientBufferAllocation},
     dmabuf::ImportedDmabufImage,
-    format::texture_view_components,
+    format::{texture_view_components, ColorEncoding},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
@@ -785,6 +785,10 @@ fn create_upload_image(
             modifier: Modifier::Invalid,
         },
         vk_format,
+        // shm buffers and CPU-rasterized chrome are premultiplied in electrical values,
+        // exactly like client DMA-BUFs. These images are SAMPLED-only, so they keep a
+        // storage-format render view: it is never usable as a colour attachment.
+        ColorEncoding::ElectricalPremultiplied,
         usage,
         y_inverted,
         vk::ImageLayout::UNDEFINED,

@@ -12,8 +12,10 @@ use crate::{
 };
 
 use super::{
-    device::DeviceState, dmabuf::ImportedDmabufImage, format::texture_view_components, VulkanRenderer,
-    VulkanRendererError, VulkanTarget, VulkanTexture,
+    device::DeviceState,
+    dmabuf::ImportedDmabufImage,
+    format::{render_view_format, srgb_view_format_list, texture_view_components, ColorEncoding},
+    VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
 #[derive(Debug)]
@@ -64,7 +66,11 @@ impl ReadbackState {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST;
 
-        let create_info = vk::ImageCreateInfo::default()
+        // Offscreens are both rendered into and sampled back, so they carry an `_SRGB`
+        // attachment view alongside the encoded UNORM sampled view.
+        let view_formats = srgb_view_format_list(vk_format);
+        let mut format_list_info;
+        let mut create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
             .extent(vk::Extent3D {
@@ -77,8 +83,17 @@ impl ReadbackState {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
+            .flags(match view_formats {
+                Some(_) => vk::ImageCreateFlags::MUTABLE_FORMAT,
+                None => vk::ImageCreateFlags::empty(),
+            })
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        if let Some(formats) = view_formats.as_ref() {
+            format_list_info = vk::ImageFormatListCreateInfo::default().view_formats(formats);
+            create_info = create_info.push_next(&mut format_list_info);
+        }
 
         // SAFETY: Device is valid and create info references live memory.
         let image = device_handle.observe_result(unsafe { vk_device.create_image(&create_info, None) })?;
@@ -145,7 +160,8 @@ impl ReadbackState {
         let render_view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk_format)
+            // Linear-light blending, same rule as every other colour attachment.
+            .format(render_view_format(vk_format))
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -183,6 +199,9 @@ impl ReadbackState {
                 modifier: Modifier::Invalid,
             },
             vk_format,
+            // Offscreens are filled by our own linear-blending render passes, so their
+            // stored bytes are the sRGB encoding of a premultiplied *linear* value.
+            ColorEncoding::LinearPremultiplied,
             usage,
             false,
             vk::ImageLayout::UNDEFINED,

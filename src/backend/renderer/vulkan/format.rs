@@ -4,13 +4,66 @@ use indexmap::{IndexMap, IndexSet};
 use crate::backend::{
     allocator::{
         format::{has_alpha, FormatSet},
-        vulkan::format::{get_vk_format, known_formats},
+        vulkan::format::{get_vk_format, get_vk_srgb_format, known_formats},
         Format, Fourcc, Modifier,
     },
     vulkan::{PhysicalDevice, UnsupportedProperty},
 };
 
 use super::VulkanRendererError;
+
+/// How the colour channels stored in an image relate to linear light.
+///
+/// The compositor blends in linear light, so every sampled texel is converted to
+/// premultiplied-linear exactly once before it reaches the blend. Which conversion
+/// applies is a property of where the pixels came from, not of their format — both
+/// variants below are stored in the very same sRGB-encoded 8-bit bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorEncoding {
+    /// Authored outside the compositor: Wayland clients, the Flutter/Impeller shell
+    /// DMA-BUFs, CPU-rasterized chrome. Wayland specifies these as premultiplied in
+    /// *electrical* values, i.e. the stored channel is `encode(colour) * alpha`. The
+    /// shader must unpremultiply before decoding and re-premultiply afterwards;
+    /// decoding the premultiplied channel directly darkens every translucent texel.
+    ElectricalPremultiplied,
+    /// Rendered by the compositor itself through an `_SRGB` colour attachment, so the
+    /// stored channel is `encode(linear_colour * alpha)` — an already premultiplied
+    /// *linear* value that merely happens to be sRGB-encoded for 8-bit precision. A
+    /// plain decode recovers it exactly; unpremultiplying it would be wrong.
+    LinearPremultiplied,
+}
+
+/// The sRGB electro-optical transfer function, applied to one colour channel.
+///
+/// Colours that arrive from configuration and protocol (clear colours, solid quads)
+/// are sRGB-encoded, so they must be linearized before entering a linear-light render
+/// pass — otherwise the attachment's encode-on-store would brighten them once more.
+/// Alpha is not a colour channel and never passes through this.
+pub(crate) fn srgb_channel_to_linear(channel: f32) -> f32 {
+    if channel <= 0.040_45 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The view-format list an image must declare so it can carry both a sampled
+/// (encoded UNORM) view and a linear-blending `_SRGB` colour attachment view.
+///
+/// Returns [`None`] for storage formats with no `_SRGB` sibling; those images are
+/// created without `MUTABLE_FORMAT` and keep blending in gamma space.
+pub(crate) fn srgb_view_format_list(storage: vk::Format) -> Option<[vk::Format; 2]> {
+    get_vk_srgb_format(storage).map(|srgb| [storage, srgb])
+}
+
+/// The format a colour attachment view of `storage` is created with.
+///
+/// This is the single rule that keeps the attachment view, the render pass and the
+/// graphics pipelines agreeing on one format; every site derives it rather than
+/// deciding for itself.
+pub(crate) fn render_view_format(storage: vk::Format) -> vk::Format {
+    get_vk_srgb_format(storage).unwrap_or(storage)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatUsage {
@@ -335,12 +388,25 @@ impl FormatCapabilities {
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
         });
 
+        // Images are created MUTABLE_FORMAT so a linear-blending `_SRGB` attachment view
+        // can coexist with the encoded UNORM sampled view. Probe exactly what we create,
+        // or we would advertise formats that later fail at image creation.
+        let view_formats = srgb_view_format_list(vk_format);
+        let mut format_list_info;
         let mut format_info = vk::PhysicalDeviceImageFormatInfo2::default()
             .format(vk_format)
             .ty(vk::ImageType::TYPE_2D)
             .usage(usage.image_usage())
-            .flags(flags)
+            .flags(match view_formats {
+                Some(_) => flags | vk::ImageCreateFlags::MUTABLE_FORMAT,
+                None => flags,
+            })
             .push_next(&mut external_image_format_info);
+
+        if let Some(formats) = view_formats.as_ref() {
+            format_list_info = vk::ImageFormatListCreateInfo::default().view_formats(formats);
+            format_info = format_info.push_next(&mut format_list_info);
+        }
 
         match drm_modifier_info.as_mut() {
             Some(drm_modifier_info) => {

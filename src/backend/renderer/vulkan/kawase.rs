@@ -29,30 +29,26 @@ use super::{
 
 /// One dual-Kawase pyramid step: renders `source` into `destination` with the
 /// down- or upsample kernel.
+///
+/// The blur always averages in linear light. Whether the encode back to storage is
+/// done by the hardware or by the shader follows from the destination's format, so it
+/// is not a caller decision.
 #[derive(Debug, Clone)]
 pub struct VulkanKawasePass {
     source: VulkanTexture,
     destination: VulkanTexture,
     upsample: bool,
     offset: f32,
-    linearize: bool,
 }
 
 impl VulkanKawasePass {
     /// Describes a kawase pass between two renderer textures.
-    pub fn new(
-        source: &VulkanTexture,
-        destination: &VulkanTexture,
-        upsample: bool,
-        offset: f32,
-        linearize: bool,
-    ) -> Self {
+    pub fn new(source: &VulkanTexture, destination: &VulkanTexture, upsample: bool, offset: f32) -> Self {
         Self {
             source: source.clone(),
             destination: destination.clone(),
             upsample,
             offset,
-            linearize,
         }
     }
 }
@@ -124,7 +120,7 @@ impl VulkanRenderer {
                 ));
             }
 
-            let pipelines = self.pipelines.pipelines_for_format(destination.vk_format())?;
+            let pipelines = self.pipelines.pipelines_for_format(destination.render_format())?;
             let descriptor_set = self
                 .descriptors
                 .texture_descriptor_set(source.view(), TextureSampler::LINEAR)?;
@@ -132,7 +128,7 @@ impl VulkanRenderer {
                 kawase_halfpixel(source.size(), destination.size()),
                 pass.offset,
                 pass.upsample,
-                pass.linearize,
+                destination.blends_in_linear_light(),
             );
             resolved.push(ResolvedKawasePass {
                 source,
@@ -370,8 +366,8 @@ mod tests {
         }
 
         let passes = [
-            VulkanKawasePass::new(&full, &half, false, 1.5, true),
-            VulkanKawasePass::new(&half, &full, true, 1.5, true),
+            VulkanKawasePass::new(&full, &half, false, 1.5),
+            VulkanKawasePass::new(&half, &full, true, 1.5),
         ];
         let sync = renderer
             .kawase_texture_chain(&passes)
