@@ -976,6 +976,17 @@ fn primary_full_repaint_diag() -> bool {
         .get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Diag bisect toggle (2026-08-20 unlock-reveal ghosting): clear the PRIMARY
+/// composite opaque red at age 0 and draw no elements. Stable red on glass
+/// during a transition proves the render-target/present pipeline sound and
+/// convicts element sampling; ghosted or unstable red convicts the
+/// rendered-slot-to-committed-framebuffer binding. Diagnostics only.
+fn primary_clear_red_diag() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_CLEAR_RED").is_ok_and(|v| v.trim() == "1"))
+}
+
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
@@ -2745,7 +2756,10 @@ where
         // where stale-slot ghosting can enter, and it is rare (transitions,
         // multi-element scenes). One INFO per flip, silent in steady state.
         if self.primary_was_composited != Some(render) {
+            // Target override: the Stage runs `smithay=warn`, and this seam
+            // witness must reach an installed session's journal at `avio=info`.
             info!(
+                target: "avio::drm_compositor_seam",
                 surface = ?self.surface.plane(),
                 primary_composited = render,
                 previous = ?self.primary_was_composited,
@@ -2852,6 +2866,16 @@ where
                         .map(|e| DrmRenderElements::Other(e)),
                 )
                 .collect::<Vec<_>>();
+
+            // Diag bisect (2026-08-20): opaque red at age 0 with no elements
+            // splits the two remaining ghosting suspects — stable red proves
+            // target/present sound (element sampling convicted); ghosted red
+            // convicts the slot-to-framebuffer binding.
+            let (elements, age, clear_color) = if primary_clear_red_diag() {
+                (Vec::new(), 0, Color32F::new(1.0, 0.0, 0.0, 1.0))
+            } else {
+                (elements, age, clear_color)
+            };
 
             let mut framebuffer = renderer
                 .bind(&mut dmabuf)
