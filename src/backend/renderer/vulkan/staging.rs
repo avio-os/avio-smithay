@@ -366,8 +366,7 @@ struct RangeAllocator {
 
 impl RangeAllocator {
     fn new(capacity: usize) -> Self {
-        let mut free = Vec::with_capacity(1);
-        free.push(0..capacity);
+        let free = std::iter::once(0..capacity).collect();
         Self { capacity, free }
     }
 
