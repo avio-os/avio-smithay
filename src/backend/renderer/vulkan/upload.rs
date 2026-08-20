@@ -362,12 +362,14 @@ fn upload_region_to_image(
 
     device.queue_image_upload(
         std::sync::Arc::clone(image),
-        data,
-        src_offset,
-        src_stride,
-        upload_row_bytes,
-        upload_height,
-        copy_region,
+        super::device::ImageUpload {
+            data,
+            source_offset: src_offset,
+            source_stride: src_stride,
+            row_bytes: upload_row_bytes,
+            rows: upload_height,
+            region: copy_region,
+        },
     )
 }
 

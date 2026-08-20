@@ -83,6 +83,25 @@ struct PendingUpload {
     old_layout: vk::ImageLayout,
 }
 
+pub(crate) struct ImageUpload<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) source_offset: usize,
+    pub(crate) source_stride: usize,
+    pub(crate) row_bytes: usize,
+    pub(crate) rows: usize,
+    pub(crate) region: vk::BufferImageCopy,
+}
+
+impl ImageUpload<'_> {
+    fn byte_len(&self) -> Result<usize, VulkanRendererError> {
+        self.row_bytes
+            .checked_mul(self.rows)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "upload byte count overflowed",
+            ))
+    }
+}
+
 #[derive(Default)]
 struct PendingUploadBatch {
     operations: Vec<PendingUpload>,
@@ -456,7 +475,9 @@ impl DeviceState {
         }
         let debug_markers_enabled = debug_utils.is_some();
 
-        let upload_arena = UploadArena::new(physical_device, device.clone())?;
+        // Host-visible staging is allocated lazily on the first memory upload.
+        // Renderers that only import DMA-BUFs retain no idle upload allocation.
+        let upload_arena = UploadArena::new(physical_device);
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -559,16 +580,10 @@ impl DeviceState {
     /// Copy exact CPU pixels into renderer-owned staging and retain one upload
     /// operation for the next real queue submission. This method records no
     /// command buffer and performs no queue submission.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn queue_image_upload(
         &mut self,
         image: Arc<ImportedDmabufImage>,
-        data: &[u8],
-        src_offset: usize,
-        src_stride: usize,
-        row_bytes: usize,
-        rows: usize,
-        region: vk::BufferImageCopy,
+        upload: ImageUpload<'_>,
     ) -> Result<(), VulkanRendererError> {
         self.reclaim_completed_submissions()?;
         if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
@@ -576,18 +591,18 @@ impl DeviceState {
                 limit: MAX_UPLOAD_BATCH_OPERATIONS,
             });
         }
-        let upload_len = row_bytes
-            .checked_mul(rows)
-            .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                "upload byte count overflowed",
-            ))?;
+        let upload_len = upload.byte_len()?;
         let reservation =
             self.upload_arena
                 .reserve(&self.physical_device, self.device.clone(), upload_len)?;
-        if let Err(error) =
-            self.upload_arena
-                .write_rows(reservation, data, src_offset, src_stride, row_bytes, rows)
-        {
+        if let Err(error) = self.upload_arena.write_rows(
+            reservation,
+            upload.data,
+            upload.source_offset,
+            upload.source_stride,
+            upload.row_bytes,
+            upload.rows,
+        ) {
             self.upload_arena.release(reservation);
             return Err(error);
         }
@@ -600,7 +615,7 @@ impl DeviceState {
         self.pending_uploads.operations.push(PendingUpload {
             image: image.clone(),
             reservation,
-            region,
+            region: upload.region,
             old_layout,
         });
         // CPU-side layout state describes the result of all renderer-queued

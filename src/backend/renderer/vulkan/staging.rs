@@ -59,26 +59,15 @@ impl fmt::Debug for UploadArena {
 }
 
 impl UploadArena {
-    pub(crate) fn new(
-        physical_device: &PhysicalDevice,
-        device: Arc<DeviceHandle>,
-    ) -> Result<Self, VulkanRendererError> {
+    pub(crate) fn new(physical_device: &PhysicalDevice) -> Self {
         let atom_size = usize::try_from(physical_device.limits().non_coherent_atom_size)
             .unwrap_or(usize::MAX)
             .max(4);
-        let initial_size = align_up(INITIAL_UPLOAD_ARENA_BYTES, atom_size).ok_or(
-            VulkanRendererError::InvalidMemoryUpload("upload arena size overflowed"),
-        )?;
-        let chunk = StagingChunk::new(physical_device, device, initial_size, atom_size)?;
-        Ok(Self {
-            chunks: vec![chunk],
+        Self {
+            chunks: Vec::new(),
             atom_size,
-            stats: UploadArenaStats {
-                capacity_bytes: initial_size,
-                chunk_count: 1,
-                ..UploadArenaStats::default()
-            },
-        })
+            stats: UploadArenaStats::default(),
+        }
     }
 
     pub(crate) fn reserve(
@@ -102,16 +91,8 @@ impl UploadArena {
 
         if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
             let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
-            let previous = self
-                .chunks
-                .last()
-                .map(|chunk| chunk.capacity())
-                .unwrap_or(INITIAL_UPLOAD_ARENA_BYTES);
-            let requested_chunk = previous
-                .saturating_mul(2)
-                .max(reserved_len)
-                .checked_next_power_of_two()
-                .unwrap_or(usize::MAX);
+            let previous = self.chunks.last().map(StagingChunk::capacity);
+            let requested_chunk = next_chunk_size(previous, reserved_len);
             let chunk_size = requested_chunk.min(remaining);
             if chunk_size >= reserved_len {
                 let chunk = StagingChunk::new(
@@ -444,6 +425,14 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|rounded| rounded / alignment * alignment)
 }
 
+fn next_chunk_size(previous: Option<usize>, requested: usize) -> usize {
+    previous
+        .map_or(INITIAL_UPLOAD_ARENA_BYTES, |size| size.saturating_mul(2))
+        .max(requested)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+}
+
 fn pick_host_visible_memory_type(
     physical_device: &PhysicalDevice,
     memory_type_bits: u32,
@@ -474,7 +463,7 @@ fn pick_host_visible_memory_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{align_up, RangeAllocator};
+    use super::{align_up, next_chunk_size, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES};
 
     #[test]
     fn allocator_never_reuses_a_live_span_and_coalesces_retired_neighbors() {
@@ -504,6 +493,15 @@ mod tests {
         assert_eq!(align_up(256, 256), Some(256));
         assert_eq!(align_up(257, 256), Some(512));
         assert_eq!(align_up(usize::MAX, 256), None);
+    }
+
+    #[test]
+    fn first_upload_allocates_only_the_initial_chunk() {
+        assert_eq!(next_chunk_size(None, 4_096), INITIAL_UPLOAD_ARENA_BYTES);
+        assert_eq!(
+            next_chunk_size(Some(INITIAL_UPLOAD_ARENA_BYTES), 4_096),
+            INITIAL_UPLOAD_ARENA_BYTES * 2
+        );
     }
 
     #[test]
