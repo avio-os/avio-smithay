@@ -89,6 +89,19 @@ pub enum VulkanRendererError {
         in_use_bytes: usize,
     },
 
+    /// One exact upload can never fit in any bounded arena chunk, even after
+    /// every in-flight reservation retires.
+    #[error(
+        "vulkan memory upload is larger than the bounded staging arena can represent: \
+         requested {requested_bytes} bytes, maximum contiguous capacity {max_contiguous_bytes} bytes"
+    )]
+    UploadExceedsArenaLimit {
+        /// Exact packed byte count requested by the upload.
+        requested_bytes: usize,
+        /// Largest contiguous reservation the bounded arena can ever provide.
+        max_contiguous_bytes: usize,
+    },
+
     /// One render opportunity attempted to enqueue more upload operations
     /// than the renderer's bounded batch can represent.
     #[error("vulkan upload batch operation limit reached: {limit}")]
@@ -156,6 +169,7 @@ impl VulkanRendererError {
             | VulkanRendererError::Io(_)
             | VulkanRendererError::UnsupportedMemoryFormat(_)
             | VulkanRendererError::InvalidMemoryUpload(_)
+            | VulkanRendererError::UploadExceedsArenaLimit { .. }
             | VulkanRendererError::UploadCapacityExhausted { .. }
             | VulkanRendererError::UploadBatchFull { .. }
             | VulkanRendererError::TemporaryFailure(_)
@@ -229,5 +243,10 @@ mod tests {
             assert_eq!(error.kind(), VulkanRendererErrorKind::TemporaryFailure);
         }
         assert!(!VulkanRendererError::InvalidMemoryUpload("bad layout").is_upload_deferred());
+        assert!(!VulkanRendererError::UploadExceedsArenaLimit {
+            requested_bytes: 8192,
+            max_contiguous_bytes: 4096,
+        }
+        .is_upload_deferred());
     }
 }

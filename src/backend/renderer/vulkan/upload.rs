@@ -4,7 +4,7 @@ use tracing::{instrument, trace};
 use crate::{
     backend::{
         allocator::{format::get_bpp, Format, Fourcc, Modifier},
-        renderer::{ImportMem, MemoryUploadBatchDisposition, MemoryUploadErrorKind, Texture},
+        renderer::{ImportMem, MemoryUploadCapacityEdge, MemoryUploadErrorKind, Texture},
     },
     utils::{Buffer as BufferCoord, Rectangle, Size},
 };
@@ -154,8 +154,8 @@ impl ImportMem for VulkanRenderer {
         }
     }
 
-    fn submit_pending_memory_uploads(&mut self) -> Result<MemoryUploadBatchDisposition, Self::Error> {
-        self.device.submit_pending_memory_uploads()
+    fn memory_upload_capacity_edge(&mut self) -> Result<MemoryUploadCapacityEdge, Self::Error> {
+        self.device.memory_upload_capacity_edge()
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -653,7 +653,7 @@ mod tests {
                 vulkan::{ImageUsageFlags, VulkanAllocator},
                 Allocator,
             },
-            renderer::{Color32F, Frame, ImportMem, Renderer},
+            renderer::{Color32F, Frame, ImportMem, MemoryUploadCapacityEdge, Renderer},
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -750,7 +750,15 @@ mod tests {
             .expect("rendering memory-backed texture should succeed");
 
         let sync = frame.finish().expect("finish should submit successfully");
+        let capacity_edge = match renderer
+            .memory_upload_capacity_edge()
+            .expect("submitted upload capacity must expose its exact completion edge")
+        {
+            MemoryUploadCapacityEdge::InFlight(edge) => edge,
+            other => panic!("render-submitted uploads must remain attributable: {other:?}"),
+        };
         let _ = sync.wait();
+        let _ = capacity_edge.wait();
         let after_submit = renderer.diagnostics();
         assert_eq!(after_submit.uploads.pending_operations, 0);
         assert_eq!(after_submit.uploads.submitted_batches, 1);

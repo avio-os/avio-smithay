@@ -642,19 +642,26 @@ pub enum MemoryUploadErrorKind {
     Other,
 }
 
-/// Outcome of sealing renderer-owned memory uploads without a render pass.
+/// Completion edge that resolves bounded renderer-owned upload backpressure.
 ///
 /// Normal rendering does not use this path: implementations batch memory
-/// copies into the next real render submission. `Submitted` exists only for a
-/// bounded-capacity edge, where sealing the already accepted prefix is what
-/// creates the completion event that can return staging capacity.
+/// copies into the next real render submission. A renderer that reports
+/// [`MemoryUploadErrorKind::DeferredCapacity`] must return one exact completion
+/// edge here: either the pending upload prefix is sealed, or the newest
+/// submission retaining staging capacity is identified. Queue ordering then
+/// guarantees that reaching the edge returns all capacity retained before it.
 #[derive(Debug, Clone)]
-pub enum MemoryUploadBatchDisposition {
-    /// No upload operation was pending, so no queue work was created.
-    Empty,
+pub enum MemoryUploadCapacityEdge {
+    /// This renderer does not implement deferred upload custody. It must never
+    /// classify an upload error as [`MemoryUploadErrorKind::DeferredCapacity`].
+    NotApplicable,
     /// One renderer submission owns every pending upload and the returned
     /// completion point is the sole safe staging-reuse edge.
     Submitted(sync::SyncPoint),
+    /// Existing submitted work owns the bounded capacity. The returned point
+    /// names the newest staging-owning submission, so its completion implies
+    /// every earlier staging reservation is also reusable.
+    InFlight(sync::SyncPoint),
 }
 
 /// Trait for renderers supporting importing bitmaps from memory.
@@ -710,14 +717,14 @@ pub trait ImportMem: Renderer {
         MemoryUploadErrorKind::Other
     }
 
-    /// Seal pending renderer-owned upload operations when bounded capacity
-    /// prevents the current materialization attempt from continuing.
+    /// Resolve the exact completion edge for bounded upload backpressure.
     ///
-    /// Implementations without deferred upload batching return `Empty`.
-    /// Calling this after ordinary successful imports must not manufacture a
-    /// second submission; the next render boundary owns those uploads.
-    fn submit_pending_memory_uploads(&mut self) -> Result<MemoryUploadBatchDisposition, Self::Error> {
-        Ok(MemoryUploadBatchDisposition::Empty)
+    /// Implementations without deferred upload custody return
+    /// [`MemoryUploadCapacityEdge::NotApplicable`]. Calling this after ordinary
+    /// successful imports must not manufacture a second submission; it exists
+    /// only as the companion edge of a `DeferredCapacity` result.
+    fn memory_upload_capacity_edge(&mut self) -> Result<MemoryUploadCapacityEdge, Self::Error> {
+        Ok(MemoryUploadCapacityEdge::NotApplicable)
     }
 
     /// Returns supported formats for memory imports.

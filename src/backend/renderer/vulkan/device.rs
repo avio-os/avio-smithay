@@ -14,7 +14,7 @@ use ash::{ext, khr, vk};
 use tracing::{instrument, trace, warn};
 
 use crate::backend::{
-    renderer::{sync::SyncPoint, MemoryUploadBatchDisposition},
+    renderer::{sync::SyncPoint, MemoryUploadCapacityEdge},
     vulkan::{version::Version, Instance, PhysicalDevice},
 };
 
@@ -681,14 +681,25 @@ impl DeviceState {
         self.pending_uploads = batch;
     }
 
-    /// Seal the already accepted upload prefix only when staging pressure made
-    /// further materialization impossible. Normal rendering submits this same
-    /// batch together with draw commands and never calls this path.
-    pub(crate) fn submit_pending_memory_uploads(
+    /// Name the exact completion edge that returns bounded upload capacity.
+    ///
+    /// Pending uploads are sealed into one submission. If all capacity is
+    /// already submitted, the newest staging-owning submission is sufficient:
+    /// Vulkan queue ordering guarantees that its completion also completes all
+    /// earlier submissions retaining arena spans.
+    pub(crate) fn memory_upload_capacity_edge(
         &mut self,
-    ) -> Result<MemoryUploadBatchDisposition, VulkanRendererError> {
+    ) -> Result<MemoryUploadCapacityEdge, VulkanRendererError> {
         if self.pending_uploads.operations.is_empty() {
-            return Ok(MemoryUploadBatchDisposition::Empty);
+            return Ok(self
+                .in_flight_submissions
+                .iter()
+                .rev()
+                .find(|submission| !submission.staging_reservations.is_empty())
+                .map(|submission| {
+                    MemoryUploadCapacityEdge::InFlight(SyncPoint::from(submission.fence.clone()))
+                })
+                .unwrap_or(MemoryUploadCapacityEdge::NotApplicable));
         }
 
         let command_buffer = self.acquire_command_buffer()?;
@@ -721,7 +732,7 @@ impl DeviceState {
             Vec::new(),
             SubmissionKind::MemoryUploadBatch,
         ) {
-            Ok((_, fence)) => Ok(MemoryUploadBatchDisposition::Submitted(SyncPoint::from(fence))),
+            Ok((_, fence)) => Ok(MemoryUploadCapacityEdge::Submitted(SyncPoint::from(fence))),
             Err(error) => {
                 let _ = self.discard_command_buffer(command_buffer);
                 Err(error)

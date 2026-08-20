@@ -134,6 +134,21 @@ impl UploadArena {
             }
         }
 
+        let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
+        let max_existing = self.chunks.iter().map(StagingChunk::capacity).max().unwrap_or(0);
+        let max_future = if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
+            remaining
+        } else {
+            0
+        };
+        let max_contiguous_bytes = max_existing.max(max_future);
+        if reserved_len > max_contiguous_bytes {
+            return Err(VulkanRendererError::UploadExceedsArenaLimit {
+                requested_bytes: len,
+                max_contiguous_bytes,
+            });
+        }
+
         self.stats.deferred_count = self.stats.deferred_count.saturating_add(1);
         Err(VulkanRendererError::UploadCapacityExhausted {
             requested_bytes: len,
