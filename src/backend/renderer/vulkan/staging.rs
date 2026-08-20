@@ -92,8 +92,7 @@ impl UploadArena {
         if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
             let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
             let previous = self.chunks.last().map(StagingChunk::capacity);
-            let requested_chunk = next_chunk_size(previous, reserved_len);
-            let chunk_size = requested_chunk.min(remaining);
+            let chunk_size = bounded_chunk_size(previous, reserved_len, remaining, self.chunks.len());
             if chunk_size >= reserved_len {
                 let chunk = StagingChunk::new(
                     physical_device,
@@ -433,6 +432,18 @@ fn next_chunk_size(previous: Option<usize>, requested: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+fn bounded_chunk_size(
+    previous: Option<usize>,
+    requested: usize,
+    remaining: usize,
+    existing_chunks: usize,
+) -> usize {
+    if existing_chunks + 1 == MAX_UPLOAD_ARENA_CHUNKS {
+        return remaining;
+    }
+    next_chunk_size(previous, requested).min(remaining)
+}
+
 fn pick_host_visible_memory_type(
     physical_device: &PhysicalDevice,
     memory_type_bits: u32,
@@ -463,7 +474,10 @@ fn pick_host_visible_memory_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{align_up, next_chunk_size, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES};
+    use super::{
+        align_up, bounded_chunk_size, next_chunk_size, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES,
+        MAX_UPLOAD_ARENA_BYTES,
+    };
 
     #[test]
     fn allocator_never_reuses_a_live_span_and_coalesces_retired_neighbors() {
@@ -502,6 +516,25 @@ mod tests {
             next_chunk_size(Some(INITIAL_UPLOAD_ARENA_BYTES), 4_096),
             INITIAL_UPLOAD_ARENA_BYTES * 2
         );
+    }
+
+    #[test]
+    fn final_chunk_uses_the_remaining_bounded_budget() {
+        let first = bounded_chunk_size(None, 4_096, MAX_UPLOAD_ARENA_BYTES, 0);
+        let second = bounded_chunk_size(Some(first), 4_096, MAX_UPLOAD_ARENA_BYTES - first, 1);
+        let third = bounded_chunk_size(Some(second), 4_096, MAX_UPLOAD_ARENA_BYTES - first - second, 2);
+        let fourth = bounded_chunk_size(
+            Some(third),
+            4_096,
+            MAX_UPLOAD_ARENA_BYTES - first - second - third,
+            3,
+        );
+
+        assert_eq!(
+            [first, second, third, fourth],
+            [16, 32, 64, 144].map(|mib| mib * 1024 * 1024)
+        );
+        assert_eq!(first + second + third + fourth, MAX_UPLOAD_ARENA_BYTES);
     }
 
     #[test]
