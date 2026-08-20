@@ -966,6 +966,16 @@ fn output_layer_full_repaint_diag() -> bool {
         .get_or_init(|| std::env::var("AVIO_DIAG_OUTPUT_LAYER_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Diag bisect toggle (2026-08-20 unlock-reveal ghosting): force age-0 full
+/// repaints of the PRIMARY composite. Clean transitions here convict the
+/// partial-repaint damage machinery across direct-scanout gaps; persisting
+/// ghosts convict plane assignment or source import. Diagnostics only.
+fn primary_full_repaint_diag() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
+}
+
 type CompositorFrameState<A, F> =
     FrameState<<A as Allocator>::Buffer, <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer>;
 
@@ -1312,6 +1322,9 @@ where
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
     supports_fencing: bool,
     reset_pending: bool,
+    /// Last frame's primary disposition (Some(true) = swapchain composite,
+    /// Some(false) = element scanout); drives the rare seam-change witness.
+    primary_was_composited: Option<bool>,
 
     framebuffer_exporter: F,
 
@@ -1568,6 +1581,7 @@ where
                         opaque_regions: Vec::new(),
                         element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
+                        primary_was_composited: None,
                         debug_flags: DebugFlags::empty(),
                         span,
                     };
@@ -1736,6 +1750,7 @@ where
             opaque_regions: Vec::new(),
             element_opaque_regions_workhouse: Vec::new(),
             supports_fencing,
+            primary_was_composited: None,
             debug_flags: DebugFlags::empty(),
             span,
         };
@@ -2725,6 +2740,21 @@ where
             .map(|config| matches!(config.buffer, ScanoutBuffer::Swapchain(_)))
             .unwrap_or(false);
 
+        // Seam witness for the direct-scanout era: the primary's disposition
+        // flipping between element scanout and swapchain composite is exactly
+        // where stale-slot ghosting can enter, and it is rare (transitions,
+        // multi-element scenes). One INFO per flip, silent in steady state.
+        if self.primary_was_composited != Some(render) {
+            info!(
+                surface = ?self.surface.plane(),
+                primary_composited = render,
+                previous = ?self.primary_was_composited,
+                overlay_planes_assigned = overlay_plane_elements.len(),
+                "drm_compositor: primary plane disposition changed"
+            );
+            self.primary_was_composited = Some(render);
+        }
+
         if render && frame_flags.contains(FrameFlags::DENY_PRIMARY_PLANE_RENDER) {
             // `render` alone only says the primary is composite-type — under
             // forced composition that is every frame, including ones whose
@@ -2759,7 +2789,11 @@ where
 
                 // It is safe to call export multiple times as the Slot will cache the dmabuf for us
                 let dmabuf = slot.export().map_err(FrameError::AsDmabufError)?;
-                let age = slot.age().into();
+                let age = if primary_full_repaint_diag() {
+                    0
+                } else {
+                    slot.age().into()
+                };
                 (dmabuf, age)
             };
 
