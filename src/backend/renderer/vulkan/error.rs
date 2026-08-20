@@ -74,6 +74,29 @@ pub enum VulkanRendererError {
     #[error("invalid memory upload metadata: {0}")]
     InvalidMemoryUpload(&'static str),
 
+    /// The bounded persistent upload arena has no completion-retired span
+    /// large enough for this exact upload.
+    #[error(
+        "vulkan upload arena capacity exhausted: requested {requested_bytes} bytes, \
+         {in_use_bytes}/{capacity_bytes} bytes in use"
+    )]
+    UploadCapacityExhausted {
+        /// Exact packed byte count requested by the upload.
+        requested_bytes: usize,
+        /// Aggregate allocated arena capacity for this renderer.
+        capacity_bytes: usize,
+        /// Capacity still retained by pending or in-flight submissions.
+        in_use_bytes: usize,
+    },
+
+    /// One render opportunity attempted to enqueue more upload operations
+    /// than the renderer's bounded batch can represent.
+    #[error("vulkan upload batch operation limit reached: {limit}")]
+    UploadBatchFull {
+        /// Maximum operations retained before the next queue submission.
+        limit: usize,
+    },
+
     /// The Vulkan renderer context has been lost and must be recreated.
     #[error("vulkan renderer context lost: {0}")]
     ContextLost(&'static str),
@@ -108,6 +131,15 @@ impl VulkanRendererError {
         )
     }
 
+    /// Returns `true` when exact upload work should remain retained until the
+    /// renderer's submission-completion edge returns staging capacity.
+    pub const fn is_upload_deferred(&self) -> bool {
+        matches!(
+            self,
+            VulkanRendererError::UploadCapacityExhausted { .. } | VulkanRendererError::UploadBatchFull { .. }
+        )
+    }
+
     /// Returns the coarse error class for this error value.
     pub const fn kind(&self) -> VulkanRendererErrorKind {
         match self {
@@ -124,6 +156,8 @@ impl VulkanRendererError {
             | VulkanRendererError::Io(_)
             | VulkanRendererError::UnsupportedMemoryFormat(_)
             | VulkanRendererError::InvalidMemoryUpload(_)
+            | VulkanRendererError::UploadCapacityExhausted { .. }
+            | VulkanRendererError::UploadBatchFull { .. }
             | VulkanRendererError::TemporaryFailure(_)
             | VulkanRendererError::NotImplemented(_) => VulkanRendererErrorKind::TemporaryFailure,
         }
@@ -178,5 +212,22 @@ mod tests {
             VulkanRendererError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).kind(),
             VulkanRendererErrorKind::ContextLost
         );
+    }
+
+    #[test]
+    fn bounded_upload_pressure_is_typed_and_recoverable() {
+        let capacity = VulkanRendererError::UploadCapacityExhausted {
+            requested_bytes: 4096,
+            capacity_bytes: 8192,
+            in_use_bytes: 8192,
+        };
+        let operations = VulkanRendererError::UploadBatchFull { limit: 256 };
+
+        for error in [capacity, operations] {
+            assert!(error.is_upload_deferred());
+            assert!(!error.is_device_lost());
+            assert_eq!(error.kind(), VulkanRendererErrorKind::TemporaryFailure);
+        }
+        assert!(!VulkanRendererError::InvalidMemoryUpload("bad layout").is_upload_deferred());
     }
 }

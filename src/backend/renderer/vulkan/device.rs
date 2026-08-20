@@ -13,13 +13,19 @@ use std::{
 use ash::{ext, khr, vk};
 use tracing::{instrument, trace, warn};
 
-use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
+use crate::backend::{
+    renderer::{sync::SyncPoint, MemoryUploadBatchDisposition},
+    vulkan::{version::Version, Instance, PhysicalDevice},
+};
 
 use super::{
     dmabuf::ImportedDmabufImage,
+    staging::{StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
     VulkanRendererError,
 };
+
+const MAX_UPLOAD_BATCH_OPERATIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SubmissionId(u64);
@@ -41,47 +47,12 @@ struct InFlightSubmission {
     /// the submission retires (a semaphore referenced by pending GPU work
     /// must not be destroyed) and destroyed on recycle.
     export_semaphore: Option<vk::Semaphore>,
-    command_buffer: vk::CommandBuffer,
+    command_buffers: Vec<vk::CommandBuffer>,
     framebuffers: Vec<vk::Framebuffer>,
     retained_images: Vec<Arc<ImportedDmabufImage>>,
-    transient_buffers: Vec<TransientBufferAllocation>,
+    staging_reservations: Vec<StagingReservation>,
     wait_semaphores: Vec<vk::Semaphore>,
     submitted_at: Instant,
-}
-
-/// Buffer allocation whose lifetime is exactly one GPU submission.
-///
-/// Upload staging must survive `vkQueueSubmit`, but retaining it until a
-/// host-side wait defeats asynchronous queueing. The tracked submission owns
-/// these handles and destroys them only after its real VkFence signals.
-pub(crate) struct TransientBufferAllocation {
-    device: Arc<DeviceHandle>,
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-}
-
-impl TransientBufferAllocation {
-    pub(crate) fn new(device: &DeviceState, buffer: vk::Buffer, memory: vk::DeviceMemory) -> Self {
-        Self {
-            device: device.shared_device(),
-            buffer,
-            memory,
-        }
-    }
-}
-
-impl Drop for TransientBufferAllocation {
-    fn drop(&mut self) {
-        self.device.destroy_with(|device| {
-            // SAFETY: This allocation is constructed only after both handles
-            // exist and is dropped either before submission or after its
-            // tracked fence signals.
-            unsafe {
-                device.destroy_buffer(self.buffer, None);
-                device.free_memory(self.memory, None);
-            }
-        });
-    }
 }
 
 /// The two legal queue-submission contracts.
@@ -92,7 +63,7 @@ impl Drop for TransientBufferAllocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionKind {
     Render,
-    Upload,
+    MemoryUploadBatch,
 }
 
 impl SubmissionKind {
@@ -101,8 +72,36 @@ impl SubmissionKind {
     }
 
     fn exports_completion(self) -> bool {
-        matches!(self, Self::Render)
+        true
     }
+}
+
+struct PendingUpload {
+    image: Arc<ImportedDmabufImage>,
+    reservation: StagingReservation,
+    region: vk::BufferImageCopy,
+    old_layout: vk::ImageLayout,
+}
+
+#[derive(Default)]
+struct PendingUploadBatch {
+    operations: Vec<PendingUpload>,
+    bytes: usize,
+}
+
+impl PendingUploadBatch {
+    fn layout_after_pending(&self, image_id: u64) -> Option<vk::ImageLayout> {
+        self.operations
+            .iter()
+            .rev()
+            .find(|operation| operation.image.id() == image_id)
+            .map(|_| vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+    }
+}
+
+struct RecordedUploadBatch {
+    command_buffer: vk::CommandBuffer,
+    batch: PendingUploadBatch,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,7 +139,9 @@ impl DeviceCapabilities {
 pub(crate) struct DeviceDiagnostics {
     pub(crate) total_submissions: u64,
     pub(crate) blocking_submissions: u64,
-    pub(crate) upload_submissions: u64,
+    pub(crate) upload_batches: u64,
+    pub(crate) upload_operations: u64,
+    pub(crate) upload_bytes: u64,
     pub(crate) reclaimed_submissions: u64,
     pub(crate) total_submit_cpu_ns: u64,
     pub(crate) max_submit_cpu_ns: u64,
@@ -158,6 +159,8 @@ pub(crate) struct DeviceState {
     command_pool: vk::CommandPool,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
+    upload_arena: UploadArena,
+    pending_uploads: PendingUploadBatch,
     pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
     device: Arc<DeviceHandle>,
@@ -178,6 +181,11 @@ impl fmt::Debug for DeviceState {
             .field("command_pool", &self.command_pool)
             .field("reusable_command_buffers", &self.reusable_command_buffers.len())
             .field("in_flight_submissions", &self.in_flight_submissions.len())
+            .field("upload_arena", &self.upload_arena)
+            .field(
+                "pending_upload_operations",
+                &self.pending_uploads.operations.len(),
+            )
             .field("next_submission_id", &self.next_submission_id)
             .field("device", &self.device.handle().handle())
             .field("supports_sync_file_import", &self.supports_sync_file_import())
@@ -189,7 +197,8 @@ impl fmt::Debug for DeviceState {
             .field("debug_markers_enabled", &self.diagnostics.debug_markers_enabled)
             .field("total_submissions", &self.diagnostics.total_submissions)
             .field("blocking_submissions", &self.diagnostics.blocking_submissions)
-            .field("upload_submissions", &self.diagnostics.upload_submissions)
+            .field("upload_batches", &self.diagnostics.upload_batches)
+            .field("upload_operations", &self.diagnostics.upload_operations)
             .field("reclaimed_submissions", &self.diagnostics.reclaimed_submissions)
             .finish()
     }
@@ -447,6 +456,8 @@ impl DeviceState {
         }
         let debug_markers_enabled = debug_utils.is_some();
 
+        let upload_arena = UploadArena::new(physical_device, device.clone())?;
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -468,6 +479,8 @@ impl DeviceState {
             command_pool,
             reusable_command_buffers: Vec::new(),
             in_flight_submissions: VecDeque::new(),
+            upload_arena,
+            pending_uploads: PendingUploadBatch::default(),
             pending_waits: Vec::new(),
             next_submission_id: 0,
             device,
@@ -533,6 +546,187 @@ impl DeviceState {
 
     pub(crate) fn diagnostics(&self) -> DeviceDiagnostics {
         self.diagnostics
+    }
+
+    pub(crate) fn upload_arena_stats(&self) -> UploadArenaStats {
+        self.upload_arena.stats()
+    }
+
+    pub(crate) fn pending_upload_stats(&self) -> (usize, usize) {
+        (self.pending_uploads.operations.len(), self.pending_uploads.bytes)
+    }
+
+    /// Copy exact CPU pixels into renderer-owned staging and retain one upload
+    /// operation for the next real queue submission. This method records no
+    /// command buffer and performs no queue submission.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn queue_image_upload(
+        &mut self,
+        image: Arc<ImportedDmabufImage>,
+        data: &[u8],
+        src_offset: usize,
+        src_stride: usize,
+        row_bytes: usize,
+        rows: usize,
+        region: vk::BufferImageCopy,
+    ) -> Result<(), VulkanRendererError> {
+        self.reclaim_completed_submissions()?;
+        if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
+            return Err(VulkanRendererError::UploadBatchFull {
+                limit: MAX_UPLOAD_BATCH_OPERATIONS,
+            });
+        }
+        let upload_len = row_bytes
+            .checked_mul(rows)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "upload byte count overflowed",
+            ))?;
+        let reservation =
+            self.upload_arena
+                .reserve(&self.physical_device, self.device.clone(), upload_len)?;
+        if let Err(error) =
+            self.upload_arena
+                .write_rows(reservation, data, src_offset, src_stride, row_bytes, rows)
+        {
+            self.upload_arena.release(reservation);
+            return Err(error);
+        }
+
+        let old_layout = self
+            .pending_uploads
+            .layout_after_pending(image.id())
+            .unwrap_or_else(|| image.current_layout());
+        self.pending_uploads.bytes = self.pending_uploads.bytes.saturating_add(upload_len);
+        self.pending_uploads.operations.push(PendingUpload {
+            image: image.clone(),
+            reservation,
+            region,
+            old_layout,
+        });
+        // CPU-side layout state describes the result of all renderer-queued
+        // operations. Every DeviceState submission prepends this batch, so a
+        // later recording can safely use the post-upload layout.
+        image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        Ok(())
+    }
+
+    fn record_pending_uploads(&mut self) -> Result<Option<RecordedUploadBatch>, VulkanRendererError> {
+        if self.pending_uploads.operations.is_empty() {
+            return Ok(None);
+        }
+        let command_buffer = self.acquire_command_buffer()?;
+        let batch = std::mem::take(&mut self.pending_uploads);
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if let Err(error) = self.device.observe_result(unsafe {
+            self.device
+                .handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+        }) {
+            let _ = self.discard_command_buffer(command_buffer);
+            self.restore_pending_uploads(batch);
+            return Err(error.into());
+        }
+        self.insert_debug_label(command_buffer, c"vulkan.upload_batch", [0.11, 0.78, 0.86, 1.0]);
+
+        for operation in &batch.operations {
+            transition_image_layout(
+                self.device.handle(),
+                command_buffer,
+                operation.image.image(),
+                operation.old_layout,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            let mut copy_region = operation.region;
+            copy_region.buffer_offset = operation.reservation.offset();
+            unsafe {
+                self.device.handle().cmd_copy_buffer_to_image(
+                    command_buffer,
+                    self.upload_arena.buffer(operation.reservation),
+                    operation.image.image(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy_region],
+                );
+            }
+            transition_image_layout(
+                self.device.handle(),
+                command_buffer,
+                operation.image.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+        }
+
+        if let Err(error) = self
+            .device
+            .observe_result(unsafe { self.device.handle().end_command_buffer(command_buffer) })
+        {
+            let _ = self.discard_command_buffer(command_buffer);
+            self.restore_pending_uploads(batch);
+            return Err(error.into());
+        }
+        Ok(Some(RecordedUploadBatch {
+            command_buffer,
+            batch,
+        }))
+    }
+
+    fn restore_pending_uploads(&mut self, mut batch: PendingUploadBatch) {
+        if self.pending_uploads.operations.is_empty() {
+            self.pending_uploads = batch;
+            return;
+        }
+        batch.bytes = batch.bytes.saturating_add(self.pending_uploads.bytes);
+        batch.operations.append(&mut self.pending_uploads.operations);
+        self.pending_uploads = batch;
+    }
+
+    /// Seal the already accepted upload prefix only when staging pressure made
+    /// further materialization impossible. Normal rendering submits this same
+    /// batch together with draw commands and never calls this path.
+    pub(crate) fn submit_pending_memory_uploads(
+        &mut self,
+    ) -> Result<MemoryUploadBatchDisposition, VulkanRendererError> {
+        if self.pending_uploads.operations.is_empty() {
+            return Ok(MemoryUploadBatchDisposition::Empty);
+        }
+
+        let command_buffer = self.acquire_command_buffer()?;
+        let begin_info =
+            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if let Err(error) = self.device.observe_result(unsafe {
+            self.device
+                .handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+        }) {
+            let _ = self.discard_command_buffer(command_buffer);
+            return Err(error.into());
+        }
+        self.insert_debug_label(
+            command_buffer,
+            c"vulkan.upload_capacity_edge",
+            [0.88, 0.45, 0.12, 1.0],
+        );
+        if let Err(error) = self
+            .device
+            .observe_result(unsafe { self.device.handle().end_command_buffer(command_buffer) })
+        {
+            let _ = self.discard_command_buffer(command_buffer);
+            return Err(error.into());
+        }
+
+        match self.submit_tracked(
+            command_buffer,
+            Vec::new(),
+            Vec::new(),
+            SubmissionKind::MemoryUploadBatch,
+        ) {
+            Ok((_, fence)) => Ok(MemoryUploadBatchDisposition::Submitted(SyncPoint::from(fence))),
+            Err(error) => {
+                let _ = self.discard_command_buffer(command_buffer);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn insert_debug_label(
@@ -711,50 +905,34 @@ impl DeviceState {
             command_buffer,
             framebuffers,
             retained_images,
-            Vec::new(),
             SubmissionKind::Render,
         )
     }
 
-    /// Submit a staging upload without consuming render acquire waits or
-    /// blocking the worker thread. Queue order makes every later render see
-    /// the upload; the tracked VkFence owns the staging allocation and target
-    /// image until execution really completes.
-    pub(crate) fn submit_upload(
-        &mut self,
-        command_buffer: vk::CommandBuffer,
-        retained_image: Arc<ImportedDmabufImage>,
-        staging: TransientBufferAllocation,
-    ) -> Result<SubmissionId, VulkanRendererError> {
-        let (id, _) = self.submit_tracked(
-            command_buffer,
-            Vec::new(),
-            vec![retained_image],
-            vec![staging],
-            SubmissionKind::Upload,
-        )?;
-        self.diagnostics.upload_submissions = self.diagnostics.upload_submissions.saturating_add(1);
-        Ok(id)
-    }
-
-    #[instrument(
-        level = "trace",
-        skip(self, command_buffer, framebuffers, retained_images, transient_buffers)
-    )]
+    #[instrument(level = "trace", skip(self, command_buffer, framebuffers, retained_images))]
     #[profiling::function]
     fn submit_tracked(
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
-        retained_images: Vec<Arc<ImportedDmabufImage>>,
-        transient_buffers: Vec<TransientBufferAllocation>,
+        mut retained_images: Vec<Arc<ImportedDmabufImage>>,
         kind: SubmissionKind,
     ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
+        let recorded_uploads = self.record_pending_uploads()?;
         let submit_started_at = Instant::now();
-        let fence = VulkanFence::create(self.shared_device())?;
+        let fence = match VulkanFence::create(self.shared_device()) {
+            Ok(fence) => fence,
+            Err(error) => {
+                if let Some(recorded_uploads) = recorded_uploads {
+                    let _ = self.discard_command_buffer(recorded_uploads.command_buffer);
+                    self.restore_pending_uploads(recorded_uploads.batch);
+                }
+                return Err(error);
+            }
+        };
 
         // Render-completion export rides a dedicated binary semaphore signaled
         // by this submission, exported exactly once immediately after submit
@@ -785,7 +963,11 @@ impl DeviceState {
         let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
             pending_waits.into_iter().unzip();
 
-        let command_buffers = [command_buffer];
+        let mut command_buffers = Vec::with_capacity(2);
+        if let Some(upload) = recorded_uploads.as_ref() {
+            command_buffers.push(upload.command_buffer);
+        }
+        command_buffers.push(command_buffer);
         let mut submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
         if !wait_semaphores.is_empty() {
             submit = submit
@@ -805,6 +987,10 @@ impl DeviceState {
                 .handle()
                 .queue_submit(self.queue, &submit_info, fence.handle())
         }) {
+            if let Some(recorded_uploads) = recorded_uploads {
+                let _ = self.discard_command_buffer(recorded_uploads.command_buffer);
+                self.restore_pending_uploads(recorded_uploads.batch);
+            }
             // Cleanup runs through the teardown accessor: once the device is lost these destroys
             // must not touch the dead driver, otherwise they fault on NVIDIA.
             self.device.destroy_with(|device| {
@@ -823,6 +1009,27 @@ impl DeviceState {
             });
             return Err(err.into());
         }
+
+        let (staging_reservations, upload_operation_count, upload_bytes) = if let Some(recorded_uploads) =
+            recorded_uploads
+        {
+            let upload_operation_count = recorded_uploads.batch.operations.len();
+            let upload_bytes = recorded_uploads.batch.bytes;
+            let mut reservations = Vec::with_capacity(upload_operation_count);
+            for operation in recorded_uploads.batch.operations {
+                retained_images.push(operation.image);
+                reservations.push(operation.reservation);
+            }
+            self.diagnostics.upload_batches = self.diagnostics.upload_batches.saturating_add(1);
+            self.diagnostics.upload_operations = self
+                .diagnostics
+                .upload_operations
+                .saturating_add(upload_operation_count as u64);
+            self.diagnostics.upload_bytes = self.diagnostics.upload_bytes.saturating_add(upload_bytes as u64);
+            (reservations, upload_operation_count, upload_bytes)
+        } else {
+            (Vec::new(), 0, 0)
+        };
 
         if let Some(semaphore) = export_semaphore {
             match self.export_semaphore_sync_file(semaphore) {
@@ -850,10 +1057,10 @@ impl DeviceState {
             id,
             fence: fence.clone(),
             export_semaphore,
-            command_buffer,
+            command_buffers,
             framebuffers,
             retained_images,
-            transient_buffers,
+            staging_reservations,
             wait_semaphores,
             submitted_at: submit_started_at,
         });
@@ -861,6 +1068,8 @@ impl DeviceState {
             submission = ?id,
             submit_cpu_ns,
             in_flight = self.in_flight_submissions.len(),
+            upload_operation_count,
+            upload_bytes,
             "submitted vulkan command buffer"
         );
 
@@ -882,6 +1091,14 @@ impl DeviceState {
         let fence = self
             .device
             .observe_result(unsafe { self.device.handle().create_fence(&fence_info, None) })?;
+        let recorded_uploads = match self.record_pending_uploads() {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                self.device
+                    .destroy_with(|device| unsafe { device.destroy_fence(fence, None) });
+                return Err(error);
+            }
+        };
 
         // Blocking submission remains only for synchronous GPU-to-CPU
         // readback. It must not consume `pending_waits`: those waits belong to
@@ -889,7 +1106,11 @@ impl DeviceState {
         // client buffers. Draining them here would both host-block readback on
         // unrelated producers and strip synchronization from the guarded
         // render.
-        let command_buffers = [command_buffer];
+        let mut command_buffers = Vec::with_capacity(2);
+        if let Some(upload) = recorded_uploads.as_ref() {
+            command_buffers.push(upload.command_buffer);
+        }
+        command_buffers.push(command_buffer);
         let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
 
         // SAFETY: Queue, fence, and command buffers are valid; queue access is serialized by `&mut self`.
@@ -897,6 +1118,10 @@ impl DeviceState {
             .device
             .observe_result(unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) })
         {
+            if let Some(recorded_uploads) = recorded_uploads {
+                let _ = self.discard_command_buffer(recorded_uploads.command_buffer);
+                self.restore_pending_uploads(recorded_uploads.batch);
+            }
             self.device.destroy_with(|device| {
                 // SAFETY: Fence belongs to this device and is not in-flight after failed submission.
                 unsafe { device.destroy_fence(fence, None) };
@@ -915,19 +1140,45 @@ impl DeviceState {
         });
         wait_result?;
 
-        // SAFETY: Command buffer belongs to this command pool and execution completed after host wait.
-        self.device.observe_result(unsafe {
-            self.device
-                .handle()
-                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-        })?;
-        self.reusable_command_buffers.push(command_buffer);
+        let (upload_operation_count, upload_bytes) = if let Some(recorded_uploads) = recorded_uploads {
+            for operation in &recorded_uploads.batch.operations {
+                self.upload_arena.release(operation.reservation);
+            }
+            let operation_count = recorded_uploads.batch.operations.len();
+            self.diagnostics.upload_batches = self.diagnostics.upload_batches.saturating_add(1);
+            self.diagnostics.upload_operations = self
+                .diagnostics
+                .upload_operations
+                .saturating_add(operation_count as u64);
+            self.diagnostics.upload_bytes = self
+                .diagnostics
+                .upload_bytes
+                .saturating_add(recorded_uploads.batch.bytes as u64);
+            (operation_count, recorded_uploads.batch.bytes)
+        } else {
+            (0, 0)
+        };
+
+        for command_buffer in command_buffers {
+            // SAFETY: Command buffer belongs to this command pool and execution completed after host wait.
+            self.device.observe_result(unsafe {
+                self.device
+                    .handle()
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+            })?;
+            self.reusable_command_buffers.push(command_buffer);
+        }
         let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
         self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
         self.diagnostics.blocking_submissions = self.diagnostics.blocking_submissions.saturating_add(1);
         self.diagnostics.total_submit_cpu_ns =
             self.diagnostics.total_submit_cpu_ns.saturating_add(submit_cpu_ns);
         self.diagnostics.max_submit_cpu_ns = self.diagnostics.max_submit_cpu_ns.max(submit_cpu_ns);
+        trace!(
+            upload_operation_count,
+            upload_bytes,
+            "completed blocking Vulkan submission"
+        );
         Ok(())
     }
 
@@ -1061,9 +1312,9 @@ impl DeviceState {
             id,
             fence: _fence,
             export_semaphore,
-            command_buffer,
+            command_buffers,
             framebuffers,
-            transient_buffers,
+            staging_reservations,
             wait_semaphores,
             submitted_at,
             ..
@@ -1107,19 +1358,21 @@ impl DeviceState {
             }
         });
 
-        // Each transient allocation owns its teardown capability. The fence
-        // is signaled, so dropping now is the exact staging-resource edge.
-        drop(transient_buffers);
+        // The exact submission completion is the sole staging-reuse edge.
+        for reservation in staging_reservations {
+            self.upload_arena.release(reservation);
+        }
 
-        // SAFETY: Command buffer belongs to `self.command_pool` and can be reset because the associated fence
-        // is known to be signaled before this method is called.
-        self.device.observe_result(unsafe {
-            self.device
-                .handle()
-                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-        })?;
-
-        self.reusable_command_buffers.push(command_buffer);
+        for command_buffer in command_buffers {
+            // SAFETY: Command buffer belongs to `self.command_pool` and can be reset because the associated fence
+            // is known to be signaled before this method is called.
+            self.device.observe_result(unsafe {
+                self.device
+                    .handle()
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+            })?;
+            self.reusable_command_buffers.push(command_buffer);
+        }
         Ok(())
     }
 
@@ -1259,16 +1512,82 @@ mod submission_kind_tests {
     use super::SubmissionKind;
 
     #[test]
-    fn render_and_upload_submission_contracts_cannot_be_mixed() {
+    fn renderer_submission_owns_acquire_waits_and_completion_export() {
         assert!(SubmissionKind::Render.consumes_pending_waits());
         assert!(SubmissionKind::Render.exports_completion());
-        assert!(!SubmissionKind::Upload.consumes_pending_waits());
-        assert!(!SubmissionKind::Upload.exports_completion());
+        assert!(!SubmissionKind::MemoryUploadBatch.consumes_pending_waits());
+        assert!(SubmissionKind::MemoryUploadBatch.exports_completion());
     }
 }
 
 fn duration_to_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn transition_image_layout(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) {
+    let (src_stage, src_access) = stage_access_for_layout(old_layout);
+    let (dst_stage, dst_access) = stage_access_for_layout(new_layout);
+    let barriers = [vk::ImageMemoryBarrier::default()
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+    }
+}
+
+fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+    match layout {
+        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
+        vk::ImageLayout::GENERAL => (
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ),
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        ),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        ),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
+            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ)
+        }
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
+            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
+        }
+        _ => (
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ),
+    }
 }
 
 impl Drop for DeviceState {

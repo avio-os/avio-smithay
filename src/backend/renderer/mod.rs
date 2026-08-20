@@ -630,7 +630,34 @@ pub trait ImportMemWl: ImportMem {
     }
 }
 
-/// Trait for Renderers supporting importing bitmaps from memory.
+/// Coarse disposition of a renderer memory-upload failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryUploadErrorKind {
+    /// Renderer-owned staging capacity is temporarily retained by pending or
+    /// in-flight GPU work. The exact caller work must remain retained until the
+    /// submitted upload batch reaches its completion edge.
+    DeferredCapacity,
+    /// Every other import or update failure. The renderer-specific error
+    /// remains the detailed source of truth for recovery policy.
+    Other,
+}
+
+/// Outcome of sealing renderer-owned memory uploads without a render pass.
+///
+/// Normal rendering does not use this path: implementations batch memory
+/// copies into the next real render submission. `Submitted` exists only for a
+/// bounded-capacity edge, where sealing the already accepted prefix is what
+/// creates the completion event that can return staging capacity.
+#[derive(Debug, Clone)]
+pub enum MemoryUploadBatchDisposition {
+    /// No upload operation was pending, so no queue work was created.
+    Empty,
+    /// One renderer submission owns every pending upload and the returned
+    /// completion point is the sole safe staging-reuse edge.
+    Submitted(sync::SyncPoint),
+}
+
+/// Trait for renderers supporting importing bitmaps from memory.
 pub trait ImportMem: Renderer {
     /// Import a given chunk of memory into the renderer.
     ///
@@ -676,6 +703,22 @@ pub trait ImportMem: Renderer {
         data: &[u8],
         region: Rectangle<i32, BufferCoord>,
     ) -> Result<(), Self::Error>;
+
+    /// Classifies whether a memory import/update failure is bounded staging
+    /// backpressure rather than rejection of the supplied texture or metadata.
+    fn memory_upload_error_kind(_error: &Self::Error) -> MemoryUploadErrorKind {
+        MemoryUploadErrorKind::Other
+    }
+
+    /// Seal pending renderer-owned upload operations when bounded capacity
+    /// prevents the current materialization attempt from continuing.
+    ///
+    /// Implementations without deferred upload batching return `Empty`.
+    /// Calling this after ordinary successful imports must not manufacture a
+    /// second submission; the next render boundary owns those uploads.
+    fn submit_pending_memory_uploads(&mut self) -> Result<MemoryUploadBatchDisposition, Self::Error> {
+        Ok(MemoryUploadBatchDisposition::Empty)
+    }
 
     /// Returns supported formats for memory imports.
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>>;

@@ -26,8 +26,10 @@
 //! - [`crate::backend::renderer::Bind`] currently accepts dma-buf render targets.
 //! - [`crate::backend::renderer::ImportDma`] imports dma-bufs as sampled textures with strict
 //!   format/modifier validation.
-//! - [`crate::backend::renderer::ImportMem`] uses host-visible staging uploads and creates writable
-//!   Vulkan textures for shm/memory-backed client paths.
+//! - [`crate::backend::renderer::ImportMem`] copies into a bounded, persistently mapped arena,
+//!   batches upload commands into the next real render submission, and creates writable Vulkan
+//!   textures for shm/memory-backed client paths. Bounded-capacity relief is a separate typed
+//!   submission whose completion point is the only staging-reuse edge.
 //! - [`crate::backend::renderer::ExportMem`] performs readback through transfer buffers and returns
 //!   deterministic linear pixel data for supported formats.
 //!
@@ -129,6 +131,7 @@ mod frame;
 mod kawase;
 mod pipeline;
 mod readback;
+mod staging;
 mod sync;
 mod target;
 mod texture;
@@ -191,6 +194,33 @@ pub struct VulkanSubmissionStats {
     pub max_completion_ns: u64,
 }
 
+/// Persistent memory-upload arena and batching diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VulkanUploadStats {
+    /// Aggregate bytes mapped across all arena chunks.
+    pub arena_capacity_bytes: usize,
+    /// Bytes retained by pending or in-flight upload operations.
+    pub arena_in_use_bytes: usize,
+    /// Largest observed live reservation total.
+    pub arena_high_water_bytes: usize,
+    /// Number of persistent mapped chunks.
+    pub arena_chunk_count: usize,
+    /// Number of bounded geometric arena growth operations.
+    pub arena_growth_count: u64,
+    /// Number of reservations deferred by the arena byte/chunk bounds.
+    pub arena_deferred_count: u64,
+    /// Operations currently waiting for the next render or capacity-edge submission.
+    pub pending_operations: usize,
+    /// Packed bytes currently waiting for submission.
+    pub pending_bytes: usize,
+    /// Number of upload batches attached to queue submissions.
+    pub submitted_batches: u64,
+    /// Number of upload operations attached to queue submissions.
+    pub submitted_operations: u64,
+    /// Packed bytes attached to queue submissions.
+    pub submitted_bytes: u64,
+}
+
 /// Aggregated runtime diagnostics for the Vulkan renderer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanRendererDiagnostics {
@@ -200,6 +230,8 @@ pub struct VulkanRendererDiagnostics {
     pub descriptor_cache: VulkanCacheStats,
     /// Submission and completion timing diagnostics.
     pub submissions: VulkanSubmissionStats,
+    /// Persistent staging and upload-batch diagnostics.
+    pub uploads: VulkanUploadStats,
     /// Whether Vulkan debug markers are active for command-buffer labels.
     pub debug_markers_enabled: bool,
 }
@@ -403,6 +435,8 @@ impl VulkanRenderer {
     /// Returns live diagnostics for cache behavior and command submission timing.
     pub fn diagnostics(&self) -> VulkanRendererDiagnostics {
         let submissions: DeviceDiagnostics = self.device.diagnostics();
+        let arena = self.device.upload_arena_stats();
+        let (pending_operations, pending_bytes) = self.device.pending_upload_stats();
         VulkanRendererDiagnostics {
             dmabuf_cache: self.dmabuf.cache_stats(),
             descriptor_cache: self.descriptors.cache_stats(),
@@ -417,6 +451,19 @@ impl VulkanRenderer {
                     submissions.reclaimed_submissions,
                 ),
                 max_completion_ns: submissions.max_completion_ns,
+            },
+            uploads: VulkanUploadStats {
+                arena_capacity_bytes: arena.capacity_bytes,
+                arena_in_use_bytes: arena.in_use_bytes,
+                arena_high_water_bytes: arena.high_water_bytes,
+                arena_chunk_count: arena.chunk_count,
+                arena_growth_count: arena.growth_count,
+                arena_deferred_count: arena.deferred_count,
+                pending_operations,
+                pending_bytes,
+                submitted_batches: submissions.upload_batches,
+                submitted_operations: submissions.upload_operations,
+                submitted_bytes: submissions.upload_bytes,
             },
             debug_markers_enabled: submissions.debug_markers_enabled,
         }

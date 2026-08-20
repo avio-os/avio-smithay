@@ -4,7 +4,7 @@ use tracing::{instrument, trace};
 use crate::{
     backend::{
         allocator::{format::get_bpp, Format, Fourcc, Modifier},
-        renderer::{ImportMem, Texture},
+        renderer::{ImportMem, MemoryUploadBatchDisposition, MemoryUploadErrorKind, Texture},
     },
     utils::{Buffer as BufferCoord, Rectangle, Size},
 };
@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    device::{DeviceState, TransientBufferAllocation},
+    device::DeviceState,
     dmabuf::ImportedDmabufImage,
     format::{texture_view_components, ColorEncoding},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
@@ -146,6 +146,18 @@ impl ImportMem for VulkanRenderer {
         self.upload.update_memory(&mut self.device, texture, data, region)
     }
 
+    fn memory_upload_error_kind(error: &Self::Error) -> MemoryUploadErrorKind {
+        if error.is_upload_deferred() {
+            MemoryUploadErrorKind::DeferredCapacity
+        } else {
+            MemoryUploadErrorKind::Other
+        }
+    }
+
+    fn submit_pending_memory_uploads(&mut self) -> Result<MemoryUploadBatchDisposition, Self::Error> {
+        self.device.submit_pending_memory_uploads()
+    }
+
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
         Box::new(self.upload.supported_formats().iter().copied())
     }
@@ -194,6 +206,7 @@ impl VulkanRenderer {
                 .update_memory(&mut self.device, texture, packed, update_region)
             {
                 Ok(()) => Ok(texture.clone()),
+                Err(error) if error.is_upload_deferred() => Err(error),
                 Err(_) => self
                     .upload
                     .import_memory(&mut self.device, packed, format, size, false),
@@ -306,55 +319,26 @@ fn upload_region_to_image(
             .ok_or(VulkanRendererError::InvalidMemoryUpload(
                 "upload row byte count overflowed",
             ))?;
-    let upload_len = upload_row_bytes
-        .checked_mul(upload_height)
-        .ok_or(VulkanRendererError::InvalidMemoryUpload("upload size overflowed"))?;
+    let texture_width = usize::try_from(image.size().w)
+        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("texture width conversion failed"))?;
+    let region_x = usize::try_from(region.loc.x)
+        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region x conversion failed"))?;
+    let region_y = usize::try_from(region.loc.y)
+        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region y conversion failed"))?;
+    let src_stride =
+        texture_width
+            .checked_mul(bytes_per_pixel)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "source stride overflowed",
+            ))?;
+    let src_offset = region_y
+        .checked_mul(src_stride)
+        .and_then(|base| base.checked_add(region_x.saturating_mul(bytes_per_pixel)))
+        .ok_or(VulkanRendererError::InvalidMemoryUpload(
+            "source upload offset overflowed",
+        ))?;
 
-    let cleanup_device = device.shared_device();
-    let vk_device = cleanup_device.handle();
-    let (staging_buffer, staging_memory, staging_coherent) = create_staging_buffer(device, upload_len)?;
-
-    let cleanup_buffer_device = cleanup_device.clone();
-    let cleanup_buffer = scopeguard::guard(staging_buffer, |buffer| {
-        // SAFETY: Staging buffer belongs to this device and is no longer needed after upload scope exits.
-        cleanup_buffer_device.destroy_with(|device| unsafe { device.destroy_buffer(buffer, None) });
-    });
-    let cleanup_memory_device = cleanup_device.clone();
-    let cleanup_memory = scopeguard::guard(staging_memory, |memory| {
-        // SAFETY: Staging memory belongs to this device and is no longer needed after upload scope exits.
-        cleanup_memory_device.destroy_with(|device| unsafe { device.free_memory(memory, None) });
-    });
-
-    write_region_to_staging_memory(
-        device,
-        *cleanup_memory,
-        staging_coherent,
-        data,
-        image.size(),
-        region,
-        upload_row_bytes,
-    )?;
-
-    let command_buffer = device.acquire_command_buffer()?;
-    let begin_info =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    // SAFETY: Command buffer belongs to this renderer command pool and is not in-flight.
-    if let Err(err) = unsafe { vk_device.begin_command_buffer(command_buffer, &begin_info) } {
-        let _ = device.discard_command_buffer(command_buffer);
-        return Err(err.into());
-    }
-    device.insert_debug_label(command_buffer, c"vulkan.upload", [0.11, 0.78, 0.86, 1.0]);
-
-    let old_layout = image.current_layout();
-    transition_image_layout(
-        vk_device,
-        command_buffer,
-        image.image(),
-        old_layout,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-    );
-
-    let copy_region = [vk::BufferImageCopy::default()
+    let copy_region = vk::BufferImageCopy::default()
         .buffer_offset(0)
         .buffer_row_length(0)
         .buffer_image_height(0)
@@ -374,202 +358,17 @@ fn upload_region_to_image(
             width: region.size.w as u32,
             height: region.size.h as u32,
             depth: 1,
-        })];
+        });
 
-    // SAFETY: Command buffer recording is active and all objects belong to the same device.
-    unsafe {
-        vk_device.cmd_copy_buffer_to_image(
-            command_buffer,
-            *cleanup_buffer,
-            image.image(),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy_region,
-        );
-    }
-
-    transition_image_layout(
-        vk_device,
-        command_buffer,
-        image.image(),
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    );
-
-    // SAFETY: Command buffer recording is valid and all pending commands were encoded above.
-    if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
-        let _ = device.discard_command_buffer(command_buffer);
-        return Err(err.into());
-    }
-
-    let staging = TransientBufferAllocation::new(
-        device,
-        scopeguard::ScopeGuard::into_inner(cleanup_buffer),
-        scopeguard::ScopeGuard::into_inner(cleanup_memory),
-    );
-    if let Err(err) = device.submit_upload(command_buffer, std::sync::Arc::clone(image), staging) {
-        let _ = device.discard_command_buffer(command_buffer);
-        return Err(err);
-    }
-    image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    Ok(())
-}
-
-fn write_region_to_staging_memory(
-    device: &DeviceState,
-    staging_memory: vk::DeviceMemory,
-    coherent: bool,
-    data: &[u8],
-    texture_size: Size<i32, BufferCoord>,
-    region: Rectangle<i32, BufferCoord>,
-    upload_row_bytes: usize,
-) -> Result<(), VulkanRendererError> {
-    let bytes_per_pixel = upload_row_bytes
-        .checked_div(
-            usize::try_from(region.size.w)
-                .map_err(|_| VulkanRendererError::InvalidMemoryUpload("upload width conversion failed"))?,
-        )
-        .ok_or(VulkanRendererError::InvalidMemoryUpload(
-            "upload bytes-per-pixel computation failed",
-        ))?;
-
-    let texture_width = usize::try_from(texture_size.w)
-        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("texture width conversion failed"))?;
-    let region_x = usize::try_from(region.loc.x)
-        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region x conversion failed"))?;
-    let region_y = usize::try_from(region.loc.y)
-        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region y conversion failed"))?;
-    let upload_height = usize::try_from(region.size.h)
-        .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region height conversion failed"))?;
-
-    let src_stride =
-        texture_width
-            .checked_mul(bytes_per_pixel)
-            .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                "source stride overflowed",
-            ))?;
-
-    let map_size =
-        (upload_row_bytes
-            .checked_mul(upload_height)
-            .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                "mapped upload size overflowed",
-            ))?) as vk::DeviceSize;
-
-    let vk_device = device.device_handle();
-    // SAFETY: Memory was allocated by this device and mapped range is bounded to the staging allocation size.
-    let mapped = unsafe { vk_device.map_memory(staging_memory, 0, map_size, vk::MemoryMapFlags::empty()) }?;
-    let mapped = mapped as *mut u8;
-
-    for row in 0..upload_height {
-        let src_row_start = (region_y + row)
-            .checked_mul(src_stride)
-            .and_then(|base| base.checked_add(region_x * bytes_per_pixel))
-            .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                "source row offset overflowed",
-            ))?;
-        let src_row_end =
-            src_row_start
-                .checked_add(upload_row_bytes)
-                .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                    "source row range overflowed",
-                ))?;
-        let src_row =
-            data.get(src_row_start..src_row_end)
-                .ok_or(VulkanRendererError::InvalidMemoryUpload(
-                    "source data slice is out of bounds",
-                ))?;
-
-        // SAFETY: Mapped pointer is valid for `map_size` bytes and destination offsets are range-checked above.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src_row.as_ptr(),
-                mapped.add(row * upload_row_bytes),
-                upload_row_bytes,
-            );
-        }
-    }
-
-    if !coherent {
-        let ranges = [vk::MappedMemoryRange::default()
-            .memory(staging_memory)
-            .offset(0)
-            .size(map_size)];
-        // SAFETY: The mapped range points to this memory allocation and was previously written by the CPU.
-        unsafe { vk_device.flush_mapped_memory_ranges(&ranges) }?;
-    }
-
-    // SAFETY: The memory range is currently mapped and no longer needed on the CPU after this point.
-    unsafe { vk_device.unmap_memory(staging_memory) };
-    Ok(())
-}
-
-fn transition_image_layout(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-) {
-    let (src_stage, src_access) = stage_access_for_layout(old_layout);
-    let (dst_stage, dst_access) = stage_access_for_layout(new_layout);
-
-    let barrier = [vk::ImageMemoryBarrier::default()
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
-        .src_access_mask(src_access)
-        .dst_access_mask(dst_access)];
-
-    // SAFETY: Command buffer recording is active and image handle belongs to this device.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-    }
-}
-
-fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
-        vk::ImageLayout::GENERAL => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
-        ),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ)
-        }
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
-        }
-        _ => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-    }
+    device.queue_image_upload(
+        std::sync::Arc::clone(image),
+        data,
+        src_offset,
+        src_stride,
+        upload_row_bytes,
+        upload_height,
+        copy_region,
+    )
 }
 
 fn validate_memory_format(format: Fourcc) -> Result<vk::Format, VulkanRendererError> {
@@ -796,54 +595,6 @@ fn create_upload_image(
     )))
 }
 
-fn create_staging_buffer(
-    device: &DeviceState,
-    size: usize,
-) -> Result<(vk::Buffer, vk::DeviceMemory, bool), VulkanRendererError> {
-    let device_handle = device.shared_device();
-    let vk_device = device_handle.handle();
-    let create_info = vk::BufferCreateInfo::default()
-        .size(size as u64)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    // SAFETY: Device is valid and create info references live data.
-    let buffer = device_handle.observe_result(unsafe { vk_device.create_buffer(&create_info, None) })?;
-    // SAFETY: Buffer belongs to this device and remains valid until destroyed.
-    let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
-
-    let (memory_type_index, coherent) =
-        pick_host_visible_memory_type(device, memory_requirements.memory_type_bits)
-            .ok_or(VulkanRendererError::NoCompatibleMemoryType)?;
-
-    let allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(memory_requirements.size)
-        .memory_type_index(memory_type_index);
-    // SAFETY: Device is valid and allocation info references live data.
-    let memory =
-        match device_handle.observe_result(unsafe { vk_device.allocate_memory(&allocate_info, None) }) {
-            Ok(memory) => memory,
-            Err(err) => {
-                // SAFETY: Buffer belongs to this device and allocation failed before binding.
-                device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
-                return Err(err.into());
-            }
-        };
-
-    // SAFETY: Buffer and memory belong to this device and memory offset 0 is valid for the allocation.
-    if let Err(err) = device_handle.observe_result(unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) })
-    {
-        // SAFETY: Handles belong to this device and were created above.
-        device_handle.destroy_with(|vk_device| unsafe {
-            vk_device.free_memory(memory, None);
-            vk_device.destroy_buffer(buffer, None);
-        });
-        return Err(err.into());
-    }
-
-    Ok((buffer, memory, coherent))
-}
-
 fn pick_image_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<u32> {
     let memory_properties = unsafe {
         device
@@ -860,24 +611,6 @@ fn pick_image_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )
     .map(|(index, _)| index)
-}
-
-fn pick_host_visible_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<(u32, bool)> {
-    let memory_properties = unsafe {
-        device
-            .physical_device()
-            .instance()
-            .handle()
-            .get_physical_device_memory_properties(device.physical_device().handle())
-    };
-
-    pick_memory_type_index(
-        &memory_properties,
-        memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE,
-        vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .map(|(index, flags)| (index, flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)))
 }
 
 fn pick_memory_type_index(
@@ -991,6 +724,11 @@ mod tests {
             Err(_) => return,
         };
 
+        let before_submit = renderer.diagnostics();
+        assert_eq!(before_submit.uploads.pending_operations, 2);
+        assert_eq!(before_submit.uploads.submitted_batches, 0);
+        assert_eq!(before_submit.submissions.total_submissions, 0);
+
         let mut frame = match renderer.render(&mut target, Size::from((32, 32)), Transform::Normal) {
             Ok(frame) => frame,
             Err(_) => return,
@@ -1013,5 +751,10 @@ mod tests {
 
         let sync = frame.finish().expect("finish should submit successfully");
         let _ = sync.wait();
+        let after_submit = renderer.diagnostics();
+        assert_eq!(after_submit.uploads.pending_operations, 0);
+        assert_eq!(after_submit.uploads.submitted_batches, 1);
+        assert_eq!(after_submit.uploads.submitted_operations, 2);
+        assert_eq!(after_submit.submissions.total_submissions, 1);
     }
 }
