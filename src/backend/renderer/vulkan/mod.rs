@@ -129,6 +129,8 @@ mod error;
 mod format;
 mod frame;
 mod kawase;
+#[cfg(test)]
+mod kawase_calibration;
 mod pipeline;
 mod readback;
 mod staging;
