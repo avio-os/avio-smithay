@@ -81,50 +81,7 @@ impl BlitState {
         filter: TextureFilter,
     ) -> Result<SyncPoint, VulkanRendererError> {
         trace!(?src, ?dst, ?filter, "recording vulkan blit");
-        if from.id() == to.id() {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "blit source and destination must be different images",
-            ));
-        }
-
-        validate_rect(from.size(), src, "source")?;
-        validate_rect(to.size(), dst, "destination")?;
-
-        if from.vk_format() != to.vk_format() {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "blit currently requires matching source and destination formats",
-            ));
-        }
-
-        if !from.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "source image does not support transfer-source usage for blit",
-            ));
-        }
-        if !to.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "destination image does not support transfer-destination usage for blit",
-            ));
-        }
-
-        let scaled = src.size != dst.size;
-        if scaled {
-            let features = self.query_format_features(device, from.vk_format());
-            if !features.contains(vk::FormatFeatureFlags::BLIT_SRC)
-                || !features.contains(vk::FormatFeatureFlags::BLIT_DST)
-            {
-                return Err(VulkanRendererError::TemporaryFailure(
-                    "scaled blit is unsupported for the image format on this device",
-                ));
-            }
-            if filter == TextureFilter::Linear
-                && !features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
-            {
-                return Err(VulkanRendererError::TemporaryFailure(
-                    "linear filtered blit is unsupported for the source format",
-                ));
-            }
-        }
+        self.validate_blit_images(device, &from, &to, src, dst, filter)?;
 
         let from_layout = from.current_layout();
         if from_layout == vk::ImageLayout::UNDEFINED {
@@ -371,7 +328,7 @@ impl BlitState {
         Ok(SyncPoint::from(submission_fence))
     }
 
-    fn validate_blit_images(
+    pub(super) fn validate_blit_images(
         &mut self,
         device: &DeviceState,
         from: &VulkanImage,
@@ -389,12 +346,6 @@ impl BlitState {
         validate_rect(from.size(), src, "source")?;
         validate_rect(to.size(), dst, "destination")?;
 
-        if from.vk_format() != to.vk_format() {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "blit currently requires matching source and destination formats",
-            ));
-        }
-
         if !from.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
             return Err(VulkanRendererError::TemporaryFailure(
                 "source image does not support transfer-source usage for blit",
@@ -406,18 +357,18 @@ impl BlitState {
             ));
         }
 
-        let scaled = src.size != dst.size;
-        if scaled {
-            let features = self.query_format_features(device, from.vk_format());
-            if !features.contains(vk::FormatFeatureFlags::BLIT_SRC)
-                || !features.contains(vk::FormatFeatureFlags::BLIT_DST)
+        if image_blit_required(from, to, src, dst) {
+            let source_features = self.query_format_features(device, from.vk_format());
+            let destination_features = self.query_format_features(device, to.vk_format());
+            if !source_features.contains(vk::FormatFeatureFlags::BLIT_SRC)
+                || !destination_features.contains(vk::FormatFeatureFlags::BLIT_DST)
             {
                 return Err(VulkanRendererError::TemporaryFailure(
-                    "scaled blit is unsupported for the image format on this device",
+                    "scaled or format-converting blit is unsupported for the image formats on this device",
                 ));
             }
             if filter == TextureFilter::Linear
-                && !features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+                && !source_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
             {
                 return Err(VulkanRendererError::TemporaryFailure(
                     "linear filtered blit is unsupported for the source format",
@@ -587,7 +538,10 @@ pub(super) fn record_image_blit(
     dst: Rectangle<i32, Physical>,
     filter: TextureFilter,
 ) {
-    if src.size != dst.size {
+    // vkCmdCopyImage copies storage bytes and therefore swaps logical red/blue
+    // between BGRA and RGBA images. A Vulkan blit performs component-aware
+    // format conversion, even when source and destination extents are equal.
+    if image_blit_required(from, to, src, dst) {
         let blit_regions = [vk::ImageBlit::default()
             .src_subresource(
                 vk::ImageSubresourceLayers::default()
@@ -689,6 +643,15 @@ pub(super) fn record_image_blit(
     }
 }
 
+fn image_blit_required(
+    from: &VulkanImage,
+    to: &VulkanImage,
+    src: Rectangle<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+) -> bool {
+    src.size != dst.size || from.vk_format() != to.vk_format()
+}
+
 #[cfg(test)]
 mod tests {
     use ash::vk;
@@ -732,6 +695,14 @@ mod tests {
             Fourcc::Argb8888 | Fourcc::Xrgb8888 => [0, 0, 255, 255],
             Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [255, 0, 0, 255],
             _ => [255, 0, 0, 255],
+        }
+    }
+
+    fn expected_blue_pixel(format: Fourcc) -> [u8; 4] {
+        match format {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => [255, 0, 0, 255],
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [0, 0, 255, 255],
+            _ => [0, 0, 255, 255],
         }
     }
 
@@ -950,6 +921,57 @@ mod tests {
             .expect("map_texture should expose readback bytes");
 
         assert_eq!(&bytes[0..4], &expected_red_pixel(format));
+    }
+
+    #[test]
+    fn equal_extent_cross_format_blit_preserves_logical_blue() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let size = Size::from((16, 16));
+        let physical_size = Size::<i32, Physical>::from((16, 16));
+        let region = Rectangle::from_size(physical_size);
+        let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
+
+        let Ok(mut source) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+            return;
+        };
+        let Ok(mut destination) = renderer.create_buffer(Fourcc::Abgr8888, size) else {
+            return;
+        };
+        let Ok(mut source_target) = renderer.bind(&mut source) else {
+            return;
+        };
+        let Ok(mut destination_target) = renderer.bind(&mut destination) else {
+            return;
+        };
+
+        {
+            let mut frame = renderer
+                .render(&mut source_target, physical_size, Transform::Normal)
+                .expect("source frame");
+            frame
+                .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[region])
+                .expect("clear source blue");
+            let _ = frame.finish().expect("finish source").wait();
+        }
+
+        let sync = renderer
+            .blit(
+                &source_target,
+                &mut destination_target,
+                region,
+                region,
+                TextureFilter::Nearest,
+            )
+            .expect("cross-format blit");
+        let _ = sync.wait();
+
+        let mapping = renderer
+            .copy_framebuffer(&destination_target, buffer_region, Fourcc::Abgr8888)
+            .expect("read destination");
+        let bytes = renderer.map_texture(&mapping).expect("map destination");
+        assert_eq!(&bytes[0..4], &expected_blue_pixel(Fourcc::Abgr8888));
     }
 
     #[test]

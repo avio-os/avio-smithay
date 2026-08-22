@@ -715,6 +715,19 @@ impl VulkanFrame<'_> {
             ));
         }
 
+        {
+            let renderer = &mut *self.renderer;
+            let (blit, device) = (&mut renderer.blit, &renderer.device);
+            blit.validate_blit_images(
+                device,
+                &target,
+                &capture_image,
+                source_area,
+                capture_area,
+                TextureFilter::Linear,
+            )?;
+        }
+
         // SAFETY: The frame owns an active render pass in this command buffer.
         unsafe {
             self.renderer.device.insert_debug_label(
@@ -1898,8 +1911,8 @@ mod tests {
                 Allocator, Fourcc,
             },
             renderer::{
-                vulkan::VulkanTexture, Bind, BlitFrame, Color32F, Frame, Offscreen, Renderer, Texture,
-                TextureFilter,
+                vulkan::VulkanTexture, Bind, BlitFrame, Color32F, ExportMem, Frame, Offscreen, Renderer,
+                Texture, TextureFilter,
             },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
@@ -2407,6 +2420,44 @@ mod tests {
             .finish()
             .expect("finish should submit frame after frame blits");
         let _ = sync.wait();
+    }
+
+    #[test]
+    fn framebuffer_effect_capture_converts_bgra_to_rgba_without_channel_swap() {
+        let Some((mut renderer, _)) = init_renderer_and_allocator() else {
+            return;
+        };
+        let size = Size::from((16, 16));
+        let physical_size = Size::<i32, Physical>::from((16, 16));
+        let region = Rectangle::from_size(physical_size);
+        let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
+
+        let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+            return;
+        };
+        let Ok(capture) = renderer.create_buffer(Fourcc::Abgr8888, size) else {
+            return;
+        };
+        let Ok(mut target) = renderer.bind(&mut frame_texture) else {
+            return;
+        };
+
+        let mut frame = renderer
+            .render(&mut target, physical_size, Transform::Normal)
+            .expect("frame");
+        frame
+            .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[region])
+            .expect("clear blue accumulator");
+        frame
+            .capture_and_filter_framebuffer(region, &capture, &[])
+            .expect("cross-format framebuffer capture");
+        let _ = frame.finish().expect("finish capture").wait();
+
+        let mapping = renderer
+            .copy_texture(&capture, buffer_region, Fourcc::Abgr8888)
+            .expect("read capture");
+        let bytes = renderer.map_texture(&mapping).expect("map capture");
+        assert_eq!(&bytes[0..4], &[0, 0, 255, 255]);
     }
 
     #[test]
