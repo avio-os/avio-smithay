@@ -3,7 +3,7 @@ use crate::{
     utils::{Buffer as BufferCoord, Size},
 };
 
-use super::dmabuf::ImportedDmabufImage;
+use super::image::VulkanImage;
 use std::sync::Arc;
 
 /// Placeholder Vulkan texture handle for phase-0 scaffolding.
@@ -12,7 +12,7 @@ pub struct VulkanTexture {
     size: Size<i32, BufferCoord>,
     format: Option<Fourcc>,
     y_inverted: bool,
-    imported: Option<Arc<ImportedDmabufImage>>,
+    image: Option<Arc<VulkanImage>>,
     memory_writable: bool,
 }
 
@@ -23,38 +23,41 @@ impl VulkanTexture {
             size,
             format,
             y_inverted: false,
-            imported: None,
+            image: None,
             memory_writable: false,
         }
     }
 
     pub(crate) fn from_dmabuf_import(
-        imported: Arc<ImportedDmabufImage>,
+        image: Arc<VulkanImage>,
         size: Size<i32, BufferCoord>,
         format: Option<Fourcc>,
         y_inverted: bool,
     ) -> Self {
+        debug_assert!(image.uses_foreign_queue());
         Self {
             size,
             format,
             y_inverted,
-            imported: Some(imported),
+            image: Some(image),
             memory_writable: false,
         }
     }
 
-    pub(crate) fn from_memory_import(
-        imported: Arc<ImportedDmabufImage>,
+    pub(crate) fn from_renderer_image(
+        image: Arc<VulkanImage>,
         size: Size<i32, BufferCoord>,
         format: Fourcc,
         y_inverted: bool,
+        memory_writable: bool,
     ) -> Self {
+        debug_assert!(image.is_renderer_local());
         Self {
             size,
             format: Some(format),
             y_inverted,
-            imported: Some(imported),
-            memory_writable: true,
+            image: Some(image),
+            memory_writable,
         }
     }
 
@@ -63,19 +66,19 @@ impl VulkanTexture {
         self.y_inverted
     }
 
-    pub(crate) fn imported_image_id(&self) -> Option<u64> {
-        self.imported.as_ref().map(|image| image.id())
+    pub(crate) fn image_resource_id(&self) -> Option<u64> {
+        self.image.as_ref().map(|image| image.id())
     }
 
-    pub(crate) fn imported_image(&self) -> Option<&Arc<ImportedDmabufImage>> {
-        self.imported.as_ref()
+    pub(crate) fn image_resource(&self) -> Option<&Arc<VulkanImage>> {
+        self.image.as_ref()
     }
 
     /// Returns true when no other owner can currently submit work touching this
     /// imported image. Compositors use this before reusing or evicting retained
     /// offscreen targets.
     pub fn is_externally_idle(&self) -> bool {
-        self.imported
+        self.image
             .as_ref()
             .map(|image| Arc::strong_count(image) <= 1)
             .unwrap_or(true)

@@ -167,17 +167,27 @@ pub(crate) struct KawasePushConstants {
     /// 1 when the shader must sRGB-encode its own output because the destination is
     /// not viewed through an `_SRGB` attachment. Taps are always decoded to linear.
     pub(crate) encode_output: u32,
-    pub(crate) _pad: [u32; 3],
+    /// Saturation applied after blur. Intermediate pyramid passes use `1.0`;
+    /// material graphs put their colour transform on the final pass only.
+    pub(crate) saturation: f32,
+    pub(crate) _pad: [u32; 2],
 }
 
 impl KawasePushConstants {
-    pub(crate) fn new(halfpixel: [f32; 2], offset: f32, upsample: bool, linear_destination: bool) -> Self {
+    pub(crate) fn new(
+        halfpixel: [f32; 2],
+        offset: f32,
+        upsample: bool,
+        linear_destination: bool,
+        saturation: f32,
+    ) -> Self {
         Self {
             halfpixel,
             offset,
             mode: u32::from(upsample),
             encode_output: u32::from(!linear_destination),
-            _pad: [0; 3],
+            saturation: saturation.clamp(0.0, 4.0),
+            _pad: [0; 2],
         }
     }
 }

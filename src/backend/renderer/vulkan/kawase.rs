@@ -20,9 +20,12 @@ use crate::{
 };
 
 use super::{
-    blit::{transition_image_layout, transition_tracked_image_layout},
+    blit::transition_tracked_image_layout,
     descriptor::TextureSampler,
-    dmabuf::ImportedDmabufImage,
+    image::{
+        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
+        restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
+    },
     pipeline::{push_constants_bytes, KawasePushConstants},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
@@ -39,6 +42,7 @@ pub struct VulkanKawasePass {
     destination: VulkanTexture,
     upsample: bool,
     offset: f32,
+    saturation: f32,
 }
 
 impl VulkanKawasePass {
@@ -49,13 +53,21 @@ impl VulkanKawasePass {
             destination: destination.clone(),
             upsample,
             offset,
+            saturation: 1.0,
         }
+    }
+
+    /// Applies a post-blur saturation transform in the destination colour
+    /// space. Material graphs should set this on their final pass only.
+    pub fn with_saturation(mut self, saturation: f32) -> Self {
+        self.saturation = saturation.clamp(0.0, 4.0);
+        self
     }
 }
 
 struct ResolvedKawasePass {
-    source: Arc<ImportedDmabufImage>,
-    destination: Arc<ImportedDmabufImage>,
+    source: Arc<VulkanImage>,
+    destination: Arc<VulkanImage>,
     descriptor_set: vk::DescriptorSet,
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
@@ -91,12 +103,12 @@ impl VulkanRenderer {
 
         let mut resolved = Vec::with_capacity(passes.len());
         for pass in passes {
-            let Some(source) = pass.source.imported_image().cloned() else {
+            let Some(source) = pass.source.image_resource().cloned() else {
                 return Err(VulkanRendererError::NotImplemented(
                     "kawase chain currently requires image-backed Vulkan source textures",
                 ));
             };
-            let Some(destination) = pass.destination.imported_image().cloned() else {
+            let Some(destination) = pass.destination.image_resource().cloned() else {
                 return Err(VulkanRendererError::NotImplemented(
                     "kawase chain currently requires image-backed Vulkan destination textures",
                 ));
@@ -129,6 +141,7 @@ impl VulkanRenderer {
                 pass.offset,
                 pass.upsample,
                 destination.blends_in_linear_light(),
+                pass.saturation,
             );
             resolved.push(ResolvedKawasePass {
                 source,
@@ -153,6 +166,17 @@ impl VulkanRenderer {
         self.device
             .insert_debug_label(command_buffer, c"vulkan.kawase_chain", [0.36, 0.65, 0.96, 1.0]);
 
+        let mut foreign_images = acquire_images_from_foreign(
+            vk_device,
+            command_buffer,
+            self.device.queue_family_index(),
+            resolved.iter().flat_map(|pass| {
+                [
+                    (pass.source.clone(), pass.source.current_layout()),
+                    (pass.destination.clone(), pass.destination.current_layout()),
+                ]
+            }),
+        );
         let mut layouts = IndexMap::new();
         let mut framebuffers: Vec<vk::Framebuffer> = Vec::with_capacity(resolved.len());
         let mut record = || -> Result<(), VulkanRendererError> {
@@ -251,6 +275,7 @@ impl VulkanRenderer {
                 unsafe { vk_device.destroy_framebuffer(framebuffer, None) };
             }
             let _ = self.device.discard_command_buffer(command_buffer);
+            restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err);
         }
 
@@ -264,6 +289,17 @@ impl VulkanRenderer {
             );
             tracked.current_layout = tracked.restore_layout;
         }
+        for (id, (_, layout)) in foreign_images.iter_mut() {
+            if let Some(tracked) = layouts.get(id) {
+                *layout = tracked.current_layout;
+            }
+        }
+        release_images_to_foreign(
+            vk_device,
+            command_buffer,
+            self.device.queue_family_index(),
+            &foreign_images,
+        );
 
         // SAFETY: Command buffer recording is valid and all commands were encoded above.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
@@ -272,6 +308,7 @@ impl VulkanRenderer {
                 unsafe { vk_device.destroy_framebuffer(framebuffer, None) };
             }
             let _ = self.device.discard_command_buffer(command_buffer);
+            restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err.into());
         }
 
@@ -287,6 +324,7 @@ impl VulkanRenderer {
                 Ok(submission) => submission,
                 Err(err) => {
                     let _ = self.device.discard_command_buffer(command_buffer);
+                    restore_unsubmitted_foreign_acquires(&foreign_images);
                     return Err(err);
                 }
             };
@@ -294,6 +332,7 @@ impl VulkanRenderer {
         for tracked in layouts.values() {
             tracked.image.set_layout(tracked.restore_layout);
         }
+        commit_foreign_releases(&foreign_images);
 
         Ok(SyncPoint::from(submission_fence))
     }
@@ -389,6 +428,147 @@ mod tests {
                 (value - 128).abs() <= 2,
                 "solid gray should survive kawase round trip, got {pixel:?}"
             );
+        }
+    }
+
+    #[test]
+    fn final_kawase_pass_applies_saturation_transform() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let full_size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let half_size: Size<i32, BufferCoord> = Size::from((8, 8));
+        let physical_size: Size<i32, Physical> = Size::from((16, 16));
+        let physical_region: Rectangle<i32, Physical> = Rectangle::from_size(physical_size);
+        let mut full = renderer
+            .create_buffer(format, full_size)
+            .expect("offscreen alloc");
+        let half = renderer
+            .create_buffer(format, half_size)
+            .expect("offscreen alloc");
+
+        {
+            let mut target = renderer.bind(&mut full).expect("bind");
+            let mut frame = renderer
+                .render(&mut target, physical_size, Transform::Normal)
+                .expect("render");
+            frame
+                .clear(Color32F::new(0.80, 0.20, 0.10, 1.0), &[physical_region])
+                .expect("clear");
+            frame.finish().expect("finish").wait().unwrap();
+        }
+
+        renderer
+            .kawase_texture_chain(&[
+                VulkanKawasePass::new(&full, &half, false, 1.5),
+                VulkanKawasePass::new(&half, &full, true, 1.5).with_saturation(0.0),
+            ])
+            .expect("desaturating kawase chain")
+            .wait()
+            .unwrap();
+
+        let target = renderer.bind(&mut full).expect("bind for readback");
+        let mapping = renderer
+            .copy_framebuffer(&target, Rectangle::from_size(full_size), format)
+            .expect("readback");
+        let data = renderer.map_texture(&mapping).expect("map");
+        let center = ((8 * 16 + 8) * 4) as usize;
+        let pixel = &data[center..center + 4];
+        let rgb = &pixel[..3];
+        let min = *rgb.iter().min().unwrap() as i32;
+        let max = *rgb.iter().max().unwrap() as i32;
+        assert!(
+            max - min <= 2,
+            "zero saturation must produce neutral RGB, got {pixel:?}"
+        );
+    }
+
+    fn region_energy(data: &[u8], width: usize, x_start: usize, x_end: usize) -> u64 {
+        (8..24)
+            .flat_map(|y| (x_start..x_end).map(move |x| (y * width + x) * 4))
+            .map(|offset| {
+                data[offset..offset + 3]
+                    .iter()
+                    .map(|channel| u64::from(*channel))
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// Reusing the same renderer-local images must expose every new producer
+    /// generation to the blur. A solid-color test cannot distinguish a fresh
+    /// image from a stale one; this alternating pattern catches the exact
+    /// persistent-pool failure mode that motivated explicit image provenance.
+    #[test]
+    fn reused_kawase_images_follow_alternating_pattern_generations() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let full_size: Size<i32, BufferCoord> = Size::from((32, 32));
+        let half_size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let physical_size: Size<i32, Physical> = Size::from((32, 32));
+        let full_region: Rectangle<i32, Physical> = Rectangle::from_size(physical_size);
+        let mut full = renderer
+            .create_buffer(format, full_size)
+            .expect("full offscreen alloc");
+        let half = renderer
+            .create_buffer(format, half_size)
+            .expect("half offscreen alloc");
+        let full_image = full.image_resource().expect("full image resource").clone();
+        let half_image = half.image_resource().expect("half image resource").clone();
+        assert!(full_image.is_renderer_local());
+        assert!(half_image.is_renderer_local());
+
+        for generation in 0..32 {
+            let bright_left = generation % 2 == 0;
+            let bright_region =
+                Rectangle::new((if bright_left { 0 } else { 16 }, 0).into(), Size::from((16, 32)));
+            {
+                let mut target = renderer.bind(&mut full).expect("bind producer target");
+                let mut frame = renderer
+                    .render(&mut target, physical_size, Transform::Normal)
+                    .expect("render producer pattern");
+                frame
+                    .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full_region])
+                    .expect("clear producer pattern");
+                frame
+                    .draw_solid(bright_region, &[bright_region], Color32F::new(1.0, 0.0, 0.0, 1.0))
+                    .expect("draw producer pattern");
+                frame.finish().expect("finish producer pattern").wait().unwrap();
+            }
+
+            let passes = [
+                VulkanKawasePass::new(&full, &half, false, 1.5),
+                VulkanKawasePass::new(&half, &full, true, 1.5),
+            ];
+            renderer
+                .kawase_texture_chain(&passes)
+                .expect("record reused kawase chain")
+                .wait()
+                .unwrap();
+
+            let target = renderer.bind(&mut full).expect("bind reused result");
+            let mapping = renderer
+                .copy_framebuffer(&target, Rectangle::from_size(full_size), format)
+                .expect("read reused result");
+            let data = renderer.map_texture(&mapping).expect("map reused result");
+            let left = region_energy(data, 32, 2, 14);
+            let right = region_energy(data, 32, 18, 30);
+            assert_eq!(
+                left > right,
+                bright_left,
+                "generation {generation} returned stale or spatially inverted blur: left={left} right={right}",
+            );
+            assert!(!full_image.is_owned_by_foreign());
+            assert!(!half_image.is_owned_by_foreign());
         }
     }
 }

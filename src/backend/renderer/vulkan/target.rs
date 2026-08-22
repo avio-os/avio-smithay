@@ -3,7 +3,7 @@ use crate::{
     utils::{Buffer as BufferCoord, Size},
 };
 
-use super::dmabuf::ImportedDmabufImage;
+use super::image::VulkanImage;
 use std::sync::Arc;
 
 /// Placeholder Vulkan render target handle for phase-0 scaffolding.
@@ -11,8 +11,7 @@ use std::sync::Arc;
 pub struct VulkanTarget {
     size: Size<i32, BufferCoord>,
     format: Option<Fourcc>,
-    imported: Option<Arc<ImportedDmabufImage>>,
-    release_to_foreign_on_finish: bool,
+    image: Option<Arc<VulkanImage>>,
 }
 
 impl VulkanTarget {
@@ -21,47 +20,28 @@ impl VulkanTarget {
         Self {
             size,
             format,
-            imported: None,
-            release_to_foreign_on_finish: false,
+            image: None,
         }
     }
 
-    pub(crate) fn from_dmabuf_import(
-        imported: Arc<ImportedDmabufImage>,
+    pub(crate) fn from_image_resource(
+        image: Arc<VulkanImage>,
         size: Size<i32, BufferCoord>,
         format: Option<Fourcc>,
     ) -> Self {
         Self {
             size,
             format,
-            imported: Some(imported),
-            release_to_foreign_on_finish: true,
+            image: Some(image),
         }
     }
 
-    pub(crate) fn from_imported_image(
-        imported: Arc<ImportedDmabufImage>,
-        size: Size<i32, BufferCoord>,
-        format: Option<Fourcc>,
-    ) -> Self {
-        Self {
-            size,
-            format,
-            imported: Some(imported),
-            release_to_foreign_on_finish: false,
-        }
+    pub(crate) fn image_resource_id(&self) -> Option<u64> {
+        self.image.as_ref().map(|image| image.id())
     }
 
-    pub(crate) fn imported_image_id(&self) -> Option<u64> {
-        self.imported.as_ref().map(|image| image.id())
-    }
-
-    pub(crate) fn imported_image(&self) -> Option<&Arc<ImportedDmabufImage>> {
-        self.imported.as_ref()
-    }
-
-    pub(crate) fn release_to_foreign_on_finish(&self) -> bool {
-        self.release_to_foreign_on_finish
+    pub(crate) fn image_resource(&self) -> Option<&Arc<VulkanImage>> {
+        self.image.as_ref()
     }
 }
 

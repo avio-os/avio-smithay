@@ -13,8 +13,11 @@ use crate::{
 
 use super::{
     device::DeviceState,
-    dmabuf::ImportedDmabufImage,
     format::{render_view_format, srgb_view_format_list, texture_view_components, ColorEncoding},
+    image::{
+        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
+        restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
+    },
     VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
@@ -187,7 +190,7 @@ impl ReadbackState {
             }
         };
 
-        let imported = Arc::new(ImportedDmabufImage::new(
+        let imported = Arc::new(VulkanImage::new_renderer_local(
             self.next_offscreen_id(),
             image,
             memory,
@@ -208,11 +211,8 @@ impl ReadbackState {
             device.shared_device(),
         ));
 
-        Ok(VulkanTexture::from_dmabuf_import(
-            imported,
-            size,
-            Some(format),
-            false,
+        Ok(VulkanTexture::from_renderer_image(
+            imported, size, format, false, false,
         ))
     }
 
@@ -221,7 +221,7 @@ impl ReadbackState {
     fn copy_image_to_mapping(
         &mut self,
         device: &mut DeviceState,
-        image: &ImportedDmabufImage,
+        image: Arc<VulkanImage>,
         region: Rectangle<i32, BufferCoord>,
         dst_format: Fourcc,
     ) -> Result<VulkanMapping, VulkanRendererError> {
@@ -273,6 +273,12 @@ impl ReadbackState {
         device.insert_debug_label(command_buffer, c"vulkan.readback", [0.52, 0.47, 0.91, 1.0]);
 
         let old_layout = image.current_layout();
+        let mut foreign_images = acquire_images_from_foreign(
+            vk_device,
+            command_buffer,
+            device.queue_family_index(),
+            [(image.clone(), old_layout)],
+        );
         transition_image_layout(
             vk_device,
             command_buffer,
@@ -321,15 +327,29 @@ impl ReadbackState {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             old_layout,
         );
+        if let Some((_, layout)) = foreign_images.get_mut(&image.id()) {
+            *layout = old_layout;
+        }
+        release_images_to_foreign(
+            vk_device,
+            command_buffer,
+            device.queue_family_index(),
+            &foreign_images,
+        );
 
         // SAFETY: Command buffer recording is valid and ready for submission.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
             let _ = device.discard_command_buffer(command_buffer);
+            restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err.into());
         }
 
-        device.submit_blocking(command_buffer)?;
+        if let Err(err) = device.submit_blocking(command_buffer) {
+            restore_unsubmitted_foreign_acquires(&foreign_images);
+            return Err(err);
+        }
         image.set_layout(old_layout);
+        commit_foreign_releases(&foreign_images);
 
         let mut raw = vec![0u8; src_len];
         // SAFETY: Memory belongs to this device and the mapped range is within allocation bounds.
@@ -419,13 +439,13 @@ impl Offscreen<VulkanTexture> for VulkanRenderer {
 
 impl Bind<VulkanTexture> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut VulkanTexture) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        let Some(imported) = target.imported_image().cloned() else {
+        let Some(imported) = target.image_resource().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "binding VulkanTexture currently requires an image-backed texture",
             ));
         };
 
-        Ok(VulkanTarget::from_imported_image(
+        Ok(VulkanTarget::from_image_resource(
             imported,
             target.size(),
             target.format(),
@@ -442,14 +462,14 @@ impl ExportMem for VulkanRenderer {
         region: Rectangle<i32, BufferCoord>,
         format: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error> {
-        let Some(image) = target.imported_image() else {
+        let Some(image) = target.image_resource() else {
             return Err(VulkanRendererError::NotImplemented(
                 "copy_framebuffer currently requires image-backed VulkanTarget",
             ));
         };
 
         self.readback
-            .copy_image_to_mapping(&mut self.device, image, region, format)
+            .copy_image_to_mapping(&mut self.device, image.clone(), region, format)
     }
 
     fn copy_texture(
@@ -458,18 +478,18 @@ impl ExportMem for VulkanRenderer {
         region: Rectangle<i32, BufferCoord>,
         format: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error> {
-        let Some(image) = texture.imported_image() else {
+        let Some(image) = texture.image_resource() else {
             return Err(VulkanRendererError::NotImplemented(
                 "copy_texture currently requires image-backed VulkanTexture",
             ));
         };
 
         self.readback
-            .copy_image_to_mapping(&mut self.device, image, region, format)
+            .copy_image_to_mapping(&mut self.device, image.clone(), region, format)
     }
 
     fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, Self::Error> {
-        let Some(image) = texture.imported_image() else {
+        let Some(image) = texture.image_resource() else {
             return Ok(false);
         };
 
@@ -646,75 +666,6 @@ fn pick_memory_type_index(
     }
 
     fallback
-}
-
-fn transition_image_layout(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-) {
-    let (src_stage, src_access) = stage_access_for_layout(old_layout);
-    let (dst_stage, dst_access) = stage_access_for_layout(new_layout);
-
-    let barrier = [vk::ImageMemoryBarrier::default()
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
-        .src_access_mask(src_access)
-        .dst_access_mask(dst_access)];
-
-    // SAFETY: Command buffer recording is active and barrier references a live image.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-    }
-}
-
-fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
-        vk::ImageLayout::GENERAL => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
-        ),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ)
-        }
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
-        }
-        _ => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-    }
 }
 
 fn bytes_per_pixel(format: Fourcc) -> Result<usize, VulkanRendererError> {

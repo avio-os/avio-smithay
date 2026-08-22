@@ -128,6 +128,7 @@ mod dmabuf;
 mod error;
 mod format;
 mod frame;
+mod image;
 mod kawase;
 #[cfg(test)]
 mod kawase_calibration;

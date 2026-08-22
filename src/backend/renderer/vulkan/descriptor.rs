@@ -525,7 +525,7 @@ mod tests {
         let third = test_view(&device).expect("test image");
         let dead_view = first.view;
         let handle = device.shared_device();
-        // Production textures notify through ImportedDmabufImage::drop; the
+        // Production textures notify through VulkanImage::drop; the
         // bare test image notifies explicitly.
         handle.note_view_retired(dead_view);
         drop(first);

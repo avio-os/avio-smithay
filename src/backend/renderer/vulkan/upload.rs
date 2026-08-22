@@ -18,8 +18,8 @@ use crate::{
 
 use super::{
     device::DeviceState,
-    dmabuf::ImportedDmabufImage,
     format::{texture_view_components, ColorEncoding},
+    image::VulkanImage,
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
@@ -76,7 +76,9 @@ impl UploadState {
         let image = create_upload_image(device, self.next_upload_id(), format, size, flipped)?;
         upload_region_to_image(device, &image, format, data, Rectangle::from_size(size))?;
 
-        Ok(VulkanTexture::from_memory_import(image, size, format, flipped))
+        Ok(VulkanTexture::from_renderer_image(
+            image, size, format, flipped, true,
+        ))
     }
 
     #[instrument(level = "trace", skip(self, device, texture, data))]
@@ -115,7 +117,7 @@ impl UploadState {
         }
         validate_region(texture_size, region)?;
 
-        let Some(image) = texture.imported_image() else {
+        let Some(image) = texture.image_resource() else {
             return Err(VulkanRendererError::InvalidMemoryUpload(
                 "memory-backed texture image is missing",
             ));
@@ -298,7 +300,7 @@ where
 
 fn upload_region_to_image(
     device: &mut DeviceState,
-    image: &std::sync::Arc<ImportedDmabufImage>,
+    image: &std::sync::Arc<VulkanImage>,
     format: Fourcc,
     data: &[u8],
     region: Rectangle<i32, BufferCoord>,
@@ -457,7 +459,7 @@ fn create_upload_image(
     format: Fourcc,
     size: Size<i32, BufferCoord>,
     y_inverted: bool,
-) -> Result<std::sync::Arc<ImportedDmabufImage>, VulkanRendererError> {
+) -> Result<std::sync::Arc<VulkanImage>, VulkanRendererError> {
     let vk_format = validate_memory_format(format)?;
     let device_handle = device.shared_device();
     let vk_device = device_handle.handle();
@@ -574,7 +576,7 @@ fn create_upload_image(
             }
         };
 
-    Ok(std::sync::Arc::new(ImportedDmabufImage::new(
+    Ok(std::sync::Arc::new(VulkanImage::new_renderer_local(
         import_id,
         image,
         memory,
@@ -692,6 +694,12 @@ mod tests {
             Ok(texture) => texture,
             Err(_) => return,
         };
+        let upload_image = texture
+            .image_resource()
+            .expect("memory upload must create an image resource")
+            .clone();
+        assert!(upload_image.is_renderer_local());
+        assert!(!upload_image.is_owned_by_foreign());
 
         let damage = Rectangle::<i32, BufferCoord>::new((4, 4).into(), Size::from((8, 8)));
         renderer
@@ -766,5 +774,6 @@ mod tests {
         assert_eq!(after_submit.uploads.submitted_batches, 1);
         assert_eq!(after_submit.uploads.submitted_operations, 2);
         assert_eq!(after_submit.submissions.total_submissions, 1);
+        assert!(!upload_image.is_owned_by_foreign());
     }
 }

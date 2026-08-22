@@ -18,9 +18,9 @@ layout(push_constant) uniform KawasePushConstants {
     float offset;   // kawase spread multiplier
     uint mode;      // 0 = downsample (5 taps), 1 = upsample (8 taps)
     uint encode_output; // 1 = shader must sRGB-encode; 0 = the _SRGB attachment does
+    float saturation; // post-blur saturation; 1 = identity
     uint _pad0;
     uint _pad1;
-    uint _pad2;
 } constants;
 
 layout(location = 0) in vec2 in_uv;
@@ -67,6 +67,13 @@ void main() {
         sum += tap(in_uv + vec2(-hp.x, -hp.y)) * 2.0;
         sum /= 12.0;
     }
+    // The rows of the SVG/CSS saturate matrix sum to one, so applying its
+    // luma form directly to premultiplied RGB is equivalent to applying it to
+    // straight RGB and premultiplying afterwards. Clamp to alpha to preserve
+    // the premultiplied invariant before the result is blended.
+    float luma = dot(sum.rgb, vec3(0.213, 0.715, 0.072));
+    sum.rgb = clamp(vec3(luma) + (sum.rgb - vec3(luma)) * constants.saturation,
+                    vec3(0.0), vec3(sum.a));
     if (constants.encode_output != 0u) {
         sum.rgb = linear_to_srgb(sum.rgb);
     }

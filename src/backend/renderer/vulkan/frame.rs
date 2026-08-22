@@ -23,8 +23,8 @@ use crate::backend::renderer::ImportDmaWl;
 
 use super::{
     descriptor::TextureSampler,
-    dmabuf::ImportedDmabufImage,
     format::srgb_channel_to_linear,
+    image::{stage_access_for_layout, VulkanImage},
     pipeline::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
     },
@@ -45,25 +45,23 @@ pub(crate) enum VulkanFrameState {
 struct FrameRecording {
     command_buffer: vk::CommandBuffer,
     framebuffer: vk::Framebuffer,
-    target: Arc<ImportedDmabufImage>,
-    release_target_to_foreign: bool,
+    target: Arc<VulkanImage>,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
     size: Size<i32, Physical>,
-    pending_layouts: IndexMap<u64, (Arc<ImportedDmabufImage>, vk::ImageLayout)>,
+    pending_layouts: IndexMap<u64, (Arc<VulkanImage>, vk::ImageLayout)>,
     /// Imported images that must return to their external owner after the
     /// frame's final access. This spans flushed command-buffer segments.
-    foreign_release_images: IndexMap<u64, Arc<ImportedDmabufImage>>,
+    foreign_release_images: IndexMap<u64, Arc<VulkanImage>>,
     /// FOREIGN acquisitions encoded only in the current, unsubmitted command
     /// buffer. Abort paths restore their CPU-side ownership bookkeeping.
-    unsubmitted_foreign_acquires: IndexMap<u64, Arc<ImportedDmabufImage>>,
+    unsubmitted_foreign_acquires: IndexMap<u64, Arc<VulkanImage>>,
 }
 
 #[derive(Debug)]
 struct FrameResumeContext {
-    target: Arc<ImportedDmabufImage>,
-    release_target_to_foreign: bool,
+    target: Arc<VulkanImage>,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -136,7 +134,7 @@ impl Renderer for VulkanRenderer {
             ));
         }
 
-        let Some(target_image) = target.imported_image().cloned() else {
+        let Some(target_image) = target.image_resource().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "Renderer::render currently requires dma-buf-backed VulkanTarget",
             ));
@@ -189,7 +187,6 @@ impl Renderer for VulkanRenderer {
                 command_buffer,
                 framebuffer,
                 target: target_image,
-                release_target_to_foreign: target.release_to_foreign_on_finish(),
                 pipelines,
                 transform: dst_transform,
                 output_size,
@@ -203,12 +200,7 @@ impl Renderer for VulkanRenderer {
         {
             let recording = frame.recording.as_ref().expect("recording initialized");
             let target = recording.target.clone();
-            let release_target_to_foreign = recording.release_target_to_foreign;
-            frame.transition_image_layout(
-                &target,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                release_target_to_foreign,
-            )?;
+            frame.transition_image_layout(&target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
         }
 
         let render_pass_begin_info = {
@@ -673,7 +665,7 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
 impl VulkanFrame<'_> {
     fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
         let format = Some(context.target.format().code);
-        VulkanTarget::from_imported_image(context.target.clone(), context.target.size(), format)
+        VulkanTarget::from_image_resource(context.target.clone(), context.target.size(), format)
     }
 
     fn recording(&self) -> Result<&FrameRecording, VulkanRendererError> {
@@ -706,13 +698,12 @@ impl VulkanFrame<'_> {
 
     fn transition_image_layout(
         &mut self,
-        image: &Arc<ImportedDmabufImage>,
+        image: &Arc<VulkanImage>,
         new_layout: vk::ImageLayout,
-        release_to_foreign_after_frame: bool,
     ) -> Result<(), VulkanRendererError> {
         let (command_buffer, old_layout) = {
             let recording = self.recording_mut()?;
-            if release_to_foreign_after_frame {
+            if image.uses_foreign_queue() {
                 recording
                     .foreign_release_images
                     .entry(image.id())
@@ -872,13 +863,13 @@ impl VulkanFrame<'_> {
             return Ok(());
         }
 
-        let Some(texture_image) = texture.imported_image().cloned() else {
+        let Some(texture_image) = texture.image_resource().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "render_texture_from_to currently requires dma-buf-backed VulkanTexture",
             ));
         };
 
-        self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, true)?;
+        self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
 
         let (command_buffer, pipelines, transform, size, linear_blending) = {
             let recording = self.recording()?;
@@ -1276,7 +1267,6 @@ impl VulkanFrame<'_> {
         self.state = VulkanFrameState::Idle;
         Ok(FrameResumeContext {
             target: recording.target,
-            release_target_to_foreign: recording.release_target_to_foreign,
             pipelines: recording.pipelines,
             transform: recording.transform,
             output_size: recording.output_size,
@@ -1325,7 +1315,6 @@ impl VulkanFrame<'_> {
             command_buffer,
             framebuffer,
             target: context.target.clone(),
-            release_target_to_foreign: context.release_target_to_foreign,
             pipelines: context.pipelines,
             transform: context.transform,
             output_size: context.output_size,
@@ -1336,11 +1325,9 @@ impl VulkanFrame<'_> {
         });
         self.state = VulkanFrameState::Recording;
 
-        if let Err(err) = self.transition_image_layout(
-            &context.target,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            context.release_target_to_foreign,
-        ) {
+        if let Err(err) =
+            self.transition_image_layout(&context.target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        {
             self.abort_recording();
             return Err(err);
         }
@@ -1413,7 +1400,7 @@ impl Drop for VulkanFrame<'_> {
     }
 }
 
-fn retained_recording_images(recording: &FrameRecording) -> Vec<Arc<ImportedDmabufImage>> {
+fn retained_recording_images(recording: &FrameRecording) -> Vec<Arc<VulkanImage>> {
     let mut images = Vec::with_capacity(
         recording
             .pending_layouts
@@ -1610,34 +1597,6 @@ fn nearly_equal(lhs: f64, rhs: f64) -> bool {
 
 fn source_rect_is_texel_aligned(src: Rectangle<f64, BufferCoord>) -> bool {
     nearly_equal(src.loc.x, src.loc.x.round()) && nearly_equal(src.loc.y, src.loc.y.round())
-}
-
-fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
-        vk::ImageLayout::GENERAL => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
-        ),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ)
-        }
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
-        }
-        _ => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-    }
 }
 
 fn combine_image_transform(src_transform: Transform, output_transform: Transform) -> Transform {
@@ -1855,7 +1814,7 @@ mod tests {
             .bind_dmabuf_target(&dmabuf)
             .expect("binding dmabuf target should succeed");
         let target_image = target
-            .imported_image()
+            .image_resource()
             .expect("dmabuf target should retain its imported image")
             .clone();
         assert!(target_image.is_owned_by_foreign());
@@ -2052,7 +2011,7 @@ mod tests {
             Err(_) => return,
         };
         let texture_image = texture
-            .imported_image()
+            .image_resource()
             .expect("dmabuf texture should retain its imported image")
             .clone();
 
@@ -2240,7 +2199,7 @@ mod tests {
             Err(_) => return,
         };
         let texture_image = texture
-            .imported_image()
+            .image_resource()
             .expect("dmabuf texture should retain its imported image")
             .clone();
 

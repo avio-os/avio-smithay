@@ -1,9 +1,6 @@
 use std::{
     os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
-    sync::{
-        atomic::{AtomicBool, AtomicI32, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use ash::{khr, vk};
@@ -25,6 +22,7 @@ use super::{
         render_view_format, srgb_view_format_list, texture_view_components, ColorEncoding,
         FormatCapabilities, ModifierCapability,
     },
+    image::VulkanImage,
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
@@ -83,7 +81,7 @@ struct DmabufSignature {
 pub(crate) struct CachedDmabuf {
     pub(crate) handle: WeakDmabuf,
     signature: DmabufSignature,
-    imported: Arc<ImportedDmabufImage>,
+    imported: Arc<VulkanImage>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,7 +149,7 @@ impl DmabufState {
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
         let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::RenderTarget)?;
-        Ok(VulkanTarget::from_dmabuf_import(
+        Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
             Some(dmabuf.format().code),
@@ -174,7 +172,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
         role: DmabufRole,
-    ) -> Result<Arc<ImportedDmabufImage>, VulkanRendererError> {
+    ) -> Result<Arc<VulkanImage>, VulkanRendererError> {
         self.import_attempts_total = self.import_attempts_total.saturating_add(1);
         self.maybe_cleanup();
 
@@ -209,7 +207,7 @@ impl DmabufState {
             .map(|cached| cached.imported.usage() | requested_usage)
             .unwrap_or(requested_usage);
 
-        let imported = self.create_imported_image(device, dmabuf, &descriptor, usage)?;
+        let imported = self.create_image_resource(device, dmabuf, &descriptor, usage)?;
         let _ = self.cache.shift_remove(&key);
         self.cache.insert(
             key.clone(),
@@ -402,13 +400,13 @@ impl DmabufState {
         })
     }
 
-    fn create_imported_image(
+    fn create_image_resource(
         &mut self,
         device: &DeviceState,
         dmabuf: &Dmabuf,
         descriptor: &DmabufImportDescriptor,
         usage: vk::ImageUsageFlags,
-    ) -> Result<Arc<ImportedDmabufImage>, VulkanRendererError> {
+    ) -> Result<Arc<VulkanImage>, VulkanRendererError> {
         let device_handle = device.shared_device();
         let vk_device = device_handle.handle();
         let format = descriptor.signature.format;
@@ -624,7 +622,7 @@ impl DmabufState {
         let import_id = self.next_import_id;
         self.next_import_id = self.next_import_id.wrapping_add(1);
 
-        Ok(Arc::new(ImportedDmabufImage::new_with_memories(
+        Ok(Arc::new(VulkanImage::new_external_dmabuf(
             import_id,
             image,
             memories,
@@ -734,207 +732,6 @@ impl DmabufState {
         }
 
         Ok(index)
-    }
-}
-
-pub(crate) struct ImportedDmabufImage {
-    import_id: u64,
-    image: vk::Image,
-    memories: Vec<vk::DeviceMemory>,
-    sampled_view: vk::ImageView,
-    render_view: vk::ImageView,
-    size: Size<i32, BufferCoord>,
-    format: Format,
-    vk_format: vk::Format,
-    color_encoding: ColorEncoding,
-    usage: vk::ImageUsageFlags,
-    y_inverted: bool,
-    layout: AtomicI32,
-    owned_by_foreign: AtomicBool,
-    device: Arc<DeviceHandle>,
-}
-
-impl std::fmt::Debug for ImportedDmabufImage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImportedDmabufImage")
-            .field("import_id", &self.import_id)
-            .field("image", &self.image)
-            .field("memories", &self.memories)
-            .field("sampled_view", &self.sampled_view)
-            .field("render_view", &self.render_view)
-            .field("size", &self.size)
-            .field("format", &self.format)
-            .field("vk_format", &self.vk_format)
-            .field("usage", &self.usage)
-            .field("y_inverted", &self.y_inverted)
-            .finish()
-    }
-}
-
-impl ImportedDmabufImage {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        import_id: u64,
-        image: vk::Image,
-        memory: vk::DeviceMemory,
-        sampled_view: vk::ImageView,
-        render_view: vk::ImageView,
-        size: Size<i32, BufferCoord>,
-        format: Format,
-        vk_format: vk::Format,
-        color_encoding: ColorEncoding,
-        usage: vk::ImageUsageFlags,
-        y_inverted: bool,
-        initial_layout: vk::ImageLayout,
-        device: Arc<DeviceHandle>,
-    ) -> Self {
-        Self::new_with_memories(
-            import_id,
-            image,
-            vec![memory],
-            sampled_view,
-            render_view,
-            size,
-            format,
-            vk_format,
-            color_encoding,
-            usage,
-            y_inverted,
-            initial_layout,
-            device,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_memories(
-        import_id: u64,
-        image: vk::Image,
-        memories: Vec<vk::DeviceMemory>,
-        sampled_view: vk::ImageView,
-        render_view: vk::ImageView,
-        size: Size<i32, BufferCoord>,
-        format: Format,
-        vk_format: vk::Format,
-        color_encoding: ColorEncoding,
-        usage: vk::ImageUsageFlags,
-        y_inverted: bool,
-        initial_layout: vk::ImageLayout,
-        device: Arc<DeviceHandle>,
-    ) -> Self {
-        Self {
-            import_id,
-            image,
-            memories,
-            sampled_view,
-            render_view,
-            size,
-            format,
-            vk_format,
-            color_encoding,
-            usage,
-            y_inverted,
-            layout: AtomicI32::new(initial_layout.as_raw()),
-            // Every DMA-BUF import starts outside this VkDevice's ownership.
-            // The first layout transition acquires it from VK_QUEUE_FAMILY_FOREIGN_EXT.
-            owned_by_foreign: AtomicBool::new(true),
-            device,
-        }
-    }
-
-    pub(crate) fn id(&self) -> u64 {
-        self.import_id
-    }
-
-    pub(crate) fn image(&self) -> vk::Image {
-        self.image
-    }
-
-    pub(crate) fn view(&self) -> vk::ImageView {
-        self.sampled_view
-    }
-
-    /// Format of the colour attachment view — the `_SRGB` sibling of the storage
-    /// format wherever one exists, so blending happens in linear light. Render passes
-    /// and pipelines must be keyed on this, not on [`Self::vk_format`].
-    pub(crate) fn render_format(&self) -> vk::Format {
-        render_view_format(self.vk_format)
-    }
-
-    /// How this image's stored channels relate to linear light. See [`ColorEncoding`].
-    pub(crate) fn color_encoding(&self) -> ColorEncoding {
-        self.color_encoding
-    }
-
-    /// Whether a render pass targeting this image blends in linear light.
-    ///
-    /// True whenever the storage format has an `_SRGB` sibling to view the attachment
-    /// through. Formats without one — the 2101010 family — keep blending in gamma
-    /// space, and every colour entering such a pass must stay encoded to match.
-    pub(crate) fn blends_in_linear_light(&self) -> bool {
-        self.render_format() != self.vk_format
-    }
-
-    pub(crate) fn render_view(&self) -> vk::ImageView {
-        self.render_view
-    }
-
-    pub(crate) fn vk_format(&self) -> vk::Format {
-        self.vk_format
-    }
-
-    pub(crate) fn format(&self) -> Format {
-        self.format
-    }
-
-    pub(crate) fn size(&self) -> Size<i32, BufferCoord> {
-        self.size
-    }
-
-    pub(crate) fn usage(&self) -> vk::ImageUsageFlags {
-        self.usage
-    }
-
-    pub(crate) fn y_inverted(&self) -> bool {
-        self.y_inverted
-    }
-
-    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
-        vk::ImageLayout::from_raw(self.layout.load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn set_layout(&self, layout: vk::ImageLayout) {
-        self.layout.store(layout.as_raw(), Ordering::Relaxed);
-    }
-
-    pub(crate) fn take_foreign_ownership(&self) -> bool {
-        self.owned_by_foreign.swap(false, Ordering::AcqRel)
-    }
-
-    pub(crate) fn set_foreign_ownership(&self) {
-        self.owned_by_foreign.store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_owned_by_foreign(&self) -> bool {
-        self.owned_by_foreign.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for ImportedDmabufImage {
-    fn drop(&mut self) {
-        // The descriptor cache retires this view's set on its next drain —
-        // the death edge that keeps the cache tracking the live working set.
-        self.device.note_view_retired(self.sampled_view);
-        // Skipped on a lost device: destroying these objects on a lost VkDevice faults on NVIDIA.
-        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
-        self.device.destroy_with(|device| unsafe {
-            device.destroy_image_view(self.sampled_view, None);
-            device.destroy_image_view(self.render_view, None);
-            device.destroy_image(self.image, None);
-            for memory in &self.memories {
-                device.free_memory(*memory, None);
-            }
-        });
     }
 }
 
@@ -1114,13 +911,13 @@ mod tests {
             .expect("re-import should succeed");
 
         assert_eq!(
-            texture_second.imported_image_id(),
-            target.imported_image_id(),
+            texture_second.image_resource_id(),
+            target.image_resource_id(),
             "cache should converge to one imported image after usage upgrade"
         );
         assert_ne!(
-            texture_first.imported_image_id(),
-            texture_second.imported_image_id(),
+            texture_first.image_resource_id(),
+            texture_second.image_resource_id(),
             "upgrading usage from sampled-only to sampled+render should re-import once"
         );
 

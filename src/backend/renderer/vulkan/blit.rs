@@ -10,8 +10,12 @@ use crate::{
 };
 
 use super::{
-    device::DeviceState, dmabuf::ImportedDmabufImage, VulkanRenderer, VulkanRendererError, VulkanTarget,
-    VulkanTexture,
+    device::DeviceState,
+    image::{
+        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
+        restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
+    },
+    VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
 /// One image blit operation in a Vulkan batch.
@@ -50,8 +54,8 @@ pub(crate) struct BlitState {
 
 #[derive(Debug)]
 struct ResolvedBlitChainStep {
-    source: Arc<ImportedDmabufImage>,
-    destination: Arc<ImportedDmabufImage>,
+    source: Arc<VulkanImage>,
+    destination: Arc<VulkanImage>,
     source_rect: Rectangle<i32, Physical>,
     destination_rect: Rectangle<i32, Physical>,
     filter: TextureFilter,
@@ -59,7 +63,7 @@ struct ResolvedBlitChainStep {
 
 #[derive(Debug)]
 pub(crate) struct TrackedBlitImageLayout {
-    pub(crate) image: Arc<ImportedDmabufImage>,
+    pub(crate) image: Arc<VulkanImage>,
     pub(crate) current_layout: vk::ImageLayout,
     pub(crate) restore_layout: vk::ImageLayout,
 }
@@ -70,8 +74,8 @@ impl BlitState {
     fn blit_images(
         &mut self,
         device: &mut DeviceState,
-        from: Arc<ImportedDmabufImage>,
-        to: Arc<ImportedDmabufImage>,
+        from: Arc<VulkanImage>,
+        to: Arc<VulkanImage>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
@@ -238,12 +242,12 @@ impl BlitState {
 
         let mut resolved_steps = Vec::with_capacity(steps.len());
         for step in steps {
-            let Some(source) = step.source.imported_image().cloned() else {
+            let Some(source) = step.source.image_resource().cloned() else {
                 return Err(VulkanRendererError::NotImplemented(
                     "blit chain currently requires image-backed Vulkan source textures",
                 ));
             };
-            let Some(destination) = step.destination.imported_image().cloned() else {
+            let Some(destination) = step.destination.image_resource().cloned() else {
                 return Err(VulkanRendererError::NotImplemented(
                     "blit chain currently requires image-backed Vulkan destination textures",
                 ));
@@ -370,8 +374,8 @@ impl BlitState {
     fn validate_blit_images(
         &mut self,
         device: &DeviceState,
-        from: &ImportedDmabufImage,
-        to: &ImportedDmabufImage,
+        from: &VulkanImage,
+        to: &VulkanImage,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
@@ -455,12 +459,12 @@ impl Blit for VulkanRenderer {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error> {
-        let Some(from_image) = from.imported_image().cloned() else {
+        let Some(from_image) = from.image_resource().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "blit currently requires image-backed Vulkan source targets",
             ));
         };
-        let Some(to_image) = to.imported_image().cloned() else {
+        let Some(to_image) = to.image_resource().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "blit currently requires image-backed Vulkan destination targets",
             ));
@@ -544,7 +548,7 @@ pub(crate) fn transition_tracked_image_layout(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     layouts: &mut IndexMap<u64, TrackedBlitImageLayout>,
-    image: Arc<ImportedDmabufImage>,
+    image: Arc<VulkanImage>,
     new_layout: vk::ImageLayout,
 ) {
     let entry = layouts.entry(image.id()).or_insert_with(|| {
@@ -577,8 +581,8 @@ pub(crate) fn transition_tracked_image_layout(
 fn record_image_blit(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    from: &ImportedDmabufImage,
-    to: &ImportedDmabufImage,
+    from: &VulkanImage,
+    to: &VulkanImage,
     src: Rectangle<i32, Physical>,
     dst: Rectangle<i32, Physical>,
     filter: TextureFilter,
@@ -685,201 +689,6 @@ fn record_image_blit(
     }
 }
 
-type ForeignBlitImages = IndexMap<u64, (Arc<ImportedDmabufImage>, vk::ImageLayout)>;
-
-fn acquire_images_from_foreign(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    queue_family_index: u32,
-    images: impl IntoIterator<Item = (Arc<ImportedDmabufImage>, vk::ImageLayout)>,
-) -> ForeignBlitImages {
-    let mut acquired = ForeignBlitImages::new();
-    for (image, layout) in images {
-        if acquired.contains_key(&image.id()) || !image.take_foreign_ownership() {
-            continue;
-        }
-        acquired.insert(image.id(), (image, layout));
-    }
-    if acquired.is_empty() {
-        return acquired;
-    }
-
-    let mut dst_stage_mask = vk::PipelineStageFlags::empty();
-    let barriers = acquired
-        .values()
-        .map(|(image, layout)| {
-            let (dst_stage, dst_access) = stage_access_for_layout(*layout);
-            dst_stage_mask |= dst_stage;
-            vk::ImageMemoryBarrier::default()
-                .old_layout(*layout)
-                .new_layout(*layout)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(queue_family_index)
-                .image(image.image())
-                .subresource_range(color_subresource_range())
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(dst_access)
-        })
-        .collect::<Vec<_>>();
-
-    // SAFETY: The command buffer is recording and every imported image is
-    // retained through submission by its caller.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            if dst_stage_mask.is_empty() {
-                vk::PipelineStageFlags::ALL_COMMANDS
-            } else {
-                dst_stage_mask
-            },
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barriers,
-        );
-    }
-    acquired
-}
-
-fn release_images_to_foreign(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    queue_family_index: u32,
-    images: &ForeignBlitImages,
-) {
-    if images.is_empty() {
-        return;
-    }
-
-    let mut src_stage_mask = vk::PipelineStageFlags::empty();
-    let barriers = images
-        .values()
-        .map(|(image, layout)| {
-            let (src_stage, src_access) = stage_access_for_layout(*layout);
-            src_stage_mask |= src_stage;
-            vk::ImageMemoryBarrier::default()
-                .old_layout(*layout)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(queue_family_index)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .image(image.image())
-                .subresource_range(color_subresource_range())
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::empty())
-        })
-        .collect::<Vec<_>>();
-
-    // SAFETY: The barrier follows the final blit access in this command
-    // buffer and returns exclusive ownership to the external producer.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            if src_stage_mask.is_empty() {
-                vk::PipelineStageFlags::ALL_COMMANDS
-            } else {
-                src_stage_mask
-            },
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barriers,
-        );
-    }
-}
-
-fn restore_unsubmitted_foreign_acquires(images: &ForeignBlitImages) {
-    for (image, _) in images.values() {
-        image.set_foreign_ownership();
-    }
-}
-
-fn commit_foreign_releases(images: &ForeignBlitImages) {
-    for (image, _) in images.values() {
-        image.set_layout(vk::ImageLayout::GENERAL);
-        image.set_foreign_ownership();
-    }
-}
-
-fn color_subresource_range() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1)
-}
-
-pub(crate) fn transition_image_layout(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-) {
-    let (src_stage, src_access) = stage_access_for_layout(old_layout);
-    let (dst_stage, dst_access) = stage_access_for_layout(new_layout);
-
-    let barrier = [vk::ImageMemoryBarrier::default()
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
-        .src_access_mask(src_access)
-        .dst_access_mask(dst_access)];
-
-    // SAFETY: Command buffer recording is active and image handle belongs to this device.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-    }
-}
-
-fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
-        vk::ImageLayout::GENERAL => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
-        ),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ)
-        }
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
-        }
-        _ => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use ash::vk;
@@ -896,10 +705,10 @@ mod tests {
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
 
-    use super::{
-        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign, VulkanRenderer,
-        VulkanRendererError,
+    use super::super::image::{
+        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
     };
+    use super::{VulkanRenderer, VulkanRendererError};
 
     fn init_renderer() -> Option<VulkanRenderer> {
         let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
@@ -927,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn ownership_barriers_round_trip_an_imported_image() {
+    fn renderer_local_image_is_excluded_from_foreign_barriers() {
         let Some(mut renderer) = init_renderer() else {
             return;
         };
@@ -939,10 +748,11 @@ mod tests {
             Err(_) => return,
         };
         let image = texture
-            .imported_image()
+            .image_resource()
             .expect("offscreen allocation should retain its imported image")
             .clone();
-        assert!(image.is_owned_by_foreign());
+        assert!(image.is_renderer_local());
+        assert!(!image.is_owned_by_foreign());
 
         let command_buffer = renderer
             .device
@@ -964,6 +774,7 @@ mod tests {
             renderer.device.queue_family_index(),
             [(image.clone(), image.current_layout())],
         );
+        assert!(acquired.is_empty());
         assert!(!image.is_owned_by_foreign());
         release_images_to_foreign(
             renderer.device.device_handle(),
@@ -982,14 +793,14 @@ mod tests {
         renderer
             .device
             .submit_with_resources_and_fence(command_buffer, Vec::new(), vec![image.clone()])
-            .expect("ownership transfer should submit");
+            .expect("empty local ownership batch should submit");
         commit_foreign_releases(&acquired);
-        assert!(image.is_owned_by_foreign());
-        assert_eq!(image.current_layout(), vk::ImageLayout::GENERAL);
+        assert!(!image.is_owned_by_foreign());
+        assert_eq!(image.current_layout(), vk::ImageLayout::UNDEFINED);
         renderer
             .device
             .wait_for_all_submissions()
-            .expect("ownership transfer should complete");
+            .expect("local ownership test submission should complete");
     }
 
     #[test]

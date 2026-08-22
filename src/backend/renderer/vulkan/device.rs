@@ -19,7 +19,7 @@ use crate::backend::{
 };
 
 use super::{
-    dmabuf::ImportedDmabufImage,
+    image::{transition_image_layout, VulkanImage},
     staging::{StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
     VulkanRendererError,
@@ -49,7 +49,7 @@ struct InFlightSubmission {
     export_semaphore: Option<vk::Semaphore>,
     command_buffers: Vec<vk::CommandBuffer>,
     framebuffers: Vec<vk::Framebuffer>,
-    retained_images: Vec<Arc<ImportedDmabufImage>>,
+    retained_images: Vec<Arc<VulkanImage>>,
     staging_reservations: Vec<StagingReservation>,
     wait_semaphores: Vec<vk::Semaphore>,
     submitted_at: Instant,
@@ -77,7 +77,7 @@ impl SubmissionKind {
 }
 
 struct PendingUpload {
-    image: Arc<ImportedDmabufImage>,
+    image: Arc<VulkanImage>,
     reservation: StagingReservation,
     region: vk::BufferImageCopy,
     old_layout: vk::ImageLayout,
@@ -582,9 +582,14 @@ impl DeviceState {
     /// command buffer and performs no queue submission.
     pub(crate) fn queue_image_upload(
         &mut self,
-        image: Arc<ImportedDmabufImage>,
+        image: Arc<VulkanImage>,
         upload: ImageUpload<'_>,
     ) -> Result<(), VulkanRendererError> {
+        if !image.is_renderer_local() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "memory uploads require a renderer-local Vulkan image",
+            ));
+        }
         self.reclaim_completed_submissions()?;
         if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
             return Err(VulkanRendererError::UploadBatchFull {
@@ -905,7 +910,7 @@ impl DeviceState {
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
-        retained_images: Vec<Arc<ImportedDmabufImage>>,
+        retained_images: Vec<Arc<VulkanImage>>,
     ) -> Result<SubmissionId, VulkanRendererError> {
         let (id, _) = self.submit_with_resources_and_fence(command_buffer, framebuffers, retained_images)?;
         Ok(id)
@@ -925,7 +930,7 @@ impl DeviceState {
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
-        retained_images: Vec<Arc<ImportedDmabufImage>>,
+        retained_images: Vec<Arc<VulkanImage>>,
     ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
         self.submit_tracked(
             command_buffer,
@@ -941,7 +946,7 @@ impl DeviceState {
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
-        mut retained_images: Vec<Arc<ImportedDmabufImage>>,
+        mut retained_images: Vec<Arc<VulkanImage>>,
         kind: SubmissionKind,
     ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
         if self.device.is_lost() {
@@ -1548,72 +1553,6 @@ mod submission_kind_tests {
 
 fn duration_to_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn transition_image_layout(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-) {
-    let (src_stage, src_access) = stage_access_for_layout(old_layout);
-    let (dst_stage, dst_access) = stage_access_for_layout(new_layout);
-    let barriers = [vk::ImageMemoryBarrier::default()
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
-        .src_access_mask(src_access)
-        .dst_access_mask(dst_access)];
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barriers,
-        );
-    }
-}
-
-fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
-    match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
-        vk::ImageLayout::GENERAL => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
-        ),
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ)
-        }
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
-            (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
-        }
-        _ => (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ),
-    }
 }
 
 impl Drop for DeviceState {
