@@ -13,7 +13,10 @@ use crate::{
 
 use super::{
     device::DeviceState,
-    format::{render_view_format, srgb_view_format_list, texture_view_components, ColorEncoding},
+    format::{
+        optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
+        ColorEncoding,
+    },
     image::{
         acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
         restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
@@ -58,7 +61,8 @@ impl ReadbackState {
 
         let vk_format = crate::backend::allocator::vulkan::format::get_vk_format(format)
             .ok_or(VulkanRendererError::UnsupportedMemoryFormat(format))?;
-        if !format_supports_offscreen_usage(device, vk_format) {
+        let format_features = optimal_tiling_features(device.physical_device(), vk_format);
+        if !format_supports_offscreen_usage(format_features) {
             return Err(VulkanRendererError::UnsupportedMemoryFormat(format));
         }
 
@@ -202,6 +206,7 @@ impl ReadbackState {
                 modifier: Modifier::Invalid,
             },
             vk_format,
+            format_features,
             // Offscreens are filled by our own linear-blending render passes, so their
             // stored bytes are the sRGB encoding of a premultiplied *linear* value.
             ColorEncoding::LinearPremultiplied,
@@ -504,20 +509,12 @@ impl ExportMem for VulkanRenderer {
     }
 }
 
-fn format_supports_offscreen_usage(device: &DeviceState, format: vk::Format) -> bool {
-    let properties = unsafe {
-        device
-            .physical_device()
-            .instance()
-            .handle()
-            .get_physical_device_format_properties(device.physical_device().handle(), format)
-    };
-
+fn format_supports_offscreen_usage(features: vk::FormatFeatureFlags) -> bool {
     let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
         | vk::FormatFeatureFlags::SAMPLED_IMAGE
         | vk::FormatFeatureFlags::TRANSFER_SRC
         | vk::FormatFeatureFlags::TRANSFER_DST;
-    properties.optimal_tiling_features.contains(required)
+    features.contains(required)
 }
 
 fn validate_region(

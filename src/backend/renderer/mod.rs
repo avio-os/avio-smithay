@@ -217,6 +217,26 @@ impl From<wayland_server::protocol::wl_output::Transform> for Transform {
     }
 }
 
+/// Operations the renderer must be allowed to perform on a bound target.
+///
+/// Most targets are only drawn into. An inline framebuffer effect also copies
+/// the already-rendered lower scene out of the active target before drawing
+/// the effect, so APIs such as Vulkan must declare transfer-source usage when
+/// the target is imported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderTargetAccess {
+    /// Draw into the target.
+    #[default]
+    Render,
+    /// Draw into the target and copy its completed lower prefix for an inline
+    /// framebuffer effect.
+    FramebufferEffectSource,
+    /// Draw a capture graph directly into the target or receive the terminal
+    /// transport blit when its channel layout differs from the compositor
+    /// accumulator.
+    CaptureTarget,
+}
+
 /// Abstraction for Renderers, that can render into different targets
 pub trait Bind<Target>: Renderer {
     /// Initialize a framebuffer with a given rendering target.
@@ -227,6 +247,19 @@ pub trait Bind<Target>: Renderer {
     /// **Note**: Some renderers might only be able to determine if a handle is compatible
     ///     during a `Renderer::render` call with the resulting `Framebuffer`.
     fn bind<'a>(&mut self, target: &'a mut Target) -> Result<Self::Framebuffer<'a>, Self::Error>;
+
+    /// Initialize a framebuffer with an explicit target-access contract.
+    ///
+    /// Renderers whose target handles do not encode creation-time usage may
+    /// keep the default implementation. APIs such as Vulkan override this to
+    /// import external images with the exact usage required by the frame.
+    fn bind_with_access<'a>(
+        &mut self,
+        target: &'a mut Target,
+        _access: RenderTargetAccess,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
 
     /// Supported pixel formats for given targets, if applicable.
     fn supported_formats(&self) -> Option<FormatSet> {

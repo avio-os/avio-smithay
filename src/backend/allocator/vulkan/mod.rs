@@ -747,11 +747,13 @@ impl VulkanAllocator {
 
         // Allocate image memory
         let memory_reqs = unsafe { self.device.get_image_memory_requirements(guard.image) };
-        // TODO: Memory type index
+        let memory_type_index = compatible_memory_type_index(memory_reqs.memory_type_bits)
+            .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let alloc_create_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_reqs.size)
+            .memory_type_index(memory_type_index)
             .push_next(&mut export_memory_allocate_info);
 
         unsafe {
@@ -810,5 +812,22 @@ impl VulkanAllocator {
             // If the image was dropped, return false
             !drop
         })
+    }
+}
+
+fn compatible_memory_type_index(memory_type_bits: u32) -> Option<u32> {
+    (memory_type_bits != 0).then(|| memory_type_bits.trailing_zeros())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compatible_memory_type_index;
+
+    #[test]
+    fn allocation_uses_a_memory_type_permitted_by_the_image() {
+        assert_eq!(compatible_memory_type_index(0), None);
+        assert_eq!(compatible_memory_type_index(0b0001), Some(0));
+        assert_eq!(compatible_memory_type_index(0b1000), Some(3));
+        assert_eq!(compatible_memory_type_index(0b1010), Some(1));
     }
 }

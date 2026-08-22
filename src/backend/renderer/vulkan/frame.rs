@@ -11,8 +11,9 @@ use crate::{
             format::{has_alpha, FormatSet},
         },
         renderer::{
-            sync::SyncPoint, Bind, Blit, BlitFrame, Color32F, ContextId, Frame, ImportDma, Renderer,
-            RendererSuper, RoundedClip, Texture, TextureFilter, TextureRenderEffect,
+            sync::SyncPoint, Bind, Blit, BlitFrame, Color32F, ContextId, Frame, ImportDma,
+            RenderTargetAccess, Renderer, RendererSuper, RoundedClip, Texture, TextureFilter,
+            TextureRenderEffect,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform},
@@ -258,6 +259,18 @@ impl Renderer for VulkanRenderer {
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
         self.bind_dmabuf_target(target)
+    }
+
+    fn bind_with_access<'a>(
+        &mut self,
+        target: &'a mut Dmabuf,
+        access: RenderTargetAccess,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        match access {
+            RenderTargetAccess::Render => self.bind_dmabuf_target(target),
+            RenderTargetAccess::FramebufferEffectSource => self.bind_dmabuf_framebuffer_effect_target(target),
+            RenderTargetAccess::CaptureTarget => self.bind_dmabuf_capture_target(target),
+        }
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
@@ -714,19 +727,19 @@ impl VulkanFrame<'_> {
                 "framebuffer-effect capture extent does not match transformed read area",
             ));
         }
-
-        {
-            let renderer = &mut *self.renderer;
-            let (blit, device) = (&mut renderer.blit, &renderer.device);
-            blit.validate_blit_images(
-                device,
-                &target,
-                &capture_image,
-                source_area,
-                capture_area,
-                TextureFilter::Linear,
-            )?;
+        if target.vk_format() != capture_image.vk_format() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "framebuffer-effect capture format must match the active target format",
+            ));
         }
+
+        self.renderer.blit.validate_blit_images(
+            &target,
+            &capture_image,
+            source_area,
+            capture_area,
+            TextureFilter::Linear,
+        )?;
 
         // SAFETY: The frame owns an active render pass in this command buffer.
         unsafe {
@@ -1911,8 +1924,8 @@ mod tests {
                 Allocator, Fourcc,
             },
             renderer::{
-                vulkan::VulkanTexture, Bind, BlitFrame, Color32F, ExportMem, Frame, Offscreen, Renderer,
-                Texture, TextureFilter,
+                vulkan::VulkanTexture, Bind, Blit, BlitFrame, Color32F, ExportMem, Frame, Offscreen,
+                RenderTargetAccess, Renderer, Texture, TextureFilter,
             },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
@@ -1942,6 +1955,33 @@ mod tests {
         .ok()?;
 
         Some((renderer, allocator))
+    }
+
+    fn init_renderer_and_effect_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
+        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+        // Avio's Vulkan-allocated external targets are the Venus/virtio path.
+        // NVIDIA's proprietary driver loses the consumer device when a DMA-BUF
+        // exported by a second VkDevice with TRANSFER_SRC usage is first used;
+        // physical NVIDIA outputs use GBM allocation instead. Prefer a device
+        // that can exercise the Vulkan-export contract this test owns.
+        let physical_device = PhysicalDevice::enumerate(&instance)
+            .ok()?
+            .find(|device| device.properties().vendor_id != 0x10de)?;
+        let renderer = VulkanRenderer::new(&physical_device).ok()?;
+        let allocator = VulkanAllocator::new(
+            &physical_device,
+            ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST,
+        )
+        .ok()?;
+        Some((renderer, allocator))
+    }
+
+    fn expected_blue_pixel(format: Fourcc) -> [u8; 4] {
+        match format {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => [255, 0, 0, 255],
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [0, 0, 255, 255],
+            _ => [0, 0, 255, 255],
+        }
     }
 
     fn output_size_for_target(transform: Transform, target_size: Size<i32, Physical>) -> Size<i32, Physical> {
@@ -2423,7 +2463,7 @@ mod tests {
     }
 
     #[test]
-    fn framebuffer_effect_capture_converts_bgra_to_rgba_without_channel_swap() {
+    fn framebuffer_effect_capture_preserves_target_storage_format() {
         let Some((mut renderer, _)) = init_renderer_and_allocator() else {
             return;
         };
@@ -2432,6 +2472,46 @@ mod tests {
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
 
+        let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+            return;
+        };
+        let Ok(capture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+            return;
+        };
+        let Ok(mut target) = renderer.bind(&mut frame_texture) else {
+            return;
+        };
+
+        let mut frame = renderer
+            .render(&mut target, physical_size, Transform::Normal)
+            .expect("frame");
+        frame
+            .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[region])
+            .expect("clear blue accumulator");
+        frame
+            .capture_and_filter_framebuffer(region, &capture, &[])
+            .expect("same-format framebuffer capture");
+        frame
+            .finish()
+            .expect("finish capture")
+            .wait()
+            .expect("same-format capture submission completes");
+
+        let mapping = renderer
+            .copy_texture(&capture, buffer_region, Fourcc::Argb8888)
+            .expect("read capture");
+        let bytes = renderer.map_texture(&mapping).expect("map capture");
+        assert_eq!(&bytes[0..4], &expected_blue_pixel(Fourcc::Argb8888));
+    }
+
+    #[test]
+    fn framebuffer_effect_capture_rejects_a_different_channel_layout() {
+        let Some((mut renderer, _)) = init_renderer_and_allocator() else {
+            return;
+        };
+        let size = Size::from((16, 16));
+        let physical_size = Size::<i32, Physical>::from((16, 16));
+        let region = Rectangle::from_size(physical_size);
         let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
             return;
         };
@@ -2448,16 +2528,145 @@ mod tests {
         frame
             .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[region])
             .expect("clear blue accumulator");
+        let error = frame
+            .capture_and_filter_framebuffer(region, &capture, &[])
+            .expect_err("material capture must not convert channel layouts");
+        assert!(error
+            .to_string()
+            .contains("capture format must match the active target format"));
+    }
+
+    #[test]
+    fn external_dmabuf_effect_target_captures_logical_blue_without_conversion() {
+        let Some((mut renderer, mut allocator)) = init_renderer_and_effect_allocator() else {
+            return;
+        };
+        let Some(format) = renderer
+            .dmabuf_framebuffer_effect_formats()
+            .iter()
+            .copied()
+            .find(|format| {
+                format.code == Fourcc::Argb8888
+                    && format.modifier == crate::backend::allocator::Modifier::Linear
+            })
+            .or_else(|| {
+                renderer
+                    .dmabuf_framebuffer_effect_formats()
+                    .iter()
+                    .copied()
+                    .find(|format| format.code == Fourcc::Argb8888)
+            })
+            .or_else(|| {
+                renderer
+                    .dmabuf_framebuffer_effect_formats()
+                    .iter()
+                    .copied()
+                    .next()
+            })
+        else {
+            return;
+        };
+        let size = Size::from((16, 16));
+        let physical_size = Size::<i32, Physical>::from((16, 16));
+        let region = Rectangle::from_size(physical_size);
+        let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
+        let Ok(buffer) = allocator.create_buffer(16, 16, format.code, &[format.modifier]) else {
+            return;
+        };
+        let Ok(mut dmabuf) = buffer.export() else {
+            return;
+        };
+        let Ok(capture) = renderer.create_buffer(format.code, size) else {
+            return;
+        };
+        let mut target = renderer
+            .bind_with_access(&mut dmabuf, RenderTargetAccess::FramebufferEffectSource)
+            .expect("effect-capable external target bind");
+        assert!(target
+            .image_resource()
+            .expect("image-backed target")
+            .usage()
+            .contains(ash::vk::ImageUsageFlags::TRANSFER_SRC));
+
+        let mut frame = renderer
+            .render(&mut target, physical_size, Transform::Normal)
+            .expect("external target frame");
+        frame
+            .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[region])
+            .expect("clear blue accumulator");
         frame
             .capture_and_filter_framebuffer(region, &capture, &[])
-            .expect("cross-format framebuffer capture");
-        let _ = frame.finish().expect("finish capture").wait();
+            .expect("external same-format framebuffer capture");
+        frame
+            .finish()
+            .expect("finish capture")
+            .wait()
+            .expect("external capture submission completes");
 
         let mapping = renderer
-            .copy_texture(&capture, buffer_region, Fourcc::Abgr8888)
+            .copy_texture(&capture, buffer_region, format.code)
             .expect("read capture");
         let bytes = renderer.map_texture(&mapping).expect("map capture");
-        assert_eq!(&bytes[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&bytes[0..4], &expected_blue_pixel(format.code));
+    }
+
+    #[test]
+    fn external_dmabuf_capture_target_accepts_a_terminal_blit() {
+        let Some((mut renderer, mut allocator)) = init_renderer_and_effect_allocator() else {
+            return;
+        };
+        let Some(format) = renderer
+            .dmabuf_capture_formats()
+            .iter()
+            .copied()
+            .find(|format| format.code == Fourcc::Argb8888)
+        else {
+            return;
+        };
+        let size = Size::from((16, 16));
+        let rect = Rectangle::<i32, Physical>::from_size((16, 16).into());
+        let Ok(buffer) = allocator.create_buffer(16, 16, format.code, &[format.modifier]) else {
+            return;
+        };
+        let Ok(mut dmabuf) = buffer.export() else {
+            return;
+        };
+        let Ok(mut source_texture) = renderer.create_buffer(format.code, size) else {
+            return;
+        };
+        let mut source = renderer.bind(&mut source_texture).expect("source target");
+        let mut source_frame = renderer
+            .render(&mut source, (16, 16).into(), Transform::Normal)
+            .expect("source frame");
+        source_frame
+            .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[rect])
+            .expect("clear source blue");
+        source_frame
+            .finish()
+            .expect("finish source")
+            .wait()
+            .expect("source submission completes");
+
+        let mut destination = renderer
+            .bind_with_access(&mut dmabuf, RenderTargetAccess::CaptureTarget)
+            .expect("capture target bind");
+        let usage = destination
+            .image_resource()
+            .expect("image-backed capture target")
+            .usage();
+        assert!(usage.contains(ash::vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(usage.contains(ash::vk::ImageUsageFlags::TRANSFER_DST));
+        Blit::blit(
+            &mut renderer,
+            &source,
+            &mut destination,
+            rect,
+            rect,
+            TextureFilter::Linear,
+        )
+        .expect("terminal capture blit")
+        .wait()
+        .expect("terminal capture blit completes");
     }
 
     #[test]

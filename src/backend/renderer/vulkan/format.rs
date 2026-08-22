@@ -65,10 +65,27 @@ pub(crate) fn render_view_format(storage: vk::Format) -> vk::Format {
     get_vk_srgb_format(storage).unwrap_or(storage)
 }
 
+/// Tiling features of a renderer-local or implicit-modifier image.
+pub(crate) fn optimal_tiling_features(
+    physical_device: &PhysicalDevice,
+    format: vk::Format,
+) -> vk::FormatFeatureFlags {
+    // SAFETY: The physical-device handle belongs to this live instance.
+    unsafe {
+        physical_device
+            .instance()
+            .handle()
+            .get_physical_device_format_properties(physical_device.handle(), format)
+            .optimal_tiling_features
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatUsage {
     Import,
     RenderTarget,
+    FramebufferEffectTarget,
+    CaptureTarget,
 }
 
 impl FormatUsage {
@@ -76,6 +93,14 @@ impl FormatUsage {
         match self {
             FormatUsage::Import => vk::ImageUsageFlags::SAMPLED,
             FormatUsage::RenderTarget => vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            FormatUsage::FramebufferEffectTarget => {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+            }
+            FormatUsage::CaptureTarget => {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
+            }
         }
     }
 }
@@ -119,15 +144,25 @@ pub(crate) struct ModifierCapability {
     pub(crate) supports_disjoint_import: bool,
     /// Whether Vulkan accepts a disjoint image with this modifier as a render target.
     pub(crate) supports_disjoint_render: bool,
+    /// Whether Vulkan accepts a disjoint image with this modifier as an inline
+    /// framebuffer-effect accumulator.
+    pub(crate) supports_disjoint_framebuffer_effect: bool,
+    /// Whether Vulkan accepts a disjoint image with this modifier as a direct
+    /// or transport-blit capture target.
+    pub(crate) supports_disjoint_capture: bool,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct FormatCapabilities {
     import_formats: FormatSet,
     render_formats: FormatSet,
+    framebuffer_effect_formats: FormatSet,
+    capture_formats: FormatSet,
     modifier_query_cache: IndexMap<Fourcc, Vec<ModifierCapability>>,
     import_modifiers_by_code: IndexMap<Fourcc, Vec<Modifier>>,
     render_modifiers_by_code: IndexMap<Fourcc, Vec<Modifier>>,
+    framebuffer_effect_modifiers_by_code: IndexMap<Fourcc, Vec<Modifier>>,
+    capture_modifiers_by_code: IndexMap<Fourcc, Vec<Modifier>>,
 }
 
 impl FormatCapabilities {
@@ -140,9 +175,13 @@ impl FormatCapabilities {
 
         let mut import_formats = IndexSet::new();
         let mut render_formats = IndexSet::new();
+        let mut framebuffer_effect_formats = IndexSet::new();
+        let mut capture_formats = IndexSet::new();
         let mut modifier_query_cache = IndexMap::new();
         let mut import_modifiers_by_code: IndexMap<Fourcc, IndexSet<Modifier>> = IndexMap::new();
         let mut render_modifiers_by_code: IndexMap<Fourcc, IndexSet<Modifier>> = IndexMap::new();
+        let mut framebuffer_effect_modifiers_by_code: IndexMap<Fourcc, IndexSet<Modifier>> = IndexMap::new();
+        let mut capture_modifiers_by_code: IndexMap<Fourcc, IndexSet<Modifier>> = IndexMap::new();
 
         for &fourcc in known_formats() {
             let Some(vk_format) = get_vk_format(fourcc) else {
@@ -177,12 +216,33 @@ impl FormatCapabilities {
                         FormatUsage::RenderTarget,
                         vk::ImageCreateFlags::DISJOINT,
                     )?;
+                let supports_disjoint_framebuffer_effect = supports_disjoint
+                    && Self::is_explicit_modifier_supported(
+                        physical_device,
+                        vk_format,
+                        modifier,
+                        FormatUsage::FramebufferEffectTarget,
+                        vk::ImageCreateFlags::DISJOINT,
+                    )?;
+                let supports_disjoint_capture = supports_disjoint
+                    && properties
+                        .drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::BLIT_DST)
+                    && Self::is_explicit_modifier_supported(
+                        physical_device,
+                        vk_format,
+                        modifier,
+                        FormatUsage::CaptureTarget,
+                        vk::ImageCreateFlags::DISJOINT,
+                    )?;
                 cached_modifiers.push(ModifierCapability {
                     modifier,
                     drm_format_modifier_plane_count: properties.drm_format_modifier_plane_count,
                     drm_format_modifier_tiling_features: properties.drm_format_modifier_tiling_features,
                     supports_disjoint_import,
                     supports_disjoint_render,
+                    supports_disjoint_framebuffer_effect,
+                    supports_disjoint_capture,
                 });
 
                 if Self::is_explicit_modifier_supported(
@@ -195,6 +255,40 @@ impl FormatCapabilities {
                     Self::insert_supported_format(
                         &mut import_formats,
                         &mut import_modifiers_by_code,
+                        fourcc,
+                        modifier,
+                    );
+                }
+
+                if properties
+                    .drm_format_modifier_tiling_features
+                    .contains(vk::FormatFeatureFlags::BLIT_DST)
+                    && Self::is_explicit_modifier_supported(
+                        physical_device,
+                        vk_format,
+                        modifier,
+                        FormatUsage::CaptureTarget,
+                        vk::ImageCreateFlags::empty(),
+                    )?
+                {
+                    Self::insert_supported_format(
+                        &mut capture_formats,
+                        &mut capture_modifiers_by_code,
+                        fourcc,
+                        modifier,
+                    );
+                }
+
+                if Self::is_explicit_modifier_supported(
+                    physical_device,
+                    vk_format,
+                    modifier,
+                    FormatUsage::FramebufferEffectTarget,
+                    vk::ImageCreateFlags::empty(),
+                )? {
+                    Self::insert_supported_format(
+                        &mut framebuffer_effect_formats,
+                        &mut framebuffer_effect_modifiers_by_code,
                         fourcc,
                         modifier,
                     );
@@ -239,14 +333,48 @@ impl FormatCapabilities {
                     Modifier::Invalid,
                 );
             }
+
+            if Self::is_implicit_modifier_supported(
+                physical_device,
+                vk_format,
+                FormatUsage::FramebufferEffectTarget,
+            )? {
+                Self::insert_supported_format(
+                    &mut framebuffer_effect_formats,
+                    &mut framebuffer_effect_modifiers_by_code,
+                    fourcc,
+                    Modifier::Invalid,
+                );
+            }
+
+            if optimal_tiling_features(physical_device, vk_format).contains(vk::FormatFeatureFlags::BLIT_DST)
+                && Self::is_implicit_modifier_supported(
+                    physical_device,
+                    vk_format,
+                    FormatUsage::CaptureTarget,
+                )?
+            {
+                Self::insert_supported_format(
+                    &mut capture_formats,
+                    &mut capture_modifiers_by_code,
+                    fourcc,
+                    Modifier::Invalid,
+                );
+            }
         }
 
         Ok(FormatCapabilities {
             import_formats: import_formats.into_iter().collect(),
             render_formats: render_formats.into_iter().collect(),
+            framebuffer_effect_formats: framebuffer_effect_formats.into_iter().collect(),
+            capture_formats: capture_formats.into_iter().collect(),
             modifier_query_cache,
             import_modifiers_by_code: Self::finalize_modifier_map(import_modifiers_by_code),
             render_modifiers_by_code: Self::finalize_modifier_map(render_modifiers_by_code),
+            framebuffer_effect_modifiers_by_code: Self::finalize_modifier_map(
+                framebuffer_effect_modifiers_by_code,
+            ),
+            capture_modifiers_by_code: Self::finalize_modifier_map(capture_modifiers_by_code),
         })
     }
 
@@ -258,12 +386,28 @@ impl FormatCapabilities {
         &self.render_formats
     }
 
+    pub(crate) fn framebuffer_effect_formats(&self) -> &FormatSet {
+        &self.framebuffer_effect_formats
+    }
+
+    pub(crate) fn capture_formats(&self) -> &FormatSet {
+        &self.capture_formats
+    }
+
     pub(crate) fn has_import_format(&self, format: Format) -> bool {
         self.import_formats.contains(&format)
     }
 
     pub(crate) fn has_render_format(&self, format: Format) -> bool {
         self.render_formats.contains(&format)
+    }
+
+    pub(crate) fn has_framebuffer_effect_format(&self, format: Format) -> bool {
+        self.framebuffer_effect_formats.contains(&format)
+    }
+
+    pub(crate) fn has_capture_format(&self, format: Format) -> bool {
+        self.capture_formats.contains(&format)
     }
 
     pub(crate) fn import_modifiers(&self, code: Fourcc) -> &[Modifier] {
@@ -280,12 +424,35 @@ impl FormatCapabilities {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn framebuffer_effect_modifiers(&self, code: Fourcc) -> &[Modifier] {
+        self.framebuffer_effect_modifiers_by_code
+            .get(&code)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn capture_modifiers(&self, code: Fourcc) -> &[Modifier] {
+        self.capture_modifiers_by_code
+            .get(&code)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub(crate) fn supports_implicit_import_modifier(&self, code: Fourcc) -> bool {
         self.import_modifiers(code).contains(&Modifier::Invalid)
     }
 
     pub(crate) fn supports_implicit_render_modifier(&self, code: Fourcc) -> bool {
         self.render_modifiers(code).contains(&Modifier::Invalid)
+    }
+
+    pub(crate) fn supports_implicit_framebuffer_effect_modifier(&self, code: Fourcc) -> bool {
+        self.framebuffer_effect_modifiers(code)
+            .contains(&Modifier::Invalid)
+    }
+
+    pub(crate) fn supports_implicit_capture_modifier(&self, code: Fourcc) -> bool {
+        self.capture_modifiers(code).contains(&Modifier::Invalid)
     }
 
     pub(crate) fn intersect_import_formats(&self, formats: &FormatSet) -> FormatSet {
@@ -302,6 +469,14 @@ impl FormatCapabilities {
 
     pub(crate) fn intersect_render_modifiers(&self, code: Fourcc, requested: &[Modifier]) -> Vec<Modifier> {
         Self::intersect_modifiers(self.render_modifiers(code), requested)
+    }
+
+    pub(crate) fn intersect_framebuffer_effect_modifiers(
+        &self,
+        code: Fourcc,
+        requested: &[Modifier],
+    ) -> Vec<Modifier> {
+        Self::intersect_modifiers(self.framebuffer_effect_modifiers(code), requested)
     }
 
     pub(crate) fn modifier_capabilities(&self, code: Fourcc) -> &[ModifierCapability] {
@@ -489,6 +664,14 @@ mod tests {
         .into_iter()
         .collect();
 
+        let framebuffer_effect_formats: crate::backend::allocator::format::FormatSet = [Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        }]
+        .into_iter()
+        .collect();
+        let capture_formats = framebuffer_effect_formats.clone();
+
         let mut import_modifiers_by_code = IndexMap::new();
         import_modifiers_by_code.insert(
             Fourcc::Argb8888,
@@ -506,12 +689,20 @@ mod tests {
             vec![Modifier::Linear, Modifier::from(0xdead_beef_u64)],
         );
 
+        let mut framebuffer_effect_modifiers_by_code = IndexMap::new();
+        framebuffer_effect_modifiers_by_code.insert(Fourcc::Argb8888, vec![Modifier::Linear]);
+        let capture_modifiers_by_code = framebuffer_effect_modifiers_by_code.clone();
+
         FormatCapabilities {
             import_formats,
             render_formats,
+            framebuffer_effect_formats,
+            capture_formats,
             modifier_query_cache: IndexMap::new(),
             import_modifiers_by_code,
             render_modifiers_by_code,
+            framebuffer_effect_modifiers_by_code,
+            capture_modifiers_by_code,
         }
     }
 
@@ -520,7 +711,42 @@ mod tests {
         let caps = sample_capabilities();
         assert!(caps.supports_implicit_import_modifier(Fourcc::Argb8888));
         assert!(!caps.supports_implicit_render_modifier(Fourcc::Argb8888));
+        assert!(!caps.supports_implicit_framebuffer_effect_modifier(Fourcc::Argb8888));
+        assert!(!caps.supports_implicit_capture_modifier(Fourcc::Argb8888));
         assert!(!caps.supports_implicit_import_modifier(Fourcc::Xrgb8888));
+    }
+
+    #[test]
+    fn framebuffer_effect_modifiers_are_a_stricter_render_contract() {
+        let caps = sample_capabilities();
+        assert!(caps.has_render_format(Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::from(0xdead_beef_u64),
+        }));
+        assert!(!caps.has_framebuffer_effect_format(Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::from(0xdead_beef_u64),
+        }));
+        assert_eq!(
+            caps.intersect_framebuffer_effect_modifiers(
+                Fourcc::Argb8888,
+                &[Modifier::from(0xdead_beef_u64), Modifier::Linear],
+            ),
+            vec![Modifier::Linear]
+        );
+    }
+
+    #[test]
+    fn capture_target_contract_is_separate_from_render_only_formats() {
+        let caps = sample_capabilities();
+        assert!(caps.has_capture_format(Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        }));
+        assert!(!caps.has_capture_format(Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::from(0xdead_beef_u64),
+        }));
     }
 
     #[test]

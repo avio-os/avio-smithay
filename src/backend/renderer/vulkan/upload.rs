@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     device::DeviceState,
-    format::{texture_view_components, ColorEncoding},
+    format::{optimal_tiling_features, texture_view_components, ColorEncoding},
     image::VulkanImage,
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
@@ -461,6 +461,7 @@ fn create_upload_image(
     y_inverted: bool,
 ) -> Result<std::sync::Arc<VulkanImage>, VulkanRendererError> {
     let vk_format = validate_memory_format(format)?;
+    let format_features = optimal_tiling_features(device.physical_device(), vk_format);
     let device_handle = device.shared_device();
     let vk_device = device_handle.handle();
     let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
@@ -588,6 +589,7 @@ fn create_upload_image(
             modifier: Modifier::Invalid,
         },
         vk_format,
+        format_features,
         // shm buffers and CPU-rasterized chrome are premultiplied in electrical values,
         // exactly like client DMA-BUFs. These images are SAMPLED-only, so they keep a
         // storage-format render view: it is never usable as a colour attachment.

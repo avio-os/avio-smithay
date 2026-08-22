@@ -48,6 +48,7 @@ pub(crate) struct VulkanImage {
     size: Size<i32, BufferCoord>,
     format: Format,
     vk_format: vk::Format,
+    format_features: vk::FormatFeatureFlags,
     color_encoding: ColorEncoding,
     usage: vk::ImageUsageFlags,
     y_inverted: bool,
@@ -68,6 +69,7 @@ impl std::fmt::Debug for VulkanImage {
             .field("size", &self.size)
             .field("format", &self.format)
             .field("vk_format", &self.vk_format)
+            .field("format_features", &self.format_features)
             .field("usage", &self.usage)
             .field("y_inverted", &self.y_inverted)
             .field("origin", &self.origin)
@@ -86,6 +88,7 @@ impl VulkanImage {
         size: Size<i32, BufferCoord>,
         format: Format,
         vk_format: vk::Format,
+        format_features: vk::FormatFeatureFlags,
         color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
@@ -101,6 +104,7 @@ impl VulkanImage {
             size,
             format,
             vk_format,
+            format_features,
             color_encoding,
             usage,
             y_inverted,
@@ -120,6 +124,7 @@ impl VulkanImage {
         size: Size<i32, BufferCoord>,
         format: Format,
         vk_format: vk::Format,
+        format_features: vk::FormatFeatureFlags,
         color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
@@ -135,6 +140,7 @@ impl VulkanImage {
             size,
             format,
             vk_format,
+            format_features,
             color_encoding,
             usage,
             y_inverted,
@@ -154,6 +160,7 @@ impl VulkanImage {
         size: Size<i32, BufferCoord>,
         format: Format,
         vk_format: vk::Format,
+        format_features: vk::FormatFeatureFlags,
         color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
@@ -170,6 +177,7 @@ impl VulkanImage {
             size,
             format,
             vk_format,
+            format_features,
             color_encoding,
             usage,
             y_inverted,
@@ -212,6 +220,10 @@ impl VulkanImage {
 
     pub(crate) fn vk_format(&self) -> vk::Format {
         self.vk_format
+    }
+
+    pub(crate) fn format_features(&self) -> vk::FormatFeatureFlags {
+        self.format_features
     }
 
     pub(crate) fn format(&self) -> Format {

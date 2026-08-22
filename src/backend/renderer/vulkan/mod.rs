@@ -279,7 +279,7 @@ impl VulkanRenderer {
             dmabuf: DmabufState::default(),
             upload: UploadState::default(),
             readback: ReadbackState::default(),
-            blit: BlitState::default(),
+            blit: BlitState,
             descriptors,
             pipelines,
         })
@@ -350,6 +350,19 @@ impl VulkanRenderer {
         self.formats.render_formats()
     }
 
+    /// Supported dma-buf format+modifier combinations for render targets
+    /// whose completed lower prefix may be copied by an inline framebuffer
+    /// effect.
+    pub fn dmabuf_framebuffer_effect_formats(&self) -> &FormatSet {
+        self.formats.framebuffer_effect_formats()
+    }
+
+    /// Supported dma-buf format+modifier combinations for direct capture
+    /// rendering and terminal transport blits.
+    pub fn dmabuf_capture_formats(&self) -> &FormatSet {
+        self.formats.capture_formats()
+    }
+
     /// Returns whether a format+modifier is supported for dma-buf texture import.
     pub fn has_dmabuf_import_format(&self, format: Format) -> bool {
         self.formats.has_import_format(format)
@@ -358,6 +371,12 @@ impl VulkanRenderer {
     /// Returns whether a format+modifier is supported for dma-buf render-target binding.
     pub fn has_dmabuf_render_format(&self, format: Format) -> bool {
         self.formats.has_render_format(format)
+    }
+
+    /// Returns whether a format+modifier is supported for a dma-buf
+    /// framebuffer-effect target.
+    pub fn has_dmabuf_framebuffer_effect_format(&self, format: Format) -> bool {
+        self.formats.has_framebuffer_effect_format(format)
     }
 
     /// Supported import modifiers for the given DRM format code.
@@ -370,6 +389,11 @@ impl VulkanRenderer {
         self.formats.render_modifiers(code)
     }
 
+    /// Supported framebuffer-effect target modifiers for the DRM format.
+    pub fn framebuffer_effect_modifiers(&self, code: Fourcc) -> &[Modifier] {
+        self.formats.framebuffer_effect_modifiers(code)
+    }
+
     /// Intersects renderer import capabilities with a caller-provided modifier preference list.
     pub fn intersect_import_modifiers(&self, code: Fourcc, requested: &[Modifier]) -> Vec<Modifier> {
         self.formats.intersect_import_modifiers(code, requested)
@@ -378,6 +402,17 @@ impl VulkanRenderer {
     /// Intersects renderer render-target capabilities with a caller-provided modifier preference list.
     pub fn intersect_render_modifiers(&self, code: Fourcc, requested: &[Modifier]) -> Vec<Modifier> {
         self.formats.intersect_render_modifiers(code, requested)
+    }
+
+    /// Intersects framebuffer-effect target capabilities with a
+    /// caller-provided modifier preference list.
+    pub fn intersect_framebuffer_effect_modifiers(
+        &self,
+        code: Fourcc,
+        requested: &[Modifier],
+    ) -> Vec<Modifier> {
+        self.formats
+            .intersect_framebuffer_effect_modifiers(code, requested)
     }
 
     /// Returns whether implicit modifier support (`Modifier::Invalid`) exists for import.
@@ -399,6 +434,27 @@ impl VulkanRenderer {
     pub fn bind_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTarget, VulkanRendererError> {
         self.dmabuf
             .bind_render_target(&self.device, &self.formats, dmabuf)
+    }
+
+    /// Bind a dma-buf as the active accumulator for inline framebuffer
+    /// effects. The imported Vulkan image declares both color-attachment and
+    /// transfer-source usage.
+    pub fn bind_dmabuf_framebuffer_effect_target(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<VulkanTarget, VulkanRendererError> {
+        self.dmabuf
+            .bind_framebuffer_effect_target(&self.device, &self.formats, dmabuf)
+    }
+
+    /// Bind a dma-buf with the complete direct-render and terminal-blit usage
+    /// contract required by compositor capture.
+    pub fn bind_dmabuf_capture_target(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<VulkanTarget, VulkanRendererError> {
+        self.dmabuf
+            .bind_capture_target(&self.device, &self.formats, dmabuf)
     }
 
     /// Drop stale cached dma-buf imports.

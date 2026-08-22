@@ -48,9 +48,7 @@ impl VulkanBlitChainStep {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct BlitState {
-    format_features: IndexMap<vk::Format, vk::FormatFeatureFlags>,
-}
+pub(crate) struct BlitState;
 
 #[derive(Debug)]
 struct ResolvedBlitChainStep {
@@ -81,7 +79,7 @@ impl BlitState {
         filter: TextureFilter,
     ) -> Result<SyncPoint, VulkanRendererError> {
         trace!(?src, ?dst, ?filter, "recording vulkan blit");
-        self.validate_blit_images(device, &from, &to, src, dst, filter)?;
+        self.validate_blit_images(&from, &to, src, dst, filter)?;
 
         let from_layout = from.current_layout();
         if from_layout == vk::ImageLayout::UNDEFINED {
@@ -210,7 +208,6 @@ impl BlitState {
                 ));
             };
             self.validate_blit_images(
-                device,
                 &source,
                 &destination,
                 step.source_rect,
@@ -329,8 +326,7 @@ impl BlitState {
     }
 
     pub(super) fn validate_blit_images(
-        &mut self,
-        device: &DeviceState,
+        &self,
         from: &VulkanImage,
         to: &VulkanImage,
         src: Rectangle<i32, Physical>,
@@ -358,8 +354,8 @@ impl BlitState {
         }
 
         if image_blit_required(from, to, src, dst) {
-            let source_features = self.query_format_features(device, from.vk_format());
-            let destination_features = self.query_format_features(device, to.vk_format());
+            let source_features = from.format_features();
+            let destination_features = to.format_features();
             if !source_features.contains(vk::FormatFeatureFlags::BLIT_SRC)
                 || !destination_features.contains(vk::FormatFeatureFlags::BLIT_DST)
             {
@@ -377,25 +373,6 @@ impl BlitState {
         }
 
         Ok(())
-    }
-
-    fn query_format_features(&mut self, device: &DeviceState, format: vk::Format) -> vk::FormatFeatureFlags {
-        if let Some(features) = self.format_features.get(&format).copied() {
-            return features;
-        }
-
-        // SAFETY: Instance/physical-device handles are valid for the lifetime of the renderer.
-        let properties = unsafe {
-            device
-                .physical_device()
-                .instance()
-                .handle()
-                .get_physical_device_format_properties(device.physical_device().handle(), format)
-        };
-
-        let features = properties.optimal_tiling_features;
-        self.format_features.insert(format, features);
-        features
     }
 }
 

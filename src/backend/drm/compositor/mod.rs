@@ -174,7 +174,7 @@ use crate::{
             },
             sync::SyncPoint,
             utils::{CommitCounter, DamageBag},
-            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture,
+            Bind, Color32F, DebugFlags, RenderTargetAccess, Renderer, RendererSuper, Texture,
         },
         SwapBuffersError,
     },
@@ -1989,7 +1989,8 @@ where
         // cursor-plane eligibility, but realize the effect-owning scene as one
         // GPU composite. A Stage root that is already a completed opaque image
         // contains no effect element and remains eligible for whole-root scanout.
-        if elements.iter().any(Element::is_framebuffer_effect) {
+        let has_framebuffer_effect = elements.iter().any(Element::is_framebuffer_effect);
+        if has_framebuffer_effect {
             frame_flags.remove(
                 FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
                     | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
@@ -2893,7 +2894,7 @@ where
             };
 
             let mut framebuffer = renderer
-                .bind(&mut dmabuf)
+                .bind_with_access(&mut dmabuf, RenderTargetAccess::FramebufferEffectSource)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
             let render_res =
                 self.damage_tracker

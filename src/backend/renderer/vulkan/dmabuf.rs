@@ -19,8 +19,8 @@ use crate::{
 use super::{
     device::{DeviceHandle, DeviceState},
     format::{
-        render_view_format, srgb_view_format_list, texture_view_components, ColorEncoding,
-        FormatCapabilities, ModifierCapability,
+        optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
+        ColorEncoding, FormatCapabilities, ModifierCapability,
     },
     image::VulkanImage,
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
@@ -30,6 +30,8 @@ use super::{
 enum DmabufRole {
     Texture,
     RenderTarget,
+    FramebufferEffectTarget,
+    CaptureTarget,
 }
 
 impl DmabufRole {
@@ -37,6 +39,14 @@ impl DmabufRole {
         match self {
             DmabufRole::Texture => vk::ImageUsageFlags::SAMPLED,
             DmabufRole::RenderTarget => vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            DmabufRole::FramebufferEffectTarget => {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+            }
+            DmabufRole::CaptureTarget => {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
+            }
         }
     }
 
@@ -44,6 +54,8 @@ impl DmabufRole {
         match self {
             DmabufRole::Texture => formats.has_import_format(format),
             DmabufRole::RenderTarget => formats.has_render_format(format),
+            DmabufRole::FramebufferEffectTarget => formats.has_framebuffer_effect_format(format),
+            DmabufRole::CaptureTarget => formats.has_capture_format(format),
         }
     }
 
@@ -55,6 +67,10 @@ impl DmabufRole {
         match self {
             DmabufRole::Texture => formats.supports_implicit_import_modifier(code),
             DmabufRole::RenderTarget => formats.supports_implicit_render_modifier(code),
+            DmabufRole::FramebufferEffectTarget => {
+                formats.supports_implicit_framebuffer_effect_modifier(code)
+            }
+            DmabufRole::CaptureTarget => formats.supports_implicit_capture_modifier(code),
         }
     }
 
@@ -62,6 +78,8 @@ impl DmabufRole {
         match self {
             DmabufRole::Texture => capability.supports_disjoint_import,
             DmabufRole::RenderTarget => capability.supports_disjoint_render,
+            DmabufRole::FramebufferEffectTarget => capability.supports_disjoint_framebuffer_effect,
+            DmabufRole::CaptureTarget => capability.supports_disjoint_capture,
         }
     }
 }
@@ -88,6 +106,7 @@ pub(crate) struct CachedDmabuf {
 struct DmabufImportDescriptor {
     signature: DmabufSignature,
     vk_format: vk::Format,
+    format_features: vk::FormatFeatureFlags,
 }
 
 #[derive(Debug, Default)]
@@ -156,6 +175,34 @@ impl DmabufState {
         ))
     }
 
+    pub(crate) fn bind_framebuffer_effect_target(
+        &mut self,
+        device: &DeviceState,
+        formats: &FormatCapabilities,
+        dmabuf: &Dmabuf,
+    ) -> Result<VulkanTarget, VulkanRendererError> {
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::FramebufferEffectTarget)?;
+        Ok(VulkanTarget::from_image_resource(
+            imported,
+            dmabuf.size(),
+            Some(dmabuf.format().code),
+        ))
+    }
+
+    pub(crate) fn bind_capture_target(
+        &mut self,
+        device: &DeviceState,
+        formats: &FormatCapabilities,
+        dmabuf: &Dmabuf,
+    ) -> Result<VulkanTarget, VulkanRendererError> {
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::CaptureTarget)?;
+        Ok(VulkanTarget::from_image_resource(
+            imported,
+            dmabuf.size(),
+            Some(dmabuf.format().code),
+        ))
+    }
+
     pub(crate) fn cleanup(&mut self) {
         self.cleanup_runs = self.cleanup_runs.saturating_add(1);
         self.cleanup_stale_entries(usize::MAX);
@@ -198,7 +245,7 @@ impl DmabufState {
             }
         }
 
-        let descriptor = Self::validate_dmabuf(dmabuf, formats, role)?;
+        let descriptor = Self::validate_dmabuf(device, dmabuf, formats, role)?;
         self.cache_stats.misses = self.cache_stats.misses.saturating_add(1);
         let usage = self
             .cache
@@ -310,6 +357,7 @@ impl DmabufState {
     }
 
     fn validate_dmabuf(
+        device: &DeviceState,
         dmabuf: &Dmabuf,
         formats: &FormatCapabilities,
         role: DmabufRole,
@@ -354,7 +402,11 @@ impl DmabufState {
         }
         let disjoint = dmabuf_is_disjoint(dmabuf)?;
 
-        if format.modifier == Modifier::Invalid {
+        let Some(vk_format) = crate::backend::allocator::vulkan::format::get_vk_format(format.code) else {
+            return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
+        };
+
+        let format_features = if format.modifier == Modifier::Invalid {
             if !role.supports_implicit_modifier(formats, format.code) {
                 return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
             }
@@ -363,6 +415,7 @@ impl DmabufState {
                     "implicit-modifier dma-bufs must contain exactly one memory plane",
                 ));
             }
+            optimal_tiling_features(device.physical_device(), vk_format)
         } else {
             let modifier_caps = formats.modifier_capabilities(format.code);
             let Some(modifier_cap) = modifier_caps.iter().find(|cap| cap.modifier == format.modifier) else {
@@ -380,10 +433,7 @@ impl DmabufState {
             if disjoint && !role.supports_disjoint(modifier_cap) {
                 return Err(VulkanRendererError::UnsupportedDmabufDisjoint);
             }
-        }
-
-        let Some(vk_format) = crate::backend::allocator::vulkan::format::get_vk_format(format.code) else {
-            return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
+            modifier_cap.drm_format_modifier_tiling_features
         };
 
         Ok(DmabufImportDescriptor {
@@ -397,6 +447,7 @@ impl DmabufState {
                 y_inverted: dmabuf.y_inverted(),
             },
             vk_format,
+            format_features,
         })
     }
 
@@ -631,6 +682,7 @@ impl DmabufState {
             size,
             format,
             descriptor.vk_format,
+            descriptor.format_features,
             // Imported buffers are authored outside the compositor: Wayland clients and
             // the Flutter shell both premultiply in electrical values.
             ColorEncoding::ElectricalPremultiplied,
@@ -749,7 +801,15 @@ mod tests {
         vulkan::{version::Version, Instance, PhysicalDevice},
     };
 
-    use super::{dmabuf_is_disjoint, DmabufState};
+    use super::{dmabuf_is_disjoint, DmabufRole, DmabufState};
+
+    #[test]
+    fn capture_target_usage_covers_direct_materials_and_terminal_blits() {
+        let usage = DmabufRole::CaptureTarget.required_usage();
+        assert!(usage.contains(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        assert!(usage.contains(ash::vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(usage.contains(ash::vk::ImageUsageFlags::TRANSFER_DST));
+    }
 
     fn backing_object(name: &str) -> OwnedFd {
         rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC).expect("temporary backing object")
