@@ -1,11 +1,10 @@
 #version 450
 
 // Dual-Kawase blur pass (KWin formulation). One module serves both pyramid
-// directions via `mode`. Taps are always decoded to linear before averaging, so
-// the blur averages physically-linear light while 8-bit storage keeps sRGB
-// precision. `encode_output` re-encodes on write only when the destination is not
-// an _SRGB attachment doing that for us — encoding in both places would darken
-// every pyramid level.
+// directions via `mode`. A pass explicitly selects linear-light or
+// CSS-compatible encoded-sRGB filtering. `encode_output` re-encodes linear
+// output only when the destination is not an _SRGB attachment doing that for
+// us — encoding in both places would darken every pyramid level.
 //
 // Blur inputs are the compositor's own offscreens, which store premultiplied-linear
 // values in sRGB encoding, so a plain decode is exact; there is no unpremultiply
@@ -19,8 +18,8 @@ layout(push_constant) uniform KawasePushConstants {
     uint mode;      // 0 = downsample (5 taps), 1 = upsample (8 taps)
     uint encode_output; // 1 = shader must sRGB-encode; 0 = the _SRGB attachment does
     float saturation; // post-blur saturation; 1 = identity
+    uint encoded_srgb; // 1 = CSS-compatible filtering on encoded channel values
     uint _pad0;
-    uint _pad1;
 } constants;
 
 layout(location = 0) in vec2 in_uv;
@@ -42,7 +41,9 @@ vec3 linear_to_srgb(vec3 c) {
 
 vec4 tap(vec2 uv) {
     vec4 s = texture(texture_sampler, uv);
-    s.rgb = srgb_to_linear(s.rgb);
+    if (constants.encoded_srgb == 0u) {
+        s.rgb = srgb_to_linear(s.rgb);
+    }
     return s;
 }
 
@@ -74,7 +75,7 @@ void main() {
     float luma = dot(sum.rgb, vec3(0.213, 0.715, 0.072));
     sum.rgb = clamp(vec3(luma) + (sum.rgb - vec3(luma)) * constants.saturation,
                     vec3(0.0), vec3(sum.a));
-    if (constants.encode_output != 0u) {
+    if (constants.encoded_srgb == 0u && constants.encode_output != 0u) {
         sum.rgb = linear_to_srgb(sum.rgb);
     }
     out_color = sum;

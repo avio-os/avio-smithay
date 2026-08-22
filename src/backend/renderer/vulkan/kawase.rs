@@ -4,9 +4,9 @@
 //! step is a fullscreen fragment pass sampling 5 (down) or 8 (up) bilinear
 //! taps at half-pixel offsets (KWin's formulation), composing a
 //! gaussian-like kernel from the same pixels the blit chain already touched
-//! — equivalent bandwidth, marginal extra ALU. Passes optionally average in
-//! linear light (sRGB decode/encode in-shader; storage stays sRGB-encoded so
-//! 8-bit precision is preserved).
+//! — equivalent bandwidth, marginal extra ALU. Passes explicitly select
+//! linear-light filtering or CSS-compatible encoded-sRGB filtering; storage
+//! stays sRGB-encoded in either case.
 
 use std::sync::Arc;
 
@@ -33,16 +33,28 @@ use super::{
 /// One dual-Kawase pyramid step: renders `source` into `destination` with the
 /// down- or upsample kernel.
 ///
-/// The blur always averages in linear light. Whether the encode back to storage is
-/// done by the hardware or by the shader follows from the destination's format, so it
-/// is not a caller decision.
+/// The pass records its working space. Linear-light passes choose hardware or
+/// shader encoding from the destination format; encoded-sRGB passes use UNORM
+/// views so the sampled and stored channel values remain encoded.
 #[derive(Debug, Clone)]
 pub struct VulkanKawasePass {
-    source: VulkanTexture,
-    destination: VulkanTexture,
-    upsample: bool,
-    offset: f32,
-    saturation: f32,
+    pub(super) source: VulkanTexture,
+    pub(super) destination: VulkanTexture,
+    pub(super) upsample: bool,
+    pub(super) offset: f32,
+    pub(super) saturation: f32,
+    pub(super) encoding: VulkanKawaseEncoding,
+}
+
+/// Colour-space convention used by a Kawase pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VulkanKawaseEncoding {
+    /// Decode sRGB, filter in linear light, then encode for storage.
+    #[default]
+    LinearLight,
+    /// Filter and apply saturation directly to gamma-encoded sRGB values.
+    /// This intentionally matches CSS backdrop-filter semantics.
+    EncodedSrgb,
 }
 
 impl VulkanKawasePass {
@@ -54,6 +66,7 @@ impl VulkanKawasePass {
             upsample,
             offset,
             saturation: 1.0,
+            encoding: VulkanKawaseEncoding::LinearLight,
         }
     }
 
@@ -63,19 +76,29 @@ impl VulkanKawasePass {
         self.saturation = saturation.clamp(0.0, 4.0);
         self
     }
+
+    /// Select CSS-compatible filtering over encoded sRGB channel values.
+    pub fn with_encoded_srgb(mut self) -> Self {
+        self.encoding = VulkanKawaseEncoding::EncodedSrgb;
+        self
+    }
 }
 
-struct ResolvedKawasePass {
-    source: Arc<VulkanImage>,
-    destination: Arc<VulkanImage>,
-    descriptor_set: vk::DescriptorSet,
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    render_pass: vk::RenderPass,
-    constants: KawasePushConstants,
+pub(super) struct ResolvedKawasePass {
+    pub(super) source: Arc<VulkanImage>,
+    pub(super) destination: Arc<VulkanImage>,
+    pub(super) destination_view: vk::ImageView,
+    pub(super) descriptor_set: vk::DescriptorSet,
+    pub(super) pipeline: vk::Pipeline,
+    pub(super) layout: vk::PipelineLayout,
+    pub(super) render_pass: vk::RenderPass,
+    pub(super) constants: KawasePushConstants,
 }
 
-fn kawase_halfpixel(source: Size<i32, BufferCoord>, destination: Size<i32, BufferCoord>) -> [f32; 2] {
+pub(super) fn kawase_halfpixel(
+    source: Size<i32, BufferCoord>,
+    destination: Size<i32, BufferCoord>,
+) -> [f32; 2] {
     // Offsets are expressed relative to the SMALLER pyramid level (KWin's
     // convention): for a downsample that is the destination, for an upsample
     // the source.
@@ -85,22 +108,10 @@ fn kawase_halfpixel(source: Size<i32, BufferCoord>, destination: Size<i32, Buffe
 }
 
 impl VulkanRenderer {
-    /// Records and submits a dual-Kawase pyramid in one command buffer.
-    ///
-    /// Mirrors [`VulkanRenderer::blit_texture_chain`]'s contract: textures
-    /// must be image-backed, layouts are restored after the chain, and the
-    /// returned [`SyncPoint`] signals when the submission retires.
-    #[instrument(level = "trace", skip(self, passes))]
-    #[profiling::function]
-    pub fn kawase_texture_chain(
+    pub(super) fn resolve_kawase_passes(
         &mut self,
         passes: &[VulkanKawasePass],
-    ) -> Result<SyncPoint, VulkanRendererError> {
-        trace!(pass_count = passes.len(), "recording vulkan kawase chain");
-        if passes.is_empty() {
-            return Ok(SyncPoint::signaled());
-        }
-
+    ) -> Result<Vec<ResolvedKawasePass>, VulkanRendererError> {
         let mut resolved = Vec::with_capacity(passes.len());
         for pass in passes {
             let Some(source) = pass.source.image_resource().cloned() else {
@@ -132,7 +143,18 @@ impl VulkanRenderer {
                 ));
             }
 
-            let pipelines = self.pipelines.pipelines_for_format(destination.render_format())?;
+            let encoded_srgb = pass.encoding == VulkanKawaseEncoding::EncodedSrgb;
+            let destination_format = if encoded_srgb {
+                destination.vk_format()
+            } else {
+                destination.render_format()
+            };
+            let destination_view = if encoded_srgb {
+                destination.view()
+            } else {
+                destination.render_view()
+            };
+            let pipelines = self.pipelines.pipelines_for_format(destination_format)?;
             let descriptor_set = self
                 .descriptors
                 .texture_descriptor_set(source.view(), TextureSampler::LINEAR)?;
@@ -142,10 +164,12 @@ impl VulkanRenderer {
                 pass.upsample,
                 destination.blends_in_linear_light(),
                 pass.saturation,
+                encoded_srgb,
             );
             resolved.push(ResolvedKawasePass {
                 source,
                 destination,
+                destination_view,
                 descriptor_set,
                 pipeline: pipelines.kawase_pipeline,
                 layout: pipelines.kawase_layout,
@@ -153,6 +177,26 @@ impl VulkanRenderer {
                 constants,
             });
         }
+        Ok(resolved)
+    }
+
+    /// Records and submits a dual-Kawase pyramid in one command buffer.
+    ///
+    /// Mirrors [`VulkanRenderer::blit_texture_chain`]'s contract: textures
+    /// must be image-backed, layouts are restored after the chain, and the
+    /// returned [`SyncPoint`] signals when the submission retires.
+    #[instrument(level = "trace", skip(self, passes))]
+    #[profiling::function]
+    pub fn kawase_texture_chain(
+        &mut self,
+        passes: &[VulkanKawasePass],
+    ) -> Result<SyncPoint, VulkanRendererError> {
+        trace!(pass_count = passes.len(), "recording vulkan kawase chain");
+        if passes.is_empty() {
+            return Ok(SyncPoint::signaled());
+        }
+
+        let resolved = self.resolve_kawase_passes(passes)?;
 
         let command_buffer = self.device.acquire_command_buffer()?;
         let vk_device = self.device.device_handle();
@@ -201,7 +245,7 @@ impl VulkanRenderer {
                     width: destination_size.w.max(1) as u32,
                     height: destination_size.h.max(1) as u32,
                 };
-                let attachments = [pass.destination.render_view()];
+                let attachments = [pass.destination_view];
                 let framebuffer_info = vk::FramebufferCreateInfo::default()
                     .render_pass(pass.render_pass)
                     .attachments(&attachments)

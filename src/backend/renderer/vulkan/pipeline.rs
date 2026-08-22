@@ -170,7 +170,9 @@ pub(crate) struct KawasePushConstants {
     /// Saturation applied after blur. Intermediate pyramid passes use `1.0`;
     /// material graphs put their colour transform on the final pass only.
     pub(crate) saturation: f32,
-    pub(crate) _pad: [u32; 2],
+    /// 1 when filtering intentionally operates on encoded sRGB channel values.
+    pub(crate) encoded_srgb: u32,
+    pub(crate) _pad: u32,
 }
 
 impl KawasePushConstants {
@@ -180,6 +182,7 @@ impl KawasePushConstants {
         upsample: bool,
         linear_destination: bool,
         saturation: f32,
+        encoded_srgb: bool,
     ) -> Self {
         Self {
             halfpixel,
@@ -187,7 +190,8 @@ impl KawasePushConstants {
             mode: u32::from(upsample),
             encode_output: u32::from(!linear_destination),
             saturation: saturation.clamp(0.0, 4.0),
-            _pad: [0; 2],
+            encoded_srgb: u32::from(encoded_srgb),
+            _pad: 0,
         }
     }
 }

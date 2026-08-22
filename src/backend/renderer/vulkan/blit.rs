@@ -578,7 +578,7 @@ pub(crate) fn transition_tracked_image_layout(
     entry.current_layout = new_layout;
 }
 
-fn record_image_blit(
+pub(super) fn record_image_blit(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     from: &VulkanImage,

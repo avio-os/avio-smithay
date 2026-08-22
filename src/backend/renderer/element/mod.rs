@@ -242,11 +242,13 @@ pub enum RenderElementPresentationState {
 #[derive(Debug, Clone, Copy)]
 pub struct RenderElementState {
     /// Holds the physical visible area of the element on the output in pixels.
-    ///  
+    ///
     /// Note: If the presentation_state is [`RenderElementPresentationState::Skipped`] this will be zero.
     pub visible_area: usize,
     /// Holds the presentation state of the element on the output
     pub presentation_state: RenderElementPresentationState,
+    /// The next `RenderElements::draw` call to this element needs an accompanying `capture_framebuffer`-call.
+    pub needs_capture: bool,
 }
 
 impl RenderElementState {
@@ -254,6 +256,7 @@ impl RenderElementState {
         RenderElementState {
             visible_area: Default::default(),
             presentation_state: RenderElementPresentationState::Skipped,
+            needs_capture: false,
         }
     }
 
@@ -261,6 +264,7 @@ impl RenderElementState {
         RenderElementState {
             visible_area,
             presentation_state: RenderElementPresentationState::Rendering { reason: None },
+            needs_capture: false,
         }
     }
 }
@@ -459,6 +463,21 @@ pub enum Kind {
     Unspecified,
 }
 
+/// Output-space regions owned by a framebuffer effect.
+///
+/// `backdrop_read_area` is the complete region whose already-composited pixels
+/// the effect may read. It may be larger than the pixels the effect paints so
+/// wide filters never clamp or mirror at the pane edge. `paint_area` is the
+/// region changed by the completed effect. Keeping them separate is required
+/// for correct damage propagation and bounded framebuffer capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramebufferEffectRegions {
+    /// Output-space pixels sampled from the completed lower scene.
+    pub backdrop_read_area: Rectangle<i32, Physical>,
+    /// Output-space pixels painted by the effect.
+    pub paint_area: Rectangle<i32, Physical>,
+}
+
 /// A single element
 pub trait Element {
     /// Get the unique id of this element
@@ -498,6 +517,34 @@ pub trait Element {
     fn kind(&self) -> Kind {
         Kind::default()
     }
+    /// Returns whether this elements is a "framebuffer effect".
+    ///
+    /// Returning `true` will cause implementations of `RenderElement::capture_framebuffer`
+    /// to be called *before* the accompanying `RenderElement::draw` call, *if* the contents behind
+    /// the element have changed.
+    ///
+    /// Additionally damage calculation will be altered to always include the whole area behind the
+    /// element, if a capture is queued up, to make sure the framebuffer contents are available for capture.
+    ///
+    /// Any damage reported by this element will also cause `capture_framebuffer` to be called.
+    fn is_framebuffer_effect(&self) -> bool {
+        false
+    }
+
+    /// Return the output-space read and paint regions for this effect.
+    ///
+    /// The default preserves the traditional one-rectangle effect contract.
+    /// Implementations with a blur or displacement kernel must expand
+    /// `backdrop_read_area` to the complete filter support.
+    fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+        self.is_framebuffer_effect().then(|| {
+            let geometry = self.geometry(scale);
+            FramebufferEffectRegions {
+                backdrop_read_area: geometry,
+                paint_area: geometry,
+            }
+        })
+    }
 }
 
 /// A single render element
@@ -529,6 +576,19 @@ pub trait RenderElement<R: Renderer>: Element {
     #[inline]
     fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.underlying_storage(renderer)
+    }
+
+    /// Notification, that the underlying framebuffer has changed allowing the element
+    /// to blit the contents of the `frame`.
+    ///
+    /// Will only be called if `Element::is_framebuffer_effect` returns `true`.
+    fn capture_framebuffer(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        regions: FramebufferEffectRegions,
+    ) -> Result<(), R::Error> {
+        let _ = (frame, regions);
+        unimplemented!("error: is_framebuffer_effect without capture_framebuffer implementation!");
     }
 }
 
@@ -592,6 +652,14 @@ where
     fn kind(&self) -> Kind {
         (*self).kind()
     }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        (*self).is_framebuffer_effect()
+    }
+
+    fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+        (*self).framebuffer_effect_regions(scale)
+    }
 }
 
 impl<R, E> RenderElement<R> for &E
@@ -618,6 +686,14 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), R::Error> {
         (*self).draw(frame, src, dst, damage, opaque_regions)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut <R>::Frame<'_, '_>,
+        regions: FramebufferEffectRegions,
+    ) -> Result<(), <R>::Error> {
+        (*self).capture_framebuffer(frame, regions)
     }
 }
 
@@ -902,6 +978,36 @@ macro_rules! render_elements_internal {
                 Self::_GenericCatcher(_) => unreachable!(),
             }
         }
+
+        fn is_framebuffer_effect(&self) -> bool {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call is_framebuffer_effect; x)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+
+        fn framebuffer_effect_regions(
+            &self,
+            scale: $crate::utils::Scale<f64>,
+        ) -> Option<$crate::backend::renderer::element::FramebufferEffectRegions> {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => x.framebuffer_effect_regions(scale)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
     };
     (@draw <$renderer:ty>; $($(#[$meta:meta])* $body:ident=$field:ty $(as <$other_renderer:ty>)?),* $(,)?) => {
         fn draw(
@@ -948,7 +1054,6 @@ macro_rules! render_elements_internal {
             }
         }
 
-
         #[inline]
         fn sampled_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage<'_>>
         {
@@ -959,6 +1064,32 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; sampled_storage; x, renderer)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn capture_framebuffer(
+            &self,
+            frame: &mut <$renderer as $crate::backend::renderer::RendererSuper>::Frame<'_, '_>,
+            regions: $crate::backend::renderer::element::FramebufferEffectRegions,
+        ) -> Result<(), <$renderer as $crate::backend::renderer::RendererSuper>::Error>
+        where
+        $(
+            $(
+                $renderer: std::convert::AsMut<$other_renderer>,
+                <$renderer as $crate::backend::renderer::RendererSuper>::Frame: std::convert::AsMut<<$other_renderer as $crate::backend::renderer::RendererSuper>::Frame>,
+                <$other_renderer as $crate::backend::renderer::RendererSuper>::Error: Into<<$renderer as $crate::backend::renderer::RendererSuper>::Error>,
+            )*
+        )*
+        {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; capture_framebuffer; x, frame, regions)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1001,7 +1132,6 @@ macro_rules! render_elements_internal {
             }
         }
 
-
         #[inline]
         fn sampled_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage<'_>>
         {
@@ -1012,6 +1142,24 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; sampled_storage; x, renderer)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn capture_framebuffer(
+            &self,
+            frame: &mut <$renderer as $crate::backend::renderer::RendererSuper>::Frame<'_, '_>,
+            regions: $crate::backend::renderer::element::FramebufferEffectRegions,
+        ) -> Result<(), <$renderer as $crate::backend::renderer::RendererSuper>::Error>
+        {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; capture_framebuffer; x, frame, regions)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1564,6 +1712,14 @@ where
     fn kind(&self) -> Kind {
         self.0.kind()
     }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.0.is_framebuffer_effect()
+    }
+
+    fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+        self.0.framebuffer_effect_regions(scale)
+    }
 }
 
 impl<R, C> RenderElement<R> for Wrap<C>
@@ -1590,6 +1746,14 @@ where
     #[inline]
     fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.0.sampled_storage(renderer)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut <R>::Frame<'_, '_>,
+        regions: FramebufferEffectRegions,
+    ) -> Result<(), <R>::Error> {
+        self.0.capture_framebuffer(frame, regions)
     }
 }
 

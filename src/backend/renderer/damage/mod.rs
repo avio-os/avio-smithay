@@ -134,6 +134,8 @@ struct ElementInstanceState {
     last_transform: Transform,
     last_alpha: f32,
     last_z_index: usize,
+    last_is_framebuffer_effect: bool,
+    last_effect_regions: Option<super::element::FramebufferEffectRegions>,
 }
 
 impl ElementInstanceState {
@@ -145,12 +147,16 @@ impl ElementInstanceState {
         transform: Transform,
         alpha: f32,
         z_index: usize,
+        is_framebuffer_effect: bool,
+        effect_regions: Option<super::element::FramebufferEffectRegions>,
     ) -> bool {
         self.last_src == src
             && self.last_geometry == geometry
             && self.last_transform == transform
             && self.last_alpha == alpha
             && self.last_z_index == z_index
+            && self.last_is_framebuffer_effect == is_framebuffer_effect
+            && self.last_effect_regions == effect_regions
     }
 }
 
@@ -169,10 +175,20 @@ impl ElementState {
         transform: Transform,
         alpha: f32,
         z_index: usize,
+        is_framebuffer_effect: bool,
+        effect_regions: Option<super::element::FramebufferEffectRegions>,
     ) -> bool {
-        self.last_instances
-            .iter()
-            .any(|instance| instance.matches(src, geometry, transform, alpha, z_index))
+        self.last_instances.iter().any(|instance| {
+            instance.matches(
+                src,
+                geometry,
+                transform,
+                alpha,
+                z_index,
+                is_framebuffer_effect,
+                effect_regions,
+            )
+        })
     }
 }
 
@@ -197,6 +213,7 @@ pub struct OutputDamageTracker {
     element_damage: Vec<Rectangle<i32, Physical>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
     opaque_regions_index: Vec<Range<usize>>,
+    element_damage_index: Vec<usize>,
     element_opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_visible_area_workhouse: Vec<Rectangle<i32, Physical>>,
     span: tracing::Span,
@@ -347,6 +364,74 @@ fn rects_area(rects: &[Rectangle<i32, Physical>]) -> u64 {
         .fold(0u64, |area, rect| area.saturating_add(rect_area(rect)))
 }
 
+/// Expand damage through framebuffer-read dependencies in accumulator order.
+///
+/// Elements arrive front-to-back, so walking them in reverse visits the
+/// lowest effect first. Its paint damage is appended before an upper effect
+/// is considered, making nested effects transitive without a second scene
+/// interpretation. `damage_floor` limits the trigger set to damage introduced
+/// by the current phase (new scene damage or buffer-age restoration).
+#[allow(clippy::too_many_arguments)]
+fn propagate_framebuffer_effect_damage<E: Element>(
+    damage: &mut Vec<Rectangle<i32, Physical>>,
+    opaque_regions: &mut [Rectangle<i32, Physical>],
+    opaque_regions_index: &[Range<usize>],
+    element_damage_index: &[usize],
+    render_elements: &[&E],
+    states: &mut RenderElementStates,
+    output_scale: Scale<f64>,
+    output_geo: Rectangle<i32, Physical>,
+    damage_floor: usize,
+    force_redraw: bool,
+) {
+    let mut capture_support_damage = Vec::new();
+    for (z_index, element) in render_elements
+        .iter()
+        .enumerate()
+        .filter(|(_, element)| element.is_framebuffer_effect())
+        .rev()
+    {
+        let Some(regions) = element.framebuffer_effect_regions(output_scale) else {
+            continue;
+        };
+        let read_area = regions.backdrop_read_area.intersection(output_geo);
+        let paint_area = regions.paint_area.intersection(output_geo);
+        let trigger_start = element_damage_index[z_index].max(damage_floor);
+        let affected = force_redraw
+            || read_area.is_some_and(|read| {
+                damage
+                    .iter()
+                    .skip(trigger_start)
+                    .any(|candidate| candidate.overlaps(read))
+            });
+        if !affected {
+            continue;
+        }
+
+        let Some(state) = states.states.get_mut(element.id()) else {
+            continue;
+        };
+        state.needs_capture = true;
+        if let Some(read) = read_area {
+            capture_support_damage.push(read);
+
+            // An opaque element above the effect normally suppresses lower
+            // drawing. The effect captures before that upper element exists,
+            // so reopen every overlapping occluder for this support region.
+            let opaque_above_end = opaque_regions_index[z_index].start;
+            for opaque in opaque_regions.iter_mut().take(opaque_above_end) {
+                if opaque.overlaps(read) {
+                    *opaque = Rectangle::default();
+                }
+            }
+        }
+        if let Some(paint) = paint_area {
+            damage.push(paint);
+        }
+    }
+    damage.extend(capture_support_damage);
+}
+
 impl<E: std::error::Error> std::fmt::Debug for Error<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -376,6 +461,7 @@ impl OutputDamageTracker {
             element_damage: Default::default(),
             opaque_regions: Default::default(),
             opaque_regions_index: Default::default(),
+            element_damage_index: Default::default(),
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
 
@@ -397,6 +483,7 @@ impl OutputDamageTracker {
             element_damage: Default::default(),
             opaque_regions: Default::default(),
             opaque_regions_index: Default::default(),
+            element_damage_index: Default::default(),
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
 
@@ -421,6 +508,7 @@ impl OutputDamageTracker {
             element_opaque_regions: Default::default(),
             opaque_regions: Default::default(),
             opaque_regions_index: Default::default(),
+            element_damage_index: Default::default(),
             element_visible_area_workhouse: Default::default(),
 
             last_state: Default::default(),
@@ -564,6 +652,16 @@ impl OutputDamageTracker {
                     element_damage,
                 );
 
+                if states
+                    .element_render_state(element_id.clone())
+                    .is_some_and(|state| state.needs_capture)
+                {
+                    let regions = element
+                        .framebuffer_effect_regions(output_scale)
+                        .expect("framebuffer effect without read/paint regions");
+                    element.capture_framebuffer(&mut frame, regions)?;
+                }
+
                 element.draw(
                     &mut frame,
                     element.src(),
@@ -693,6 +791,7 @@ impl OutputDamageTracker {
         };
         self.opaque_regions.clear();
         self.opaque_regions_index.clear();
+        self.element_damage_index.clear();
 
         let mut element_render_states = RenderElementStates {
             states: HashMap::with_capacity(elements.len()),
@@ -702,6 +801,7 @@ impl OutputDamageTracker {
         let mut element_damage = std::mem::take(&mut self.element_damage);
 
         let mut element_visible_area_workhouse = std::mem::take(&mut self.element_visible_area_workhouse);
+        let mut z_index = 0;
         for (element_index, element) in elements.iter().enumerate() {
             let element_id = element.id();
             let element_loc = element.geometry(output_scale).loc;
@@ -736,38 +836,92 @@ impl OutputDamageTracker {
                 continue;
             }
 
-            let element_output_damage_start = self.damage.len();
-            let element_output_damage = element
-                .damage_since(
-                    output_scale,
-                    self.last_state.elements.get(element_id).map(|s| s.last_commit),
-                )
-                .into_iter()
-                .map(|mut d| {
-                    d.loc += element_loc;
-                    d
+            let element_src = element.src();
+            let element_geometry = element.geometry(output_scale);
+            let element_transform = element.transform();
+            let element_alpha = element.alpha();
+            let element_last_state = self.last_state.elements.get(element.id());
+            let element_is_framebuffer_effect = element.is_framebuffer_effect();
+            let element_effect_regions = element.framebuffer_effect_regions(output_scale);
+
+            self.element_damage_index.push(self.damage.len());
+            if element_last_state
+                .map(|s| {
+                    !s.instance_matches(
+                        element_src,
+                        element_geometry,
+                        element_transform,
+                        element_alpha,
+                        z_index,
+                        element_is_framebuffer_effect,
+                        element_effect_regions,
+                    )
                 })
-                .filter_map(|geo| geo.intersection(output_geo));
-            self.damage.extend(element_output_damage);
-            let element_output_damage = &self.damage[element_output_damage_start..];
-            if !element_output_damage.is_empty() {
-                let element_damage_area = rects_area(element_output_damage);
-                self.damage_summary.element_damage_element_count =
-                    self.damage_summary.element_damage_element_count.saturating_add(1);
-                self.damage_summary.element_damage_rect_count = self
-                    .damage_summary
-                    .element_damage_rect_count
-                    .saturating_add(element_output_damage.len());
-                self.damage_summary.element_damage_area = self
-                    .damage_summary
-                    .element_damage_area
-                    .saturating_add(element_damage_area);
-                if element_damage_area > self.damage_summary.top_element_damage_area {
-                    self.damage_summary.top_element_damage_index = Some(element_index);
-                    self.damage_summary.top_element_damage_kind = Some(element.kind());
-                    self.damage_summary.top_element_damage_rect_count = element_output_damage.len();
-                    self.damage_summary.top_element_damage_area = element_damage_area;
-                    self.damage_summary.top_element_damage_geometry_area = rect_area(element_output_geometry);
+                .unwrap_or(true)
+            {
+                if let Some(intersection) = element_geometry.intersection(output_geo) {
+                    self.damage.push(intersection);
+                }
+                if let Some(state) = element_last_state {
+                    self.damage.extend(
+                        state
+                            .last_instances
+                            .iter()
+                            .filter_map(|i| i.last_geometry.intersection(output_geo)),
+                    );
+                }
+                let state_change_damage = &self.damage[self.element_damage_index[z_index]..];
+                if !state_change_damage.is_empty() {
+                    let state_change_damage_area = rects_area(state_change_damage);
+                    self.damage_summary.element_state_change_count =
+                        self.damage_summary.element_state_change_count.saturating_add(1);
+                    self.damage_summary.element_state_change_damage_area = self
+                        .damage_summary
+                        .element_state_change_damage_area
+                        .saturating_add(state_change_damage_area);
+                    if state_change_damage_area > self.damage_summary.top_element_state_change_area {
+                        self.damage_summary.top_element_state_change_index = Some(element_index);
+                        self.damage_summary.top_element_state_change_kind = Some(element.kind());
+                        self.damage_summary.top_element_state_change_area = state_change_damage_area;
+                        self.damage_summary.top_element_state_change_geometry_area =
+                            rect_area(element_output_geometry);
+                    }
+                }
+            } else {
+                let element_output_damage_start = self.damage.len();
+                let element_output_damage = element
+                    .damage_since(
+                        output_scale,
+                        self.last_state.elements.get(element_id).map(|s| s.last_commit),
+                    )
+                    .into_iter()
+                    .map(|mut d| {
+                        d.loc += element_loc;
+                        d
+                    })
+                    .filter_map(|geo| geo.intersection(output_geo));
+                self.damage.extend(element_output_damage);
+                let element_output_damage = &self.damage[element_output_damage_start..];
+                if !element_output_damage.is_empty() {
+                    let element_damage_area = rects_area(element_output_damage);
+                    self.damage_summary.element_damage_element_count =
+                        self.damage_summary.element_damage_element_count.saturating_add(1);
+                    self.damage_summary.element_damage_rect_count = self
+                        .damage_summary
+                        .element_damage_rect_count
+                        .saturating_add(element_output_damage.len());
+                    self.damage_summary.element_damage_area = self
+                        .damage_summary
+                        .element_damage_area
+                        .saturating_add(element_damage_area);
+                    if element_damage_area > self.damage_summary.top_element_damage_area {
+                        self.damage_summary.top_element_damage_index = Some(element_index);
+                        self.damage_summary.top_element_damage_kind = Some(element.kind());
+                        self.damage_summary.top_element_damage_rect_count = element_output_damage.len();
+                        self.damage_summary.top_element_damage_area = element_damage_area;
+                        self.damage_summary.top_element_damage_geometry_area =
+                            rect_area(element_output_geometry);
+                    }
                 }
             }
 
@@ -792,12 +946,19 @@ impl OutputDamageTracker {
                 } else {
                     state.visible_area += element_visible_area;
                 }
+                if element_is_framebuffer_effect {
+                    // One cache identity cannot safely represent two captures
+                    // in the same ordered scene. Force both instances through
+                    // capture rather than reusing ambiguous framebuffer state.
+                    state.needs_capture = true;
+                }
             } else {
                 element_render_states.states.insert(
                     element_id.clone(),
                     RenderElementState::rendered(element_visible_area),
                 );
             }
+            z_index += 1;
         }
         std::mem::swap(
             &mut self.element_visible_area_workhouse,
@@ -832,58 +993,6 @@ impl OutputDamageTracker {
             }
         }
 
-        // if the element has been moved or it's alpha or z index changed, damage it
-        for (z_index, element) in render_elements.iter().enumerate() {
-            let element_src = element.src();
-            let element_geometry = element.geometry(output_scale);
-            let element_transform = element.transform();
-            let element_alpha = element.alpha();
-            let element_last_state = self.last_state.elements.get(element.id());
-
-            if element_last_state
-                .map(|s| {
-                    !s.instance_matches(
-                        element_src,
-                        element_geometry,
-                        element_transform,
-                        element_alpha,
-                        z_index,
-                    )
-                })
-                .unwrap_or(true)
-            {
-                let state_change_damage_start = self.damage.len();
-                if let Some(intersection) = element_geometry.intersection(output_geo) {
-                    self.damage.push(intersection);
-                }
-                if let Some(state) = element_last_state {
-                    self.damage.extend(
-                        state
-                            .last_instances
-                            .iter()
-                            .filter_map(|i| i.last_geometry.intersection(output_geo)),
-                    );
-                }
-                let state_change_damage = &self.damage[state_change_damage_start..];
-                if !state_change_damage.is_empty() {
-                    let state_change_damage_area = rects_area(state_change_damage);
-                    self.damage_summary.element_state_change_count =
-                        self.damage_summary.element_state_change_count.saturating_add(1);
-                    self.damage_summary.element_state_change_damage_area = self
-                        .damage_summary
-                        .element_state_change_damage_area
-                        .saturating_add(state_change_damage_area);
-                    if state_change_damage_area > self.damage_summary.top_element_state_change_area {
-                        self.damage_summary.top_element_state_change_index = Some(z_index);
-                        self.damage_summary.top_element_state_change_kind = Some(element.kind());
-                        self.damage_summary.top_element_state_change_area = state_change_damage_area;
-                        self.damage_summary.top_element_state_change_geometry_area =
-                            rect_area(element_geometry);
-                    }
-                }
-            }
-        }
-
         // damage regions no longer covered by opaque regions
         element_damage.clear();
         element_damage.extend_from_slice(&self.last_state.opaque_regions);
@@ -905,10 +1014,10 @@ impl OutputDamageTracker {
         // re-use its allocation next time
         std::mem::swap(&mut self.element_damage, &mut element_damage);
 
-        if self.last_state.size != Some(output_geo.size)
+        let force_effect_redraw = self.last_state.size != Some(output_geo.size)
             || self.last_state.transform != Some(output_transform)
-            || self.last_state.clear_color != clear_color
-        {
+            || self.last_state.clear_color != clear_color;
+        if force_effect_redraw {
             // The output geometry or transform changed, so just damage everything
             self.damage_summary.output_state_full_damage = true;
             trace!(
@@ -923,17 +1032,32 @@ impl OutputDamageTracker {
             self.damage.push(output_geo);
         }
 
+        propagate_framebuffer_effect_damage(
+            &mut self.damage,
+            &mut self.opaque_regions,
+            &self.opaque_regions_index,
+            &self.element_damage_index,
+            &render_elements,
+            &mut element_render_states,
+            output_scale,
+            output_geo,
+            0,
+            force_effect_redraw,
+        );
+
         // That is all completely new damage, which we need to store for subsequent renders
         let mut new_damage = self.damage.clone();
         new_damage.shrink_to_fit();
 
         // We now add old damage states, if we have an age value
-        if age > 0 && self.last_state.old_damage.len() >= age {
+        let age_damage_start = self.damage.len();
+        let buffer_age_forces_full_damage = if age > 0 && self.last_state.old_damage.len() >= age {
             trace!("age of {} recent enough, using old damage", age);
             // We do not need even older states anymore
             self.last_state.old_damage.truncate(age);
             self.damage
                 .extend(self.last_state.old_damage.iter().take(age - 1).flatten().copied());
+            false
         } else {
             self.damage_summary.buffer_age_full_damage = true;
             trace!(
@@ -948,7 +1072,30 @@ impl OutputDamageTracker {
             // just damage everything, if we have no damage
             self.damage.clear();
             self.damage.push(output_geo);
+            true
         };
+
+        // Buffer-age damage is target-local correctness damage just like new
+        // scene damage. If it intersects an effect's read support, the lower
+        // prefix is redrawn into this target and the effect must recapture in
+        // the same frame. In particular, age 0/full repaint may never draw an
+        // effect from an unrelated target's stale scratch image.
+        propagate_framebuffer_effect_damage(
+            &mut self.damage,
+            &mut self.opaque_regions,
+            &self.opaque_regions_index,
+            &self.element_damage_index,
+            &render_elements,
+            &mut element_render_states,
+            output_scale,
+            output_geo,
+            if buffer_age_forces_full_damage {
+                0
+            } else {
+                age_damage_start
+            },
+            buffer_age_forces_full_damage,
+        );
 
         // Optimize the damage for rendering
 
@@ -984,6 +1131,8 @@ impl OutputDamageTracker {
                     let elem_alpha = elem.alpha();
                     let elem_geometry = elem.geometry(output_scale);
                     let elem_transform = elem.transform();
+                    let element_is_framebuffer_effect = elem.is_framebuffer_effect();
+                    let element_effect_regions = elem.framebuffer_effect_regions(output_scale);
 
                     if let Some(state) = map.get_mut(id) {
                         state.last_instances.push(ElementInstanceState {
@@ -992,6 +1141,8 @@ impl OutputDamageTracker {
                             last_transform: elem_transform,
                             last_alpha: elem_alpha,
                             last_z_index: z_index,
+                            last_is_framebuffer_effect: element_is_framebuffer_effect,
+                            last_effect_regions: element_effect_regions,
                         });
                     } else {
                         let current_commit = elem.current_commit();
@@ -1005,6 +1156,8 @@ impl OutputDamageTracker {
                                     last_transform: elem_transform,
                                     last_alpha: elem_alpha,
                                     last_z_index: z_index,
+                                    last_is_framebuffer_effect: element_is_framebuffer_effect,
+                                    last_effect_regions: element_effect_regions,
                                 }],
                             },
                         );
@@ -1025,5 +1178,212 @@ impl OutputDamageTracker {
         self.last_state.clear_color = clear_color;
 
         element_render_states
+    }
+}
+
+#[cfg(test)]
+mod framebuffer_effect_tests {
+    use super::*;
+    use crate::{
+        backend::renderer::{
+            element::FramebufferEffectRegions,
+            utils::{DamageSet, OpaqueRegions},
+        },
+        utils::Point,
+    };
+
+    #[derive(Debug, Clone)]
+    struct TestElement {
+        id: Id,
+        commit: CommitCounter,
+        geometry: Rectangle<i32, Physical>,
+        effect_regions: Option<FramebufferEffectRegions>,
+    }
+
+    impl TestElement {
+        fn draw(geometry: Rectangle<i32, Physical>, commit: usize) -> Self {
+            Self {
+                id: Id::new(),
+                commit: CommitCounter::from(commit),
+                geometry,
+                effect_regions: None,
+            }
+        }
+
+        fn effect(
+            paint_area: Rectangle<i32, Physical>,
+            backdrop_read_area: Rectangle<i32, Physical>,
+        ) -> Self {
+            Self {
+                id: Id::new(),
+                commit: CommitCounter::from(1),
+                geometry: paint_area,
+                effect_regions: Some(FramebufferEffectRegions {
+                    backdrop_read_area,
+                    paint_area,
+                }),
+            }
+        }
+    }
+
+    impl Element for TestElement {
+        fn id(&self) -> &Id {
+            &self.id
+        }
+
+        fn current_commit(&self) -> CommitCounter {
+            self.commit
+        }
+
+        fn src(&self) -> Rectangle<f64, BufferCoords> {
+            Rectangle::new(
+                Point::from((0.0, 0.0)),
+                (self.geometry.size.w as f64, self.geometry.size.h as f64).into(),
+            )
+        }
+
+        fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+            self.geometry
+        }
+
+        fn damage_since(
+            &self,
+            _scale: Scale<f64>,
+            commit: Option<CommitCounter>,
+        ) -> DamageSet<i32, Physical> {
+            if commit == Some(self.commit) {
+                DamageSet::default()
+            } else {
+                DamageSet::from_slice(&[Rectangle::from_size(self.geometry.size)])
+            }
+        }
+
+        fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+            OpaqueRegions::default()
+        }
+
+        fn is_framebuffer_effect(&self) -> bool {
+            self.effect_regions.is_some()
+        }
+
+        fn framebuffer_effect_regions(&self, _scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+            self.effect_regions
+        }
+    }
+
+    fn rect(x: i32, y: i32, width: i32, height: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new((x, y).into(), (width, height).into())
+    }
+
+    fn effect_needs_capture(states: &RenderElementStates, effect: &TestElement) -> bool {
+        states
+            .element_render_state(effect.id.clone())
+            .expect("visible effect state")
+            .needs_capture
+    }
+
+    #[test]
+    fn support_band_damage_recaptures_but_outside_damage_does_not() {
+        let effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
+        let mut lower = TestElement::draw(rect(15, 15, 1, 1), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        tracker
+            .damage_output(0, &[effect.clone(), lower.clone()])
+            .expect("initial damage");
+
+        lower.commit = CommitCounter::from(2);
+        let (_, states) = tracker
+            .damage_output(1, &[effect.clone(), lower.clone()])
+            .expect("support-band damage");
+        assert!(effect_needs_capture(&states, &effect));
+
+        lower.geometry = rect(150, 150, 1, 1);
+        lower.commit = CommitCounter::from(3);
+        tracker
+            .damage_output(1, &[effect.clone(), lower.clone()])
+            .expect("movement establishes the new lower geometry");
+        lower.commit = CommitCounter::from(4);
+        let (_, states) = tracker
+            .damage_output(1, &[effect.clone(), lower])
+            .expect("outside damage");
+        assert!(!effect_needs_capture(&states, &effect));
+    }
+
+    #[test]
+    fn lower_effect_damage_propagates_to_an_overlapping_upper_effect() {
+        let upper = TestElement::effect(rect(60, 60, 30, 30), rect(30, 30, 100, 100));
+        let lower = TestElement::effect(rect(70, 70, 30, 30), rect(40, 40, 100, 100));
+        let mut content = TestElement::draw(rect(80, 80, 1, 1), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        tracker
+            .damage_output(0, &[upper.clone(), lower.clone(), content.clone()])
+            .expect("initial damage");
+
+        content.commit = CommitCounter::from(2);
+        let (_, states) = tracker
+            .damage_output(1, &[upper.clone(), lower.clone(), content])
+            .expect("nested effect damage");
+        assert!(effect_needs_capture(&states, &lower));
+        assert!(effect_needs_capture(&states, &upper));
+    }
+
+    #[test]
+    fn full_buffer_age_repaint_always_recaptures_effects() {
+        let effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
+        let lower = TestElement::draw(rect(0, 0, 200, 200), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        tracker
+            .damage_output(0, &[effect.clone(), lower.clone()])
+            .expect("initial damage");
+
+        let (_, states) = tracker
+            .damage_output(0, &[effect.clone(), lower])
+            .expect("unknown buffer age");
+        assert!(effect_needs_capture(&states, &effect));
+    }
+
+    #[test]
+    fn moving_effect_recaptures_old_and_new_geometry() {
+        let mut effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
+        let lower = TestElement::draw(rect(0, 0, 200, 200), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        tracker
+            .damage_output(0, &[effect.clone(), lower.clone()])
+            .expect("initial damage");
+
+        effect.geometry = rect(80, 40, 20, 20);
+        effect.effect_regions = Some(FramebufferEffectRegions {
+            backdrop_read_area: rect(50, 10, 80, 80),
+            paint_area: effect.geometry,
+        });
+        let (damage, states) = tracker
+            .damage_output(1, &[effect.clone(), lower])
+            .expect("moved effect");
+        assert!(effect_needs_capture(&states, &effect));
+        let damage = damage.expect("movement damage");
+        assert!(damage
+            .iter()
+            .any(|candidate| candidate.overlaps(rect(40, 40, 20, 20))));
+        assert!(damage
+            .iter()
+            .any(|candidate| candidate.overlaps(rect(80, 40, 20, 20))));
+    }
+
+    #[test]
+    fn duplicate_effect_identity_forces_capture() {
+        let mut first = TestElement::effect(rect(20, 20, 20, 20), rect(0, 0, 60, 60));
+        let mut second = TestElement::effect(rect(80, 80, 20, 20), rect(60, 60, 60, 60));
+        second.id = first.id.clone();
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        tracker
+            .damage_output(0, &[first.clone(), second.clone()])
+            .expect("initial duplicate identity");
+
+        first.commit = CommitCounter::from(1);
+        second.commit = CommitCounter::from(1);
+        let (_, states) = tracker
+            .damage_output(1, &[first.clone(), second])
+            .expect("stable duplicate identity");
+        assert!(effect_needs_capture(&states, &first));
     }
 }

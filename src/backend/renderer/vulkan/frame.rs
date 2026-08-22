@@ -22,14 +22,17 @@ use crate::{
 use crate::backend::renderer::ImportDmaWl;
 
 use super::{
+    blit::record_image_blit,
     descriptor::TextureSampler,
     format::srgb_channel_to_linear,
     image::{stage_access_for_layout, VulkanImage},
+    kawase::ResolvedKawasePass,
     pipeline::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
     },
     sync::VulkanFence,
-    VulkanRenderer, VulkanRendererError, VulkanRendererErrorKind, VulkanTarget, VulkanTexture,
+    VulkanKawasePass, VulkanRenderer, VulkanRendererError, VulkanRendererErrorKind, VulkanTarget,
+    VulkanTexture,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,6 +48,7 @@ pub(crate) enum VulkanFrameState {
 struct FrameRecording {
     command_buffer: vk::CommandBuffer,
     framebuffer: vk::Framebuffer,
+    effect_framebuffers: Vec<vk::Framebuffer>,
     target: Arc<VulkanImage>,
     pipelines: PipelineHandles,
     transform: Transform,
@@ -186,6 +190,7 @@ impl Renderer for VulkanRenderer {
             recording: Some(FrameRecording {
                 command_buffer,
                 framebuffer,
+                effect_framebuffers: Vec::new(),
                 target: target_image,
                 pipelines,
                 transform: dst_transform,
@@ -663,6 +668,182 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
 }
 
 impl VulkanFrame<'_> {
+    /// Capture a bounded rectangle from the current output prefix and execute
+    /// a Kawase filter graph in this frame's active command buffer.
+    ///
+    /// The main render pass is paused and resumed with `LOAD`; no queue submit,
+    /// host wait, or second renderer authority is introduced. Every image and
+    /// transient framebuffer is retained by the final frame submission.
+    pub fn capture_and_filter_framebuffer(
+        &mut self,
+        backdrop_read_area: Rectangle<i32, Physical>,
+        capture: &VulkanTexture,
+        passes: &[VulkanKawasePass],
+    ) -> Result<(), VulkanRendererError> {
+        let Some(capture_image) = capture.image_resource().cloned() else {
+            return Err(VulkanRendererError::NotImplemented(
+                "framebuffer-effect capture requires an image-backed Vulkan texture",
+            ));
+        };
+        if !capture_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "framebuffer-effect capture texture lacks transfer-destination usage",
+            ));
+        }
+
+        let resolved = self.renderer.resolve_kawase_passes(passes)?;
+        let (command_buffer, target, transform, frame_size, main_render_pass, main_framebuffer) = {
+            let recording = self.recording()?;
+            (
+                recording.command_buffer,
+                recording.target.clone(),
+                recording.transform,
+                recording.size,
+                recording.pipelines.render_pass,
+                recording.framebuffer,
+            )
+        };
+        let Some(source_area) = framebuffer_capture_area(transform, frame_size, backdrop_read_area) else {
+            return Ok(());
+        };
+        let capture_size = capture_image.size();
+        let capture_area: Rectangle<i32, Physical> =
+            Rectangle::from_size((capture_size.w, capture_size.h).into());
+        if capture_area.size != source_area.size {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "framebuffer-effect capture extent does not match transformed read area",
+            ));
+        }
+
+        // SAFETY: The frame owns an active render pass in this command buffer.
+        unsafe {
+            self.renderer.device.insert_debug_label(
+                command_buffer,
+                c"vulkan.frame.framebuffer_effect",
+                [0.67, 0.34, 0.91, 1.0],
+            );
+            self.renderer
+                .device
+                .device_handle()
+                .cmd_end_render_pass(command_buffer);
+        }
+
+        self.transition_image_layout(&target, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
+        self.transition_image_layout(&capture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
+        record_image_blit(
+            self.renderer.device.device_handle(),
+            command_buffer,
+            &target,
+            &capture_image,
+            source_area,
+            capture_area,
+            TextureFilter::Linear,
+        );
+
+        for pass in &resolved {
+            self.record_kawase_pass(command_buffer, pass)?;
+        }
+
+        self.transition_image_layout(&target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
+        let render_pass_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(main_render_pass)
+            .framebuffer(main_framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: frame_size.w.max(1) as u32,
+                    height: frame_size.h.max(1) as u32,
+                },
+            });
+        // SAFETY: Main framebuffer/render pass are live for the frame and use
+        // LOAD, preserving the completed lower scene captured above.
+        unsafe {
+            self.renderer.device.device_handle().cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_begin,
+                vk::SubpassContents::INLINE,
+            );
+        }
+        Ok(())
+    }
+
+    fn record_kawase_pass(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        pass: &ResolvedKawasePass,
+    ) -> Result<(), VulkanRendererError> {
+        self.transition_image_layout(&pass.source, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
+        self.transition_image_layout(&pass.destination, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
+
+        let destination_size = pass.destination.size();
+        let extent = vk::Extent2D {
+            width: destination_size.w.max(1) as u32,
+            height: destination_size.h.max(1) as u32,
+        };
+        let attachments = [pass.destination_view];
+        let framebuffer_info = vk::FramebufferCreateInfo::default()
+            .render_pass(pass.render_pass)
+            .attachments(&attachments)
+            .width(extent.width)
+            .height(extent.height)
+            .layers(1);
+        // SAFETY: Device and render-pass handles are live for this renderer.
+        let framebuffer = unsafe {
+            self.renderer
+                .device
+                .device_handle()
+                .create_framebuffer(&framebuffer_info, None)
+        }?;
+        self.recording_mut()?.effect_framebuffers.push(framebuffer);
+
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let render_pass_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(pass.render_pass)
+            .framebuffer(framebuffer)
+            .render_area(render_area);
+        // SAFETY: All handles are valid, recording is active, and every pass
+        // overwrites its complete destination.
+        unsafe {
+            let device = self.renderer.device.device_handle();
+            device.cmd_begin_render_pass(command_buffer, &render_pass_begin, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pass.pipeline);
+            device.cmd_set_viewport(
+                command_buffer,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(command_buffer, 0, &[render_area]);
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pass.layout,
+                0,
+                &[pass.descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pass.layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_constants_bytes(&pass.constants),
+            );
+            device.cmd_draw(command_buffer, 4, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+        }
+        Ok(())
+    }
+
     fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
         let format = Some(context.target.format().code);
         VulkanTarget::from_image_resource(context.target.clone(), context.target.size(), format)
@@ -1150,7 +1331,12 @@ impl VulkanFrame<'_> {
             self.renderer
                 .device
                 .shared_device()
-                .destroy_with(|device| unsafe { device.destroy_framebuffer(recording.framebuffer, None) });
+                .destroy_with(|device| unsafe {
+                    device.destroy_framebuffer(recording.framebuffer, None);
+                    for framebuffer in recording.effect_framebuffers.drain(..) {
+                        device.destroy_framebuffer(framebuffer, None);
+                    }
+                });
             let _ = self
                 .renderer
                 .device
@@ -1162,9 +1348,12 @@ impl VulkanFrame<'_> {
         }
 
         let retained_images = retained_recording_images(&recording);
+        let mut framebuffers = Vec::with_capacity(1 + recording.effect_framebuffers.len());
+        framebuffers.push(recording.framebuffer);
+        framebuffers.append(&mut recording.effect_framebuffers);
         let (_, submission_fence) = match self.renderer.device.submit_with_resources_and_fence(
             recording.command_buffer,
-            vec![recording.framebuffer],
+            framebuffers,
             retained_images,
         ) {
             Ok(submission) => submission,
@@ -1229,7 +1418,12 @@ impl VulkanFrame<'_> {
             self.renderer
                 .device
                 .shared_device()
-                .destroy_with(|device| unsafe { device.destroy_framebuffer(recording.framebuffer, None) });
+                .destroy_with(|device| unsafe {
+                    device.destroy_framebuffer(recording.framebuffer, None);
+                    for framebuffer in recording.effect_framebuffers.drain(..) {
+                        device.destroy_framebuffer(framebuffer, None);
+                    }
+                });
             let _ = self
                 .renderer
                 .device
@@ -1241,9 +1435,12 @@ impl VulkanFrame<'_> {
         }
 
         let retained_images = retained_recording_images(&recording);
+        let mut framebuffers = Vec::with_capacity(1 + recording.effect_framebuffers.len());
+        framebuffers.push(recording.framebuffer);
+        framebuffers.append(&mut recording.effect_framebuffers);
         if let Err(err) = self.renderer.device.submit_with_resources(
             recording.command_buffer,
-            vec![recording.framebuffer],
+            framebuffers,
             retained_images,
         ) {
             let _ = self
@@ -1314,6 +1511,7 @@ impl VulkanFrame<'_> {
         self.recording = Some(FrameRecording {
             command_buffer,
             framebuffer,
+            effect_framebuffers: Vec::new(),
             target: context.target.clone(),
             pipelines: context.pipelines,
             transform: context.transform,
@@ -1373,7 +1571,12 @@ impl VulkanFrame<'_> {
             self.renderer
                 .device
                 .shared_device()
-                .destroy_with(|device| unsafe { device.destroy_framebuffer(recording.framebuffer, None) });
+                .destroy_with(|device| unsafe {
+                    device.destroy_framebuffer(recording.framebuffer, None);
+                    for framebuffer in recording.effect_framebuffers.drain(..) {
+                        device.destroy_framebuffer(framebuffer, None);
+                    }
+                });
 
             if let Err(err) = self
                 .renderer
@@ -1387,6 +1590,17 @@ impl VulkanFrame<'_> {
 
         self.state = VulkanFrameState::Aborted;
     }
+}
+
+fn framebuffer_capture_area(
+    transform: Transform,
+    target_size: Size<i32, Physical>,
+    backdrop_read_area: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    let source_frame_size = transform.invert().transform_size(target_size);
+    transform
+        .transform_rect_in(backdrop_read_area, &source_frame_size)
+        .intersection(Rectangle::from_size(target_size))
 }
 
 impl Drop for VulkanFrame<'_> {
@@ -1673,8 +1887,8 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_image_transform, texture_sampler_for_render, TextureSampler, VulkanRenderer,
-        VulkanRendererError,
+        combine_image_transform, framebuffer_capture_area, texture_sampler_for_render, TextureSampler,
+        VulkanRenderer, VulkanRendererError,
     };
     use crate::{
         backend::{
@@ -1727,6 +1941,29 @@ mod tests {
 
     fn dst_rect(width: i32, height: i32) -> Rectangle<i32, Physical> {
         Rectangle::new((0, 0).into(), (width, height).into())
+    }
+
+    #[test]
+    fn framebuffer_capture_uses_the_pre_transform_output_extent() {
+        let output_size = Size::<i32, Physical>::from((300, 200));
+        let read = Rectangle::new((20, 30).into(), (180, 120).into());
+
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let target_size = transform.transform_size(output_size);
+            let capture = framebuffer_capture_area(transform, target_size, read)
+                .expect("read area remains inside the transformed target");
+            assert!(Rectangle::from_size(target_size).contains_rect(capture));
+            assert_eq!(capture.size, transform.transform_size(read.size));
+        }
     }
 
     #[test]

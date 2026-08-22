@@ -248,6 +248,7 @@ impl RenderElementState {
         RenderElementState {
             visible_area,
             presentation_state: RenderElementPresentationState::ZeroCopy,
+            needs_capture: false,
         }
     }
 
@@ -255,6 +256,7 @@ impl RenderElementState {
         RenderElementState {
             visible_area: 0,
             presentation_state: RenderElementPresentationState::Rendering { reason: Some(reason) },
+            needs_capture: false,
         }
     }
 }
@@ -972,8 +974,7 @@ fn output_layer_full_repaint_diag() -> bool {
 /// ghosts convict plane assignment or source import. Diagnostics only.
 fn primary_full_repaint_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_FULL_REPAINT").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Diag bisect toggle (2026-08-20 unlock-reveal ghosting): clear the PRIMARY
@@ -983,8 +984,7 @@ fn primary_full_repaint_diag() -> bool {
 /// rendered-slot-to-committed-framebuffer binding. Diagnostics only.
 fn primary_clear_red_diag() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_CLEAR_RED").is_ok_and(|v| v.trim() == "1"))
+    *ENABLED.get_or_init(|| std::env::var("AVIO_DIAG_PRIMARY_CLEAR_RED").is_ok_and(|v| v.trim() == "1"))
 }
 
 type CompositorFrameState<A, F> =
@@ -1974,7 +1974,7 @@ where
         renderer: &mut R,
         elements: &'a [E],
         clear_color: impl Into<Color32F>,
-        frame_flags: FrameFlags,
+        mut frame_flags: FrameFlags,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
@@ -1982,6 +1982,21 @@ where
         R::TextureId: Texture + 'static,
     {
         let mut clear_color = clear_color.into();
+
+        // A framebuffer effect reads the already-composited scene beneath it.
+        // Splitting any contributor in that scene onto a KMS plane would make
+        // those pixels unavailable to the effect's framebuffer capture. Keep
+        // cursor-plane eligibility, but realize the effect-owning scene as one
+        // GPU composite. A Stage root that is already a completed opaque image
+        // contains no effect element and remains eligible for whole-root scanout.
+        if elements.iter().any(Element::is_framebuffer_effect) {
+            frame_flags.remove(
+                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+                    | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+                    | FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT
+                    | FrameFlags::ALLOW_OUTPUT_LAYER_SCANOUT,
+            );
+        }
 
         if !self.surface.is_active() {
             return Err(RenderFrameErrorType::<A, F, R>::PrepareFrame(
@@ -3817,6 +3832,9 @@ where
             );
             return Err(None);
         };
+        if element.is_framebuffer_effect() {
+            return Err(None);
+        }
 
         let mut rendering_reason: Option<RenderingReason> = None;
 

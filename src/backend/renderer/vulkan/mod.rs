@@ -142,7 +142,8 @@ mod upload;
 
 pub use blit::VulkanBlitChainStep;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
-pub use kawase::VulkanKawasePass;
+pub use frame::VulkanFrame;
+pub use kawase::{VulkanKawaseEncoding, VulkanKawasePass};
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
 

@@ -2,7 +2,9 @@
 
 use crate::{
     backend::renderer::{
-        element::{AsRenderElements, Element, Id, Kind, RenderElement, UnderlyingStorage},
+        element::{
+            AsRenderElements, Element, FramebufferEffectRegions, Id, Kind, RenderElement, UnderlyingStorage,
+        },
         utils::{DamageSet, OpaqueRegions},
         Renderer,
     },
@@ -90,6 +92,25 @@ impl<E: Element> Element for RescaleRenderElement<E> {
     fn kind(&self) -> Kind {
         self.element.kind()
     }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.element.is_framebuffer_effect()
+    }
+
+    fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+        self.element.framebuffer_effect_regions(scale).map(|regions| {
+            let map = |mut rect: Rectangle<i32, Physical>| {
+                rect.loc -= self.origin;
+                rect = rect.to_f64().upscale(self.scale).to_i32_up();
+                rect.loc += self.origin;
+                rect
+            };
+            FramebufferEffectRegions {
+                backdrop_read_area: map(regions.backdrop_read_area),
+                paint_area: map(regions.paint_area),
+            }
+        })
+    }
 }
 
 impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RescaleRenderElement<E> {
@@ -112,6 +133,14 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RescaleRenderElement
     #[inline]
     fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.element.sampled_storage(renderer)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut <R>::Frame<'_, '_>,
+        regions: FramebufferEffectRegions,
+    ) -> Result<(), <R>::Error> {
+        self.element.capture_framebuffer(frame, regions)
     }
 }
 
@@ -284,6 +313,20 @@ impl<E: Element> Element for CropRenderElement<E> {
     fn kind(&self) -> Kind {
         self.element.kind()
     }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.element.is_framebuffer_effect()
+    }
+
+    fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+        self.element
+            .framebuffer_effect_regions(scale)
+            .map(|mut regions| {
+                regions.backdrop_read_area = regions.backdrop_read_area.intersection(self.crop_rect)?;
+                regions.paint_area = regions.paint_area.intersection(self.crop_rect)?;
+                Some(regions)
+            })?
+    }
 }
 
 impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for CropRenderElement<E> {
@@ -306,6 +349,14 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for CropRenderElement<E>
     #[inline]
     fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.element.sampled_storage(renderer)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut <R>::Frame<'_, '_>,
+        regions: FramebufferEffectRegions,
+    ) -> Result<(), <R>::Error> {
+        self.element.capture_framebuffer(frame, regions)
     }
 }
 
@@ -396,6 +447,21 @@ impl<E: Element> Element for RelocateRenderElement<E> {
     fn kind(&self) -> Kind {
         self.element.kind()
     }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.element.is_framebuffer_effect()
+    }
+
+    fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
+        self.element.framebuffer_effect_regions(scale).map(|mut regions| {
+            let original = self.element.geometry(scale).loc;
+            let relocated = self.geometry(scale).loc;
+            let delta = relocated - original;
+            regions.backdrop_read_area.loc += delta;
+            regions.paint_area.loc += delta;
+            regions
+        })
+    }
 }
 
 impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RelocateRenderElement<E> {
@@ -418,6 +484,14 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RelocateRenderElemen
     #[inline]
     fn sampled_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.element.sampled_storage(renderer)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut <R>::Frame<'_, '_>,
+        regions: FramebufferEffectRegions,
+    ) -> Result<(), <R>::Error> {
+        self.element.capture_framebuffer(frame, regions)
     }
 }
 
