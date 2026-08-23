@@ -113,7 +113,9 @@ use crate::{
 #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
 use super::{element::UnderlyingStorage, utils::Buffer as WaylandBuffer};
 use super::{
-    element::{Element, Id, Kind, RenderElement, RenderElementState, RenderElementStates},
+    element::{
+        Element, FramebufferCapturePolicy, Id, Kind, RenderElement, RenderElementState, RenderElementStates,
+    },
     sync::SyncPoint,
     utils::CommitCounter,
     Color32F,
@@ -216,6 +218,7 @@ pub struct OutputDamageTracker {
     element_damage_index: Vec<usize>,
     element_opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_visible_area_workhouse: Vec<Rectangle<i32, Physical>>,
+    visibility_opaque_regions: Vec<Rectangle<i32, Physical>>,
     span: tracing::Span,
 }
 
@@ -416,9 +419,10 @@ fn propagate_framebuffer_effect_damage<E: Element>(
             capture_support_damage.push(read);
 
             // An opaque element above the effect normally suppresses lower
-            // drawing. The effect captures before that upper element exists,
-            // so reopen every overlapping occluder for this support region.
-            let opaque_above_end = opaque_regions_index[z_index].start;
+            // drawing. The effect captures before either that upper element
+            // or the effect itself exists, so reopen every overlapping
+            // occluder through the effect's own range for this support region.
+            let opaque_above_end = opaque_regions_index[z_index].end;
             for opaque in opaque_regions.iter_mut().take(opaque_above_end) {
                 if opaque.overlaps(read) {
                     *opaque = Rectangle::default();
@@ -464,6 +468,7 @@ impl OutputDamageTracker {
             element_damage_index: Default::default(),
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
+            visibility_opaque_regions: Default::default(),
 
             span: info_span!("renderer_damage"),
         }
@@ -486,6 +491,7 @@ impl OutputDamageTracker {
             element_damage_index: Default::default(),
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
+            visibility_opaque_regions: Default::default(),
 
             last_state: Default::default(),
             span: info_span!("renderer_damage", output = output.name()),
@@ -510,6 +516,7 @@ impl OutputDamageTracker {
             opaque_regions_index: Default::default(),
             element_damage_index: Default::default(),
             element_visible_area_workhouse: Default::default(),
+            visibility_opaque_regions: Default::default(),
 
             last_state: Default::default(),
         }
@@ -801,6 +808,8 @@ impl OutputDamageTracker {
         let mut element_damage = std::mem::take(&mut self.element_damage);
 
         let mut element_visible_area_workhouse = std::mem::take(&mut self.element_visible_area_workhouse);
+        let mut visibility_opaque_regions = std::mem::take(&mut self.visibility_opaque_regions);
+        visibility_opaque_regions.clear();
         let mut z_index = 0;
         for (element_index, element) in elements.iter().enumerate() {
             let element_id = element.id();
@@ -818,7 +827,7 @@ impl OutputDamageTracker {
             element_visible_area_workhouse.push(element_output_geometry);
             element_visible_area_workhouse = Rectangle::subtract_rects_many_in_place(
                 element_visible_area_workhouse,
-                self.opaque_regions.iter().copied(),
+                visibility_opaque_regions.iter().copied(),
             );
             let element_visible_area = element_visible_area_workhouse
                 .iter()
@@ -938,6 +947,24 @@ impl OutputDamageTracker {
             let element_opaque_regions_end_index = self.opaque_regions.len();
             self.opaque_regions_index
                 .push(element_opaque_regions_start_index..element_opaque_regions_end_index);
+
+            // Final-output opacity and traversal opacity have different
+            // lifetimes around a framebuffer effect. Elements above the
+            // effect are absent when its lower prefix is captured, so their
+            // opacity cannot permanently cull contributors in the declared
+            // read support. Elements encountered after the effect are part of
+            // that prefix and may occlude still-lower contributors normally.
+            visibility_opaque_regions.extend_from_slice(
+                &self.opaque_regions[element_opaque_regions_start_index..element_opaque_regions_end_index],
+            );
+            if element_is_framebuffer_effect {
+                if let Some(read_area) = element_effect_regions
+                    .and_then(|regions| regions.backdrop_read_area.intersection(output_geo))
+                {
+                    visibility_opaque_regions =
+                        Rectangle::subtract_rects_many_in_place(visibility_opaque_regions, [read_area]);
+                }
+            }
             render_elements.push(element);
 
             if let Some(state) = element_render_states.states.get_mut(element_id) {
@@ -953,16 +980,23 @@ impl OutputDamageTracker {
                     state.needs_capture = true;
                 }
             } else {
-                element_render_states.states.insert(
-                    element_id.clone(),
-                    RenderElementState::rendered(element_visible_area),
-                );
+                let mut state = RenderElementState::rendered(element_visible_area);
+                state.needs_capture = element_is_framebuffer_effect
+                    && matches!(
+                        element.framebuffer_capture_policy(),
+                        FramebufferCapturePolicy::EveryDraw
+                    );
+                element_render_states.states.insert(element_id.clone(), state);
             }
             z_index += 1;
         }
         std::mem::swap(
             &mut self.element_visible_area_workhouse,
             &mut element_visible_area_workhouse,
+        );
+        std::mem::swap(
+            &mut self.visibility_opaque_regions,
+            &mut visibility_opaque_regions,
         );
 
         // add the damage for elements gone that are not covered an opaque region
@@ -1186,7 +1220,7 @@ mod framebuffer_effect_tests {
     use super::*;
     use crate::{
         backend::renderer::{
-            element::FramebufferEffectRegions,
+            element::{FramebufferCapturePolicy, FramebufferEffectRegions},
             utils::{DamageSet, OpaqueRegions},
         },
         utils::Point,
@@ -1198,6 +1232,8 @@ mod framebuffer_effect_tests {
         commit: CommitCounter,
         geometry: Rectangle<i32, Physical>,
         effect_regions: Option<FramebufferEffectRegions>,
+        opaque: bool,
+        capture_policy: FramebufferCapturePolicy,
     }
 
     impl TestElement {
@@ -1207,6 +1243,8 @@ mod framebuffer_effect_tests {
                 commit: CommitCounter::from(commit),
                 geometry,
                 effect_regions: None,
+                opaque: false,
+                capture_policy: FramebufferCapturePolicy::OnBackdropDamage,
             }
         }
 
@@ -1222,7 +1260,14 @@ mod framebuffer_effect_tests {
                     backdrop_read_area,
                     paint_area,
                 }),
+                opaque: false,
+                capture_policy: FramebufferCapturePolicy::OnBackdropDamage,
             }
+        }
+
+        fn opaque(mut self) -> Self {
+            self.opaque = true;
+            self
         }
     }
 
@@ -1259,7 +1304,11 @@ mod framebuffer_effect_tests {
         }
 
         fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-            OpaqueRegions::default()
+            if self.opaque {
+                OpaqueRegions::from_slice(&[Rectangle::from_size(self.geometry.size)])
+            } else {
+                OpaqueRegions::default()
+            }
         }
 
         fn is_framebuffer_effect(&self) -> bool {
@@ -1268,6 +1317,10 @@ mod framebuffer_effect_tests {
 
         fn framebuffer_effect_regions(&self, _scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
             self.effect_regions
+        }
+
+        fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+            self.capture_policy
         }
     }
 
@@ -1280,6 +1333,63 @@ mod framebuffer_effect_tests {
             .element_render_state(effect.id.clone())
             .expect("visible effect state")
             .needs_capture
+    }
+
+    fn element_was_rendered(states: &RenderElementStates, element: &TestElement) -> bool {
+        matches!(
+            states
+                .element_render_state(element.id.clone())
+                .expect("element state")
+                .presentation_state,
+            RenderElementPresentationState::Rendering { .. }
+        )
+    }
+
+    #[test]
+    fn every_draw_policy_recaptures_for_foreground_only_damage() {
+        let mut effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
+        let lower = TestElement::draw(rect(0, 0, 200, 200), 1);
+        let mut foreground = TestElement::draw(rect(45, 45, 1, 1), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        tracker
+            .damage_output(0, &[foreground.clone(), effect.clone(), lower.clone()])
+            .expect("initial damage");
+
+        foreground.commit = CommitCounter::from(2);
+        let (_, states) = tracker
+            .damage_output(1, &[foreground.clone(), effect.clone(), lower.clone()])
+            .expect("foreground-only damage with the default capture policy");
+        assert!(!effect_needs_capture(&states, &effect));
+
+        effect.capture_policy = FramebufferCapturePolicy::EveryDraw;
+        foreground.commit = CommitCounter::from(3);
+        let (_, states) = tracker
+            .damage_output(1, &[foreground, effect.clone(), lower])
+            .expect("foreground-only damage with the every-draw capture policy");
+        assert!(effect_needs_capture(&states, &effect));
+    }
+
+    #[test]
+    fn effect_read_support_reopens_only_opacity_above_the_effect() {
+        let foreground_band = TestElement::draw(rect(10, 10, 80, 20), 1).opaque();
+        let effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
+        let lower_contributor = TestElement::draw(rect(15, 15, 1, 1), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        let (_, states) = tracker
+            .damage_output(0, &[foreground_band, effect.clone(), lower_contributor.clone()])
+            .expect("effect support behind foreground opacity");
+
+        assert!(effect_needs_capture(&states, &effect));
+        assert!(element_was_rendered(&states, &lower_contributor));
+
+        let backdrop_occluder = TestElement::draw(rect(10, 10, 80, 20), 1).opaque();
+        let hidden_lower = TestElement::draw(rect(15, 15, 1, 1), 1);
+        let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
+        let (_, states) = tracker
+            .damage_output(0, &[effect, backdrop_occluder, hidden_lower.clone()])
+            .expect("opacity inside the captured prefix");
+
+        assert!(!element_was_rendered(&states, &hidden_lower));
     }
 
     #[test]

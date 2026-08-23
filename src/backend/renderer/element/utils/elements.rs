@@ -3,7 +3,8 @@
 use crate::{
     backend::renderer::{
         element::{
-            AsRenderElements, Element, FramebufferEffectRegions, Id, Kind, RenderElement, UnderlyingStorage,
+            AsRenderElements, Element, FramebufferCapturePolicy, FramebufferEffectRegions, Id, Kind,
+            RenderElement, UnderlyingStorage,
         },
         utils::{DamageSet, OpaqueRegions},
         Renderer,
@@ -110,6 +111,10 @@ impl<E: Element> Element for RescaleRenderElement<E> {
                 paint_area: map(regions.paint_area),
             }
         })
+    }
+
+    fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+        self.element.framebuffer_capture_policy()
     }
 }
 
@@ -327,6 +332,10 @@ impl<E: Element> Element for CropRenderElement<E> {
                 Some(regions)
             })?
     }
+
+    fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+        self.element.framebuffer_capture_policy()
+    }
 }
 
 impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for CropRenderElement<E> {
@@ -461,6 +470,10 @@ impl<E: Element> Element for RelocateRenderElement<E> {
             regions.paint_area.loc += delta;
             regions
         })
+    }
+
+    fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+        self.element.framebuffer_capture_policy()
     }
 }
 

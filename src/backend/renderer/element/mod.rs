@@ -478,6 +478,23 @@ pub struct FramebufferEffectRegions {
     pub paint_area: Rectangle<i32, Physical>,
 }
 
+/// Defines when a framebuffer effect must refresh its captured input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FramebufferCapturePolicy {
+    /// Re-capture when the effect or its framebuffer-read dependency is damaged.
+    ///
+    /// This is suitable for effects whose captured input remains valid between
+    /// draws targeting the same framebuffer.
+    #[default]
+    OnBackdropDamage,
+    /// Re-capture immediately before every draw of the effect.
+    ///
+    /// Effects backed by attempt-local scratch images or other target-local
+    /// state must use this policy. It does not itself create output damage; it
+    /// only guarantees capture when some existing damage makes the effect draw.
+    EveryDraw,
+}
+
 /// A single element
 pub trait Element {
     /// Get the unique id of this element
@@ -544,6 +561,15 @@ pub trait Element {
                 paint_area: geometry,
             }
         })
+    }
+
+    /// Return the lifetime policy for this effect's framebuffer capture.
+    ///
+    /// This method is ignored when [`Self::is_framebuffer_effect`] is `false`.
+    /// The default retains framebuffer contents until damage intersects the
+    /// effect or its declared read dependency.
+    fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+        FramebufferCapturePolicy::OnBackdropDamage
     }
 }
 
@@ -659,6 +685,10 @@ where
 
     fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
         (*self).framebuffer_effect_regions(scale)
+    }
+
+    fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+        (*self).framebuffer_capture_policy()
     }
 }
 
@@ -1004,6 +1034,21 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => x.framebuffer_effect_regions(scale)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn framebuffer_capture_policy(
+            &self,
+        ) -> $crate::backend::renderer::element::FramebufferCapturePolicy {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call framebuffer_capture_policy; x)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1719,6 +1764,10 @@ where
 
     fn framebuffer_effect_regions(&self, scale: Scale<f64>) -> Option<FramebufferEffectRegions> {
         self.0.framebuffer_effect_regions(scale)
+    }
+
+    fn framebuffer_capture_policy(&self) -> FramebufferCapturePolicy {
+        self.0.framebuffer_capture_policy()
     }
 }
 
