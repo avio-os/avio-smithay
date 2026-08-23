@@ -400,13 +400,25 @@ fn propagate_framebuffer_effect_damage<E: Element>(
         let read_area = regions.backdrop_read_area.intersection(output_geo);
         let paint_area = regions.paint_area.intersection(output_geo);
         let trigger_start = element_damage_index[z_index].max(damage_floor);
-        let affected = force_redraw
-            || read_area.is_some_and(|read| {
-                damage
-                    .iter()
-                    .skip(trigger_start)
-                    .any(|candidate| candidate.overlaps(read))
-            });
+        let backdrop_affected = read_area.is_some_and(|read| {
+            damage
+                .iter()
+                .skip(trigger_start)
+                .any(|candidate| candidate.overlaps(read))
+        });
+        // EveryDraw does not synthesize a frame. Once existing damage will
+        // draw the effect, however, its attempt-local capture must rebuild the
+        // complete declared read support before the effect is drawn.
+        let every_draw_affected = matches!(
+            element.framebuffer_capture_policy(),
+            FramebufferCapturePolicy::EveryDraw
+        ) && paint_area.is_some_and(|paint| {
+            damage
+                .iter()
+                .skip(damage_floor)
+                .any(|candidate| candidate.overlaps(paint))
+        });
+        let affected = force_redraw || backdrop_affected || every_draw_affected;
         if !affected {
             continue;
         }
@@ -808,8 +820,9 @@ impl OutputDamageTracker {
         let mut element_damage = std::mem::take(&mut self.element_damage);
 
         let mut element_visible_area_workhouse = std::mem::take(&mut self.element_visible_area_workhouse);
-        let mut visibility_opaque_regions = std::mem::take(&mut self.visibility_opaque_regions);
-        visibility_opaque_regions.clear();
+        // Preserve the original opacity traversal with no extra copying until
+        // a framebuffer effect actually needs a distinct capture view.
+        let mut visibility_opaque_regions: Option<Vec<Rectangle<i32, Physical>>> = None;
         let mut z_index = 0;
         for (element_index, element) in elements.iter().enumerate() {
             let element_id = element.id();
@@ -827,7 +840,11 @@ impl OutputDamageTracker {
             element_visible_area_workhouse.push(element_output_geometry);
             element_visible_area_workhouse = Rectangle::subtract_rects_many_in_place(
                 element_visible_area_workhouse,
-                visibility_opaque_regions.iter().copied(),
+                visibility_opaque_regions
+                    .as_deref()
+                    .unwrap_or(&self.opaque_regions)
+                    .iter()
+                    .copied(),
             );
             let element_visible_area = element_visible_area_workhouse
                 .iter()
@@ -954,15 +971,26 @@ impl OutputDamageTracker {
             // opacity cannot permanently cull contributors in the declared
             // read support. Elements encountered after the effect are part of
             // that prefix and may occlude still-lower contributors normally.
-            visibility_opaque_regions.extend_from_slice(
-                &self.opaque_regions[element_opaque_regions_start_index..element_opaque_regions_end_index],
-            );
+            if let Some(visibility_opaque_regions) = visibility_opaque_regions.as_mut() {
+                visibility_opaque_regions.extend_from_slice(
+                    &self.opaque_regions
+                        [element_opaque_regions_start_index..element_opaque_regions_end_index],
+                );
+            }
             if element_is_framebuffer_effect {
                 if let Some(read_area) = element_effect_regions
                     .and_then(|regions| regions.backdrop_read_area.intersection(output_geo))
                 {
-                    visibility_opaque_regions =
-                        Rectangle::subtract_rects_many_in_place(visibility_opaque_regions, [read_area]);
+                    let visibility_opaque_regions = visibility_opaque_regions.get_or_insert_with(|| {
+                        let mut regions = std::mem::take(&mut self.visibility_opaque_regions);
+                        regions.clear();
+                        regions.extend_from_slice(&self.opaque_regions);
+                        regions
+                    });
+                    *visibility_opaque_regions = Rectangle::subtract_rects_many_in_place(
+                        std::mem::take(visibility_opaque_regions),
+                        [read_area],
+                    );
                 }
             }
             render_elements.push(element);
@@ -994,10 +1022,12 @@ impl OutputDamageTracker {
             &mut self.element_visible_area_workhouse,
             &mut element_visible_area_workhouse,
         );
-        std::mem::swap(
-            &mut self.visibility_opaque_regions,
-            &mut visibility_opaque_regions,
-        );
+        if let Some(mut visibility_opaque_regions) = visibility_opaque_regions {
+            std::mem::swap(
+                &mut self.visibility_opaque_regions,
+                &mut visibility_opaque_regions,
+            );
+        }
 
         // add the damage for elements gone that are not covered an opaque region
         let elements_gone = self.last_state.elements.iter().filter(|(id, _)| {
@@ -1347,25 +1377,68 @@ mod framebuffer_effect_tests {
 
     #[test]
     fn every_draw_policy_recaptures_for_foreground_only_damage() {
-        let mut effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
-        let lower = TestElement::draw(rect(0, 0, 200, 200), 1);
+        let upper_opaque_band = TestElement::draw(rect(10, 10, 80, 20), 1).opaque();
         let mut foreground = TestElement::draw(rect(45, 45, 1, 1), 1);
+        let mut effect = TestElement::effect(rect(40, 40, 20, 20), rect(10, 10, 80, 80));
+        let lower_contributor = TestElement::draw(rect(15, 15, 1, 1), 1);
         let mut tracker = OutputDamageTracker::new((200, 200), 1.0, Transform::Normal);
         tracker
-            .damage_output(0, &[foreground.clone(), effect.clone(), lower.clone()])
+            .damage_output(
+                0,
+                &[
+                    upper_opaque_band.clone(),
+                    foreground.clone(),
+                    effect.clone(),
+                    lower_contributor.clone(),
+                ],
+            )
             .expect("initial damage");
 
         foreground.commit = CommitCounter::from(2);
-        let (_, states) = tracker
-            .damage_output(1, &[foreground.clone(), effect.clone(), lower.clone()])
+        let (damage, states) = tracker
+            .damage_output(
+                1,
+                &[
+                    upper_opaque_band.clone(),
+                    foreground.clone(),
+                    effect.clone(),
+                    lower_contributor.clone(),
+                ],
+            )
             .expect("foreground-only damage with the default capture policy");
         assert!(!effect_needs_capture(&states, &effect));
+        assert!(damage
+            .expect("foreground damage")
+            .iter()
+            .all(|candidate| !candidate.overlaps(lower_contributor.geometry)));
 
         effect.capture_policy = FramebufferCapturePolicy::EveryDraw;
         foreground.commit = CommitCounter::from(3);
-        let (_, states) = tracker
-            .damage_output(1, &[foreground, effect.clone(), lower])
+        let (damage, states) = tracker
+            .damage_output(
+                1,
+                &[
+                    upper_opaque_band.clone(),
+                    foreground.clone(),
+                    effect.clone(),
+                    lower_contributor.clone(),
+                ],
+            )
             .expect("foreground-only damage with the every-draw capture policy");
+        assert!(effect_needs_capture(&states, &effect));
+        assert!(element_was_rendered(&states, &lower_contributor));
+        assert!(damage
+            .expect("capture support damage")
+            .iter()
+            .any(|candidate| candidate.overlaps(lower_contributor.geometry)));
+
+        let (damage, states) = tracker
+            .damage_output(
+                1,
+                &[upper_opaque_band, foreground, effect.clone(), lower_contributor],
+            )
+            .expect("stable every-draw scene");
+        assert!(damage.is_none());
         assert!(effect_needs_capture(&states, &effect));
     }
 
