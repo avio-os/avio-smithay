@@ -109,15 +109,33 @@ impl Cacheable for DrmSyncobjCachedState {
     }
 
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
-        if self.acquire_point.is_some() && self.release_point.is_some() {
-            if let Some(release_point) = &into.release_point {
+        merge_complete_point_pair(
+            self.acquire_point,
+            self.release_point,
+            &mut into.acquire_point,
+            &mut into.release_point,
+            |release_point| {
                 if let Err(err) = release_point.signal() {
                     tracing::error!("Failed to signal syncobj release point: {}", err);
                 }
-            }
-            into.acquire_point = self.acquire_point;
-            into.release_point = self.release_point;
+            },
+        );
+    }
+}
+
+fn merge_complete_point_pair<T>(
+    next_acquire: Option<T>,
+    next_release: Option<T>,
+    current_acquire: &mut Option<T>,
+    current_release: &mut Option<T>,
+    signal_discarded_release: impl FnOnce(T),
+) {
+    if next_acquire.is_some() && next_release.is_some() {
+        if let Some(discarded_release) = current_release.take() {
+            signal_discarded_release(discarded_release);
         }
+        *current_acquire = next_acquire;
+        *current_release = next_release;
     }
 }
 
@@ -166,12 +184,14 @@ impl DrmSyncobjState {
 
     /// Sets a new `import_device` to import the syncobj fds and wait on them.
     ///
-    /// Note: This will not update already existing timeline objects,
-    /// which will continue to use the previous device.
+    /// Existing timelines are re-imported onto the successor device. A
+    /// timeline that cannot migrate is invalidated so it cannot retain the
+    /// predecessor device as a second synchronization authority.
     pub fn update_device(&mut self, import_device: DrmDeviceFd) {
         for timeline in self.known_timelines.iter().filter_map(Weak::upgrade) {
             if let Err(err) = timeline.update_device(&import_device) {
-                warn!(?err, "Failed to update existing timeline");
+                warn!(?err, "Failed to migrate existing timeline; invalidating it");
+                timeline.invalidate();
             }
         }
         self.import_device = import_device;
@@ -313,6 +333,17 @@ fn destruction_hook<D: DrmSyncobjHandler>(_data: &mut D, surface: &WlSurface) {
     });
 }
 
+fn discard_pending_point_pair<T>(
+    acquire_point: &mut Option<T>,
+    release_point: &mut Option<T>,
+    signal_release: impl FnOnce(T),
+) {
+    *acquire_point = None;
+    if let Some(release_point) = release_point.take() {
+        signal_release(release_point);
+    }
+}
+
 impl<D> Dispatch<WpLinuxDrmSyncobjManagerV1, (), D> for DrmSyncobjState
 where
     D: Dispatch<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData>,
@@ -423,12 +454,16 @@ where
                         // Committed sync points should still be used, but pending points can
                         // be cleared.
                         let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-                        cached.pending().acquire_point = None;
-                        if let Some(release_point) = cached.pending().release_point.take() {
-                            if let Err(err) = release_point.signal() {
-                                tracing::error!("Failed to signal syncobj release point: {}", err);
-                            }
-                        }
+                        let pending = cached.pending();
+                        discard_pending_point_pair(
+                            &mut pending.acquire_point,
+                            &mut pending.release_point,
+                            |release_point| {
+                                if let Err(err) = release_point.signal() {
+                                    tracing::error!("Failed to signal syncobj release point: {}", err);
+                                }
+                            },
+                        );
                     });
                 }
             }
@@ -531,7 +566,10 @@ impl<D: DrmSyncobjHandler> Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimel
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_commit_point_pair, DrmSyncobjCommitPointError};
+    use super::{
+        discard_pending_point_pair, merge_complete_point_pair, validate_commit_point_pair,
+        DrmSyncobjCommitPointError,
+    };
 
     #[test]
     fn explicit_sync_points_are_required_exactly_with_a_new_buffer() {
@@ -558,6 +596,34 @@ mod tests {
             validate_commit_point_pair(true, true, false),
             Err(DrmSyncobjCommitPointError::NoReleasePoint)
         );
+    }
+
+    #[test]
+    fn destroying_surface_syncobj_discards_acquire_and_signals_release() {
+        let mut acquire = Some(17_u64);
+        let mut release = Some(23_u64);
+        let mut signaled = Vec::new();
+
+        discard_pending_point_pair(&mut acquire, &mut release, |point| signaled.push(point));
+
+        assert_eq!(acquire, None);
+        assert_eq!(release, None);
+        assert_eq!(signaled, vec![23]);
+    }
+
+    #[test]
+    fn superseding_pending_commit_before_acquire_signals_discarded_release() {
+        let mut acquire = Some(17_u64);
+        let mut release = Some(23_u64);
+        let mut signaled = Vec::new();
+
+        merge_complete_point_pair(Some(29), Some(31), &mut acquire, &mut release, |point| {
+            signaled.push(point)
+        });
+
+        assert_eq!(acquire, Some(29));
+        assert_eq!(release, Some(31));
+        assert_eq!(signaled, vec![23]);
     }
 }
 

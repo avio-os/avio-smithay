@@ -246,6 +246,13 @@ pub enum Error<E: std::error::Error> {
     /// The provided [`Renderer`] returned an error
     #[error(transparent)]
     Rendering(E),
+    /// Rendering sampled a Wayland buffer but produced no observable completion edge.
+    ///
+    /// The caller must retain every sampled source until the renderer epoch is
+    /// torn down. Waiting here would block the compositor's render path, while
+    /// treating the draw as complete could release a client buffer too early.
+    #[error("Wayland buffer completion is unobservable; renderer epoch teardown required")]
+    WaylandCompletionUnobservable,
     /// The given [`Output`] has no mode set
     #[error(transparent)]
     OutputNoMode(#[from] OutputNoMode),
@@ -257,8 +264,33 @@ impl<E: std::error::Error + MaybeDeviceLost> Error<E> {
     pub fn is_device_lost(&self) -> bool {
         match self {
             Error::Rendering(err) => err.is_device_lost(),
+            Error::WaylandCompletionUnobservable => false,
             Error::OutputNoMode(_) => false,
         }
+    }
+
+    /// Returns `true` when rendering may have sampled a Wayland buffer but no
+    /// exact completion edge can prove when that read finished.
+    pub fn is_wayland_completion_unobservable(&self) -> bool {
+        matches!(self, Error::WaylandCompletionUnobservable)
+    }
+}
+
+#[cfg(test)]
+mod completion_error_tests {
+    use super::{Error, MaybeDeviceLost};
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("test renderer error")]
+    struct TestRendererError;
+
+    impl MaybeDeviceLost for TestRendererError {}
+
+    #[test]
+    fn unobservable_wayland_completion_is_typed_and_not_device_loss() {
+        let error = Error::<TestRendererError>::WaylandCompletionUnobservable;
+        assert!(error.is_wayland_completion_unobservable());
+        assert!(!error.is_device_lost());
     }
 }
 
@@ -452,6 +484,7 @@ impl<E: std::error::Error> std::fmt::Debug for Error<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Rendering(err) => std::fmt::Debug::fmt(err, f),
+            Error::WaylandCompletionUnobservable => f.write_str("WaylandCompletionUnobservable"),
             Error::OutputNoMode(err) => std::fmt::Debug::fmt(err, f),
         }
     }
@@ -701,29 +734,22 @@ impl OutputDamageTracker {
                 #[cfg(feature = "backend_drm")]
                 let shared_sync_file = sync.export().map(Arc::new);
                 #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
-                let completion_was_host_waited = if !rendered_wayland_buffers.is_empty()
-                    && !sync.is_reached()
-                    && shared_sync_file.is_none()
-                {
-                    // An asynchronous Wayland-buffer read must leave one
-                    // pollable completion identity for release ownership. If
-                    // the renderer cannot export one, finish the producer work
-                    // here rather than creating a periodic release poller or
-                    // allowing the attachment to retire without evidence.
-                    renderer.wait(&sync).map_err(Error::Rendering)?;
-                    true
-                } else {
-                    false
-                };
+                if !rendered_wayland_buffers.is_empty() && !sync.is_reached() && shared_sync_file.is_none() {
+                    // An asynchronous Wayland-buffer read must leave one exact,
+                    // pollable completion identity for release ownership. The
+                    // caller already owns the sampled resources; return typed
+                    // unobservable custody so it can quarantine them through
+                    // renderer-epoch teardown without blocking this path.
+                    self.last_state = Default::default();
+                    return Err(Error::WaylandCompletionUnobservable);
+                }
                 #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
                 for buffer in rendered_wayland_buffers {
-                    if !completion_was_host_waited && !sync.is_reached() {
+                    if !sync.is_reached() {
                         buffer.record_render_completion(
                             shared_sync_file
                                 .as_ref()
-                                .expect(
-                                    "pending Wayland render completion lacked an export after host-wait gate",
-                                )
+                                .expect("pending Wayland render completion passed the typed export gate")
                                 .clone(),
                         );
                     }

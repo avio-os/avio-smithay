@@ -5583,6 +5583,15 @@ where
             RenderFrameError::RenderFrame(err) => err.is_device_lost(),
         }
     }
+
+    /// Returns `true` when the renderer may have sampled Wayland sources but
+    /// could not export an exact completion edge for their release authority.
+    pub fn is_wayland_completion_unobservable(&self) -> bool {
+        match self {
+            RenderFrameError::PrepareFrame(_) => false,
+            RenderFrameError::RenderFrame(err) => err.is_wayland_completion_unobservable(),
+        }
+    }
 }
 
 impl<A, B, F, R> std::fmt::Debug for RenderFrameError<A, B, F, R>

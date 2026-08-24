@@ -19,25 +19,37 @@ use crate::wayland::compositor::{Blocker, BlockerState};
 pub(super) struct DrmTimelineInner {
     timeline_fd: OwnedFd,
     dev_ctx: Mutex<DrmTimelineDeviceSpecific>,
+    invalidated: AtomicBool,
 }
 
 impl DrmTimelineInner {
     pub(super) fn update_device(&self, device: &DrmDeviceFd) -> io::Result<()> {
+        if self.invalidated.load(Ordering::SeqCst) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         let mut ctx = self.dev_ctx.lock().unwrap();
+        if self.invalidated.load(Ordering::SeqCst) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         let mut new = DrmTimelineDeviceSpecific::import(self.timeline_fd.as_fd(), device)?;
         for (point, eventfd) in ctx
             .event_fds
             .iter()
             .flat_map(|(p, fd)| fd.upgrade().map(|fd| (p, fd)))
         {
-            device.syncobj_eventfd(new.syncobj, *point, eventfd.as_fd(), false)?;
+            if let Err(error) = device.syncobj_eventfd(new.syncobj, *point, eventfd.as_fd(), false) {
+                new.destroy_syncobj();
+                return Err(error);
+            }
             new.event_fds.push((*point, Arc::downgrade(&eventfd)));
         }
+        ctx.destroy_syncobj();
         *ctx = new;
         Ok(())
     }
 
     pub(super) fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::SeqCst);
         self.dev_ctx.lock().unwrap().invalidate()
     }
 }
@@ -59,15 +71,28 @@ impl DrmTimelineDeviceSpecific {
         })
     }
 
-    fn invalidate(&mut self) {
+    fn destroy_syncobj(&mut self) {
         if let Some(device) = self.device.upgrade() {
             let _ = device.destroy_syncobj(self.syncobj);
         }
         self.device = WeakDrmDeviceFd::new();
-        // trigger event fds
+    }
+
+    fn invalidate(&mut self) {
+        self.destroy_syncobj();
+        // Wake event sources so transaction queues can observe the shared
+        // invalidation bit and cancel rather than release their blockers.
         for eventfd in self.event_fds.drain(..).filter_map(|(_, x)| Weak::upgrade(&x)) {
-            let _ = rustix::io::write(&eventfd, &[1]);
+            let _ = wake_eventfd(eventfd.as_ref());
         }
+    }
+}
+
+fn wake_eventfd(eventfd: &OwnedFd) -> io::Result<()> {
+    let wake = 1_u64.to_ne_bytes();
+    match rustix::io::write(eventfd, &wake)? {
+        written if written == wake.len() => Ok(()),
+        _ => Err(io::ErrorKind::WriteZero.into()),
     }
 }
 
@@ -88,6 +113,7 @@ impl DrmTimeline {
         Ok(Self(Arc::new(DrmTimelineInner {
             timeline_fd: fd,
             dev_ctx,
+            invalidated: AtomicBool::new(false),
         })))
     }
 
@@ -113,6 +139,10 @@ pub struct DrmSyncPoint {
 }
 
 impl DrmSyncPoint {
+    fn is_invalidated(&self) -> bool {
+        self.timeline.0.invalidated.load(Ordering::SeqCst)
+    }
+
     /// Create an eventfd that will be signaled by the syncpoint
     pub fn eventfd(&self) -> io::Result<Arc<OwnedFd>> {
         let fd = rustix::event::eventfd(
@@ -256,6 +286,7 @@ fn import_sync_file_as_syncobj(
         flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
         fd: sync_file.as_raw_fd(),
         pad: 0,
+        ..Default::default()
     };
     // SAFETY: `device` is a live DRM fd and `args` matches the kernel's
     // `struct drm_syncobj_handle` layout for this opcode.
@@ -347,13 +378,50 @@ pub struct DrmSyncPointBlocker {
 
 impl Blocker for DrmSyncPointBlocker {
     fn state(&self) -> BlockerState {
+        if self.sync_point.is_invalidated() {
+            return BlockerState::Cancelled;
+        }
         // The eventfd callback is the fast path. Querying the timeline point
         // makes blocker state authoritative even if that one-shot wakeup is
         // lost before the compositor re-enters its transaction queue.
-        if self.signal.load(Ordering::SeqCst) || self.sync_point.is_signaled() {
-            BlockerState::Released
-        } else {
-            BlockerState::Pending
-        }
+        let signaled = self.signal.load(Ordering::SeqCst) || self.sync_point.is_signaled();
+        // Invalidation may have supplied the eventfd wake observed above.
+        // Sample it again at the decision edge so cancellation remains
+        // dominant over a wake that is not completion evidence.
+        sync_point_blocker_state(self.sync_point.is_invalidated(), signaled)
+    }
+}
+
+fn sync_point_blocker_state(invalidated: bool, signaled: bool) -> BlockerState {
+    if invalidated {
+        BlockerState::Cancelled
+    } else if signaled {
+        BlockerState::Released
+    } else {
+        BlockerState::Pending
+    }
+}
+
+#[cfg(test)]
+mod blocker_state_tests {
+    use super::{sync_point_blocker_state, wake_eventfd};
+    use crate::wayland::compositor::BlockerState;
+    use rustix::event::{eventfd, EventfdFlags};
+
+    #[test]
+    fn invalidation_cancels_even_if_the_eventfd_woke() {
+        assert_eq!(sync_point_blocker_state(true, true), BlockerState::Cancelled);
+        assert_eq!(sync_point_blocker_state(false, true), BlockerState::Released);
+        assert_eq!(sync_point_blocker_state(false, false), BlockerState::Pending);
+    }
+
+    #[test]
+    fn invalidation_wake_is_a_complete_eventfd_word() {
+        let eventfd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+        wake_eventfd(&eventfd).unwrap();
+
+        let mut wake = [0_u8; std::mem::size_of::<u64>()];
+        assert_eq!(rustix::io::read(&eventfd, &mut wake).unwrap(), wake.len());
+        assert_eq!(u64::from_ne_bytes(wake), 1);
     }
 }

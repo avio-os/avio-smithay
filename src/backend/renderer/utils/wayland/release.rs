@@ -42,6 +42,11 @@ enum ReleaseTarget {
         dmabuf: Option<Dmabuf>,
     },
     Explicit(DrmSyncPoint),
+    #[cfg(test)]
+    Probe {
+        attachment: u64,
+        completed: Arc<Mutex<Vec<u64>>>,
+    },
 }
 
 #[derive(Debug)]
@@ -77,6 +82,14 @@ impl BufferReleaseMerger {
 
     pub(super) fn explicit(release_point: DrmSyncPoint) -> Self {
         Self::new(ReleaseTarget::Explicit(release_point))
+    }
+
+    #[cfg(test)]
+    fn probe(attachment: u64, completed: Arc<Mutex<Vec<u64>>>) -> Self {
+        Self::new(ReleaseTarget::Probe {
+            attachment,
+            completed,
+        })
     }
 
     fn new(target: ReleaseTarget) -> Self {
@@ -367,6 +380,17 @@ impl PendingFinalization {
                         FinalizationProgress::TerminalFailure
                     }
                 }
+            }
+            #[cfg(test)]
+            ReleaseTarget::Probe {
+                attachment,
+                completed,
+            } => {
+                completed
+                    .lock()
+                    .expect("test release probe poisoned")
+                    .push(*attachment);
+                FinalizationProgress::Complete
             }
         }
     }
@@ -789,5 +813,37 @@ mod tests {
         assert!(finalization_is_ready(&state));
         state.finalize_queued = true;
         assert!(!finalization_is_ready(&state));
+    }
+
+    #[test]
+    fn separate_attachment_release_targets_complete_out_of_order() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let first = BufferReleaseMerger::probe(11, Arc::clone(&completed));
+        let second = BufferReleaseMerger::probe(22, Arc::clone(&completed));
+        first.inner.state.lock().unwrap().pending_waits = 1;
+        second.inner.state.lock().unwrap().pending_waits = 1;
+
+        first.retire();
+        second.retire();
+        assert!(completed.lock().unwrap().is_empty());
+
+        second.inner.complete_wait();
+        assert_eq!(*completed.lock().unwrap(), vec![22]);
+        first.inner.complete_wait();
+        assert_eq!(*completed.lock().unwrap(), vec![22, 11]);
+    }
+
+    #[test]
+    fn attachment_release_waits_for_every_retained_reader() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let attachment = BufferReleaseMerger::probe(31, Arc::clone(&completed));
+        attachment.inner.state.lock().unwrap().pending_waits = 2;
+
+        attachment.retire();
+        attachment.inner.complete_wait();
+        assert!(completed.lock().unwrap().is_empty());
+
+        attachment.inner.complete_wait();
+        assert_eq!(*completed.lock().unwrap(), vec![31]);
     }
 }
