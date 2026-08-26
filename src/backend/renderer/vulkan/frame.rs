@@ -32,6 +32,7 @@ use super::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
     },
     sync::VulkanFence,
+    target::VulkanTargetEncoding,
     VulkanKawasePass, VulkanRenderer, VulkanRendererError, VulkanRendererErrorKind, VulkanTarget,
     VulkanTexture,
 };
@@ -51,6 +52,7 @@ struct FrameRecording {
     framebuffer: vk::Framebuffer,
     effect_framebuffers: Vec<vk::Framebuffer>,
     target: Arc<VulkanImage>,
+    encoding: VulkanTargetEncoding,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -67,6 +69,7 @@ struct FrameRecording {
 #[derive(Debug)]
 struct FrameResumeContext {
     target: Arc<VulkanImage>,
+    encoding: VulkanTargetEncoding,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -164,7 +167,7 @@ impl Renderer for VulkanRenderer {
         // fixed-function blend operate in linear light.
         let pipelines = self
             .pipelines
-            .pipelines_for_format(target_image.render_format())?;
+            .pipelines_for_format(target.encoding.format(target_image.vk_format()))?;
 
         let command_buffer = self.device.acquire_command_buffer()?;
         let begin_info =
@@ -181,7 +184,7 @@ impl Renderer for VulkanRenderer {
         let framebuffer = create_framebuffer(
             self.device.device_handle(),
             pipelines.render_pass,
-            target_image.render_view(),
+            target.encoding.view(&target_image),
             transformed_size,
         )?;
 
@@ -193,6 +196,7 @@ impl Renderer for VulkanRenderer {
                 framebuffer,
                 effect_framebuffers: Vec::new(),
                 target: target_image,
+                encoding: target.encoding,
                 pipelines,
                 transform: dst_transform,
                 output_size,
@@ -312,7 +316,7 @@ impl Frame for VulkanFrame<'_> {
                 recording.command_buffer,
                 recording.transform,
                 recording.size,
-                recording.target.blends_in_linear_light(),
+                recording.encoding.blends_in_linear_light(&recording.target),
             )
         };
 
@@ -401,7 +405,12 @@ impl Frame for VulkanFrame<'_> {
         // The shader premultiplies by alpha; linearizing the channels first makes that
         // a premultiplied-*linear* value, which is what a linear-light blend expects.
         let constants = SolidPushConstants {
-            color: encode_color_for_target(color, self.recording()?.target.blends_in_linear_light()),
+            color: encode_color_for_target(
+                color,
+                self.recording()?
+                    .encoding
+                    .blends_in_linear_light(&self.recording()?.target),
+            ),
         };
 
         // SAFETY: Command buffer recording is active and all pipeline/layout handles are valid.
@@ -584,6 +593,17 @@ fn wait_on_sync_point(
     }
 
     if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
+        // Exported render completions are queue dependencies, including when
+        // a sibling renderer reads an immutable image copy. Never turn that
+        // acquire into a host wait, or silently block after an import error.
+        if sync.is_exportable() {
+            let sync_file = sync.export().ok_or(VulkanRendererError::TemporaryFailure(
+                "could not retain exported Vulkan completion",
+            ))?;
+            return renderer
+                .device
+                .queue_wait_on_sync_file_with_stage(sync_file, wait_stage_mask);
+        }
         return vulkan_fence.wait_vk().map_err(Into::into);
     }
 
@@ -872,7 +892,10 @@ impl VulkanFrame<'_> {
 
     fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
         let format = Some(context.target.format().code);
-        VulkanTarget::from_image_resource(context.target.clone(), context.target.size(), format)
+        let mut target =
+            VulkanTarget::from_image_resource(context.target.clone(), context.target.size(), format);
+        target.encoding = context.encoding;
+        target
     }
 
     fn recording(&self) -> Result<&FrameRecording, VulkanRendererError> {
@@ -1085,7 +1108,7 @@ impl VulkanFrame<'_> {
                 recording.pipelines,
                 recording.transform,
                 recording.size,
-                recording.target.blends_in_linear_light(),
+                recording.encoding.blends_in_linear_light(&recording.target),
             )
         };
 
@@ -1490,6 +1513,7 @@ impl VulkanFrame<'_> {
         self.state = VulkanFrameState::Idle;
         Ok(FrameResumeContext {
             target: recording.target,
+            encoding: recording.encoding,
             pipelines: recording.pipelines,
             transform: recording.transform,
             output_size: recording.output_size,
@@ -1522,7 +1546,7 @@ impl VulkanFrame<'_> {
         let framebuffer = match create_framebuffer(
             self.renderer.device.device_handle(),
             context.pipelines.render_pass,
-            context.target.render_view(),
+            context.encoding.view(&context.target),
             context.size,
         ) {
             Ok(framebuffer) => framebuffer,
@@ -1539,6 +1563,7 @@ impl VulkanFrame<'_> {
             framebuffer,
             effect_framebuffers: Vec::new(),
             target: context.target.clone(),
+            encoding: context.encoding,
             pipelines: context.pipelines,
             transform: context.transform,
             output_size: context.output_size,
@@ -1955,6 +1980,29 @@ mod tests {
         .ok()?;
 
         Some((renderer, allocator))
+    }
+
+    #[test]
+    #[ignore = "requires a hardware Vulkan render node; run explicitly with --ignored"]
+    fn exported_vulkan_acquire_failure_does_not_fall_back_to_host_wait() {
+        let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+        let physical = PhysicalDevice::enumerate(&instance)
+            .unwrap()
+            .find(|device| device.render_node().ok().flatten().is_some())
+            .expect("hardware render node required");
+        let mut renderer = VulkanRenderer::new(&physical).unwrap();
+        // This unsignaled native fence has no submission, so a host wait would
+        // never finish. Reject the GPU acquire with an empty wait-stage mask;
+        // the result must not fall back to that host wait. The descriptor is
+        // only a test export and is never submitted to a queue.
+        let fence = super::VulkanFence::create(renderer.device.shared_device()).unwrap();
+        fence.set_exported_sync_file(std::fs::File::open("/dev/null").unwrap().into());
+        let sync = crate::backend::renderer::sync::SyncPoint::from(fence);
+        assert!(!sync.is_reached());
+        assert!(
+            super::wait_on_sync_point(&mut renderer, &sync, ash::vk::PipelineStageFlags::empty(),).is_err()
+        );
+        assert_eq!(renderer.device.in_flight_submission_count(), 0);
     }
 
     fn init_renderer_and_effect_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {

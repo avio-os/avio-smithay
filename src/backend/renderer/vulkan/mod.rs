@@ -436,6 +436,28 @@ impl VulkanRenderer {
             .bind_render_target(&self.device, &self.formats, dmabuf)
     }
 
+    /// Bind immutable-image copy storage without the compositing pass's sRGB
+    /// conversion. An unscaled source drawn with alpha one over transparent
+    /// black retains its encoded premultiplied channels, including alpha.
+    ///
+    /// The destination must have an alpha channel: opaque DRM formats use a
+    /// sampled-view component swizzle, which is not a legal attachment view.
+    /// This is a resource-copy target, not a different display blend policy.
+    pub fn bind_dmabuf_storage_copy_target(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<VulkanTarget, VulkanRendererError> {
+        use crate::backend::allocator::Buffer;
+        if !crate::backend::allocator::format::has_alpha(dmabuf.format().code) {
+            return Err(VulkanRendererError::InvalidDmabuf(
+                "storage-copy target requires identity alpha components",
+            ));
+        }
+        let mut target = self.bind_dmabuf_target(dmabuf)?;
+        target.encoding = target::VulkanTargetEncoding::PreserveStorage;
+        Ok(target)
+    }
+
     /// Bind a dma-buf as the active accumulator for inline framebuffer
     /// effects. The imported Vulkan image declares both color-attachment and
     /// transfer-source usage.
