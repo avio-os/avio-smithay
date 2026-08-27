@@ -11,7 +11,7 @@ use crate::{
             format::{has_alpha, FormatSet},
         },
         renderer::{
-            sync::SyncPoint, Bind, Blit, BlitFrame, Color32F, ContextId, Frame, ImportDma,
+            sync::SyncPoint, Bind, Blit, BlitFrame, BottomEdgeClip, Color32F, ContextId, Frame, ImportDma,
             RenderTargetAccess, Renderer, RendererSuper, RoundedClip, Texture, TextureFilter,
             TextureRenderEffect,
         },
@@ -501,7 +501,33 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            Some(rounded_clip),
+            Some(AnalyticClip::Rounded(rounded_clip)),
+            TextureRenderEffect::NONE,
+        )
+    }
+
+    #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
+    #[profiling::function]
+    fn render_texture_from_to_with_bottom_edge_clip(
+        &mut self,
+        texture: &VulkanTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        bottom_edge_clip: BottomEdgeClip,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
+            alpha,
+            Some(AnalyticClip::BottomEdge(bottom_edge_clip)),
             TextureRenderEffect::NONE,
         )
     }
@@ -554,7 +580,7 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            Some(rounded_clip),
+            Some(AnalyticClip::Rounded(rounded_clip)),
             effect,
         )
     }
@@ -1086,7 +1112,7 @@ impl VulkanFrame<'_> {
         opaque_regions: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
-        rounded_clip: Option<RoundedClip>,
+        analytic_clip: Option<AnalyticClip>,
         effect: TextureRenderEffect,
     ) -> Result<(), VulkanRendererError> {
         if damage.is_empty() {
@@ -1117,9 +1143,9 @@ impl VulkanFrame<'_> {
             return Ok(());
         };
 
-        let rounded_clip = rounded_clip.map(|clip| transform_rounded_clip(transform, size, clip));
-        let has_rounded_clip = rounded_clip
-            .map(|clip| clip.corner_mask != 0 && clip.radius > 0.0)
+        let analytic_clip = analytic_clip.map(|clip| transform_analytic_clip(transform, size, clip));
+        let has_analytic_clip = analytic_clip
+            .map(TransformedAnalyticClip::has_coverage_mask)
             .unwrap_or(false);
 
         let draw_damage = Self::transformed_damage_rects(transform, size, dst, damage);
@@ -1167,17 +1193,31 @@ impl VulkanFrame<'_> {
         .with_source_encoding(texture_image.color_encoding(), linear_blending)
         .with_effect(effect);
 
-        if let Some(clip) = rounded_clip {
-            push_constants = push_constants.with_rounded_clip(
-                clip.corner_mask,
-                rounded_clip_rect_push_constant(clip.rect),
-                [
-                    clip.radius.max(0.0),
-                    clip.exponent.max(2.0),
-                    clip.aa_width.max(0.001),
-                    0.0,
-                ],
-            );
+        if let Some(clip) = analytic_clip {
+            push_constants = match clip {
+                TransformedAnalyticClip::Rounded(clip) => push_constants.with_rounded_clip(
+                    clip.corner_mask,
+                    analytic_clip_rect_push_constant(clip.rect),
+                    [
+                        clip.radius.max(0.0),
+                        clip.exponent.max(2.0),
+                        clip.aa_width.max(0.001),
+                        0.0,
+                    ],
+                ),
+                TransformedAnalyticClip::BottomEdge { clip, transform } => push_constants
+                    .with_bottom_edge_clip(
+                        transform,
+                        analytic_clip_rect_push_constant(clip.rect),
+                        [
+                            clip.content_width.max(0.0),
+                            clip.progress.max(0.0),
+                            clip.edge_height.max(0.0),
+                            clip.plateau_inset.max(0.0),
+                        ],
+                        clip.geometry_scale.max(0.001),
+                    ),
+            };
         }
 
         let sampler = texture_sampler_for_render(
@@ -1194,9 +1234,9 @@ impl VulkanFrame<'_> {
 
         let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
         let has_shader_effect = !effect.is_none();
-        let use_opaque_only = alpha >= 1.0 && !texture_has_alpha && !has_rounded_clip && !has_shader_effect;
+        let use_opaque_only = alpha >= 1.0 && !texture_has_alpha && !has_analytic_clip && !has_shader_effect;
 
-        let transformed_opaque = if alpha >= 1.0 && !has_rounded_clip && !has_shader_effect {
+        let transformed_opaque = if alpha >= 1.0 && !has_analytic_clip && !has_shader_effect {
             Self::transformed_damage_rects(transform, size, dst, opaque_regions)
         } else {
             Vec::new()
@@ -1745,13 +1785,59 @@ fn to_vk_viewport(rect: Rectangle<i32, Physical>) -> vk::Viewport {
     }
 }
 
-fn rounded_clip_rect_push_constant(rect: Rectangle<f64, Physical>) -> [f32; 4] {
+#[derive(Debug, Clone, Copy)]
+enum AnalyticClip {
+    Rounded(RoundedClip),
+    BottomEdge(BottomEdgeClip),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransformedAnalyticClip {
+    Rounded(RoundedClip),
+    BottomEdge {
+        clip: BottomEdgeClip,
+        transform: TextureTransform,
+    },
+}
+
+impl TransformedAnalyticClip {
+    fn has_coverage_mask(self) -> bool {
+        match self {
+            Self::Rounded(clip) => clip.corner_mask != 0 && clip.radius > 0.0,
+            Self::BottomEdge { .. } => true,
+        }
+    }
+}
+
+fn analytic_clip_rect_push_constant(rect: Rectangle<f64, Physical>) -> [f32; 4] {
     [
         rect.loc.x as f32,
         rect.loc.y as f32,
         rect.size.w as f32,
         rect.size.h as f32,
     ]
+}
+
+fn transform_analytic_clip(
+    transform: Transform,
+    frame_size: Size<i32, Physical>,
+    clip: AnalyticClip,
+) -> TransformedAnalyticClip {
+    match clip {
+        AnalyticClip::Rounded(clip) => {
+            TransformedAnalyticClip::Rounded(transform_rounded_clip(transform, frame_size, clip))
+        }
+        AnalyticClip::BottomEdge(clip) => {
+            let frame_size = frame_size.to_f64();
+            TransformedAnalyticClip::BottomEdge {
+                clip: BottomEdgeClip {
+                    rect: transform.transform_rect_in(clip.rect, &frame_size),
+                    ..clip
+                },
+                transform: TextureTransform::from(transform),
+            }
+        }
+    }
 }
 
 fn transform_rounded_clip(
@@ -1938,7 +2024,8 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_image_transform, framebuffer_capture_area, texture_sampler_for_render, TextureSampler,
+        combine_image_transform, framebuffer_capture_area, texture_sampler_for_render,
+        transform_analytic_clip, AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip,
         VulkanRenderer, VulkanRendererError,
     };
     use crate::{
@@ -1949,8 +2036,8 @@ mod tests {
                 Allocator, Fourcc,
             },
             renderer::{
-                vulkan::VulkanTexture, Bind, Blit, BlitFrame, Color32F, ExportMem, Frame, Offscreen,
-                RenderTargetAccess, Renderer, Texture, TextureFilter,
+                vulkan::VulkanTexture, Bind, Blit, BlitFrame, BottomEdgeClip, Color32F, ExportMem, Frame,
+                Offscreen, RenderTargetAccess, Renderer, Texture, TextureFilter,
             },
             vulkan::{version::Version, Instance, PhysicalDevice},
         },
@@ -2064,6 +2151,46 @@ mod tests {
                 .expect("read area remains inside the transformed target");
             assert!(Rectangle::from_size(target_size).contains_rect(capture));
             assert_eq!(capture.size, transform.transform_size(read.size));
+        }
+    }
+
+    #[test]
+    fn bottom_edge_clip_keeps_source_orientation_across_output_transforms() {
+        let frame_size = Size::<i32, Physical>::from((300, 200));
+        let source_rect = Rectangle::new((20.0, 30.0).into(), (100.0, 80.0).into());
+        let source = BottomEdgeClip {
+            rect: source_rect,
+            content_width: 72.0,
+            progress: 1.05,
+            edge_height: 62.0,
+            plateau_inset: 8.0,
+            geometry_scale: 1.25,
+        };
+
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let transformed =
+                transform_analytic_clip(transform, frame_size, AnalyticClip::BottomEdge(source));
+            let TransformedAnalyticClip::BottomEdge {
+                clip,
+                transform: clip_transform,
+            } = transformed
+            else {
+                panic!("bottom-edge clip kind changed while transforming");
+            };
+            assert_eq!(
+                clip.rect,
+                transform.transform_rect_in(source_rect, &frame_size.to_f64())
+            );
+            assert_eq!(clip_transform, TextureTransform::from(transform));
         }
     }
 

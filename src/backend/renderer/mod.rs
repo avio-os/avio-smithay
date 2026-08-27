@@ -336,6 +336,27 @@ impl RoundedClip {
     pub const BOTTOM_CORNERS: u32 = Self::BOTTOM_LEFT | Self::BOTTOM_RIGHT;
 }
 
+/// Analytic bottom-edge pull clipping applied while sampling a texture.
+///
+/// The curve is resolved by the renderer from a bounded parameter set rather
+/// than a client-supplied bitmap mask. All lengths are physical pixels in the
+/// untransformed destination coordinate space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BottomEdgeClip {
+    /// Bounding rectangle in framebuffer physical coordinates.
+    pub rect: Rectangle<f64, Physical>,
+    /// Width of the Dock's content plateau before the authored inset.
+    pub content_width: f32,
+    /// Live pull progress. Values above one preserve the spring overshoot.
+    pub progress: f32,
+    /// Settled height of the pulled edge.
+    pub edge_height: f32,
+    /// Extra inset on each side of the content plateau.
+    pub plateau_inset: f32,
+    /// Physical pixels per authored logical pixel.
+    pub geometry_scale: f32,
+}
+
 /// Renderer-owned texture effect applied while sampling a texture.
 ///
 /// These effects are intentionally expressed as compact shader parameters so
@@ -475,6 +496,23 @@ pub trait Frame {
         src_transform: Transform,
         alpha: f32,
         _rounded_clip: RoundedClip,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to(texture, src, dst, damage, opaque_regions, src_transform, alpha)
+    }
+
+    /// Render a texture with Avio's analytic bottom-edge pull clip applied in
+    /// the destination coordinate space.
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_with_bottom_edge_clip(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        _bottom_edge_clip: BottomEdgeClip,
     ) -> Result<(), Self::Error> {
         self.render_texture_from_to(texture, src, dst, damage, opaque_regions, src_transform, alpha)
     }

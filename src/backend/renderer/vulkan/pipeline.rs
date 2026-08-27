@@ -64,7 +64,12 @@ pub(crate) struct TexturePushConstants {
     /// How the sampled texels relate to linear light, and therefore which conversion
     /// the shader applies before the blend. See [`ColorEncoding`].
     pub(crate) source_encoding: u32,
+    /// Physical pixels per authored logical pixel for parametric clips.
+    pub(crate) clip_scale: f32,
 }
+
+const BOTTOM_EDGE_CLIP_FLAG: u32 = 1 << 31;
+const CLIP_TRANSFORM_SHIFT: u32 = 8;
 
 /// Shader-side spelling of [`ColorEncoding`]. Kept next to the push-constant struct so
 /// the two stay in step; `texture.frag` reads the same numbering.
@@ -96,6 +101,7 @@ impl Default for TexturePushConstants {
             effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
             effect_params: [0.0, 0.0, 0.0, 0.0],
             source_encoding: SOURCE_ENCODING_PASSTHROUGH,
+            clip_scale: 1.0,
         }
     }
 }
@@ -114,6 +120,7 @@ impl TexturePushConstants {
             effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
             effect_params: [0.0, 0.0, 0.0, 0.0],
             source_encoding: SOURCE_ENCODING_PASSTHROUGH,
+            clip_scale: 1.0,
         }
     }
 
@@ -140,6 +147,20 @@ impl TexturePushConstants {
         self.rounded_clip_flags = flags;
         self.clip_rect = rect;
         self.clip_params = params;
+        self
+    }
+
+    pub(crate) fn with_bottom_edge_clip(
+        mut self,
+        transform: TextureTransform,
+        rect: [f32; 4],
+        params: [f32; 4],
+        geometry_scale: f32,
+    ) -> Self {
+        self.rounded_clip_flags = BOTTOM_EDGE_CLIP_FLAG | ((transform as u32) << CLIP_TRANSFORM_SHIFT);
+        self.clip_rect = rect;
+        self.clip_params = params;
+        self.clip_scale = geometry_scale;
         self
     }
 
@@ -755,8 +776,8 @@ mod tests {
         super::device::DeviceHandle,
         super::device::DeviceState,
         push_constants_bytes, PipelineState, SolidPushConstants, TexturePushConstants, TextureTransform,
-        SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED, SOURCE_ENCODING_LINEAR_PREMULTIPLIED,
-        SOURCE_ENCODING_PASSTHROUGH,
+        BOTTOM_EDGE_CLIP_FLAG, CLIP_TRANSFORM_SHIFT, SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
+        SOURCE_ENCODING_LINEAR_PREMULTIPLIED, SOURCE_ENCODING_PASSTHROUGH,
     };
 
     const TEST_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -1391,6 +1412,34 @@ mod tests {
             [TextureRenderEffectKind::Genie as u32 as f32, 1.0, 0.25, 0.875]
         );
         assert_eq!(constants.effect_params, [0.11, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn texture_push_constants_encode_bottom_edge_clip() {
+        let constants = TexturePushConstants::new(1.0, TextureTransform::Normal, false)
+            .with_bottom_edge_clip(
+                TextureTransform::Rotate90,
+                [12.0, 24.0, 640.0, 78.0],
+                [420.0, 0.875, 62.0, 8.0],
+                1.25,
+            );
+
+        assert_eq!(
+            constants.rounded_clip_flags,
+            BOTTOM_EDGE_CLIP_FLAG | ((TextureTransform::Rotate90 as u32) << CLIP_TRANSFORM_SHIFT)
+        );
+        assert_eq!(constants.clip_rect, [12.0, 24.0, 640.0, 78.0]);
+        assert_eq!(constants.clip_params, [420.0, 0.875, 62.0, 8.0]);
+        assert_eq!(constants.clip_scale, 1.25);
+    }
+
+    #[test]
+    fn texture_push_constant_layout_matches_the_shader_block() {
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 104);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, alpha), 0);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_rect), 32);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, source_encoding), 96);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_scale), 100);
     }
 
     #[derive(Debug)]

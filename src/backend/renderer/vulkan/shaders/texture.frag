@@ -14,12 +14,15 @@ layout(push_constant) uniform TexturePushConstants {
     vec4 effect;
     vec4 effect_params;
     uint source_encoding;
+    float clip_scale;
 } constants;
 
 // Must match the SOURCE_ENCODING_* constants in pipeline.rs.
 const uint SOURCE_ELECTRICAL_PREMULTIPLIED = 0u;
 const uint SOURCE_LINEAR_PREMULTIPLIED = 1u;
 const uint SOURCE_PASSTHROUGH = 2u;
+const uint BOTTOM_EDGE_CLIP_FLAG = 0x80000000u;
+const uint CLIP_TRANSFORM_SHIFT = 8u;
 
 vec3 srgb_to_linear(vec3 c) {
     bvec3 lo = lessThanEqual(c, vec3(0.04045));
@@ -90,7 +93,8 @@ vec2 apply_transform(vec2 uv, uint transform) {
 }
 
 float rounded_clip_alpha(vec2 frag_pos) {
-    if (constants.rounded_clip_flags == 0u) {
+    uint corner_flags = constants.rounded_clip_flags & 0xFu;
+    if (corner_flags == 0u) {
         return 1.0;
     }
 
@@ -127,13 +131,206 @@ float rounded_clip_alpha(vec2 frag_pos) {
         return 1.0;
     }
 
-    if ((constants.rounded_clip_flags & corner_flag) == 0u) {
+    if ((corner_flags & corner_flag) == 0u) {
         return 1.0;
     }
 
     vec2 delta = abs(clip_pos - center);
     float dist = pow(pow(delta.x, exponent) + pow(delta.y, exponent), 1.0 / exponent) - radius;
     return 1.0 - smoothstep(-aa_width, aa_width, dist);
+}
+
+float cubic_component(float p0, float p1, float p2, float p3, float t) {
+    float inverse = 1.0 - t;
+    return inverse * inverse * inverse * p0 +
+        3.0 * inverse * inverse * t * p1 +
+        3.0 * inverse * t * t * p2 +
+        t * t * t * p3;
+}
+
+float bottom_edge_left_boundary(
+    float y,
+    float baseline,
+    float plateau_top,
+    float plateau_left,
+    float foot_left,
+    float foot_radius,
+    float foot_tangent,
+    float top_extension,
+    float cosine,
+    float sine,
+    float corner_handle
+) {
+    float foot_end_y = baseline - foot_tangent * sine;
+    float cubic_start_y = plateau_top + top_extension * sine;
+
+    if (y >= foot_end_y) {
+        vec2 center = vec2(foot_left - foot_tangent, baseline - foot_radius);
+        float dy = y - center.y;
+        return center.x + sqrt(max(0.0, foot_radius * foot_radius - dy * dy));
+    }
+
+    vec2 foot_end = vec2(
+        foot_left + foot_tangent * cosine,
+        foot_end_y
+    );
+    vec2 cubic_start = vec2(
+        plateau_left - top_extension * cosine,
+        cubic_start_y
+    );
+    if (y >= cubic_start_y) {
+        float line_progress = (y - cubic_start.y) /
+            max(foot_end.y - cubic_start.y, 0.0001);
+        return mix(cubic_start.x, foot_end.x, line_progress);
+    }
+
+    vec2 p0 = cubic_start;
+    vec2 p1 = vec2(
+        plateau_left - corner_handle * top_extension * cosine,
+        plateau_top + corner_handle * top_extension * sine
+    );
+    vec2 p2 = vec2(
+        plateau_left + corner_handle * top_extension,
+        plateau_top
+    );
+    vec2 p3 = vec2(plateau_left + top_extension, plateau_top);
+    float low = 0.0;
+    float high = 1.0;
+    for (int iteration = 0; iteration < 10; iteration++) {
+        float candidate = (low + high) * 0.5;
+        float candidate_y = cubic_component(p0.y, p1.y, p2.y, p3.y, candidate);
+        if (candidate_y > y) {
+            low = candidate;
+        } else {
+            high = candidate;
+        }
+    }
+    float t = (low + high) * 0.5;
+    return cubic_component(p0.x, p1.x, p2.x, p3.x, t);
+}
+
+float bottom_edge_clip_alpha(vec2 frag_pos) {
+    if ((constants.rounded_clip_flags & BOTTOM_EDGE_CLIP_FLAG) == 0u) {
+        return 1.0;
+    }
+
+    vec2 clip_size = constants.clip_rect.zw;
+    vec2 transformed_position = frag_pos - constants.clip_rect.xy;
+    if (transformed_position.x < 0.0 || transformed_position.y < 0.0 ||
+        transformed_position.x > clip_size.x || transformed_position.y > clip_size.y) {
+        return 0.0;
+    }
+
+    uint clip_transform =
+        (constants.rounded_clip_flags >> CLIP_TRANSFORM_SHIFT) & 0x7u;
+    vec2 transformed_uv = transformed_position / max(clip_size, vec2(0.0001));
+    vec2 source_uv = apply_transform(transformed_uv, clip_transform);
+    bool swaps_axes = clip_transform == 1u || clip_transform == 3u ||
+        clip_transform == 5u || clip_transform == 7u;
+    vec2 source_size = swaps_axes ? clip_size.yx : clip_size;
+    vec2 point = source_uv * source_size;
+
+    const float ANGLE_LOW = 9.0;
+    const float ANGLE_FULL = 89.6;
+    const float ANGLE_EASE = 0.55;
+    const float SPLAY = 52.0;
+    const float SPLAY_EASE = 1.2;
+    const float MINIMUM_STRAIGHT = 6.0;
+    const float JOIN_SMOOTH = 16.0;
+    const float SQUIRCLE_EXTENSION = 1.6;
+    const float SQUIRCLE_HANDLE = 0.26;
+    const float CIRCULAR_HANDLE = 0.4477;
+    const float TOP_RADIUS_MAXIMUM = 20.0;
+    const float FOOT_RADIUS_MAXIMUM = 8.0;
+    const float FOOT_RADIUS_SOFT = 20.0;
+    const float TOP_RADIUS_SOFT = 16.0;
+
+    float geometry_scale = max(constants.clip_scale, 0.001);
+    float progress = max(constants.clip_params.y, 0.0);
+    float raised_height = constants.clip_params.z * progress;
+    if (raised_height < 0.5 * geometry_scale) {
+        return 0.0;
+    }
+
+    float settled = clamp(progress, 0.0, 1.0);
+    float angle_degrees = mix(ANGLE_LOW, ANGLE_FULL, pow(settled, ANGLE_EASE));
+    float angle_radians = radians(angle_degrees);
+    float side_run = angle_radians > radians(89.5) ? 0.0 :
+        raised_height / tan(angle_radians);
+    float top_radius = min(
+        raised_height * 1.3,
+        (TOP_RADIUS_MAXIMUM + TOP_RADIUS_SOFT * (1.0 - settled)) * geometry_scale
+    );
+    float foot_radius = min(
+        raised_height * 1.1,
+        (FOOT_RADIUS_MAXIMUM + FOOT_RADIUS_SOFT * (1.0 - settled)) * geometry_scale
+    );
+    float half_tangent = tan(angle_radians * 0.5);
+    float span = raised_height / sin(angle_radians);
+    float overlap = (foot_radius + top_radius) * half_tangent -
+        (span - MINIMUM_STRAIGHT * geometry_scale * settled);
+    if (overlap > 0.0) {
+        float denominator = max((foot_radius + top_radius) * half_tangent, 0.0001);
+        float shrink = max(0.0, 1.0 - overlap / denominator);
+        top_radius *= shrink;
+        foot_radius *= shrink;
+    }
+
+    float straight = span - (foot_radius + top_radius) * half_tangent;
+    float curvature_blend = clamp(
+        1.0 - straight / (JOIN_SMOOTH * geometry_scale),
+        0.0,
+        1.0
+    );
+    if (curvature_blend > 0.0) {
+        float mean_radius = (top_radius + foot_radius) * 0.5;
+        top_radius = mix(top_radius, mean_radius, curvature_blend);
+        foot_radius = mix(foot_radius, mean_radius, curvature_blend);
+    }
+
+    float foot_tangent = foot_radius * half_tangent;
+    float top_tangent = top_radius * half_tangent;
+    float extension = 1.0 + (SQUIRCLE_EXTENSION - 1.0) * (1.0 - settled);
+    float corner_handle = mix(CIRCULAR_HANDLE, SQUIRCLE_HANDLE, 1.0 - settled);
+    float plateau_half = constants.clip_params.x * 0.5 + constants.clip_params.w;
+    float top_extension = min(
+        min(top_tangent * extension, top_tangent + max(0.0, straight) * 0.85),
+        plateau_half * 0.9
+    );
+
+    float baseline = source_size.y;
+    float plateau_top = baseline - raised_height;
+    float center_x = source_size.x * 0.5;
+    float half_width = plateau_half + SPLAY * geometry_scale *
+        pow(1.0 - settled, SPLAY_EASE);
+    float plateau_left = center_x - half_width;
+    float foot_left = plateau_left - side_run;
+    float cosine = cos(angle_radians);
+    float sine = sin(angle_radians);
+    if (point.y < plateau_top || point.y > baseline) {
+        return 0.0;
+    }
+
+    float left = bottom_edge_left_boundary(
+        point.y,
+        baseline,
+        plateau_top,
+        plateau_left,
+        foot_left,
+        foot_radius,
+        foot_tangent,
+        top_extension,
+        cosine,
+        sine,
+        corner_handle
+    );
+    float right = source_size.x - left;
+    float signed_inside = min(
+        min(point.x - left, right - point.x),
+        min(point.y - plateau_top, baseline - point.y)
+    );
+    float aa_width = max(fwidth(signed_inside) * 0.75, 0.5 * geometry_scale);
+    return smoothstep(-aa_width, aa_width, signed_inside);
 }
 
 vec2 genie_effect_uv(vec2 uv, out float coverage) {
@@ -225,6 +422,7 @@ void main() {
     uv = constants.src_offset + (uv * constants.src_scale);
 
     vec4 sampled = to_linear_premultiplied(texture(texture_sampler, uv));
-    float coverage = rounded_clip_alpha(gl_FragCoord.xy);
+    float coverage = rounded_clip_alpha(gl_FragCoord.xy) *
+        bottom_edge_clip_alpha(gl_FragCoord.xy);
     out_color = vec4(sampled.rgb * constants.alpha, sampled.a * constants.alpha) * coverage * effect_coverage;
 }
