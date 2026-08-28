@@ -12,8 +12,8 @@ use crate::{
         },
         renderer::{
             sync::SyncPoint, Bind, Blit, BlitFrame, BottomEdgeClip, Color32F, ContextId, Frame, ImportDma,
-            RenderTargetAccess, Renderer, RendererSuper, RoundedClip, Texture, TextureAlphaMode,
-            TextureFilter, TextureRenderEffect, TextureRenderOptions,
+            RenderTargetAccess, Renderer, RendererSuper, RoundedClip, Texture, TextureFilter,
+            TextureRenderEffect,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform},
@@ -475,7 +475,6 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            TextureAlphaMode::LinearCoverage,
             None,
             TextureRenderEffect::NONE,
         )
@@ -502,7 +501,6 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            TextureAlphaMode::LinearCoverage,
             Some(AnalyticClip::Rounded(rounded_clip)),
             TextureRenderEffect::NONE,
         )
@@ -529,7 +527,6 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            TextureAlphaMode::LinearCoverage,
             Some(AnalyticClip::BottomEdge(bottom_edge_clip)),
             TextureRenderEffect::NONE,
         )
@@ -556,7 +553,6 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            TextureAlphaMode::LinearCoverage,
             None,
             effect,
         )
@@ -584,36 +580,8 @@ impl Frame for VulkanFrame<'_> {
             opaque_regions,
             src_transform,
             alpha,
-            TextureAlphaMode::LinearCoverage,
             Some(AnalyticClip::Rounded(rounded_clip)),
             effect,
-        )
-    }
-
-    #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
-    #[profiling::function]
-    fn render_texture_from_to_with_options(
-        &mut self,
-        texture: &Self::TextureId,
-        src: Rectangle<f64, BufferCoord>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        src_transform: Transform,
-        alpha: f32,
-        options: TextureRenderOptions,
-    ) -> Result<(), Self::Error> {
-        self.render_texture_from_to_internal(
-            texture,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            src_transform,
-            alpha,
-            options.alpha_mode,
-            options.rounded_clip.map(AnalyticClip::Rounded),
-            options.effect,
         )
     }
 
@@ -1144,7 +1112,6 @@ impl VulkanFrame<'_> {
         opaque_regions: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
-        source_alpha_mode: TextureAlphaMode,
         analytic_clip: Option<AnalyticClip>,
         effect: TextureRenderEffect,
     ) -> Result<(), VulkanRendererError> {
@@ -1224,7 +1191,6 @@ impl VulkanFrame<'_> {
         )
         .with_src_rect(src_offset, src_scale)
         .with_source_encoding(texture_image.color_encoding(), linear_blending)
-        .with_source_alpha_mode(source_alpha_mode, linear_blending)
         .with_effect(effect);
 
         if let Some(clip) = analytic_clip {

@@ -15,15 +15,12 @@ layout(push_constant) uniform TexturePushConstants {
     vec4 effect_params;
     uint source_encoding;
     float clip_scale;
-    uint source_alpha_mode;
 } constants;
 
 // Must match the SOURCE_ENCODING_* constants in pipeline.rs.
 const uint SOURCE_ELECTRICAL_PREMULTIPLIED = 0u;
 const uint SOURCE_LINEAR_PREMULTIPLIED = 1u;
 const uint SOURCE_PASSTHROUGH = 2u;
-const uint SOURCE_ALPHA_LINEAR_COVERAGE = 0u;
-const uint SOURCE_ALPHA_ENCODED_SRGB_UI = 1u;
 const uint BOTTOM_EDGE_CLIP_FLAG = 0x80000000u;
 const uint CLIP_TRANSFORM_SHIFT = 8u;
 
@@ -61,27 +58,6 @@ vec4 to_linear_premultiplied(vec4 texel) {
     }
     vec3 straight = min(texel.rgb / texel.a, vec3(1.0));
     return vec4(srgb_to_linear(straight) * texel.a, texel.a);
-}
-
-// UI producers author text opacity, glyph coverage, vector antialiasing and
-// raster edges for conventional encoded-sRGB composition. A later linear-light
-// source-over makes that dark ink visibly lighter. Transfer the sampled alpha
-// once at the source seam, preserving its straight linear colour. Compositor-
-// owned analytic clips are multiplied afterwards and therefore retain the
-// linear-light edge response they were introduced for.
-//
-// `1 - linear(1 - alpha)` is the exact sRGB transfer for black ink over a white
-// reference backdrop and retains both endpoints. It is the appropriate model
-// for Avio's near-black ink over its pale material palette, without a backdrop
-// read, extra texture, or extra pass.
-vec4 apply_source_alpha_mode(vec4 texel) {
-    if (constants.source_alpha_mode != SOURCE_ALPHA_ENCODED_SRGB_UI ||
-        texel.a <= 0.0 || texel.a >= 1.0) {
-        return texel;
-    }
-
-    float transferred_alpha = 1.0 - srgb_to_linear(vec3(1.0 - texel.a)).r;
-    return vec4(texel.rgb * (transferred_alpha / texel.a), transferred_alpha);
 }
 
 layout(location = 0) in vec2 in_uv;
@@ -445,9 +421,7 @@ void main() {
 
     uv = constants.src_offset + (uv * constants.src_scale);
 
-    vec4 sampled = apply_source_alpha_mode(
-        to_linear_premultiplied(texture(texture_sampler, uv))
-    );
+    vec4 sampled = to_linear_premultiplied(texture(texture_sampler, uv));
     float coverage = rounded_clip_alpha(gl_FragCoord.xy) *
         bottom_edge_clip_alpha(gl_FragCoord.xy);
     out_color = vec4(sampled.rgb * constants.alpha, sampled.a * constants.alpha) * coverage * effect_coverage;
