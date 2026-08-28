@@ -225,6 +225,40 @@ pub struct VulkanUploadStats {
     pub submitted_bytes: u64,
 }
 
+/// Bounded descriptor-arena diagnostics. The stable-key cache target is a
+/// performance policy; `arena_max_sets` is the independent safety bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VulkanDescriptorStats {
+    /// Sets allocated across all live descriptor-pool pages.
+    pub arena_capacity_sets: usize,
+    /// Hard renderer-local set limit.
+    pub arena_max_sets: usize,
+    /// Number of lazily allocated descriptor-pool pages.
+    pub arena_pool_count: usize,
+    /// Stable texture keys currently cached.
+    pub cached_sets: usize,
+    /// Dead-view sets awaiting their last GPU completion.
+    pub retired_sets: usize,
+    /// Immediately rewriteable sets outside the cache.
+    pub free_sets: usize,
+    /// Sets bound by the current, not-yet-submitted recording.
+    pub recording_sets: usize,
+    /// Largest observed cache plus retired-set working set.
+    pub arena_high_water_sets: usize,
+    /// Number of bounded page growth operations.
+    pub arena_growth_count: u64,
+    /// Number of admissions deferred by incomplete GPU work at the hard bound.
+    pub arena_deferred_count: u64,
+}
+
+/// Opaque queue frontier used to determine whether a fallible render scope
+/// actually submitted work. Equality is renderer-local and wrap-safe for the
+/// practical lifetime of a renderer epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VulkanSubmissionSnapshot {
+    next_submission_id: u64,
+}
+
 /// Aggregated runtime diagnostics for the Vulkan renderer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanRendererDiagnostics {
@@ -232,6 +266,8 @@ pub struct VulkanRendererDiagnostics {
     pub dmabuf_cache: VulkanCacheStats,
     /// Texture descriptor cache diagnostics.
     pub descriptor_cache: VulkanCacheStats,
+    /// Bounded descriptor-pool and transactional-use diagnostics.
+    pub descriptors: VulkanDescriptorStats,
     /// Submission and completion timing diagnostics.
     pub submissions: VulkanSubmissionStats,
     /// Persistent staging and upload-batch diagnostics.
@@ -499,6 +535,28 @@ impl VulkanRenderer {
         self.device.take_pending_wait_semaphores()
     }
 
+    /// Preallocate descriptor pages for a conservative recording bound and
+    /// reject pressure before command recording begins.
+    pub fn reserve_texture_descriptors(&mut self, requested_sets: usize) -> Result<(), VulkanRendererError> {
+        self.device.reclaim_completed_submissions()?;
+        self.descriptors.reserve_texture_descriptors(requested_sets)
+    }
+
+    /// Capture the renderer's queue frontier immediately before a fallible
+    /// scope whose submission behavior must later be classified exactly.
+    pub fn submission_snapshot(&self) -> VulkanSubmissionSnapshot {
+        self.device.submission_snapshot()
+    }
+
+    /// Return the completion edge of the newest submission after `snapshot`,
+    /// or `None` when the scope provably submitted nothing.
+    pub fn completion_since(
+        &self,
+        snapshot: VulkanSubmissionSnapshot,
+    ) -> Option<crate::backend::renderer::sync::SyncPoint> {
+        self.device.completion_since(snapshot)
+    }
+
     /// Exports the current Vulkan pipeline cache blob for persistence by the caller.
     pub fn pipeline_cache_data(&self) -> Result<Vec<u8>, VulkanRendererError> {
         self.pipelines.pipeline_cache_data()
@@ -522,6 +580,7 @@ impl VulkanRenderer {
         VulkanRendererDiagnostics {
             dmabuf_cache: self.dmabuf.cache_stats(),
             descriptor_cache: self.descriptors.cache_stats(),
+            descriptors: self.descriptors.arena_stats(),
             submissions: VulkanSubmissionStats {
                 total_submissions: submissions.total_submissions,
                 blocking_submissions: submissions.blocking_submissions,

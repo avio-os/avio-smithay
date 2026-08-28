@@ -170,7 +170,6 @@ impl BlitState {
         ) {
             Ok(submission) => submission,
             Err(err) => {
-                let _ = device.discard_command_buffer(command_buffer);
                 restore_unsubmitted_foreign_acquires(&foreign_images);
                 return Err(err);
             }
@@ -311,7 +310,6 @@ impl BlitState {
             match device.submit_with_resources_and_fence(command_buffer, Vec::new(), retained_images) {
                 Ok(submission) => submission,
                 Err(err) => {
-                    let _ = device.discard_command_buffer(command_buffer);
                     restore_unsubmitted_foreign_acquires(&foreign_images);
                     return Err(err);
                 }

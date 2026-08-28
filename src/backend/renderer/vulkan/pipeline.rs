@@ -1118,7 +1118,8 @@ mod tests {
             vk_device.end_command_buffer(command_buffer).expect("end");
         }
 
-        device.submit(command_buffer).expect("submit");
+        let submission = device.submit(command_buffer).expect("submit");
+        descriptors.commit_submission(submission);
         device.wait_for_all_submissions().expect("wait");
         let pixels = readback.read().expect("readback");
         // The descriptor cache is keyed by raw vk::ImageView handle, so dropping
@@ -1846,9 +1847,14 @@ mod tests {
             }
         }
 
-        if device.submit(command_buffer).is_err() {
-            return;
-        }
+        let submission = match device.submit(command_buffer) {
+            Ok(submission) => submission,
+            Err(_) => {
+                descriptors.abort_recording();
+                return;
+            }
+        };
+        descriptors.commit_submission(submission);
         if device.wait_for_all_submissions().is_err() {
             return;
         }

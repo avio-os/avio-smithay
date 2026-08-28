@@ -75,6 +75,13 @@ Create `src/backend/renderer/vulkan/` with focused modules:
 - Renderer owns Vulkan device-side long-lived objects:
   - `VkDevice`, queue(s), command pool(s), descriptor pool(s), pipeline cache.
 - Per-frame objects are short-lived and strictly bounded by `Frame` lifetime.
+- Descriptor cache retention and descriptor allocation capacity are separate
+  policies. Combined-image-sampler sets come from lazily grown bounded pool
+  pages, are rewritten only after their last successful submission completes,
+  and are never individually freed on the recording path.
+- Descriptor use is transactional: recording marks a set locally, successful
+  queue submission commits the real submission id, and an aborted recording
+  rolls back without inventing GPU work.
 - Imported dmabufs are cached by `WeakDmabuf` with liveness checks.
 - Drop paths must be deterministic and safe even for partially initialized objects.
 
@@ -176,7 +183,8 @@ Exit criteria:
 
 - [x] Add solid-color pipeline.
 - [x] Add texture sampling pipeline with transform and alpha controls.
-- [x] Add descriptor set layouts/pools and update model.
+- [x] Add descriptor set layouts, bounded growable pool pages, completion-owned
+  recycling, and pre-recording admission.
 - [x] Precompile/ship SPIR-V assets or build-time shader compilation path.
 - [x] Add pipeline cache persistence strategy (optional but recommended).
 
@@ -369,7 +377,10 @@ Minimum matrix before production recommendation:
 - Risk: Sync fd import/export differs across drivers.
   - Mitigation: layered fallback (`SyncPoint` wait), capability detection at runtime.
 - Risk: Descriptor pool exhaustion in pathological scenes.
-  - Mitigation: pool sizing heuristics, recycling, and pressure metrics.
+  - Mitigation: a conservative graph bound is admitted before recording;
+    pool pages grow to a hard renderer-local limit, completion-safe sets are
+    recycled in place, and typed pressure plus arena metrics distinguish a
+    waitable in-flight working set from an impossible request.
 - Risk: Hidden lifetime bugs in dmabuf cache.
   - Mitigation: weak-key caches, explicit liveness checks, stress tests.
 - Risk: Shader/pipeline combinatoric growth.

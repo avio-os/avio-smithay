@@ -66,6 +66,15 @@ struct FrameRecording {
     unsubmitted_foreign_acquires: IndexMap<u64, Arc<VulkanImage>>,
 }
 
+impl FrameRecording {
+    fn take_framebuffers(&mut self) -> Vec<vk::Framebuffer> {
+        let mut framebuffers = Vec::with_capacity(1 + self.effect_framebuffers.len());
+        framebuffers.push(self.framebuffer);
+        framebuffers.append(&mut self.effect_framebuffers);
+        framebuffers
+    }
+}
+
 #[derive(Debug)]
 struct FrameResumeContext {
     target: Arc<VulkanImage>,
@@ -173,20 +182,29 @@ impl Renderer for VulkanRenderer {
         let begin_info =
             vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: Command buffer belongs to this device command pool and is not currently in use.
-        unsafe {
+        if let Err(error) = unsafe {
             self.device
                 .device_handle()
                 .begin_command_buffer(command_buffer, &begin_info)
-        }?;
+        } {
+            let _ = self.device.discard_command_buffer(command_buffer);
+            return Err(error.into());
+        }
         self.device
             .insert_debug_label(command_buffer, c"vulkan.render.begin", [0.17, 0.42, 0.86, 1.0]);
 
-        let framebuffer = create_framebuffer(
+        let framebuffer = match create_framebuffer(
             self.device.device_handle(),
             pipelines.render_pass,
             target.encoding.view(&target_image),
             transformed_size,
-        )?;
+        ) {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                let _ = self.device.discard_command_buffer(command_buffer);
+                return Err(error);
+            }
+        };
 
         let mut frame = VulkanFrame {
             renderer: self,
@@ -1416,20 +1434,11 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .end_command_buffer(recording.command_buffer)
         }) {
-            // SAFETY: Framebuffer was created for this device and command buffer will not be submitted.
-            self.renderer
-                .device
-                .shared_device()
-                .destroy_with(|device| unsafe {
-                    device.destroy_framebuffer(recording.framebuffer, None);
-                    for framebuffer in recording.effect_framebuffers.drain(..) {
-                        device.destroy_framebuffer(framebuffer, None);
-                    }
-                });
             let _ = self
                 .renderer
                 .device
-                .discard_command_buffer(recording.command_buffer);
+                .discard_recording_resources(recording.command_buffer, recording.take_framebuffers());
+            self.renderer.descriptors.abort_recording();
             Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
@@ -1437,26 +1446,21 @@ impl VulkanFrame<'_> {
         }
 
         let retained_images = retained_recording_images(&recording);
-        let mut framebuffers = Vec::with_capacity(1 + recording.effect_framebuffers.len());
-        framebuffers.push(recording.framebuffer);
-        framebuffers.append(&mut recording.effect_framebuffers);
-        let (_, submission_fence) = match self.renderer.device.submit_with_resources_and_fence(
+        let (submission_id, submission_fence) = match self.renderer.device.submit_with_resources_and_fence(
             recording.command_buffer,
-            framebuffers,
+            recording.take_framebuffers(),
             retained_images,
         ) {
             Ok(submission) => submission,
             Err(err) => {
-                let _ = self
-                    .renderer
-                    .device
-                    .discard_command_buffer(recording.command_buffer);
+                self.renderer.descriptors.abort_recording();
                 Self::restore_unsubmitted_foreign_acquires(&mut recording);
                 self.renderer.device.clear_pending_wait_semaphores();
                 self.state = VulkanFrameState::Aborted;
                 return Err(err);
             }
         };
+        self.renderer.descriptors.commit_submission(submission_id);
 
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
             image.set_layout(layout);
@@ -1503,20 +1507,11 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .end_command_buffer(recording.command_buffer)
         }) {
-            // SAFETY: Framebuffer was created for this device and command buffer will not be submitted.
-            self.renderer
-                .device
-                .shared_device()
-                .destroy_with(|device| unsafe {
-                    device.destroy_framebuffer(recording.framebuffer, None);
-                    for framebuffer in recording.effect_framebuffers.drain(..) {
-                        device.destroy_framebuffer(framebuffer, None);
-                    }
-                });
             let _ = self
                 .renderer
                 .device
-                .discard_command_buffer(recording.command_buffer);
+                .discard_recording_resources(recording.command_buffer, recording.take_framebuffers());
+            self.renderer.descriptors.abort_recording();
             Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
@@ -1524,23 +1519,21 @@ impl VulkanFrame<'_> {
         }
 
         let retained_images = retained_recording_images(&recording);
-        let mut framebuffers = Vec::with_capacity(1 + recording.effect_framebuffers.len());
-        framebuffers.push(recording.framebuffer);
-        framebuffers.append(&mut recording.effect_framebuffers);
-        if let Err(err) = self.renderer.device.submit_with_resources(
+        let submission_id = match self.renderer.device.submit_with_resources(
             recording.command_buffer,
-            framebuffers,
+            recording.take_framebuffers(),
             retained_images,
         ) {
-            let _ = self
-                .renderer
-                .device
-                .discard_command_buffer(recording.command_buffer);
-            Self::restore_unsubmitted_foreign_acquires(&mut recording);
-            self.renderer.device.clear_pending_wait_semaphores();
-            self.state = VulkanFrameState::Aborted;
-            return Err(err);
-        }
+            Ok(submission_id) => submission_id,
+            Err(err) => {
+                self.renderer.descriptors.abort_recording();
+                Self::restore_unsubmitted_foreign_acquires(&mut recording);
+                self.renderer.device.clear_pending_wait_semaphores();
+                self.state = VulkanFrameState::Aborted;
+                return Err(err);
+            }
+        };
+        self.renderer.descriptors.commit_submission(submission_id);
 
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
             image.set_layout(layout);
@@ -1654,27 +1647,15 @@ impl VulkanFrame<'_> {
 
     fn abort_recording(&mut self) {
         self.renderer.device.clear_pending_wait_semaphores();
+        self.renderer.descriptors.abort_recording();
 
         if let Some(mut recording) = self.recording.take() {
-            // SAFETY: Framebuffer was created by this device and command buffer is not submitted on abort.
-            // Skipped on a lost device: destroying it on a lost VkDevice faults on NVIDIA. `destroy_with`
-            // is the single ownership-encoded teardown gate; a no-op when lost.
-            self.renderer
-                .device
-                .shared_device()
-                .destroy_with(|device| unsafe {
-                    device.destroy_framebuffer(recording.framebuffer, None);
-                    for framebuffer in recording.effect_framebuffers.drain(..) {
-                        device.destroy_framebuffer(framebuffer, None);
-                    }
-                });
-
             if let Err(err) = self
                 .renderer
                 .device
-                .discard_command_buffer(recording.command_buffer)
+                .discard_recording_resources(recording.command_buffer, recording.take_framebuffers())
             {
-                warn!(?err, "failed to discard Vulkan frame command buffer during abort");
+                warn!(?err, "failed to discard Vulkan frame resources during abort");
             }
             Self::restore_unsubmitted_foreign_acquires(&mut recording);
         }

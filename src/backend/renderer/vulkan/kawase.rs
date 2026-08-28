@@ -196,15 +196,28 @@ impl VulkanRenderer {
             return Ok(SyncPoint::signaled());
         }
 
-        let resolved = self.resolve_kawase_passes(passes)?;
+        let resolved = match self.resolve_kawase_passes(passes) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.descriptors.abort_recording();
+                return Err(error);
+            }
+        };
 
-        let command_buffer = self.device.acquire_command_buffer()?;
+        let command_buffer = match self.device.acquire_command_buffer() {
+            Ok(command_buffer) => command_buffer,
+            Err(error) => {
+                self.descriptors.abort_recording();
+                return Err(error);
+            }
+        };
         let vk_device = self.device.device_handle();
         let begin_info =
             vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: Command buffer belongs to this device command pool and is not currently in-flight.
         if let Err(err) = unsafe { vk_device.begin_command_buffer(command_buffer, &begin_info) } {
             let _ = self.device.discard_command_buffer(command_buffer);
+            self.descriptors.abort_recording();
             return Err(err.into());
         }
         self.device
@@ -313,12 +326,10 @@ impl VulkanRenderer {
         };
 
         if let Err(err) = record() {
-            for framebuffer in framebuffers.drain(..) {
-                // SAFETY: Framebuffers were created above and the command
-                // buffer will never be submitted.
-                unsafe { vk_device.destroy_framebuffer(framebuffer, None) };
-            }
-            let _ = self.device.discard_command_buffer(command_buffer);
+            let _ = self
+                .device
+                .discard_recording_resources(command_buffer, std::mem::take(&mut framebuffers));
+            self.descriptors.abort_recording();
             restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err);
         }
@@ -347,11 +358,10 @@ impl VulkanRenderer {
 
         // SAFETY: Command buffer recording is valid and all commands were encoded above.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
-            for framebuffer in framebuffers.drain(..) {
-                // SAFETY: Created above; command buffer will not be submitted.
-                unsafe { vk_device.destroy_framebuffer(framebuffer, None) };
-            }
-            let _ = self.device.discard_command_buffer(command_buffer);
+            let _ = self
+                .device
+                .discard_recording_resources(command_buffer, std::mem::take(&mut framebuffers));
+            self.descriptors.abort_recording();
             restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err.into());
         }
@@ -360,18 +370,19 @@ impl VulkanRenderer {
             .iter()
             .flat_map(|pass| [pass.source.clone(), pass.destination.clone()])
             .collect::<Vec<_>>();
-        let (_, submission_fence) =
+        let (submission_id, submission_fence) =
             match self
                 .device
                 .submit_with_resources_and_fence(command_buffer, framebuffers, retained_images)
             {
                 Ok(submission) => submission,
                 Err(err) => {
-                    let _ = self.device.discard_command_buffer(command_buffer);
+                    self.descriptors.abort_recording();
                     restore_unsubmitted_foreign_acquires(&foreign_images);
                     return Err(err);
                 }
             };
+        self.descriptors.commit_submission(submission_id);
 
         for tracked in layouts.values() {
             tracked.image.set_layout(tracked.restore_layout);

@@ -22,7 +22,7 @@ use super::{
     image::{transition_image_layout, VulkanImage},
     staging::{StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
-    VulkanRendererError,
+    VulkanRendererError, VulkanSubmissionSnapshot,
 };
 
 const MAX_UPLOAD_BATCH_OPERATIONS: usize = 256;
@@ -251,10 +251,6 @@ pub(super) struct DeviceHandle {
     /// total. Written only by submission reclaim; read by the descriptor
     /// cache to prove a cached set is no longer referenced by pending work.
     completed_submission_watermark: std::sync::atomic::AtomicU64,
-    /// The id the next queue submission will carry. Consumers stamping
-    /// resources "used by the recording frame" use this id; the stamp
-    /// completes when that submission (or any later one) retires.
-    upcoming_submission: std::sync::atomic::AtomicU64,
     /// Image views destroyed since the descriptor cache last drained. A
     /// dead view's descriptor set must leave the cache promptly — leaving
     /// it to capacity-triggered eviction let ordinary client-buffer churn
@@ -336,14 +332,6 @@ impl DeviceHandle {
 
     pub(super) fn submission_completed(&self, id: SubmissionId) -> bool {
         id.0 < self.completed_submission_watermark.load(Ordering::Acquire)
-    }
-
-    pub(super) fn upcoming_submission(&self) -> SubmissionId {
-        SubmissionId(self.upcoming_submission.load(Ordering::Acquire))
-    }
-
-    fn store_upcoming_submission(&self, next: u64) {
-        self.upcoming_submission.store(next, Ordering::Release);
     }
 
     fn mark_submission_pending(&self) {
@@ -450,7 +438,6 @@ impl DeviceState {
             instance_lost: physical_device.instance().lost_flag(),
             pending_submissions: std::sync::atomic::AtomicUsize::new(0),
             completed_submission_watermark: std::sync::atomic::AtomicU64::new(0),
-            upcoming_submission: std::sync::atomic::AtomicU64::new(0),
             retired_texture_views: std::sync::Mutex::new(Vec::new()),
         });
         let external_fence_fd = enabled_extensions
@@ -753,10 +740,7 @@ impl DeviceState {
             SubmissionKind::MemoryUploadBatch,
         ) {
             Ok((_, fence)) => Ok(MemoryUploadCapacityEdge::Submitted(SyncPoint::from(fence))),
-            Err(error) => {
-                let _ = self.discard_command_buffer(command_buffer);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -952,15 +936,26 @@ impl DeviceState {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
-        let recorded_uploads = self.record_pending_uploads()?;
+        let recorded_uploads = match self.record_pending_uploads() {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let _ = self.discard_recording_resources(command_buffer, framebuffers);
+                return Err(error);
+            }
+        };
         let submit_started_at = Instant::now();
         let fence = match VulkanFence::create(self.shared_device()) {
             Ok(fence) => fence,
             Err(error) => {
                 if let Some(recorded_uploads) = recorded_uploads {
-                    let _ = self.discard_command_buffer(recorded_uploads.command_buffer);
-                    self.restore_pending_uploads(recorded_uploads.batch);
+                    if self
+                        .discard_command_buffer(recorded_uploads.command_buffer)
+                        .is_ok()
+                    {
+                        self.restore_pending_uploads(recorded_uploads.batch);
+                    }
                 }
+                let _ = self.discard_recording_resources(command_buffer, framebuffers);
                 return Err(error);
             }
         };
@@ -1019,11 +1014,14 @@ impl DeviceState {
                 .queue_submit(self.queue, &submit_info, fence.handle())
         }) {
             if let Some(recorded_uploads) = recorded_uploads {
-                let _ = self.discard_command_buffer(recorded_uploads.command_buffer);
-                self.restore_pending_uploads(recorded_uploads.batch);
+                if self
+                    .discard_command_buffer(recorded_uploads.command_buffer)
+                    .is_ok()
+                {
+                    self.restore_pending_uploads(recorded_uploads.batch);
+                }
             }
-            // Cleanup runs through the teardown accessor: once the device is lost these destroys
-            // must not touch the dead driver, otherwise they fault on NVIDIA.
+            let _ = self.discard_recording_resources(command_buffer, framebuffers);
             self.device.destroy_with(|device| {
                 for semaphore in wait_semaphores {
                     // SAFETY: Semaphore belongs to this device and the submission did not succeed.
@@ -1032,10 +1030,6 @@ impl DeviceState {
                 if let Some(semaphore) = export_semaphore {
                     // SAFETY: Semaphore belongs to this device and was never submitted.
                     unsafe { device.destroy_semaphore(semaphore, None) };
-                }
-                for framebuffer in framebuffers {
-                    // SAFETY: Framebuffer belongs to this device and is not referenced by a failed submission.
-                    unsafe { device.destroy_framebuffer(framebuffer, None) };
                 }
             });
             return Err(err.into());
@@ -1082,7 +1076,6 @@ impl DeviceState {
 
         let id = SubmissionId(self.next_submission_id);
         self.next_submission_id = self.next_submission_id.wrapping_add(1);
-        self.device.store_upcoming_submission(self.next_submission_id);
         self.device.mark_submission_pending();
         self.in_flight_submissions.push_back(InFlightSubmission {
             id,
@@ -1231,8 +1224,47 @@ impl DeviceState {
         Ok(())
     }
 
+    /// Reset an unsubmitted command buffer before destroying objects encoded
+    /// into it. On reset failure the child handles intentionally survive until
+    /// device teardown rather than being destroyed while still referenced by
+    /// an executable command buffer.
+    pub(crate) fn discard_recording_resources(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        framebuffers: Vec<vk::Framebuffer>,
+    ) -> Result<(), VulkanRendererError> {
+        self.discard_command_buffer(command_buffer)?;
+        self.device.destroy_with(|device| {
+            for framebuffer in framebuffers {
+                // SAFETY: Reset removed every command-buffer reference and no
+                // queue submission ever consumed this framebuffer.
+                unsafe { device.destroy_framebuffer(framebuffer, None) };
+            }
+        });
+        Ok(())
+    }
+
     pub(crate) fn in_flight_submission_count(&self) -> usize {
         self.in_flight_submissions.len()
+    }
+
+    pub(crate) fn submission_snapshot(&self) -> VulkanSubmissionSnapshot {
+        VulkanSubmissionSnapshot {
+            next_submission_id: self.next_submission_id,
+        }
+    }
+
+    pub(crate) fn completion_since(&self, snapshot: VulkanSubmissionSnapshot) -> Option<SyncPoint> {
+        if snapshot.next_submission_id == self.next_submission_id {
+            return None;
+        }
+        let newest = SubmissionId(self.next_submission_id.wrapping_sub(1));
+        self.in_flight_submissions
+            .iter()
+            .rev()
+            .find(|submission| submission.id == newest)
+            .map(|submission| SyncPoint::from(submission.fence.clone()))
+            .or_else(|| Some(SyncPoint::signaled()))
     }
 
     /// Create the binary semaphore that carries a submission's exportable
@@ -1351,16 +1383,36 @@ impl DeviceState {
             ..
         } = submission;
 
-        if let Some(semaphore) = export_semaphore {
-            // The submission completed, so no pending operation references the
-            // semaphore anymore; its exported payload lives on in the fd.
-            self.device.destroy_with(|device| {
-                // SAFETY: Semaphore belongs to this device and is no longer in use.
-                unsafe { device.destroy_semaphore(semaphore, None) };
-            });
+        let completion_ns = duration_to_ns(submitted_at.elapsed());
+        for command_buffer in command_buffers {
+            // SAFETY: The fence is signaled. Reset removes all recorded child
+            // references before those children are destroyed below.
+            self.device.observe_result(unsafe {
+                self.device
+                    .handle()
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+            })?;
+            self.reusable_command_buffers.push(command_buffer);
         }
 
-        let completion_ns = duration_to_ns(submitted_at.elapsed());
+        self.device.destroy_with(|device| {
+            if let Some(semaphore) = export_semaphore {
+                // SAFETY: Submission completed and command buffers were reset.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+            for framebuffer in framebuffers {
+                // SAFETY: Submission completed and recorded references were reset.
+                unsafe { device.destroy_framebuffer(framebuffer, None) };
+            }
+            for semaphore in wait_semaphores {
+                // SAFETY: Submission completion released the queue reference.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+        });
+        for reservation in staging_reservations {
+            self.upload_arena.release(reservation);
+        }
+
         self.device.mark_submission_completed();
         self.device.note_submission_completed(id);
         self.diagnostics.reclaimed_submissions = self.diagnostics.reclaimed_submissions.saturating_add(1);
@@ -1373,37 +1425,6 @@ impl DeviceState {
             reclaimed = self.diagnostics.reclaimed_submissions,
             "reclaimed completed vulkan submission"
         );
-
-        // Routed through the teardown accessor: a device lost mid-drain must not have its
-        // framebuffers/semaphores destroyed on the dead driver (faults on NVIDIA).
-        self.device.destroy_with(|device| {
-            for framebuffer in framebuffers {
-                // SAFETY: The submission fence is already signaled when this method is called,
-                // so command buffer execution is complete and framebuffer handles may be destroyed.
-                unsafe { device.destroy_framebuffer(framebuffer, None) };
-            }
-
-            for semaphore in wait_semaphores {
-                // SAFETY: Submission completion implies this semaphore is no longer referenced by the queue.
-                unsafe { device.destroy_semaphore(semaphore, None) };
-            }
-        });
-
-        // The exact submission completion is the sole staging-reuse edge.
-        for reservation in staging_reservations {
-            self.upload_arena.release(reservation);
-        }
-
-        for command_buffer in command_buffers {
-            // SAFETY: Command buffer belongs to `self.command_pool` and can be reset because the associated fence
-            // is known to be signaled before this method is called.
-            self.device.observe_result(unsafe {
-                self.device
-                    .handle()
-                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-            })?;
-            self.reusable_command_buffers.push(command_buffer);
-        }
         Ok(())
     }
 

@@ -110,6 +110,36 @@ pub enum VulkanRendererError {
         limit: usize,
     },
 
+    /// The bounded descriptor arena cannot admit the requested recording
+    /// until one or more submitted descriptor uses complete.
+    #[error(
+        "vulkan descriptor arena capacity exhausted: requested {requested_sets} sets, \
+         {in_use_sets}/{capacity_sets} sets in use"
+    )]
+    DescriptorCapacityExhausted {
+        /// Conservative number of distinct sampled descriptors requested by
+        /// the next recording scope.
+        requested_sets: usize,
+        /// Total descriptor sets currently allocated across bounded pages.
+        capacity_sets: usize,
+        /// Sets that cannot currently be rewritten because they are recording
+        /// or referenced by an incomplete submission.
+        in_use_sets: usize,
+    },
+
+    /// One recording's conservative descriptor bound exceeds the renderer's
+    /// configured arena limit and therefore cannot succeed after waiting.
+    #[error(
+        "vulkan descriptor request exceeds the bounded arena limit: \
+         requested {requested_sets} sets, maximum {max_sets} sets"
+    )]
+    DescriptorRequestExceedsLimit {
+        /// Conservative number of distinct sampled descriptors requested.
+        requested_sets: usize,
+        /// Hard renderer-local arena bound.
+        max_sets: usize,
+    },
+
     /// The Vulkan renderer context has been lost and must be recreated.
     #[error("vulkan renderer context lost: {0}")]
     ContextLost(&'static str),
@@ -153,6 +183,13 @@ impl VulkanRendererError {
         )
     }
 
+    /// Returns `true` only for descriptor pressure that completion can
+    /// relieve. An over-limit request is a permanent contract violation, not
+    /// a reason to wait for an unrelated submission.
+    pub const fn is_descriptor_deferred(&self) -> bool {
+        matches!(self, VulkanRendererError::DescriptorCapacityExhausted { .. })
+    }
+
     /// Returns the coarse error class for this error value.
     pub const fn kind(&self) -> VulkanRendererErrorKind {
         match self {
@@ -172,6 +209,8 @@ impl VulkanRendererError {
             | VulkanRendererError::UploadExceedsArenaLimit { .. }
             | VulkanRendererError::UploadCapacityExhausted { .. }
             | VulkanRendererError::UploadBatchFull { .. }
+            | VulkanRendererError::DescriptorCapacityExhausted { .. }
+            | VulkanRendererError::DescriptorRequestExceedsLimit { .. }
             | VulkanRendererError::TemporaryFailure(_)
             | VulkanRendererError::NotImplemented(_) => VulkanRendererErrorKind::TemporaryFailure,
         }
@@ -248,5 +287,25 @@ mod tests {
             max_contiguous_bytes: 4096,
         }
         .is_upload_deferred());
+    }
+
+    #[test]
+    fn descriptor_pressure_distinguishes_waitable_from_impossible() {
+        let pressure = VulkanRendererError::DescriptorCapacityExhausted {
+            requested_sets: 768,
+            capacity_sets: 1024,
+            in_use_sets: 512,
+        };
+        let impossible = VulkanRendererError::DescriptorRequestExceedsLimit {
+            requested_sets: 4097,
+            max_sets: 4096,
+        };
+
+        assert!(pressure.is_descriptor_deferred());
+        assert!(!impossible.is_descriptor_deferred());
+        assert!(!pressure.is_device_lost());
+        assert!(!impossible.is_device_lost());
+        assert_eq!(pressure.kind(), VulkanRendererErrorKind::TemporaryFailure);
+        assert_eq!(impossible.kind(), VulkanRendererErrorKind::TemporaryFailure);
     }
 }
