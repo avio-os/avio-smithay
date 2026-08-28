@@ -3,7 +3,7 @@ use std::{io::Cursor, sync::Arc};
 use ash::{util::read_spv, vk};
 use indexmap::IndexMap;
 
-use crate::backend::renderer::{TextureRenderEffect, TextureRenderEffectKind};
+use crate::backend::renderer::{TextureAlphaMode, TextureRenderEffect, TextureRenderEffectKind};
 
 use super::{device::DeviceHandle, format::ColorEncoding, VulkanRendererError};
 
@@ -66,6 +66,8 @@ pub(crate) struct TexturePushConstants {
     pub(crate) source_encoding: u32,
     /// Physical pixels per authored logical pixel for parametric clips.
     pub(crate) clip_scale: f32,
+    /// Transfer applied to sampled alpha before compositor-owned coverage.
+    pub(crate) source_alpha_mode: u32,
 }
 
 const BOTTOM_EDGE_CLIP_FLAG: u32 = 1 << 31;
@@ -102,6 +104,7 @@ impl Default for TexturePushConstants {
             effect_params: [0.0, 0.0, 0.0, 0.0],
             source_encoding: SOURCE_ENCODING_PASSTHROUGH,
             clip_scale: 1.0,
+            source_alpha_mode: TextureAlphaMode::LinearCoverage as u32,
         }
     }
 }
@@ -121,6 +124,7 @@ impl TexturePushConstants {
             effect_params: [0.0, 0.0, 0.0, 0.0],
             source_encoding: SOURCE_ENCODING_PASSTHROUGH,
             clip_scale: 1.0,
+            source_alpha_mode: TextureAlphaMode::LinearCoverage as u32,
         }
     }
 
@@ -133,6 +137,19 @@ impl TexturePushConstants {
             encoding.into()
         } else {
             SOURCE_ENCODING_PASSTHROUGH
+        };
+        self
+    }
+
+    pub(crate) fn with_source_alpha_mode(
+        mut self,
+        alpha_mode: TextureAlphaMode,
+        linear_blending: bool,
+    ) -> Self {
+        self.source_alpha_mode = if linear_blending {
+            alpha_mode as u32
+        } else {
+            TextureAlphaMode::LinearCoverage as u32
         };
         self
     }
@@ -767,7 +784,7 @@ mod tests {
     use ash::vk;
 
     use crate::backend::{
-        renderer::{TextureRenderEffect, TextureRenderEffectKind},
+        renderer::{TextureAlphaMode, TextureRenderEffect, TextureRenderEffectKind},
         vulkan::{version::Version, Instance, PhysicalDevice},
     };
 
@@ -893,6 +910,7 @@ mod tests {
         pipelines: &mut PipelineState,
         keepalive: &mut Vec<TestImage>,
         source_encoding: u32,
+        source_alpha_mode: u32,
         dst_bytes: [u8; 4],
         src_bytes: [u8; 4],
         draw_alpha: f32,
@@ -1087,6 +1105,7 @@ mod tests {
             );
             let mut constants = TexturePushConstants::new(draw_alpha, TextureTransform::Normal, false);
             constants.source_encoding = source_encoding;
+            constants.source_alpha_mode = source_alpha_mode;
             vk_device.cmd_push_constants(
                 command_buffer,
                 handles.textured_layout,
@@ -1170,6 +1189,28 @@ mod tests {
                 &mut self.pipelines,
                 &mut self.keepalive,
                 source_encoding,
+                TextureAlphaMode::LinearCoverage as u32,
+                dst,
+                src,
+                draw_alpha,
+            )
+        }
+
+        fn composite_with_alpha_mode(
+            &mut self,
+            source_encoding: u32,
+            alpha_mode: TextureAlphaMode,
+            dst: [u8; 4],
+            src: [u8; 4],
+            draw_alpha: f32,
+        ) -> [u8; 4] {
+            srgb_blend_probe(
+                &mut self.device,
+                &mut self.descriptors,
+                &mut self.pipelines,
+                &mut self.keepalive,
+                source_encoding,
+                alpha_mode as u32,
                 dst,
                 src,
                 draw_alpha,
@@ -1240,6 +1281,72 @@ mod tests {
         assert!(
             (148..=154).contains(&linear[0]),
             "linear blend should land near the perceptual midpoint (~151), got {linear:?}"
+        );
+    }
+
+    /// UI coverage is authored for encoded-sRGB source-over. When that source
+    /// remains translucent until the compositor supplies a pale backdrop, the
+    /// typed transfer must reproduce the encoded reference without moving the
+    /// whole target back to gamma-space blending.
+    #[test]
+    fn encoded_srgb_ui_alpha_matches_the_gamma_reference_for_dark_ink() {
+        let Some(mut fixture) = LinearBlendFixture::new() else {
+            return;
+        };
+
+        let backdrop = [255, 255, 255, 255];
+        let dark_ink_at_half_opacity = [0, 0, 0, 128];
+        let gamma = fixture.composite(
+            SOURCE_ENCODING_PASSTHROUGH,
+            backdrop,
+            dark_ink_at_half_opacity,
+            1.0,
+        );
+        let ordinary_linear = fixture.composite(
+            SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
+            backdrop,
+            dark_ink_at_half_opacity,
+            1.0,
+        );
+        let transferred = fixture.composite_with_alpha_mode(
+            SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
+            TextureAlphaMode::EncodedSrgbUi,
+            backdrop,
+            dark_ink_at_half_opacity,
+            1.0,
+        );
+
+        assert!(
+            ordinary_linear[0] > gamma[0] + 50,
+            "ordinary linear coverage should expose the reported light-ink regression: \
+             gamma={gamma:?}, linear={ordinary_linear:?}"
+        );
+        assert!(
+            transferred[0].abs_diff(gamma[0]) <= 1,
+            "typed UI alpha must reproduce the encoded-sRGB reference: \
+             gamma={gamma:?}, transferred={transferred:?}"
+        );
+    }
+
+    /// Draw opacity and compositor-authored clips are deliberately outside the
+    /// sampled-alpha transfer. Their half-coverage edge keeps the perceptual
+    /// linear-light midpoint that motivated the renderer seam.
+    #[test]
+    fn encoded_srgb_ui_mode_does_not_transform_compositor_coverage() {
+        let Some(mut fixture) = LinearBlendFixture::new() else {
+            return;
+        };
+
+        let output = fixture.composite_with_alpha_mode(
+            SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
+            TextureAlphaMode::EncodedSrgbUi,
+            [255, 255, 255, 255],
+            [0, 0, 0, 255],
+            0.5,
+        );
+        assert!(
+            (186..=189).contains(&output[0]),
+            "compositor coverage must remain at the linear-light midpoint, got {output:?}"
         );
     }
 
@@ -1435,11 +1542,12 @@ mod tests {
 
     #[test]
     fn texture_push_constant_layout_matches_the_shader_block() {
-        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 104);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 108);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, alpha), 0);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_rect), 32);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, source_encoding), 96);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_scale), 100);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, source_alpha_mode), 104);
     }
 
     #[derive(Debug)]
