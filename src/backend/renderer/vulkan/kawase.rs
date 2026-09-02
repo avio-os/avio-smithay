@@ -26,7 +26,7 @@ use super::{
         acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
         restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
     },
-    pipeline::{push_constants_bytes, KawasePushConstants},
+    pipeline::{push_constants_bytes, KawaseColorTransform, KawasePushConstants},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
@@ -42,7 +42,7 @@ pub struct VulkanKawasePass {
     pub(super) destination: VulkanTexture,
     pub(super) upsample: bool,
     pub(super) offset: f32,
-    pub(super) saturation: f32,
+    pub(super) transform: KawaseColorTransform,
     pub(super) encoding: VulkanKawaseEncoding,
 }
 
@@ -52,8 +52,8 @@ pub enum VulkanKawaseEncoding {
     /// Decode sRGB, filter in linear light, then encode for storage.
     #[default]
     LinearLight,
-    /// Filter and apply saturation directly to gamma-encoded sRGB values.
-    /// This intentionally matches CSS backdrop-filter semantics.
+    /// Filter and apply the colour transform directly to gamma-encoded sRGB
+    /// values. This intentionally matches CSS backdrop-filter semantics.
     EncodedSrgb,
 }
 
@@ -65,15 +65,36 @@ impl VulkanKawasePass {
             destination: destination.clone(),
             upsample,
             offset,
-            saturation: 1.0,
+            transform: KawaseColorTransform::IDENTITY,
             encoding: VulkanKawaseEncoding::LinearLight,
         }
     }
 
     /// Applies a post-blur saturation transform in the destination colour
     /// space. Material graphs should set this on their final pass only.
+    ///
+    /// Saturation runs last, after [`with_contrast`](Self::with_contrast) and
+    /// [`with_brightness`](Self::with_brightness), matching the CSS
+    /// `backdrop-filter: blur() contrast() brightness() saturate()` order
+    /// regardless of the order the builders are called in.
     pub fn with_saturation(mut self, saturation: f32) -> Self {
-        self.saturation = saturation.clamp(0.0, 4.0);
+        self.transform.saturation = saturation.clamp(0.0, 4.0);
+        self
+    }
+
+    /// Applies a post-blur CSS `contrast()` transform in the destination
+    /// colour space: `(x - 0.5) * contrast + 0.5`, clamped. It runs first
+    /// after the blur, before brightness and saturation. `1.0` is the identity.
+    pub fn with_contrast(mut self, contrast: f32) -> Self {
+        self.transform.contrast = contrast.clamp(0.0, 4.0);
+        self
+    }
+
+    /// Applies a post-blur CSS `brightness()` multiply in the destination
+    /// colour space, clamped. It runs after contrast and before saturation.
+    /// `1.0` is the identity.
+    pub fn with_brightness(mut self, brightness: f32) -> Self {
+        self.transform.brightness = brightness.clamp(0.0, 4.0);
         self
     }
 
@@ -163,7 +184,7 @@ impl VulkanRenderer {
                 pass.offset,
                 pass.upsample,
                 destination.blends_in_linear_light(),
-                pass.saturation,
+                pass.transform,
                 encoded_srgb,
             );
             resolved.push(ResolvedKawasePass {
@@ -540,6 +561,143 @@ mod tests {
             max - min <= 2,
             "zero saturation must produce neutral RGB, got {pixel:?}"
         );
+    }
+
+    /// Renders one solid colour through a two-pass chain whose final pass
+    /// carries `transform`, in the encoded-sRGB working space, and returns the
+    /// centre pixel's stored bytes.
+    fn filtered_solid_center_pixel(
+        renderer: &mut VulkanRenderer,
+        format: Fourcc,
+        color: Color32F,
+        transform: impl FnOnce(VulkanKawasePass) -> VulkanKawasePass,
+    ) -> [u8; 4] {
+        let full_size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let half_size: Size<i32, BufferCoord> = Size::from((8, 8));
+        let physical_size: Size<i32, Physical> = Size::from((16, 16));
+        let physical_region: Rectangle<i32, Physical> = Rectangle::from_size(physical_size);
+        let mut full = renderer
+            .create_buffer(format, full_size)
+            .expect("offscreen alloc");
+        let half = renderer
+            .create_buffer(format, half_size)
+            .expect("offscreen alloc");
+
+        {
+            let mut target = renderer.bind(&mut full).expect("bind");
+            let mut frame = renderer
+                .render(&mut target, physical_size, Transform::Normal)
+                .expect("render");
+            frame.clear(color, &[physical_region]).expect("clear");
+            frame.finish().expect("finish").wait().unwrap();
+        }
+
+        renderer
+            .kawase_texture_chain(&[
+                VulkanKawasePass::new(&full, &half, false, 1.5).with_encoded_srgb(),
+                transform(VulkanKawasePass::new(&half, &full, true, 1.5).with_encoded_srgb()),
+            ])
+            .expect("filtering kawase chain")
+            .wait()
+            .unwrap();
+
+        let target = renderer.bind(&mut full).expect("bind for readback");
+        let mapping = renderer
+            .copy_framebuffer(&target, Rectangle::from_size(full_size), format)
+            .expect("readback");
+        let data = renderer.map_texture(&mapping).expect("map");
+        let center = ((8 * 16 + 8) * 4) as usize;
+        let mut pixel = [0_u8; 4];
+        pixel.copy_from_slice(&data[center..center + 4]);
+        pixel
+    }
+
+    /// The stored bytes of one readback pixel as `[r, g, b]`, undoing the
+    /// fourcc's little-endian channel order.
+    fn stored_rgb(format: Fourcc, pixel: [u8; 4]) -> [u8; 3] {
+        match format {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => [pixel[2], pixel[1], pixel[0]],
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => [pixel[0], pixel[1], pixel[2]],
+            other => panic!("unexpected readback format {other:?}"),
+        }
+    }
+
+    fn assert_rgb_within(format: Fourcc, pixel: [u8; 4], expected: [u8; 3], tolerance: i32, what: &str) {
+        let rgb = stored_rgb(format, pixel);
+        for (channel, want) in expected.into_iter().enumerate() {
+            let got = i32::from(rgb[channel]);
+            assert!(
+                (got - i32::from(want)).abs() <= tolerance,
+                "{what}: channel {channel} expected {want} +-{tolerance}, got rgb {rgb:?}"
+            );
+        }
+    }
+
+    /// Contrast runs before brightness, and each primitive clamps before the
+    /// next one reads it, exactly like a CSS filter list. Stored bytes of
+    /// (0.8, 0.2, 0.4) through `contrast(2) brightness(0.4)`:
+    ///
+    /// - red: `(0.8 - 0.5) * 2 + 0.5 = 1.1` clamps to 1 before the multiply,
+    ///   then `0.4` — a brightness-first order would give `0.14` instead;
+    /// - green: `(0.2 - 0.5) * 2 + 0.5 = -0.1` clamps to 0 and stays there;
+    /// - blue: `(0.4 - 0.5) * 2 + 0.5 = 0.3`, then `0.12`.
+    #[test]
+    fn final_kawase_pass_applies_contrast_then_brightness_with_css_clamping() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let pixel =
+            filtered_solid_center_pixel(&mut renderer, format, Color32F::new(0.8, 0.2, 0.4, 1.0), |pass| {
+                pass.with_brightness(0.4).with_contrast(2.0)
+            });
+
+        assert_rgb_within(format, pixel, [102, 0, 31], 2, "contrast(2) brightness(0.4)");
+    }
+
+    /// The identity transform leaves a solid colour on its stored bytes, so a
+    /// recipe that declares neither contrast nor brightness renders exactly as
+    /// it did before the two primitives existed.
+    #[test]
+    fn identity_contrast_and_brightness_preserve_the_stored_bytes() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let pixel =
+            filtered_solid_center_pixel(&mut renderer, format, Color32F::new(0.8, 0.2, 0.4, 1.0), |pass| {
+                pass.with_contrast(1.0).with_brightness(1.0).with_saturation(1.0)
+            });
+
+        assert_rgb_within(format, pixel, [204, 51, 102], 1, "identity transform");
+    }
+
+    /// The Avio dark glass recipe end to end: `contrast(1.35) brightness(0.4)
+    /// saturate(2.9)` takes the prototype's pale sky `rgb(150 190 230)` to the
+    /// deep blue it documents, `(0.11, 0.36, 0.55)`, with nothing clipped.
+    #[test]
+    fn dark_glass_transform_lands_the_prototypes_sky_on_its_documented_blue() {
+        let Some(mut renderer) = init_renderer() else {
+            return;
+        };
+        let Some(format) = first_working_offscreen_format(&mut renderer) else {
+            return;
+        };
+
+        let pixel = filtered_solid_center_pixel(
+            &mut renderer,
+            format,
+            Color32F::new(150.0 / 255.0, 190.0 / 255.0, 230.0 / 255.0, 1.0),
+            |pass| pass.with_contrast(1.35).with_brightness(0.4).with_saturation(2.9),
+        );
+
+        assert_rgb_within(format, pixel, [28, 91, 141], 3, "dark glass over a pale sky");
     }
 
     fn region_energy(data: &[u8], width: usize, x_start: usize, x_end: usize) -> u64 {

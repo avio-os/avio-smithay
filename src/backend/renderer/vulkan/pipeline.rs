@@ -188,11 +188,18 @@ pub(crate) struct KawasePushConstants {
     /// 1 when the shader must sRGB-encode its own output because the destination is
     /// not viewed through an `_SRGB` attachment. Taps are always decoded to linear.
     pub(crate) encode_output: u32,
-    /// Saturation applied after blur. Intermediate pyramid passes use `1.0`;
-    /// material graphs put their colour transform on the final pass only.
+    /// Saturation applied after blur, contrast and brightness. Intermediate
+    /// pyramid passes use `1.0`; material graphs put their colour transform on
+    /// the final pass only.
     pub(crate) saturation: f32,
     /// 1 when filtering intentionally operates on encoded sRGB channel values.
     pub(crate) encoded_srgb: u32,
+    /// Contrast applied first after the blur, in CSS `contrast()` form:
+    /// `(x - 0.5) * contrast + 0.5`, clamped. `1.0` is the identity.
+    pub(crate) contrast: f32,
+    /// Brightness multiply applied after contrast and before saturation, in
+    /// CSS `brightness()` form, clamped. `1.0` is the identity.
+    pub(crate) brightness: f32,
     pub(crate) _pad: u32,
 }
 
@@ -202,7 +209,7 @@ impl KawasePushConstants {
         offset: f32,
         upsample: bool,
         linear_destination: bool,
-        saturation: f32,
+        transform: KawaseColorTransform,
         encoded_srgb: bool,
     ) -> Self {
         Self {
@@ -210,10 +217,37 @@ impl KawasePushConstants {
             offset,
             mode: u32::from(upsample),
             encode_output: u32::from(!linear_destination),
-            saturation: saturation.clamp(0.0, 4.0),
+            saturation: transform.saturation,
             encoded_srgb: u32::from(encoded_srgb),
+            contrast: transform.contrast,
+            brightness: transform.brightness,
             _pad: 0,
         }
+    }
+}
+
+/// Post-blur colour transform of one kawase pass, applied in the pass's
+/// working space in CSS `backdrop-filter` order: `contrast()`, then
+/// `brightness()`, then `saturate()`, each clamped before the next.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct KawaseColorTransform {
+    pub(crate) contrast: f32,
+    pub(crate) brightness: f32,
+    pub(crate) saturation: f32,
+}
+
+impl KawaseColorTransform {
+    /// The identity transform every intermediate pyramid pass carries.
+    pub(crate) const IDENTITY: Self = Self {
+        contrast: 1.0,
+        brightness: 1.0,
+        saturation: 1.0,
+    };
+}
+
+impl Default for KawaseColorTransform {
+    fn default() -> Self {
+        Self::IDENTITY
     }
 }
 
