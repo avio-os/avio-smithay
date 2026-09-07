@@ -80,17 +80,20 @@ use crate::{
     utils::{Logical, Rectangle},
 };
 
+pub use in_process::InProcessTextInput;
 pub use input_method_handle::{InputMethodHandle, InputMethodUserData};
 pub use input_method_keyboard_grab::{InputMethodKeyboardGrab, InputMethodKeyboardUserData};
 pub use input_method_popup_surface::InputMethodPopupSurfaceUserData;
 
-use super::text_input::TextInputHandle;
+use super::text_input::{TextInputHandle, TextInputSeat};
 
 const MANAGER_VERSION: u32 = 1;
 
 /// The role of the input method popup.
 pub const INPUT_POPUP_SURFACE_ROLE: &str = "zwp_input_popup_surface_v2";
 
+mod in_process;
+mod inert;
 mod input_method_handle;
 mod input_method_keyboard_grab;
 mod input_method_popup_surface;
@@ -115,9 +118,18 @@ pub trait InputMethodHandler {
 pub trait InputMethodSeat {
     /// Get an input method associated with this seat
     fn input_method(&self) -> &InputMethodHandle;
+
+    /// Acquire exclusive in-process text-input ownership for this seat.
+    /// Returns `None` while another client or in-process provider owns it.
+    /// The returned lease sends text-input leave and releases ownership on drop.
+    fn acquire_in_process_text_input(&self) -> Option<InProcessTextInput>;
 }
 
 impl<D: SeatHandler + 'static> InputMethodSeat for Seat<D> {
+    fn acquire_in_process_text_input(&self) -> Option<InProcessTextInput> {
+        InProcessTextInput::acquire(self.input_method().clone(), self.text_input().clone())
+    }
+
     fn input_method(&self) -> &InputMethodHandle {
         let user_data = self.user_data();
         user_data.insert_if_missing(InputMethodHandle::default);
@@ -211,9 +223,6 @@ where
                 user_data.insert_if_missing(InputMethodHandle::default);
                 let handle = user_data.get::<InputMethodHandle>().unwrap();
                 let text_input_handle = user_data.get::<TextInputHandle>().unwrap();
-                text_input_handle.with_focused_text_input(|ti, surface| {
-                    ti.enter(surface);
-                });
                 let keyboard_handle = seat.get_keyboard().unwrap();
                 let instance = data_init.init(
                     input_method,
@@ -227,7 +236,7 @@ where
                         dismiss_popup: D::dismiss_popup,
                     },
                 );
-                handle.add_instance(&instance);
+                handle.add_instance(&instance, text_input_handle);
             }
             zwp_input_method_manager_v2::Request::Destroy => {
                 // Nothing to do

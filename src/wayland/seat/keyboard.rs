@@ -244,7 +244,7 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
     let text_input = seat.text_input();
     let input_method = seat.input_method();
 
-    if input_method.has_instance() {
+    if input_method.has_provider() {
         input_method.deactivate_input_method(state);
     }
 
@@ -253,7 +253,7 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
     text_input.set_focus(Some(surface.clone()));
 
     // Only notify on `enter` once we have an actual IME.
-    if input_method.has_instance() {
+    if input_method.has_provider() {
         text_input.enter();
     }
 }
@@ -278,7 +278,7 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
         let text_input = seat.text_input();
         let input_method = seat.input_method();
 
-        if input_method.has_instance() {
+        if input_method.has_provider() {
             input_method.deactivate_input_method(state);
             text_input.leave();
         }

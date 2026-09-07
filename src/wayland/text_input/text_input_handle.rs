@@ -91,6 +91,21 @@ impl TextInputHandle {
         }
     }
 
+    /// Return the live text-input objects this client bound on this seat.
+    /// Binding alone does not imply that a text field is enabled or focused.
+    pub fn client_text_inputs(&self, client: &wayland_server::Client) -> Vec<ZwpTextInputV3> {
+        self.inner
+            .lock()
+            .unwrap()
+            .instances
+            .iter()
+            .filter(|instance| {
+                instance.instance.is_alive() && instance.instance.client().as_ref() == Some(client)
+            })
+            .map(|instance| instance.instance.clone())
+            .collect()
+    }
+
     /// Return the currently focused surface.
     pub fn focus(&self) -> Option<WlSurface> {
         self.inner.lock().unwrap().focus.clone()
@@ -208,8 +223,8 @@ where
             data.handle.increment_serial(resource);
         }
 
-        // Discard requsets without any active input method instance.
-        if !data.input_method_handle.has_instance() {
+        // Discard requsets without any active input method provider.
+        if !data.input_method_handle.has_provider() {
             debug!("discarding text-input request without IME running");
             return;
         }

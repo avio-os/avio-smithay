@@ -29,9 +29,15 @@ use super::{
 
 #[derive(Default, Debug)]
 pub(crate) struct InputMethod {
-    pub instance: Option<Instance>,
+    pub provider: Option<InputMethodProvider>,
     pub popup_handle: PopupHandle,
     pub keyboard_grab: InputMethodKeyboardGrab,
+}
+
+#[derive(Debug)]
+pub(crate) enum InputMethodProvider {
+    Client(Instance),
+    InProcess(Arc<()>),
 }
 
 #[derive(Debug)]
@@ -55,22 +61,27 @@ pub struct InputMethodHandle {
 }
 
 impl InputMethodHandle {
-    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
+    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2, text_input: &TextInputHandle) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(instance) = inner.instance.as_mut() {
-            instance.serial = 0;
-            instance.object.unavailable();
+        if inner.provider.is_some() {
+            instance.unavailable();
         } else {
-            inner.instance = Some(Instance {
+            inner.provider = Some(InputMethodProvider::Client(Instance {
                 object: instance.clone(),
                 serial: 0,
-            });
+            }));
+            text_input.enter();
         }
     }
 
-    /// Whether there's an acitve instance of input-method.
-    pub(crate) fn has_instance(&self) -> bool {
-        self.inner.lock().unwrap().instance.is_some()
+    /// Whether this seat has a client or in-process input-method provider.
+    pub(crate) fn has_provider(&self) -> bool {
+        self.inner.lock().unwrap().provider.is_some()
+    }
+
+    fn is_current_instance(&self, instance: &ZwpInputMethodV2) -> bool {
+        matches!(&self.inner.lock().unwrap().provider,
+            Some(InputMethodProvider::Client(current)) if current.object == *instance)
     }
 
     /// Callback function to access the input method object
@@ -79,7 +90,7 @@ impl InputMethodHandle {
         F: FnOnce(&mut Instance),
     {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(instance) = inner.instance.as_mut() {
+        if let Some(InputMethodProvider::Client(instance)) = inner.provider.as_mut() {
             f(instance);
         }
     }
@@ -115,7 +126,7 @@ impl InputMethodHandle {
 
         popup_surface.set_text_input_rectangle(rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
 
-        if let Some(instance) = &inner.instance {
+        if let Some(InputMethodProvider::Client(instance)) = &inner.provider {
             let data = instance.object.data::<InputMethodUserData<D>>().unwrap();
             (data.popup_repositioned)(state, popup_surface);
         };
@@ -124,7 +135,7 @@ impl InputMethodHandle {
     /// Activate input method on the given surface.
     pub(crate) fn activate_input_method<D: SeatHandler + 'static>(&self, state: &mut D, surface: &WlSurface) {
         self.with_input_method(|im| {
-            if let Some(instance) = im.instance.as_ref() {
+            if let Some(InputMethodProvider::Client(instance)) = im.provider.as_ref() {
                 instance.object.activate();
                 if let Some(popup) = im.popup_handle.surface.as_mut() {
                     let data = instance.object.data::<InputMethodUserData<D>>().unwrap();
@@ -149,7 +160,7 @@ impl InputMethodHandle {
     /// The `done` is always send when deactivating IME.
     pub(crate) fn deactivate_input_method<D: SeatHandler + 'static>(&self, state: &mut D) {
         self.with_input_method(|im| {
-            if let Some(instance) = im.instance.as_mut() {
+            if let Some(InputMethodProvider::Client(instance)) = im.provider.as_mut() {
                 instance.object.deactivate();
                 instance.done();
                 if let Some(popup) = im.popup_handle.surface.as_mut() {
@@ -204,6 +215,20 @@ where
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
+        if !data.handle.is_current_instance(seat) {
+            // The protocol requires all requests on unavailable methods to be
+            // ignored. Constructor IDs still need inert protocol objects.
+            match request {
+                zwp_input_method_v2::Request::GetInputPopupSurface { id, .. } => {
+                    data_init.custom_init(id, Arc::new(super::inert::InertChild));
+                }
+                zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
+                    data_init.custom_init(keyboard, Arc::new(super::inert::InertChild));
+                }
+                _ => {}
+            }
+            return;
+        }
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
                 data.text_input_handle.with_active_text_input(|ti, _surface| {
@@ -228,15 +253,9 @@ where
                 });
             }
             zwp_input_method_v2::Request::Commit { serial } => {
-                let current_serial = data
-                    .handle
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .instance
-                    .as_ref()
-                    .map(|i| i.serial)
-                    .unwrap_or(0);
+                let mut current_serial = 0;
+                data.handle
+                    .with_instance(|instance| current_serial = instance.serial);
 
                 data.text_input_handle.done(serial != current_serial);
             }
@@ -321,12 +340,28 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        state: &mut D,
         _client: ClientId,
-        _input_method: &ZwpInputMethodV2,
+        input_method: &ZwpInputMethodV2,
         data: &InputMethodUserData<D>,
     ) {
-        data.handle.inner.lock().unwrap().instance = None;
+        let mut inner = data.handle.inner.lock().unwrap();
+        if !matches!(&inner.provider, Some(InputMethodProvider::Client(current)) if current.object == *input_method)
+        {
+            return;
+        }
+        let had_grab = inner.keyboard_grab.inner.lock().unwrap().grab.take().is_some();
+        let popup = inner.popup_handle.surface.take();
+        inner.provider = None;
         data.text_input_handle.leave();
+        drop(inner);
+        if had_grab {
+            data.keyboard_handle.unset_grab(state);
+        }
+        if let Some(popup) = popup {
+            if popup.get_parent().is_some() {
+                state.dismiss_popup(popup);
+            }
+        }
     }
 }
