@@ -190,6 +190,20 @@ impl VulkanRendererError {
         matches!(self, VulkanRendererError::DescriptorCapacityExhausted { .. })
     }
 
+    /// Allocation refusal alone does not prove whether queue submission began.
+    /// Callers may reject an attempt only with independent pre-submission proof.
+    pub const fn is_resource_allocation_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Vk(
+                vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                    | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    | vk::Result::ERROR_OUT_OF_POOL_MEMORY
+                    | vk::Result::ERROR_FRAGMENTED_POOL
+            )
+        )
+    }
+
     /// Returns the coarse error class for this error value.
     pub const fn kind(&self) -> VulkanRendererErrorKind {
         match self {
@@ -307,5 +321,26 @@ mod tests {
         assert!(!impossible.is_device_lost());
         assert_eq!(pressure.kind(), VulkanRendererErrorKind::TemporaryFailure);
         assert_eq!(impossible.kind(), VulkanRendererErrorKind::TemporaryFailure);
+    }
+}
+
+#[cfg(test)]
+mod resource_allocation_tests {
+    use super::*;
+    #[test]
+    fn allocation_refusals_are_distinct_from_device_loss_and_unknown_errors() {
+        for result in [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_OUT_OF_POOL_MEMORY,
+            vk::Result::ERROR_FRAGMENTED_POOL,
+        ] {
+            let error = VulkanRendererError::Vk(result);
+            assert!(error.is_resource_allocation_failure());
+            assert!(!error.is_device_lost());
+        }
+        for result in [vk::Result::ERROR_DEVICE_LOST, vk::Result::ERROR_UNKNOWN] {
+            assert!(!VulkanRendererError::Vk(result).is_resource_allocation_failure());
+        }
     }
 }

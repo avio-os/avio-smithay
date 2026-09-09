@@ -784,11 +784,10 @@ impl VulkanFrame<'_> {
             return Ok(());
         };
         let capture_size = capture_image.size();
-        let capture_area: Rectangle<i32, Physical> =
-            Rectangle::from_size((capture_size.w, capture_size.h).into());
-        if capture_area.size != source_area.size {
+        let capture_area: Rectangle<i32, Physical> = Rectangle::from_size(source_area.size);
+        if capture_size.w < source_area.size.w || capture_size.h < source_area.size.h {
             return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture extent does not match transformed read area",
+                "framebuffer-effect capture capacity is smaller than transformed read area",
             ));
         }
         if target.vk_format() != capture_image.vk_format() {
@@ -865,7 +864,7 @@ impl VulkanFrame<'_> {
         self.transition_image_layout(&pass.source, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
         self.transition_image_layout(&pass.destination, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
 
-        let destination_size = pass.destination.size();
+        let destination_size = pass.destination_extent;
         let extent = vk::Extent2D {
             width: destination_size.w.max(1) as u32,
             height: destination_size.h.max(1) as u32,

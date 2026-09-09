@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use tracing::{instrument, trace};
 
 use crate::{
-    backend::renderer::sync::SyncPoint,
+    backend::renderer::{sync::SyncPoint, Texture},
     utils::{Buffer as BufferCoord, Size},
 };
 
@@ -44,6 +44,8 @@ pub struct VulkanKawasePass {
     pub(super) offset: f32,
     pub(super) transform: KawaseColorTransform,
     pub(super) encoding: VulkanKawaseEncoding,
+    pub(super) source_extent: Size<i32, BufferCoord>,
+    pub(super) destination_extent: Size<i32, BufferCoord>,
 }
 
 /// Colour-space convention used by a Kawase pass.
@@ -67,7 +69,23 @@ impl VulkanKawasePass {
             offset,
             transform: KawaseColorTransform::IDENTITY,
             encoding: VulkanKawaseEncoding::LinearLight,
+            source_extent: source.size(),
+            destination_extent: destination.size(),
         }
+    }
+
+    /// Restrict this pass to initialized, origin-aligned regions of reusable
+    /// backing images. Sampling clamps at the source region's texel centers;
+    /// pixels beyond the destination extent are neither read nor written.
+    /// Extents are validated against the image capacities before recording.
+    pub fn with_extents(
+        mut self,
+        source: Size<i32, BufferCoord>,
+        destination: Size<i32, BufferCoord>,
+    ) -> Self {
+        self.source_extent = source;
+        self.destination_extent = destination;
+        self
     }
 
     /// Applies a post-blur saturation transform in the destination colour
@@ -114,6 +132,7 @@ pub(super) struct ResolvedKawasePass {
     pub(super) layout: vk::PipelineLayout,
     pub(super) render_pass: vk::RenderPass,
     pub(super) constants: KawasePushConstants,
+    pub(super) destination_extent: Size<i32, BufferCoord>,
 }
 
 pub(super) fn kawase_halfpixel(
@@ -145,6 +164,16 @@ impl VulkanRenderer {
                     "kawase chain currently requires image-backed Vulkan destination textures",
                 ));
             };
+            for (extent, capacity) in [
+                (pass.source_extent, source.size()),
+                (pass.destination_extent, destination.size()),
+            ] {
+                if extent.w <= 0 || extent.h <= 0 || extent.w > capacity.w || extent.h > capacity.h {
+                    return Err(VulkanRendererError::TemporaryFailure(
+                        "kawase active extent exceeds image capacity",
+                    ));
+                }
+            }
             if source.id() == destination.id() {
                 return Err(VulkanRendererError::TemporaryFailure(
                     "kawase source and destination must be different images",
@@ -180,13 +209,14 @@ impl VulkanRenderer {
                 .descriptors
                 .texture_descriptor_set(source.view(), TextureSampler::LINEAR)?;
             let constants = KawasePushConstants::new(
-                kawase_halfpixel(source.size(), destination.size()),
+                kawase_halfpixel(pass.source_extent, pass.destination_extent),
                 pass.offset,
                 pass.upsample,
                 destination.blends_in_linear_light(),
                 pass.transform,
                 encoded_srgb,
-            );
+            )
+            .with_source_extent(pass.source_extent, source.size());
             resolved.push(ResolvedKawasePass {
                 source,
                 destination,
@@ -196,6 +226,7 @@ impl VulkanRenderer {
                 layout: pipelines.kawase_layout,
                 render_pass: pipelines.render_pass,
                 constants,
+                destination_extent: pass.destination_extent,
             });
         }
         Ok(resolved)
@@ -274,7 +305,7 @@ impl VulkanRenderer {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 );
 
-                let destination_size = pass.destination.size();
+                let destination_size = pass.destination_extent;
                 let extent = vk::Extent2D {
                     width: destination_size.w.max(1) as u32,
                     height: destination_size.h.max(1) as u32,
