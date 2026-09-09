@@ -919,6 +919,60 @@ mod tests {
         }
     }
 
+    /// Exercises the allocator and a separate import device, including drivers
+    /// whose preferred modifier requires compressed dedicated image memory.
+    #[test]
+    #[ignore = "requires a hardware Vulkan render node; run explicitly"]
+    fn exported_modifier_images_roundtrip_between_devices() {
+        use crate::backend::renderer::{ExportMem, Frame, Renderer};
+        use crate::utils::{Rectangle, Transform};
+
+        let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+        let physical = PhysicalDevice::enumerate(&instance)
+            .unwrap()
+            .find(|device| device.render_node().ok().flatten().is_some())
+            .expect("hardware Vulkan render node required");
+        let mut renderer = VulkanRenderer::new(&physical).unwrap();
+        let mut allocator = VulkanAllocator::new(
+            &physical,
+            ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC,
+        )
+        .unwrap();
+        let modifiers = renderer
+            .dmabuf_import_formats()
+            .iter()
+            .filter(|format| {
+                format.code == Fourcc::Argb8888
+                    && format.modifier != Modifier::Invalid
+                    && renderer.has_dmabuf_render_format(**format)
+            })
+            .map(|format| format.modifier)
+            .collect::<Vec<_>>();
+        assert!(!modifiers.is_empty());
+
+        // Keep the driver's preference: forcing LINEAR would hide a mismatch
+        // between a compressed modifier and the allocation's memory attributes.
+        for (width, height) in [(64, 64), (1600, 1200), (2400, 1600), (64, 64)] {
+            let buffer = allocator
+                .create_buffer(width, height, Fourcc::Argb8888, &modifiers)
+                .unwrap();
+            let dmabuf = buffer.export().unwrap();
+            let mut target = renderer.bind_dmabuf_target(&dmabuf).unwrap();
+            let size = (width as i32, height as i32).into();
+            let mut frame = renderer.render(&mut target, size, Transform::Normal).unwrap();
+            frame
+                .clear([0.0, 0.0, 1.0, 1.0].into(), &[Rectangle::from_size(size)])
+                .unwrap();
+            let ready = frame.finish().unwrap();
+            renderer.wait(&ready).unwrap();
+            let texture = renderer.import_dmabuf_texture(&dmabuf).unwrap();
+            let mapping = renderer
+                .copy_texture(&texture, Rectangle::from_size((1, 1).into()), Fourcc::Argb8888)
+                .unwrap();
+            assert_eq!(renderer.map_texture(&mapping).unwrap(), &[255, 0, 0, 255]);
+        }
+    }
+
     #[test]
     fn import_bind_reimport_stress() {
         let Some((physical_device, mut renderer)) = renderer_and_device() else {

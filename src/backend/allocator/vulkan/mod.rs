@@ -751,10 +751,17 @@ impl VulkanAllocator {
             .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // Exported modifier images own their complete allocation. Name that image
+        // when allocating so the driver derives compression and other memory
+        // attributes from the selected DRM modifier, not just the memory type.
+        // Xe2 can otherwise allocate NO_COMPRESSION memory for a compressed
+        // modifier, which the receiving device cannot legally bind.
+        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(guard.image);
         let alloc_create_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_reqs.size)
             .memory_type_index(memory_type_index)
-            .push_next(&mut export_memory_allocate_info);
+            .push_next(&mut export_memory_allocate_info)
+            .push_next(&mut dedicated_info);
 
         unsafe {
             // Allocate memory for the image.
