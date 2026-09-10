@@ -338,7 +338,9 @@ impl Frame for VulkanFrame<'_> {
             )
         };
 
-        let clear_regions = Self::transformed_damage_rects(transform, size, Rectangle::from_size(size), at);
+        let output_size = transform.invert().transform_size(size);
+        let clear_regions =
+            Self::transformed_damage_rects(transform, size, Rectangle::from_size(output_size), at);
         if clear_regions.is_empty() {
             return Ok(());
         }
@@ -405,7 +407,10 @@ impl Frame for VulkanFrame<'_> {
         };
 
         let frame_bounds = Rectangle::from_size(size);
-        let Some(viewport_rect) = transform.transform_rect_in(dst, &size).intersection(frame_bounds) else {
+        let Some(viewport_rect) = transform
+            .transform_rect_in(dst, &transform.invert().transform_size(size))
+            .intersection(frame_bounds)
+        else {
             return Ok(());
         };
 
@@ -495,6 +500,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             None,
             TextureRenderEffect::NONE,
+            None,
         )
     }
 
@@ -521,6 +527,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             Some(AnalyticClip::Rounded(rounded_clip)),
             TextureRenderEffect::NONE,
+            None,
         )
     }
 
@@ -547,6 +554,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             Some(AnalyticClip::BottomEdge(bottom_edge_clip)),
             TextureRenderEffect::NONE,
+            None,
         )
     }
 
@@ -573,6 +581,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             None,
             effect,
+            None,
         )
     }
 
@@ -600,6 +609,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             Some(AnalyticClip::Rounded(rounded_clip)),
             effect,
+            None,
         )
     }
 
@@ -745,6 +755,37 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
 }
 
 impl VulkanFrame<'_> {
+    /// Interpolate the completed accumulator with its saved lower prefix.
+    ///
+    /// `group_opacity` weights the current attachment; the saved prefix gets
+    /// its complement. The dedicated pipeline interpolates premultiplied RGBA,
+    /// including alpha, so this also works for transparent capture targets.
+    /// Call after drawing the complete group with its ordinary member alpha.
+    pub fn interpolate_framebuffer_prefix(
+        &mut self,
+        prefix: &VulkanTexture,
+        region: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        group_opacity: f32,
+    ) -> Result<(), VulkanRendererError> {
+        if !group_opacity.is_finite() || !(0.0..=1.0).contains(&group_opacity) {
+            return Err(VulkanRendererError::TemporaryFailure("invalid group opacity"));
+        }
+        let source = Rectangle::from_size(prefix.size().to_f64());
+        self.render_texture_from_to_internal(
+            prefix,
+            source,
+            region,
+            damage,
+            &[],
+            self.transformation(),
+            1.0,
+            None,
+            TextureRenderEffect::NONE,
+            Some(1.0 - group_opacity),
+        )
+    }
+
     /// Capture a bounded rectangle from the current output prefix and execute
     /// a Kawase filter graph in this frame's active command buffer.
     ///
@@ -1132,6 +1173,7 @@ impl VulkanFrame<'_> {
         alpha: f32,
         analytic_clip: Option<AnalyticClip>,
         effect: TextureRenderEffect,
+        prefix_weight: Option<f32>,
     ) -> Result<(), VulkanRendererError> {
         if damage.is_empty() {
             return Ok(());
@@ -1157,11 +1199,15 @@ impl VulkanFrame<'_> {
         };
 
         let frame_bounds = Rectangle::from_size(size);
-        let Some(viewport_rect) = transform.transform_rect_in(dst, &size).intersection(frame_bounds) else {
+        let Some(viewport_rect) = transform
+            .transform_rect_in(dst, &transform.invert().transform_size(size))
+            .intersection(frame_bounds)
+        else {
             return Ok(());
         };
 
-        let analytic_clip = analytic_clip.map(|clip| transform_analytic_clip(transform, size, clip));
+        let analytic_clip = analytic_clip
+            .map(|clip| transform_analytic_clip(transform, transform.invert().transform_size(size), clip));
         let has_analytic_clip = analytic_clip
             .map(TransformedAnalyticClip::has_coverage_mask)
             .unwrap_or(false);
@@ -1252,13 +1298,18 @@ impl VulkanFrame<'_> {
 
         let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
         let has_shader_effect = !effect.is_none();
-        let use_opaque_only = alpha >= 1.0 && !texture_has_alpha && !has_analytic_clip && !has_shader_effect;
+        let use_opaque_only = prefix_weight.is_none()
+            && alpha >= 1.0
+            && !texture_has_alpha
+            && !has_analytic_clip
+            && !has_shader_effect;
 
-        let transformed_opaque = if alpha >= 1.0 && !has_analytic_clip && !has_shader_effect {
-            Self::transformed_damage_rects(transform, size, dst, opaque_regions)
-        } else {
-            Vec::new()
-        };
+        let transformed_opaque =
+            if prefix_weight.is_none() && alpha >= 1.0 && !has_analytic_clip && !has_shader_effect {
+                Self::transformed_damage_rects(transform, size, dst, opaque_regions)
+            } else {
+                Vec::new()
+            };
 
         let (opaque_draws, blended_draws) = if use_opaque_only {
             (draw_damage, Vec::new())
@@ -1331,10 +1382,20 @@ impl VulkanFrame<'_> {
             }
 
             if !blended_draws.is_empty() {
+                if let Some(weight) = prefix_weight {
+                    self.renderer
+                        .device
+                        .device_handle()
+                        .cmd_set_blend_constants(command_buffer, &[weight; 4]);
+                }
                 self.renderer.device.device_handle().cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    pipelines.textured_pipeline,
+                    if prefix_weight.is_some() {
+                        pipelines.prefix_mix_pipeline
+                    } else {
+                        pipelines.textured_pipeline
+                    },
                 );
                 self.renderer.device.device_handle().cmd_bind_descriptor_sets(
                     command_buffer,
@@ -1392,7 +1453,9 @@ impl VulkanFrame<'_> {
 
                 absolute
                     .intersection(dst_bounds)
-                    .map(|clipped| transform.transform_rect_in(clipped, &size))
+                    .map(|clipped| {
+                        transform.transform_rect_in(clipped, &transform.invert().transform_size(size))
+                    })
                     .and_then(|transformed| transformed.intersection(frame_bounds))
                     .filter(|region| region.size.w > 0 && region.size.h > 0)
             })
@@ -2004,6 +2067,7 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 
 #[cfg(test)]
 mod tests {
+    include!("frame/window_group_tests.rs");
     use super::{
         combine_image_transform, framebuffer_capture_area, texture_sampler_for_render,
         transform_analytic_clip, AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip,

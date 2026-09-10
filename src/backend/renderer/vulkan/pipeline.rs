@@ -258,6 +258,7 @@ pub(crate) struct PipelineHandles {
     pub(crate) solid_opaque_pipeline: vk::Pipeline,
     pub(crate) textured_pipeline: vk::Pipeline,
     pub(crate) textured_opaque_pipeline: vk::Pipeline,
+    pub(crate) prefix_mix_pipeline: vk::Pipeline,
     pub(crate) kawase_pipeline: vk::Pipeline,
     pub(crate) solid_layout: vk::PipelineLayout,
     pub(crate) textured_layout: vk::PipelineLayout,
@@ -271,6 +272,7 @@ struct FormatPipelineSet {
     solid_opaque_pipeline: vk::Pipeline,
     textured_pipeline: vk::Pipeline,
     textured_opaque_pipeline: vk::Pipeline,
+    prefix_mix_pipeline: vk::Pipeline,
     kawase_pipeline: vk::Pipeline,
 }
 
@@ -515,6 +517,7 @@ impl PipelineState {
             solid_opaque_pipeline: set.solid_opaque_pipeline,
             textured_pipeline: set.textured_pipeline,
             textured_opaque_pipeline: set.textured_opaque_pipeline,
+            prefix_mix_pipeline: set.prefix_mix_pipeline,
             kawase_pipeline: set.kawase_pipeline,
             solid_layout: self.solid_layout,
             textured_layout: self.textured_layout,
@@ -535,6 +538,7 @@ impl PipelineState {
             self.solid_vertex_module,
             self.solid_fragment_module,
             true,
+            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -548,6 +552,7 @@ impl PipelineState {
             self.solid_layout,
             self.solid_vertex_module,
             self.solid_fragment_module,
+            false,
             false,
         ) {
             Ok(pipeline) => pipeline,
@@ -566,6 +571,7 @@ impl PipelineState {
             self.texture_vertex_module,
             self.texture_fragment_module,
             true,
+            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
@@ -583,6 +589,7 @@ impl PipelineState {
             self.textured_layout,
             self.texture_vertex_module,
             self.texture_fragment_module,
+            false,
             false,
         ) {
             Ok(pipeline) => pipeline,
@@ -605,10 +612,33 @@ impl PipelineState {
             self.texture_vertex_module,
             self.kawase_fragment_module,
             false,
+            false,
         ) {
             Ok(pipeline) => pipeline,
             Err(err) => {
                 unsafe {
+                    vk_device.destroy_pipeline(textured_opaque_pipeline, None);
+                    vk_device.destroy_pipeline(textured_pipeline, None);
+                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
+                    vk_device.destroy_pipeline(solid_pipeline, None);
+                    vk_device.destroy_render_pass(render_pass, None);
+                }
+                return Err(err);
+            }
+        };
+
+        let prefix_mix_pipeline = match self.create_graphics_pipeline(
+            render_pass,
+            self.textured_layout,
+            self.texture_vertex_module,
+            self.texture_fragment_module,
+            true,
+            true,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                unsafe {
+                    vk_device.destroy_pipeline(kawase_pipeline, None);
                     vk_device.destroy_pipeline(textured_opaque_pipeline, None);
                     vk_device.destroy_pipeline(textured_pipeline, None);
                     vk_device.destroy_pipeline(solid_opaque_pipeline, None);
@@ -625,6 +655,7 @@ impl PipelineState {
             solid_opaque_pipeline,
             textured_pipeline,
             textured_opaque_pipeline,
+            prefix_mix_pipeline,
             kawase_pipeline,
         })
     }
@@ -636,6 +667,7 @@ impl PipelineState {
         vertex_shader_module: vk::ShaderModule,
         fragment_shader_module: vk::ShaderModule,
         blend_enabled: bool,
+        prefix_mix: bool,
     ) -> Result<vk::Pipeline, VulkanRendererError> {
         let vk_device = self.device.handle();
 
@@ -668,16 +700,36 @@ impl PipelineState {
         // contents and the compositor's solid color path.
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(blend_enabled)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .src_color_blend_factor(if prefix_mix {
+                vk::BlendFactor::CONSTANT_ALPHA
+            } else {
+                vk::BlendFactor::ONE
+            })
+            .dst_color_blend_factor(if prefix_mix {
+                vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA
+            } else {
+                vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+            })
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .src_alpha_blend_factor(if prefix_mix {
+                vk::BlendFactor::CONSTANT_ALPHA
+            } else {
+                vk::BlendFactor::ONE
+            })
+            .dst_alpha_blend_factor(if prefix_mix {
+                vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA
+            } else {
+                vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+            })
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::BLEND_CONSTANTS,
+        ];
         let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         let create_info = [vk::GraphicsPipelineCreateInfo::default()
@@ -721,6 +773,7 @@ impl Drop for PipelineState {
         self.device.destroy_with(|device| {
             for (_, set) in per_format {
                 unsafe {
+                    device.destroy_pipeline(set.prefix_mix_pipeline, None);
                     device.destroy_pipeline(set.kawase_pipeline, None);
                     device.destroy_pipeline(set.textured_opaque_pipeline, None);
                     device.destroy_pipeline(set.textured_pipeline, None);
