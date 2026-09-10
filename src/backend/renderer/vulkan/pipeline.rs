@@ -178,7 +178,7 @@ impl TexturePushConstants {
 
 /// Push constants for the dual-Kawase blur pass. Layout mirrors the GLSL
 /// push-constant block in `shaders/kawase.frag` (std430: vec2 at offset 0,
-/// scalars packed after, padded to 32 bytes).
+/// scalars packed after, followed by three vec2 region bounds; 64 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KawasePushConstants {
@@ -201,6 +201,9 @@ pub(crate) struct KawasePushConstants {
     /// CSS `brightness()` form, clamped. `1.0` is the identity.
     pub(crate) brightness: f32,
     pub(crate) _pad: u32,
+    pub(crate) source_uv_scale: [f32; 2],
+    pub(crate) source_uv_min: [f32; 2],
+    pub(crate) source_uv_max: [f32; 2],
 }
 
 impl KawasePushConstants {
@@ -222,7 +225,26 @@ impl KawasePushConstants {
             contrast: transform.contrast,
             brightness: transform.brightness,
             _pad: 0,
+            source_uv_scale: [1.0; 2],
+            source_uv_min: [0.0; 2],
+            source_uv_max: [1.0; 2],
         }
+    }
+    pub(crate) fn with_source_extent(
+        mut self,
+        extent: crate::utils::Size<i32, crate::utils::Buffer>,
+        capacity: crate::utils::Size<i32, crate::utils::Buffer>,
+    ) -> Self {
+        self.source_uv_scale = [
+            extent.w as f32 / capacity.w as f32,
+            extent.h as f32 / capacity.h as f32,
+        ];
+        self.source_uv_min = [0.5 / capacity.w as f32, 0.5 / capacity.h as f32];
+        self.source_uv_max = [
+            (extent.w as f32 - 0.5) / capacity.w as f32,
+            (extent.h as f32 - 0.5) / capacity.h as f32,
+        ];
+        self
     }
 }
 

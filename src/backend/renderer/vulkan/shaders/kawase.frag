@@ -22,6 +22,9 @@ layout(push_constant) uniform KawasePushConstants {
     float contrast;   // post-blur CSS contrast(), applied before brightness; 1 = identity
     float brightness; // post-blur CSS brightness(), applied before saturation; 1 = identity
     uint _pad0;
+    vec2 source_uv_scale;
+    vec2 source_uv_min;
+    vec2 source_uv_max;
 } constants;
 
 layout(location = 0) in vec2 in_uv;
@@ -42,6 +45,11 @@ vec3 linear_to_srgb(vec3 c) {
 }
 
 vec4 tap(vec2 uv) {
+    // Preserve the existing full-image path exactly. A region-backed source
+    // needs its own clamp boundary so uninitialized backing pixels cannot leak.
+    if (any(notEqual(constants.source_uv_scale, vec2(1.0)))) {
+        uv = clamp(uv * constants.source_uv_scale, constants.source_uv_min, constants.source_uv_max);
+    }
     vec4 s = texture(texture_sampler, uv);
     if (constants.encoded_srgb == 0u) {
         s.rgb = srgb_to_linear(s.rgb);

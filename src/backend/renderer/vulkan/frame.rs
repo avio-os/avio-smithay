@@ -328,19 +328,24 @@ impl Frame for VulkanFrame<'_> {
     #[instrument(level = "trace", skip(self, at))]
     #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
-        let (command_buffer, transform, size, linear_blending) = {
+        let (command_buffer, transform, output_size, size, linear_blending) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.transform,
+                recording.output_size,
                 recording.size,
                 recording.encoding.blends_in_linear_light(&recording.target),
             )
         };
 
-        let output_size = transform.invert().transform_size(size);
-        let clear_regions =
-            Self::transformed_damage_rects(transform, size, Rectangle::from_size(output_size), at);
+        let clear_regions = Self::transformed_damage_rects(
+            transform,
+            output_size,
+            size,
+            Rectangle::from_size(output_size),
+            at,
+        );
         if clear_regions.is_empty() {
             return Ok(());
         }
@@ -396,25 +401,22 @@ impl Frame for VulkanFrame<'_> {
             return Ok(());
         }
 
-        let (command_buffer, pipelines, transform, size) = {
+        let (command_buffer, pipelines, transform, output_size, size) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.pipelines,
                 recording.transform,
+                recording.output_size,
                 recording.size,
             )
         };
 
-        let frame_bounds = Rectangle::from_size(size);
-        let Some(viewport_rect) = transform
-            .transform_rect_in(dst, &transform.invert().transform_size(size))
-            .intersection(frame_bounds)
-        else {
+        let Some(viewport_rect) = framebuffer_rect(transform, output_size, size, dst) else {
             return Ok(());
         };
 
-        let draw_damage = Self::transformed_damage_rects(transform, size, dst, damage);
+        let draw_damage = Self::transformed_damage_rects(transform, output_size, size, dst, damage);
         if draw_damage.is_empty() {
             return Ok(());
         }
@@ -810,26 +812,27 @@ impl VulkanFrame<'_> {
         }
 
         let resolved = self.renderer.resolve_kawase_passes(passes)?;
-        let (command_buffer, target, transform, frame_size, main_render_pass, main_framebuffer) = {
+        let (command_buffer, target, transform, output_size, frame_size, main_render_pass, main_framebuffer) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.target.clone(),
                 recording.transform,
+                recording.output_size,
                 recording.size,
                 recording.pipelines.render_pass,
                 recording.framebuffer,
             )
         };
-        let Some(source_area) = framebuffer_capture_area(transform, frame_size, backdrop_read_area) else {
+        let Some(source_area) = framebuffer_rect(transform, output_size, frame_size, backdrop_read_area)
+        else {
             return Ok(());
         };
         let capture_size = capture_image.size();
-        let capture_area: Rectangle<i32, Physical> =
-            Rectangle::from_size((capture_size.w, capture_size.h).into());
-        if capture_area.size != source_area.size {
+        let capture_area: Rectangle<i32, Physical> = Rectangle::from_size(source_area.size);
+        if capture_size.w < source_area.size.w || capture_size.h < source_area.size.h {
             return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture extent does not match transformed read area",
+                "framebuffer-effect capture capacity is smaller than transformed read area",
             ));
         }
         if target.vk_format() != capture_image.vk_format() {
@@ -906,7 +909,7 @@ impl VulkanFrame<'_> {
         self.transition_image_layout(&pass.source, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
         self.transition_image_layout(&pass.destination, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
 
-        let destination_size = pass.destination.size();
+        let destination_size = pass.destination_extent;
         let extent = vk::Extent2D {
             width: destination_size.w.max(1) as u32,
             height: destination_size.h.max(1) as u32,
@@ -1187,32 +1190,28 @@ impl VulkanFrame<'_> {
 
         self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
 
-        let (command_buffer, pipelines, transform, size, linear_blending) = {
+        let (command_buffer, pipelines, transform, output_size, size, linear_blending) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.pipelines,
                 recording.transform,
+                recording.output_size,
                 recording.size,
                 recording.encoding.blends_in_linear_light(&recording.target),
             )
         };
 
-        let frame_bounds = Rectangle::from_size(size);
-        let Some(viewport_rect) = transform
-            .transform_rect_in(dst, &transform.invert().transform_size(size))
-            .intersection(frame_bounds)
-        else {
+        let Some(viewport_rect) = framebuffer_rect(transform, output_size, size, dst) else {
             return Ok(());
         };
 
-        let analytic_clip = analytic_clip
-            .map(|clip| transform_analytic_clip(transform, transform.invert().transform_size(size), clip));
+        let analytic_clip = analytic_clip.map(|clip| transform_analytic_clip(transform, output_size, clip));
         let has_analytic_clip = analytic_clip
             .map(TransformedAnalyticClip::has_coverage_mask)
             .unwrap_or(false);
 
-        let draw_damage = Self::transformed_damage_rects(transform, size, dst, damage);
+        let draw_damage = Self::transformed_damage_rects(transform, output_size, size, dst, damage);
         if draw_damage.is_empty() {
             return Ok(());
         }
@@ -1306,7 +1305,7 @@ impl VulkanFrame<'_> {
 
         let transformed_opaque =
             if prefix_weight.is_none() && alpha >= 1.0 && !has_analytic_clip && !has_shader_effect {
-                Self::transformed_damage_rects(transform, size, dst, opaque_regions)
+                Self::transformed_damage_rects(transform, output_size, size, dst, opaque_regions)
             } else {
                 Vec::new()
             };
@@ -1432,12 +1431,12 @@ impl VulkanFrame<'_> {
 
     fn transformed_damage_rects(
         transform: Transform,
-        size: Size<i32, Physical>,
+        output_size: Size<i32, Physical>,
+        target_size: Size<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Vec<Rectangle<i32, Physical>> {
         let dst_bounds = dst;
-        let frame_bounds = Rectangle::from_size(size);
 
         damage
             .iter()
@@ -1453,10 +1452,7 @@ impl VulkanFrame<'_> {
 
                 absolute
                     .intersection(dst_bounds)
-                    .map(|clipped| {
-                        transform.transform_rect_in(clipped, &transform.invert().transform_size(size))
-                    })
-                    .and_then(|transformed| transformed.intersection(frame_bounds))
+                    .and_then(|clipped| framebuffer_rect(transform, output_size, target_size, clipped))
                     .filter(|region| region.size.w > 0 && region.size.h > 0)
             })
             .collect()
@@ -1727,14 +1723,16 @@ impl VulkanFrame<'_> {
     }
 }
 
-fn framebuffer_capture_area(
+/// Shared mapping for draws, damage and backdrop capture. Clip in target space
+/// only after rotating around the original output extent.
+fn framebuffer_rect(
     transform: Transform,
+    output_size: Size<i32, Physical>,
     target_size: Size<i32, Physical>,
-    backdrop_read_area: Rectangle<i32, Physical>,
+    output_rect: Rectangle<i32, Physical>,
 ) -> Option<Rectangle<i32, Physical>> {
-    let source_frame_size = transform.invert().transform_size(target_size);
     transform
-        .transform_rect_in(backdrop_read_area, &source_frame_size)
+        .transform_rect_in(output_rect, &output_size)
         .intersection(Rectangle::from_size(target_size))
 }
 
@@ -2069,9 +2067,9 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 mod tests {
     include!("frame/window_group_tests.rs");
     use super::{
-        combine_image_transform, framebuffer_capture_area, texture_sampler_for_render,
-        transform_analytic_clip, AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip,
-        VulkanRenderer, VulkanRendererError,
+        combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
+        AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,
+        VulkanRendererError,
     };
     use crate::{
         backend::{
@@ -2177,6 +2175,79 @@ mod tests {
     }
 
     #[test]
+    fn non_square_output_clear_covers_the_entire_transformed_target() {
+        let output_size = Size::<i32, Physical>::from((97, 81));
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let target_size = transform.transform_size(output_size);
+            let source_bounds = Rectangle::from_size(output_size);
+            let clear = VulkanFrame::transformed_damage_rects(
+                transform,
+                output_size,
+                target_size,
+                source_bounds,
+                &[Rectangle::from_size(output_size)],
+            );
+            assert_eq!(clear, vec![Rectangle::from_size(target_size)], "{transform:?}");
+        }
+    }
+
+    #[test]
+    fn non_square_draw_damage_capture_and_clip_share_source_extent() {
+        let output_size = Size::<i32, Physical>::from((97, 81));
+        let dst = Rectangle::new((19, 7).into(), (41, 65).into());
+        // Hand-derived locations in each transformed target; all use the
+        // original 97x81 output as the rotation/flip extent.
+        for (transform, location, size) in [
+            (Transform::Normal, (19, 7), (41, 65)),
+            (Transform::_90, (9, 19), (65, 41)),
+            (Transform::_180, (37, 9), (41, 65)),
+            (Transform::_270, (7, 37), (65, 41)),
+            (Transform::Flipped, (37, 7), (41, 65)),
+            (Transform::Flipped90, (9, 37), (65, 41)),
+            (Transform::Flipped180, (19, 9), (41, 65)),
+            (Transform::Flipped270, (7, 19), (65, 41)),
+        ] {
+            let target_size = transform.transform_size(output_size);
+            let expected = Rectangle::new(location.into(), size.into());
+            assert_eq!(
+                framebuffer_rect(transform, output_size, target_size, dst),
+                Some(expected)
+            );
+            let damage = VulkanFrame::transformed_damage_rects(
+                transform,
+                output_size,
+                target_size,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+            );
+            assert_eq!(damage, vec![expected]);
+            let clip = BottomEdgeClip {
+                rect: dst.to_f64(),
+                content_width: 30.0,
+                progress: 1.0,
+                edge_height: 8.0,
+                plateau_inset: 2.0,
+                geometry_scale: 1.0,
+            };
+            let TransformedAnalyticClip::BottomEdge { clip, .. } =
+                transform_analytic_clip(transform, output_size, AnalyticClip::BottomEdge(clip))
+            else {
+                panic!("expected bottom-edge clip");
+            };
+            assert_eq!(clip.rect, expected.to_f64());
+        }
+    }
+
+    #[test]
     fn framebuffer_capture_uses_the_pre_transform_output_extent() {
         let output_size = Size::<i32, Physical>::from((300, 200));
         let read = Rectangle::new((20, 30).into(), (180, 120).into());
@@ -2192,7 +2263,7 @@ mod tests {
             Transform::Flipped270,
         ] {
             let target_size = transform.transform_size(output_size);
-            let capture = framebuffer_capture_area(transform, target_size, read)
+            let capture = framebuffer_rect(transform, output_size, target_size, read)
                 .expect("read area remains inside the transformed target");
             assert!(Rectangle::from_size(target_size).contains_rect(capture));
             assert_eq!(capture.size, transform.transform_size(read.size));
