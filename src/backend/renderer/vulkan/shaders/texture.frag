@@ -216,10 +216,8 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
 
     vec2 clip_size = constants.clip_rect.zw;
     vec2 transformed_position = frag_pos - constants.clip_rect.xy;
-    if (transformed_position.x < 0.0 || transformed_position.y < 0.0 ||
-        transformed_position.x > clip_size.x || transformed_position.y > clip_size.y) {
-        return 0.0;
-    }
+    bool outside_rect = transformed_position.x < 0.0 || transformed_position.y < 0.0 ||
+        transformed_position.x > clip_size.x || transformed_position.y > clip_size.y;
 
     uint clip_transform =
         (constants.rounded_clip_flags >> CLIP_TRANSFORM_SHIFT) & 0x7u;
@@ -307,9 +305,7 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
     float foot_left = plateau_left - side_run;
     float cosine = cos(angle_radians);
     float sine = sin(angle_radians);
-    if (point.y < plateau_top || point.y > baseline) {
-        return 0.0;
-    }
+    bool outside_height = point.y < plateau_top || point.y > baseline;
 
     float left = bottom_edge_left_boundary(
         point.y,
@@ -329,8 +325,12 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
         min(point.x - left, right - point.x),
         min(point.y - plateau_top, baseline - point.y)
     );
+    // Fragment-dependent early returns before fwidth leave quad derivatives
+    // undefined. Every lane computes the field and its footprint first;
+    // visibility still masks the same authored rectangle and height afterward.
     float aa_width = max(fwidth(signed_inside) * 0.75, 0.5 * geometry_scale);
-    return smoothstep(-aa_width, aa_width, signed_inside);
+    float coverage = smoothstep(-aa_width, aa_width, signed_inside);
+    return outside_rect || outside_height ? 0.0 : coverage;
 }
 
 vec2 genie_effect_uv(vec2 uv, out float coverage) {
