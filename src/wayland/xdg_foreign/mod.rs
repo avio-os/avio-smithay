@@ -127,6 +127,18 @@ impl XdgForeignState {
     pub fn importer_global(&self) -> GlobalId {
         self.importer.clone()
     }
+
+    /// Returns the live toplevel exported under `handle`.
+    ///
+    /// Desktop portal backends receive this opaque handle as the Wayland
+    /// `parent_window` identifier and need to resolve it to compositor-owned
+    /// surface identity. Destroying the export removes the entry, so callers
+    /// can never resolve a revoked handle through this accessor.
+    pub fn exported_surface(&self, handle: &str) -> Option<WlSurface> {
+        self.exported
+            .iter()
+            .find_map(|(key, state)| (key.as_str() == handle).then(|| state.exported_surface.clone()))
+    }
 }
 
 /// Macro to delegate implementation of the xdg foreign to [`XdgForeignState`].
