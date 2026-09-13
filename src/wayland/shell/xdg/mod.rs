@@ -344,6 +344,8 @@ xdg_role!(
         /// should be brought to front. If the parent is focused
         /// all of it's child should be brought to front.
         pub parent: Option<wl_surface::WlSurface>,
+        /// Exact foreign import that owns this parent relationship, if any.
+        pub(crate) foreign_parent: Option<wayland_server::backend::ObjectId>,
         /// Hint related to the toplevel's "dialog" status.
         /// See ToplevelDialogHint for more information.
         ///

@@ -76,6 +76,8 @@ sha2 = "0.10.9"
 tracy-client = { version = "0.18.4", default-features = false, optional = true }
 
 [dev-dependencies]
+wayland-client = "0.31.10"
+wayland-protocols = { version = "0.32.9", features = ["client", "unstable"] }
 clap = { version = "4", features = ["derive"] }
 criterion = { version = "0.5" }
 image = "0.25"

@@ -38,9 +38,13 @@ use rand::distr::{Alphanumeric, SampleString};
 use wayland_protocols::xdg::foreign::zv2::server::{
     zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2, zxdg_importer_v2::ZxdgImporterV2,
 };
-use wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface, DisplayHandle, GlobalDispatch};
+use wayland_server::{
+    backend::GlobalId, protocol::wl_surface::WlSurface, DisplayHandle, GlobalDispatch, Resource,
+};
 
 mod handlers;
+#[cfg(test)]
+mod tests;
 
 /// A trait implemented to be notified of activation requests using the xdg foreign protocol.
 pub trait XdgForeignHandler: 'static {
@@ -86,8 +90,8 @@ pub struct XdgImportedUserData {
 #[derive(Debug)]
 struct ExportedState {
     exported_surface: WlSurface,
-    requested_child: Option<(WlSurface, ZxdgImportedV2)>,
-    imported_by: HashSet<ZxdgImportedV2>,
+    destruction_hook: crate::wayland::compositor::HookId,
+    imported_by: HashMap<ZxdgImportedV2, HashSet<WlSurface>>,
 }
 
 /// Tracks the list of exported surfaces
@@ -135,9 +139,10 @@ impl XdgForeignState {
     /// surface identity. Destroying the export removes the entry, so callers
     /// can never resolve a revoked handle through this accessor.
     pub fn exported_surface(&self, handle: &str) -> Option<WlSurface> {
-        self.exported
-            .iter()
-            .find_map(|(key, state)| (key.as_str() == handle).then(|| state.exported_surface.clone()))
+        self.exported.iter().find_map(|(key, state)| {
+            (key.as_str() == handle && state.exported_surface.is_alive())
+                .then(|| state.exported_surface.clone())
+        })
     }
 }
 

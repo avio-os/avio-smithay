@@ -251,6 +251,7 @@ pub fn set_parent(toplevel: &xdg_toplevel::XdgToplevel, parent: Option<wl_surfac
 
     with_surface_toplevel_role_data(toplevel, |data| {
         data.parent = parent;
+        data.foreign_parent = None;
     });
 
     true
