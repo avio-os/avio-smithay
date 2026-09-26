@@ -1176,6 +1176,25 @@ impl X11Wm {
         Ok(())
     }
 
+    /// Replaces the X resource database: the `RESOURCE_MANAGER` property of
+    /// the root window, in `xrdb` format.
+    ///
+    /// Toolkits read it for settings XSETTINGS does not carry. Xlib cursor
+    /// loaders (libXcursor, Chromium's X11 cursors) take their size from
+    /// `Xcursor.size` there, and Xft-only clients their font DPI from
+    /// `Xft.dpi`, so a scaled Xwayland needs both.
+    pub fn set_resource_database(&mut self, resources: &str) -> Result<(), ConnectionError> {
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.screen.root,
+            AtomEnum::RESOURCE_MANAGER,
+            AtomEnum::STRING,
+            resources.as_bytes(),
+        )?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
     /// Gets the current primary output as advertised by xrandr
     pub fn get_randr_primary_output(&self) -> Result<Option<String>, ReplyError> {
         let current_primary = self
