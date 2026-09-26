@@ -250,6 +250,19 @@ pub struct SurfaceAttributes {
     pub(crate) client_scale: f64,
 }
 
+impl SurfaceAttributes {
+    /// The client scale this state was committed at.
+    ///
+    /// Surface coordinates from the client are converted with it (damage,
+    /// regions, offsets), but a surface's size still comes from its buffer in
+    /// client coordinates. A renderer that does not use
+    /// [`RendererSurfaceState`](crate::backend::renderer::utils::RendererSurfaceState)
+    /// divides that size by this scale, as `SurfaceView` does.
+    pub fn client_scale(&self) -> f64 {
+        self.client_scale
+    }
+}
+
 impl Default for SurfaceAttributes {
     fn default() -> SurfaceAttributes {
         SurfaceAttributes {
