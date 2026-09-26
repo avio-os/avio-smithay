@@ -41,6 +41,9 @@ pub mod vulkan;
 mod color;
 pub use color::Color32F;
 
+mod staged;
+pub use staged::{StagedMemoryRows, StagedMemoryUpdate};
+
 use crate::backend::allocator::{dmabuf::Dmabuf, Format, Fourcc};
 #[cfg(all(
     feature = "wayland_frontend",
@@ -797,6 +800,41 @@ pub trait ImportMem: Renderer {
     fn memory_upload_capacity_edge(&mut self) -> Result<MemoryUploadCapacityEdge, Self::Error> {
         Ok(MemoryUploadCapacityEdge::NotApplicable)
     }
+
+    /// Reserve renderer staging memory for an update of `region` of `texture`
+    /// whose pixel rows are written later, on any thread.
+    ///
+    /// Same texture and region rules as [`ImportMem::update_memory`]. Returns
+    /// `Ok(None)` when this renderer has no staged path; callers then use
+    /// [`ImportMem::update_memory`]. The texture keeps its pixels until the
+    /// update is submitted.
+    fn stage_memory_update(
+        &mut self,
+        _texture: &Self::TextureId,
+        _region: Rectangle<i32, BufferCoord>,
+    ) -> Result<Option<(StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Apply a staged update whose rows are all written. The whole region
+    /// lands at the renderer's next submission, before anything it draws.
+    ///
+    /// Errors release the reservation; the texture keeps its pixels.
+    ///
+    /// # Panics
+    ///
+    /// Renderers without a staged path never create updates; handing them one
+    /// is a caller bug.
+    fn submit_staged_memory_update(
+        &mut self,
+        update: StagedMemoryUpdate,
+        _rows: StagedMemoryRows,
+    ) -> Result<(), Self::Error> {
+        panic!("{update:?} was not staged by this renderer")
+    }
+
+    /// Release a staged update's reservation without applying it.
+    fn cancel_staged_memory_update(&mut self, _update: StagedMemoryUpdate) {}
 
     /// Returns supported formats for memory imports.
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>>;

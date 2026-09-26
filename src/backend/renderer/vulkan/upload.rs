@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use ash::vk;
 use tracing::{instrument, trace};
 
 use crate::{
     backend::{
         allocator::{format::get_bpp, Format, Fourcc, Modifier},
-        renderer::{ImportMem, MemoryUploadCapacityEdge, MemoryUploadErrorKind, Texture},
+        renderer::{
+            ImportMem, MemoryUploadCapacityEdge, MemoryUploadErrorKind, StagedMemoryRows, StagedMemoryUpdate,
+            Texture,
+        },
     },
     utils::{Buffer as BufferCoord, Rectangle, Size},
 };
@@ -17,9 +22,10 @@ use crate::{
 };
 
 use super::{
-    device::DeviceState,
+    device::{DeviceHandle, DeviceState},
     format::{optimal_tiling_features, texture_view_components, ColorEncoding},
     image::VulkanImage,
+    staging::StagingReservation,
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
@@ -79,6 +85,90 @@ impl UploadState {
         Ok(VulkanTexture::from_renderer_image(
             image, size, format, flipped, true,
         ))
+    }
+
+    /// Reserve staging for `region` of `texture`, to be written off-thread.
+    pub(crate) fn stage_memory_update(
+        &mut self,
+        device: &mut DeviceState,
+        texture: &VulkanTexture,
+        region: Rectangle<i32, BufferCoord>,
+    ) -> Result<(StagedMemoryUpdate, StagedMemoryRows), VulkanRendererError> {
+        let (image, format) = writable_memory_image(texture)?;
+        validate_region(texture.size(), region)?;
+        let row_bytes = usize::try_from(region.size.w)
+            .ok()
+            .and_then(|width| width.checked_mul(bytes_per_pixel(format).ok()?))
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "staged row size overflowed",
+            ))?;
+        let rows = usize::try_from(region.size.h)
+            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("staged row count overflowed"))?;
+        let len = row_bytes
+            .checked_mul(rows)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "staged byte count overflowed",
+            ))?;
+        let (reservation, ptr, memory) = device.stage_image_upload(image, len)?;
+        let ticket = self.next_upload_id();
+        let staged = VulkanStagedUpdate {
+            device: Arc::as_ptr(&device.shared_device()),
+            image: Arc::clone(image),
+            reservation,
+            copy: buffer_image_copy(region),
+        };
+        // SAFETY: The reservation is `len` bytes of the chunk's persistent
+        // mapping, owned by this update until it is submitted or cancelled;
+        // `memory` keeps that mapping alive wherever the rows go.
+        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, ticket, memory) };
+        Ok((StagedMemoryUpdate::new(ticket, region, Box::new(staged)), rows))
+    }
+
+    fn staged_record(
+        device: &DeviceState,
+        update: StagedMemoryUpdate,
+    ) -> Result<VulkanStagedUpdate, VulkanRendererError> {
+        let staged = update
+            .into_inner()
+            .downcast::<VulkanStagedUpdate>()
+            .map_err(|_| {
+                VulkanRendererError::InvalidMemoryUpload("staged update was not staged by a Vulkan renderer")
+            })?;
+        if staged.device != Arc::as_ptr(&device.shared_device()) {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "staged update belongs to another Vulkan renderer",
+            ));
+        }
+        Ok(*staged)
+    }
+
+    /// Queue a staged update whose rows are written.
+    pub(crate) fn submit_staged_memory_update(
+        &mut self,
+        device: &mut DeviceState,
+        update: StagedMemoryUpdate,
+        rows: StagedMemoryRows,
+    ) -> Result<(), VulkanRendererError> {
+        if rows.ticket() != update.ticket() {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "staged rows belong to another update",
+            ));
+        }
+        let staged = Self::staged_record(device, update)?;
+        // The rows are back: no other thread writes the reservation any more.
+        drop(rows);
+        device.queue_staged_image_upload(staged.image, staged.reservation, staged.copy)
+    }
+
+    /// Release a staged update's reservation.
+    pub(crate) fn cancel_staged_memory_update(
+        &mut self,
+        device: &mut DeviceState,
+        update: StagedMemoryUpdate,
+    ) {
+        if let Ok(staged) = Self::staged_record(device, update) {
+            device.release_staged_image_upload(staged.reservation);
+        }
     }
 
     #[instrument(level = "trace", skip(self, device, texture, data))]
@@ -158,6 +248,29 @@ impl ImportMem for VulkanRenderer {
 
     fn memory_upload_capacity_edge(&mut self) -> Result<MemoryUploadCapacityEdge, Self::Error> {
         self.device.memory_upload_capacity_edge()
+    }
+
+    fn stage_memory_update(
+        &mut self,
+        texture: &Self::TextureId,
+        region: Rectangle<i32, BufferCoord>,
+    ) -> Result<Option<(StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
+        self.upload
+            .stage_memory_update(&mut self.device, texture, region)
+            .map(Some)
+    }
+
+    fn submit_staged_memory_update(
+        &mut self,
+        update: StagedMemoryUpdate,
+        rows: StagedMemoryRows,
+    ) -> Result<(), Self::Error> {
+        self.upload
+            .submit_staged_memory_update(&mut self.device, update, rows)
+    }
+
+    fn cancel_staged_memory_update(&mut self, update: StagedMemoryUpdate) {
+        self.upload.cancel_staged_memory_update(&mut self.device, update);
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -296,6 +409,65 @@ where
         f(&packed, format, Size::from((data.width, data.height)))
     })
     .map_err(|_| VulkanRendererError::TemporaryFailure("failed to access wl_shm buffer contents"))?
+}
+
+/// A Vulkan renderer's record of one staged update.
+struct VulkanStagedUpdate {
+    /// Identity of the staging device; checked on submit and cancel.
+    device: *const DeviceHandle,
+    image: Arc<VulkanImage>,
+    reservation: StagingReservation,
+    copy: vk::BufferImageCopy,
+}
+
+// SAFETY: `device` is only compared as an identity, never dereferenced; the
+// rest are owned handles the renderer's own records already move between threads.
+unsafe impl Send for VulkanStagedUpdate {}
+
+fn writable_memory_image(
+    texture: &VulkanTexture,
+) -> Result<(&Arc<VulkanImage>, Fourcc), VulkanRendererError> {
+    if !texture.memory_writable() {
+        return Err(VulkanRendererError::InvalidMemoryUpload(
+            "texture is not writable through ImportMem::update_memory",
+        ));
+    }
+    let Some(format) = texture.format() else {
+        return Err(VulkanRendererError::InvalidMemoryUpload(
+            "memory-backed texture format metadata is missing",
+        ));
+    };
+    let _ = validate_memory_format(format)?;
+    let Some(image) = texture.image_resource() else {
+        return Err(VulkanRendererError::InvalidMemoryUpload(
+            "memory-backed texture image is missing",
+        ));
+    };
+    Ok((image, format))
+}
+
+fn buffer_image_copy(region: Rectangle<i32, BufferCoord>) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D {
+            x: region.loc.x,
+            y: region.loc.y,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: region.size.w as u32,
+            height: region.size.h as u32,
+            depth: 1,
+        })
 }
 
 fn upload_region_to_image(
@@ -677,6 +849,77 @@ mod tests {
         )
         .ok()?;
         Some((renderer, allocator))
+    }
+
+    fn read_pixel(renderer: &mut VulkanRenderer, texture: &super::VulkanTexture, x: i32, y: i32) -> [u8; 4] {
+        use crate::backend::renderer::ExportMem;
+        let mapping = renderer
+            .copy_texture(
+                texture,
+                Rectangle::new((x, y).into(), Size::from((1, 1))),
+                crate::backend::allocator::Fourcc::Argb8888,
+            )
+            .expect("texture readback");
+        let bytes = renderer.map_texture(&mapping).expect("mapped readback");
+        [bytes[0], bytes[1], bytes[2], bytes[3]]
+    }
+
+    /// Rows written on another thread land atomically at the next
+    /// submission after they are handed back; until then the texture keeps
+    /// its pixels. Cancelling releases the reservation.
+    #[test]
+    fn staged_memory_update_lands_rows_written_on_another_thread() {
+        let Some((mut renderer, _allocator)) = init_renderer_and_allocator() else {
+            return;
+        };
+        let format = crate::backend::allocator::Fourcc::Argb8888;
+        let size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let texture = match renderer.import_memory(&vec![0u8; 16 * 16 * 4], format, size, false) {
+            Ok(texture) => texture,
+            Err(_) => return,
+        };
+        let region = Rectangle::<i32, BufferCoord>::new((4, 4).into(), Size::from((8, 8)));
+        let (update, rows) = renderer
+            .stage_memory_update(&texture, region)
+            .expect("in-bounds staged update")
+            .expect("the Vulkan renderer stages");
+        assert_eq!((rows.rows(), rows.row_bytes()), (8, 32));
+        assert_eq!(update.region(), region);
+
+        let rows = std::thread::spawn(move || {
+            let mut rows = rows;
+            for row in 0..rows.rows() {
+                rows.row_mut(row).fill(0xff);
+            }
+            rows
+        })
+        .join()
+        .expect("writer thread");
+        assert_eq!(
+            read_pixel(&mut renderer, &texture, 5, 5),
+            [0; 4],
+            "not yet submitted"
+        );
+
+        renderer
+            .submit_staged_memory_update(update, rows)
+            .expect("staged update queued");
+        assert_eq!(read_pixel(&mut renderer, &texture, 5, 5), [0xff; 4]);
+        assert_eq!(read_pixel(&mut renderer, &texture, 11, 11), [0xff; 4]);
+        assert_eq!(read_pixel(&mut renderer, &texture, 3, 3), [0; 4]);
+        assert_eq!(read_pixel(&mut renderer, &texture, 12, 12), [0; 4]);
+
+        let in_use = renderer.diagnostics().uploads.arena_in_use_bytes;
+        let (update, _rows) = renderer
+            .stage_memory_update(&texture, region)
+            .expect("in-bounds staged update")
+            .expect("the Vulkan renderer stages");
+        assert!(renderer.diagnostics().uploads.arena_in_use_bytes > in_use);
+        renderer.cancel_staged_memory_update(update);
+        assert_eq!(renderer.diagnostics().uploads.arena_in_use_bytes, in_use);
+
+        let outside = Rectangle::<i32, BufferCoord>::new((12, 12).into(), Size::from((8, 8)));
+        assert!(renderer.stage_memory_update(&texture, outside).is_err());
     }
 
     #[test]

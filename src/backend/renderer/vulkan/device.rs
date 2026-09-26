@@ -20,7 +20,7 @@ use crate::backend::{
 
 use super::{
     image::{transition_image_layout, VulkanImage},
-    staging::{StagingReservation, UploadArena, UploadArenaStats},
+    staging::{ChunkMemory, StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
     VulkanRendererError, VulkanSubmissionSnapshot,
 };
@@ -615,6 +615,70 @@ impl DeviceState {
         // later recording can safely use the post-upload layout.
         image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
+    }
+
+    /// Reserve staging bytes for an upload into `image` whose rows are
+    /// written later, possibly on another thread ([`Self::queue_staged_image_upload`]).
+    pub(crate) fn stage_image_upload(
+        &mut self,
+        image: &Arc<VulkanImage>,
+        len: usize,
+    ) -> Result<(StagingReservation, *mut u8, Arc<ChunkMemory>), VulkanRendererError> {
+        if !image.is_renderer_local() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "memory uploads require a renderer-local Vulkan image",
+            ));
+        }
+        self.reclaim_completed_submissions()?;
+        let reservation = self
+            .upload_arena
+            .reserve(&self.physical_device, self.device.clone(), len)?;
+        match self.upload_arena.detach(reservation) {
+            Ok((ptr, memory)) => Ok((reservation, ptr, memory)),
+            Err(error) => {
+                self.upload_arena.release(reservation);
+                Err(error)
+            }
+        }
+    }
+
+    /// Queue a staged upload whose rows are all written. It joins the pending
+    /// batch that the next submission carries first. On error the reservation
+    /// is released and `image` keeps its pixels.
+    pub(crate) fn queue_staged_image_upload(
+        &mut self,
+        image: Arc<VulkanImage>,
+        reservation: StagingReservation,
+        region: vk::BufferImageCopy,
+    ) -> Result<(), VulkanRendererError> {
+        if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
+            self.upload_arena.release(reservation);
+            return Err(VulkanRendererError::UploadBatchFull {
+                limit: MAX_UPLOAD_BATCH_OPERATIONS,
+            });
+        }
+        if let Err(error) = self.upload_arena.flush(reservation) {
+            self.upload_arena.release(reservation);
+            return Err(error);
+        }
+        let old_layout = self
+            .pending_uploads
+            .layout_after_pending(image.id())
+            .unwrap_or_else(|| image.current_layout());
+        self.pending_uploads.bytes = self.pending_uploads.bytes.saturating_add(reservation.len());
+        image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        self.pending_uploads.operations.push(PendingUpload {
+            image,
+            reservation,
+            region,
+            old_layout,
+        });
+        Ok(())
+    }
+
+    /// Release a staged reservation that will not be queued.
+    pub(crate) fn release_staged_image_upload(&mut self, reservation: StagingReservation) {
+        self.upload_arena.release(reservation);
     }
 
     fn record_pending_uploads(&mut self) -> Result<Option<RecordedUploadBatch>, VulkanRendererError> {

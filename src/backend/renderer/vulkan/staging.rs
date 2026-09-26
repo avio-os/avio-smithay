@@ -179,12 +179,43 @@ impl UploadArena {
             .ok_or(VulkanRendererError::TemporaryFailure(
                 "staging reservation names an unknown chunk",
             ))?;
-        chunk.write_rows(reservation.offset, data, src_offset, src_stride, row_bytes, rows)?;
-        chunk.flush(reservation.offset, reservation.reserved_len)
+        chunk
+            .memory
+            .write_rows(reservation.offset, data, src_offset, src_stride, row_bytes, rows)?;
+        chunk.memory.flush(reservation.offset, reservation.reserved_len)
     }
 
     pub(crate) fn buffer(&self, reservation: StagingReservation) -> vk::Buffer {
-        self.chunks[reservation.chunk].buffer
+        self.chunks[reservation.chunk].memory.buffer
+    }
+
+    /// The reservation's bytes as an exclusive writable view that may move to
+    /// another thread. The returned mapping owner keeps the bytes valid even if
+    /// the arena is dropped first.
+    pub(crate) fn detach(
+        &self,
+        reservation: StagingReservation,
+    ) -> Result<(*mut u8, Arc<ChunkMemory>), VulkanRendererError> {
+        let chunk = self
+            .chunks
+            .get(reservation.chunk)
+            .ok_or(VulkanRendererError::TemporaryFailure(
+                "staging reservation names an unknown chunk",
+            ))?;
+        // SAFETY: The reservation lies inside the chunk's persistent mapping.
+        let ptr = unsafe { chunk.memory.mapped.0.add(reservation.offset) };
+        Ok((ptr, Arc::clone(&chunk.memory)))
+    }
+
+    /// Make host writes to the reservation visible to the device.
+    pub(crate) fn flush(&self, reservation: StagingReservation) -> Result<(), VulkanRendererError> {
+        let chunk = self
+            .chunks
+            .get(reservation.chunk)
+            .ok_or(VulkanRendererError::TemporaryFailure(
+                "staging reservation names an unknown chunk",
+            ))?;
+        chunk.memory.flush(reservation.offset, reservation.reserved_len)
     }
 
     pub(crate) fn release(&mut self, reservation: StagingReservation) {
@@ -202,12 +233,18 @@ impl UploadArena {
 }
 
 struct StagingChunk {
+    memory: Arc<ChunkMemory>,
+    ranges: RangeAllocator,
+}
+
+/// One chunk's buffer, memory and persistent mapping. Shared with detached
+/// writers so a reservation being written off-thread outlives the arena.
+pub(crate) struct ChunkMemory {
     device: Arc<DeviceHandle>,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: MappedAddress,
     coherent: bool,
-    ranges: RangeAllocator,
 }
 
 impl StagingChunk {
@@ -265,11 +302,13 @@ impl StagingChunk {
         let capacity = usize::try_from(allocation_size).unwrap_or(usize::MAX).min(size);
         let capacity = capacity - (capacity % atom_size);
         Ok(Self {
-            device,
-            buffer,
-            memory,
-            mapped,
-            coherent,
+            memory: Arc::new(ChunkMemory {
+                device,
+                buffer,
+                memory,
+                mapped,
+                coherent,
+            }),
             ranges: RangeAllocator::new(capacity),
         })
     }
@@ -277,7 +316,9 @@ impl StagingChunk {
     fn capacity(&self) -> usize {
         self.ranges.capacity
     }
+}
 
+impl ChunkMemory {
     fn write_rows(
         &self,
         dst_offset: usize,
@@ -339,7 +380,7 @@ impl StagingChunk {
     }
 }
 
-impl Drop for StagingChunk {
+impl Drop for ChunkMemory {
     fn drop(&mut self) {
         self.device.destroy_with(|device| unsafe {
             device.unmap_memory(self.memory);
@@ -350,14 +391,17 @@ impl Drop for StagingChunk {
 }
 
 /// The Vulkan renderer is moved between worker setup and its final queue-owner
-/// thread, but a mapped address is only dereferenced through that exclusive
-/// `&mut VulkanRenderer` authority. Vulkan host synchronization for the memory
-/// allocation is therefore preserved across the move.
+/// thread, and a detached reservation is written on another thread. Every
+/// write goes to a reserved range no one else touches until it is handed
+/// back; mapping and unmapping stay with the owning chunk memory.
 struct MappedAddress(*mut u8);
 
-// SAFETY: See the type-level ownership argument above. The pointer is never
-// shared across queue owners and is unmapped only by its owning chunk.
+// SAFETY: See the type-level ownership argument above. The address itself is
+// immutable; disjoint reservations never alias, and the mapping is unmapped
+// only when the last owner of the chunk memory drops it.
 unsafe impl Send for MappedAddress {}
+// SAFETY: As above: shared references only read the base address.
+unsafe impl Sync for MappedAddress {}
 
 struct RangeAllocator {
     capacity: usize,
