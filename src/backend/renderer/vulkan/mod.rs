@@ -16,6 +16,10 @@
 //!    [`crate::backend::renderer::sync::SyncPoint`] objects to presentation/scheduling code.
 //! 6. Periodically call [`VulkanRenderer::cleanup_dmabuf_cache`] (or
 //!    [`crate::backend::renderer::Renderer::cleanup_texture_cache`]) in long-running compositors.
+//! 7. Optionally bound what the device keeps bound by calling
+//!    [`VulkanRenderer::evict_idle_sampled_dmabuf_imports`] after a frame is submitted. Imported
+//!    textures otherwise stay cached, used or not, until their dma-buf is dropped or the cache
+//!    overflows.
 //!
 //! # Trait Behavior Notes
 //!
@@ -147,7 +151,7 @@ pub use kawase::{VulkanKawaseEncoding, VulkanKawasePass};
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
 
-use std::ffi::CStr;
+use std::{ffi::CStr, time::Instant};
 
 use crate::backend::{
     allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc, Modifier},
@@ -518,6 +522,29 @@ impl VulkanRenderer {
     /// Drop stale cached dma-buf imports.
     pub fn cleanup_dmabuf_cache(&mut self) {
         self.dmabuf.cleanup();
+    }
+
+    /// Drop up to `max` cached dma-buf texture imports that were last imported
+    /// before `used_before`, least recently used first, and return how many
+    /// were dropped.
+    ///
+    /// Dropping an import destroys the renderer's Vulkan image and imported
+    /// memory for that dma-buf, so the device no longer keeps it bound; the
+    /// dma-buf itself is untouched. A later [`Self::import_dmabuf_texture`] of
+    /// the same dma-buf imports it again, exactly like a first import.
+    ///
+    /// Only imports made solely through [`Self::import_dmabuf_texture`] (or
+    /// [`crate::backend::renderer::ImportDma`]) are candidates. An import that
+    /// has been bound as a render, storage-copy, framebuffer-effect or capture
+    /// target is kept: its contents are renderer-authored and callers may track
+    /// their age. An import still referenced by a [`VulkanTexture`], a
+    /// [`VulkanTarget`] or submitted GPU work is kept as well.
+    ///
+    /// This is opt-in residency control for a caller that owns a retention
+    /// policy. The renderer never calls it, and [`Self::cleanup_dmabuf_cache`]
+    /// is unchanged.
+    pub fn evict_idle_sampled_dmabuf_imports(&mut self, used_before: Instant, max: usize) -> usize {
+        self.dmabuf.evict_idle_sampled(used_before, max)
     }
 
     /// Take (and drop) any wait semaphores staged via [`Renderer::wait`] that

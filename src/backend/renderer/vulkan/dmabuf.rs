@@ -1,6 +1,7 @@
 use std::{
     os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
     sync::Arc,
+    time::Instant,
 };
 
 use ash::{khr, vk};
@@ -84,6 +85,20 @@ impl DmabufRole {
     }
 }
 
+/// Whether an import may be dropped only because it has been idle: it was only
+/// ever imported as a texture.
+///
+/// Every target role (render, storage-copy, framebuffer-effect, capture) adds
+/// `COLOR_ATTACHMENT`, and a texture later bound as a target keeps the union of
+/// both usages. Target contents are renderer-authored, and callers track their
+/// age by dma-buf identity, which outlives the import: a re-import starts from
+/// an `UNDEFINED` layout that such a caller would still treat as preserved. A
+/// sampled-only import holds no contents of its own, so re-importing it is the
+/// same as importing it for the first time.
+fn idle_evictable_usage(usage: vk::ImageUsageFlags) -> bool {
+    DmabufRole::Texture.required_usage().contains(usage)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DmabufSignature {
     size: Size<i32, BufferCoord>,
@@ -100,6 +115,10 @@ pub(crate) struct CachedDmabuf {
     pub(crate) handle: WeakDmabuf,
     signature: DmabufSignature,
     imported: Arc<VulkanImage>,
+    /// When a caller last imported or bound this entry. Stamped only where the
+    /// entry moves to the back of the cache, so it never decreases from front
+    /// to back.
+    last_used: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +138,7 @@ pub(crate) struct DmabufState {
     cleanup_scanned: u64,
     cleanup_stale_evictions: u64,
     capacity_evictions: u64,
+    idle_evictions: u64,
     max_cache_len: usize,
     cache_stats: VulkanCacheStats,
 }
@@ -209,6 +229,39 @@ impl DmabufState {
         self.evict_to_capacity();
     }
 
+    /// Drops up to `max` idle-evictable imports last used before `used_before`,
+    /// least recently used first, and returns how many it dropped.
+    ///
+    /// An entry whose image is referenced outside the cache (a caller's texture
+    /// or target, or submitted GPU work retaining it until completion) is kept,
+    /// so dropping the cache's reference destroys the image only when no GPU
+    /// work can still use it. The renderer itself never calls this.
+    pub(crate) fn evict_idle_sampled(&mut self, used_before: Instant, max: usize) -> usize {
+        let mut evicted = 0usize;
+        let mut index = 0usize;
+        while evicted < max {
+            let Some((_, cached)) = self.cache.get_index(index) else {
+                break;
+            };
+            // The cache is in recency order: everything behind this entry was
+            // used at or after it.
+            if cached.last_used >= used_before {
+                break;
+            }
+            if idle_evictable_usage(cached.imported.usage()) && Arc::strong_count(&cached.imported) <= 1 {
+                let _ = self.cache.shift_remove_index(index);
+                evicted = evicted.saturating_add(1);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+
+        let evicted_count = evicted as u64;
+        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(evicted_count);
+        self.idle_evictions = self.idle_evictions.saturating_add(evicted_count);
+        evicted
+    }
+
     pub(crate) fn cache_stats(&self) -> VulkanCacheStats {
         self.cache_stats
     }
@@ -262,6 +315,7 @@ impl DmabufState {
                 handle: key,
                 signature: descriptor.signature,
                 imported: imported.clone(),
+                last_used: Instant::now(),
             },
         );
         self.update_max_cache_len();
@@ -325,9 +379,10 @@ impl DmabufState {
     }
 
     fn promote_entry(&mut self, key: &WeakDmabuf) {
-        let Some(entry) = self.cache.shift_remove(key) else {
+        let Some(mut entry) = self.cache.shift_remove(key) else {
             return;
         };
+        entry.last_used = Instant::now();
         self.cache.insert(key.clone(), entry);
     }
 
@@ -352,6 +407,7 @@ impl DmabufState {
             cleanup_scanned = self.cleanup_scanned,
             cleanup_stale_evictions = self.cleanup_stale_evictions,
             capacity_evictions = self.capacity_evictions,
+            idle_evictions = self.idle_evictions,
             "smithay vulkan dmabuf cache diagnostics"
         );
     }
@@ -801,7 +857,9 @@ mod tests {
         vulkan::{version::Version, Instance, PhysicalDevice},
     };
 
-    use super::{dmabuf_is_disjoint, DmabufRole, DmabufState};
+    use super::{dmabuf_is_disjoint, idle_evictable_usage, DmabufRole, DmabufState};
+
+    include!("dmabuf/idle_eviction_tests.rs");
 
     #[test]
     fn capture_target_usage_covers_direct_materials_and_terminal_blits() {
@@ -809,6 +867,31 @@ mod tests {
         assert!(usage.contains(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT));
         assert!(usage.contains(ash::vk::ImageUsageFlags::TRANSFER_SRC));
         assert!(usage.contains(ash::vk::ImageUsageFlags::TRANSFER_DST));
+    }
+
+    #[test]
+    fn only_texture_only_imports_are_idle_evictable() {
+        let sampled = DmabufRole::Texture.required_usage();
+        assert_eq!(sampled, ash::vk::ImageUsageFlags::SAMPLED);
+        assert!(idle_evictable_usage(sampled));
+
+        for role in [
+            DmabufRole::RenderTarget,
+            DmabufRole::FramebufferEffectTarget,
+            DmabufRole::CaptureTarget,
+        ] {
+            let usage = role.required_usage();
+            assert!(
+                usage.contains(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT),
+                "{role:?}"
+            );
+            assert!(!idle_evictable_usage(usage), "{role:?} must keep its import");
+            // A texture later bound as this target carries both usages.
+            assert!(
+                !idle_evictable_usage(usage | sampled),
+                "{role:?} bound after a texture import must keep its import"
+            );
+        }
     }
 
     fn backing_object(name: &str) -> OwnedFd {
