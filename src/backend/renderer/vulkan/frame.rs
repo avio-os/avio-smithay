@@ -763,6 +763,11 @@ impl VulkanFrame<'_> {
     /// its complement. The dedicated pipeline interpolates premultiplied RGBA,
     /// including alpha, so this also works for transparent capture targets.
     /// Call after drawing the complete group with its ordinary member alpha.
+    ///
+    /// `prefix` is the image [`Self::capture_and_filter_framebuffer`] filled
+    /// for the same `region`, which must lie inside the output. Only the
+    /// captured extent at the image's origin is sampled, so a reused image
+    /// larger than the region is valid and its spare texels are never read.
     pub fn interpolate_framebuffer_prefix(
         &mut self,
         prefix: &VulkanTexture,
@@ -773,7 +778,22 @@ impl VulkanFrame<'_> {
         if !group_opacity.is_finite() || !(0.0..=1.0).contains(&group_opacity) {
             return Err(VulkanRendererError::TemporaryFailure("invalid group opacity"));
         }
-        let source = Rectangle::from_size(prefix.size().to_f64());
+        let (transform, output_size, frame_size) = {
+            let recording = self.recording()?;
+            (recording.transform, recording.output_size, recording.size)
+        };
+        // The capture blitted exactly this framebuffer area to the origin.
+        let Some(captured) = framebuffer_rect(transform, output_size, frame_size, region) else {
+            return Ok(());
+        };
+        let prefix_size = prefix.size();
+        if prefix_size.w < captured.size.w || prefix_size.h < captured.size.h {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "framebuffer prefix image is smaller than its captured extent",
+            ));
+        }
+        let source =
+            Rectangle::from_size(Size::<i32, BufferCoord>::from((captured.size.w, captured.size.h)).to_f64());
         self.render_texture_from_to_internal(
             prefix,
             source,

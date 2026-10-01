@@ -100,3 +100,115 @@ fn framebuffer_group_prefix_interpolates_premultiplied_rgba() {
         }
     }
 }
+
+/// A reused prefix image may be larger than the area a group captures. The
+/// interpolation must read only the captured extent at the image's origin:
+/// an oversized image whose spare texels hold garbage composes exactly like an
+/// image of the captured size, for every output transform.
+#[test]
+#[ignore = "requires Vulkan; run explicitly to prevent silently skipped pixel evidence"]
+fn framebuffer_group_prefix_samples_only_its_extent_of_a_larger_image() {
+    let instance = Instance::new(Version::VERSION_1_3, None).expect("Vulkan instance");
+    let physical = PhysicalDevice::enumerate(&instance)
+        .expect("devices")
+        .find(|device| device.render_node().ok().flatten().is_some())
+        .expect("hardware render node");
+    let mut renderer = VulkanRenderer::new(&physical).expect("renderer");
+    let output = Size::<i32, Physical>::from((12, 8));
+    let full = Rectangle::from_size(output);
+    // Off-origin and not output-proportional, so a whole-image sample would
+    // both stretch the garbage in and misplace the lower scene.
+    let region = Rectangle::<i32, Physical>::new((3, 2).into(), (7, 5).into());
+    // Lower-scene structure inside and around the group.
+    let stripe = Rectangle::<i32, Physical>::new((1, 1).into(), (6, 4).into());
+    for transform in [
+        Transform::Normal,
+        Transform::_90,
+        Transform::_180,
+        Transform::_270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ] {
+        for background_alpha in [0.35_f32, 1.0] {
+            for opacity in [0.25_f32, 0.7] {
+                let storage = transform.transform_size(output);
+                let size = Size::from((storage.w, storage.h));
+                let captured = transform.transform_rect_in(region, &output).size;
+                let exact = Size::<i32, BufferCoord>::from((captured.w, captured.h));
+                let oversized = Size::<i32, BufferCoord>::from((captured.w + 9, captured.h + 6));
+                let mut compose = |prefix_size: Size<i32, BufferCoord>| -> Vec<u8> {
+                    let mut prefix = renderer
+                        .create_buffer(Fourcc::Abgr8888, prefix_size)
+                        .expect("prefix");
+                    {
+                        let poison_size = Size::<i32, Physical>::from((prefix_size.w, prefix_size.h));
+                        let mut poison = renderer.bind(&mut prefix).expect("bind prefix");
+                        let mut frame = renderer
+                            .render(&mut poison, poison_size, Transform::Normal)
+                            .expect("poison frame");
+                        frame
+                            .clear(
+                                Color32F::new(1.0, 0.0, 1.0, 1.0),
+                                &[Rectangle::from_size(poison_size)],
+                            )
+                            .unwrap();
+                        frame.finish().expect("submit").wait().expect("poisoned");
+                    }
+                    let mut accumulator = renderer.create_buffer(Fourcc::Abgr8888, size).expect("target");
+                    let mut target = renderer.bind(&mut accumulator).expect("bind");
+                    let mut frame = renderer.render(&mut target, output, transform).expect("frame");
+                    frame
+                        .clear(
+                            Color32F::new(0.0, 0.0, background_alpha, background_alpha),
+                            &[full],
+                        )
+                        .unwrap();
+                    frame
+                        .draw_solid(
+                            stripe,
+                            &[Rectangle::from_size(stripe.size)],
+                            Color32F::new(1.0, 0.0, 0.0, 1.0),
+                        )
+                        .unwrap();
+                    frame
+                        .capture_and_filter_framebuffer(region, &prefix, &[])
+                        .unwrap();
+                    frame
+                        .draw_solid(
+                            region,
+                            &[Rectangle::from_size(region.size)],
+                            Color32F::new(0.0, 0.5, 0.0, 0.5),
+                        )
+                        .unwrap();
+                    frame
+                        .interpolate_framebuffer_prefix(
+                            &prefix,
+                            region,
+                            &[Rectangle::from_size(region.size)],
+                            opacity,
+                        )
+                        .unwrap();
+                    frame.finish().expect("submit").wait().expect("completed");
+                    drop(target);
+                    let mapping = renderer
+                        .copy_texture(&accumulator, Rectangle::from_size(size), Fourcc::Abgr8888)
+                        .expect("readback");
+                    renderer.map_texture(&mapping).expect("map").to_vec()
+                };
+                let reference = compose(exact);
+                let reused = compose(oversized);
+                for (index, (actual, expected)) in reused.iter().zip(&reference).enumerate() {
+                    assert!(
+                        (*actual as i32 - *expected as i32).abs() <= 1,
+                        "{transform:?}, background={background_alpha}, opacity={opacity}: \
+                         byte {index} (pixel {}, channel {}) got {actual}, exact prefix gives {expected}",
+                        index / 4,
+                        index % 4,
+                    );
+                }
+            }
+        }
+    }
+}
