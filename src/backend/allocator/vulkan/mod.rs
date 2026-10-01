@@ -24,7 +24,10 @@ use std::{
     ffi::CStr,
     fmt,
     os::unix::io::{FromRawFd, OwnedFd},
-    sync::{mpsc, Arc, Weak},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 use ash::{ext, khr, vk};
@@ -37,7 +40,7 @@ use crate::backend::drm::DrmNode;
 use crate::{
     backend::{
         allocator::dmabuf::DmabufFlags,
-        vulkan::{version::Version, PhysicalDevice},
+        vulkan::{version::Version, Instance, PhysicalDevice},
     },
     utils::{Buffer as BufferCoord, Size},
 };
@@ -122,31 +125,52 @@ pub enum Error {
 }
 
 /// An allocator which uses Vulkan to create buffers.
+///
+/// Every [`VulkanImage`] owns its memory and frees it when it is dropped. The
+/// allocator's `VkDevice` lives until the allocator and every image it created
+/// are gone, so an image may outlive its allocator.
 pub struct VulkanAllocator {
     formats: Vec<FormatEntry>,
-    images: Vec<ImageInner>,
     default_usage: ImageUsageFlags,
-    remaining_allocations: u32,
+    remaining_allocations: Arc<AtomicU32>,
     extension_fns: ExtensionFns,
-    dropped_recv: mpsc::Receiver<ImageInner>,
-    dropped_sender: mpsc::Sender<ImageInner>,
     phd: PhysicalDevice,
     #[cfg(feature = "backend_drm")]
     node: Option<DrmNode>,
-    device: Arc<ash::Device>,
+    device: Arc<AllocatorDevice>,
 }
 
 impl fmt::Debug for VulkanAllocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VulkanAllocator")
             .field("formats", &self.formats)
-            .field("images", &self.images)
             .field("default_usage", &self.default_usage)
             .field("remaining_allocations", &self.remaining_allocations)
-            .field("dropped_recv", &self.dropped_recv)
-            .field("dropped_sender", &self.dropped_sender)
             .field("phd", &self.phd)
             .finish()
+    }
+}
+
+/// The allocator's `VkDevice`, destroyed when its last holder drops.
+///
+/// The allocator and every live image hold it, so no image can outlive the
+/// device that must destroy it. It also holds the device's [`Instance`], so
+/// the device is destroyed before its instance however the allocator, its
+/// [`PhysicalDevice`] and the caller's instance handles are dropped
+/// (VUID-vkDestroyInstance-instance-00629).
+struct AllocatorDevice(
+    ash::Device,
+    /// Kept alive until the device above is destroyed.
+    #[allow(dead_code)]
+    Instance,
+);
+
+impl Drop for AllocatorDevice {
+    fn drop(&mut self) {
+        // SAFETY: Every image created on this device holds this owner and
+        // destroys its own handles first; the device records no commands.
+        // The instance in `self.1` is released only after this returns.
+        unsafe { self.0.destroy_device(None) };
     }
 }
 
@@ -246,8 +270,6 @@ impl VulkanAllocator {
             khr_external_memory_fd: khr::external_memory_fd::Device::new(instance, &device),
         };
 
-        let (dropped_sender, dropped_recv) = mpsc::channel();
-
         #[cfg(feature = "backend_drm")]
         let node = phd
             .render_node()
@@ -257,16 +279,13 @@ impl VulkanAllocator {
 
         let mut allocator = VulkanAllocator {
             formats: Vec::new(),
-            images: Vec::new(),
             default_usage,
-            remaining_allocations: phd.limits().max_memory_allocation_count,
+            remaining_allocations: Arc::new(AtomicU32::new(phd.limits().max_memory_allocation_count)),
             extension_fns,
-            dropped_recv,
-            dropped_sender,
             phd: phd.clone(),
             #[cfg(feature = "backend_drm")]
             node,
-            device: Arc::new(device),
+            device: Arc::new(AllocatorDevice(device, phd.instance().clone())),
         };
 
         allocator.init_formats();
@@ -308,8 +327,6 @@ impl VulkanAllocator {
         modifiers: &[DrmModifier],
         usage: ImageUsageFlags,
     ) -> Result<VulkanImage, Error> {
-        self.cleanup();
-
         let vk_format = format::get_vk_format(fourcc).ok_or(Error::UnsupportedFormat)?;
         let vk_usage = vk::ImageUsageFlags::from_raw(usage.bits());
 
@@ -365,22 +382,15 @@ impl Allocator for VulkanAllocator {
     }
 }
 
-impl Drop for VulkanAllocator {
-    fn drop(&mut self) {
-        unsafe {
-            for image in &self.images {
-                self.device.destroy_image(image.image, None);
-                self.device.free_memory(image.memory, None);
-            }
-
-            self.device.destroy_device(None);
-        }
-    }
-}
-
 /// Vulkan image object.
 ///
 /// This type implements [`Buffer`] and the underlying image may be exported as a dmabuf.
+///
+/// Dropping the image destroys it and frees its memory at once. That is safe
+/// whatever still reads the pixels: the allocator's device never records or
+/// submits a command, so no submission on it can reference the image, and a
+/// consumer reads an exported dmabuf through its own import, whose kernel
+/// object the dmabuf keeps alive after this device lets go of it.
 pub struct VulkanImage {
     inner: ImageInner,
     width: u32,
@@ -391,8 +401,8 @@ pub struct VulkanImage {
     /// The number of planes the image has for dmabuf export.
     format_plane_count: u32,
     khr_external_memory_fd: khr::external_memory_fd::Device,
-    dropped_sender: mpsc::Sender<ImageInner>,
-    device: Weak<ash::Device>,
+    remaining_allocations: Arc<AtomicU32>,
+    device: Arc<AllocatorDevice>,
 }
 
 impl fmt::Debug for VulkanImage {
@@ -429,7 +439,7 @@ impl AsDmabuf for VulkanImage {
 
     #[profiling::function]
     fn export(&self) -> Result<Dmabuf, Self::Error> {
-        let device = self.device.upgrade().ok_or(ExportError::AllocatorDestroyed)?;
+        let device = &self.device.0;
 
         // Implementation may be broken if the plane count is wrong.
         if self.format_plane_count == 0 {
@@ -489,7 +499,14 @@ impl AsDmabuf for VulkanImage {
 
 impl Drop for VulkanImage {
     fn drop(&mut self) {
-        let _ = self.dropped_sender.send(self.inner);
+        // SAFETY: The image and memory belong to `self.device`, which this
+        // image keeps alive, and no other owner can name them. See the type
+        // documentation for why no GPU work can still use them.
+        unsafe {
+            self.device.0.destroy_image(self.inner.image, None);
+            self.device.0.free_memory(self.inner.memory, None);
+        }
+        self.remaining_allocations.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -497,6 +514,8 @@ impl Drop for VulkanImage {
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
     /// The image could not export a dmabuf since the allocator has been destroyed.
+    ///
+    /// No longer returned: an image keeps its allocator's device alive.
     #[error("allocator has been destroyed")]
     AllocatorDestroyed,
 
@@ -672,7 +691,7 @@ impl VulkanAllocator {
         assert!(height > 0);
 
         // Ensure maximum allocations are not exceeded.
-        if self.remaining_allocations == 0 {
+        if self.remaining_allocations.load(Ordering::Relaxed) == 0 {
             todo!()
         }
 
@@ -714,10 +733,10 @@ impl VulkanAllocator {
         let mut guard = scopeguard::guard(
             ImageInner {
                 // This is the only spot where ? may be used to detect and error since no previous handles have been created.
-                image: unsafe { self.device.create_image(&image_create_info, None) }?,
+                image: unsafe { self.device.0.create_image(&image_create_info, None) }?,
                 memory: vk::DeviceMemory::null(),
             },
-            |inner| unsafe { self.device.destroy_image(inner.image, None) },
+            |inner| unsafe { self.device.0.destroy_image(inner.image, None) },
         );
 
         // Get the modifier Vulkan created the image using.
@@ -746,7 +765,7 @@ impl VulkanAllocator {
             .drm_format_modifier_plane_count;
 
         // Allocate image memory
-        let memory_reqs = unsafe { self.device.get_image_memory_requirements(guard.image) };
+        let memory_reqs = unsafe { self.device.0.get_image_memory_requirements(guard.image) };
         let memory_type_index = compatible_memory_type_index(memory_reqs.memory_type_bits)
             .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
@@ -765,18 +784,16 @@ impl VulkanAllocator {
 
         unsafe {
             // Allocate memory for the image.
-            guard.memory = self.device.allocate_memory(&alloc_create_info, None)?;
+            guard.memory = self.device.0.allocate_memory(&alloc_create_info, None)?;
             // Finally bind the memory to the image
-            self.device.bind_image_memory(guard.image, guard.memory, 0)?;
+            self.device.0.bind_image_memory(guard.image, guard.memory, 0)?;
         }
 
         // Initialization is complete, prevent the scope guard from running it's dropfn.
+        // From here the image destroys itself when dropped.
         let inner = scopeguard::ScopeGuard::into_inner(guard);
 
-        // Track the image for destruction.
-        self.images.push(inner);
-
-        self.remaining_allocations -= 1;
+        self.remaining_allocations.fetch_sub(1, Ordering::Relaxed);
 
         Ok(VulkanImage {
             inner,
@@ -785,39 +802,10 @@ impl VulkanAllocator {
             format,
             format_plane_count,
             khr_external_memory_fd: self.extension_fns.khr_external_memory_fd.clone(),
-            dropped_sender: self.dropped_sender.clone(),
-            device: Arc::downgrade(&self.device),
+            remaining_allocations: self.remaining_allocations.clone(),
+            device: self.device.clone(),
             #[cfg(feature = "backend_drm")]
             node: self.node,
-        })
-    }
-
-    fn cleanup(&mut self) {
-        let dropped = self.dropped_recv.try_iter().collect::<Vec<_>>();
-
-        self.images.retain(|image| {
-            // Only drop if the
-            let drop = dropped.contains(image);
-
-            if drop {
-                // Destroy the underlying image resource
-                unsafe {
-                    self.device.destroy_image(image.image, None);
-                    self.device.free_memory(image.memory, None);
-                }
-
-                self.remaining_allocations = self
-                    .remaining_allocations
-                    .checked_add(1)
-                    .expect("Remaining allocations overflowed");
-                debug_assert!(
-                    self.phd.limits().max_memory_allocation_count >= self.remaining_allocations,
-                    "Too many allocations released",
-                );
-            }
-
-            // If the image was dropped, return false
-            !drop
         })
     }
 }
@@ -837,4 +825,7 @@ mod tests {
         assert_eq!(compatible_memory_type_index(0b1000), Some(3));
         assert_eq!(compatible_memory_type_index(0b1010), Some(1));
     }
+
+    #[cfg(feature = "renderer_vulkan")]
+    include!("free_on_drop_tests.rs");
 }
