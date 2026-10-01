@@ -4376,19 +4376,26 @@ where
             plane_info.handle
         );
 
-        // if we fail to create a buffer we can just return false and
-        // force the cursor to be rendered on the primary plane
-        let mut cursor_buffer = match cursor_state.allocator.create_buffer(
-            cursor_plane_size.w as u32,
-            cursor_plane_size.h as u32,
-            DrmFourcc::Argb8888,
-            &[DrmModifier::Linear],
-        ) {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                debug!("failed to create cursor buffer: {}", err);
-                return None;
+        // The plane fills its buffer only from storage it can read, so that
+        // is decided before anything is allocated. An element it cannot fill
+        // is composited; if we fail to create a buffer we do the same.
+        let storage = element.underlying_storage(renderer);
+        let Some(mut cursor_buffer) = allocate_for_fillable_cursor(storage.as_ref(), || {
+            match cursor_state.allocator.create_buffer(
+                cursor_plane_size.w as u32,
+                cursor_plane_size.h as u32,
+                DrmFourcc::Argb8888,
+                &[DrmModifier::Linear],
+            ) {
+                Ok(buffer) => Some(buffer),
+                Err(err) => {
+                    debug!("failed to create cursor buffer: {}", err);
+                    None
+                }
             }
+        }) else {
+            trace!("no cursor plane buffer for element {:?}, skipping", element.id());
+            return None;
         };
 
         // if we fail to export a framebuffer for our buffer we can skip the rest
@@ -5370,6 +5377,33 @@ fn apply_output_transform(transform: Transform, output_transform: Transform) -> 
     }
 }
 
+/// Whether the cursor plane can fill a buffer of its own from `storage`.
+///
+/// The plane copies (or, with the pixman renderer, draws) the element's
+/// pixels into a buffer it allocates. It can do that from memory and from a
+/// Wayland buffer. It never reads a DMA-BUF: that read needs a GPU copy or a
+/// CPU map and sync of a buffer another device may still be writing, which
+/// belongs to the owner of the element, off any real-time thread.
+fn cursor_plane_can_fill(storage: &UnderlyingStorage<'_>) -> bool {
+    match storage {
+        UnderlyingStorage::Wayland(_) | UnderlyingStorage::Memory(_) => true,
+        UnderlyingStorage::Dmabuf(_) => false,
+    }
+}
+
+/// Run `allocate` only for an element whose storage the cursor plane can
+/// fill. Deciding after the allocation would create a buffer and a
+/// framebuffer only to drop them again, on every frame the element is shown.
+fn allocate_for_fillable_cursor<B>(
+    storage: Option<&UnderlyingStorage<'_>>,
+    allocate: impl FnOnce() -> Option<B>,
+) -> Option<B> {
+    if !storage.is_some_and(cursor_plane_can_fill) {
+        return None;
+    }
+    allocate()
+}
+
 #[profiling::function]
 fn copy_element_to_cursor_bo<R, E>(
     renderer: &mut R,
@@ -5797,4 +5831,59 @@ fn compositor_bounds_accept_vulkan_renderer() {
     }
 
     assert_compositor_renderer_bounds::<VulkanRenderer, SolidColorRenderElement>();
+}
+
+#[cfg(test)]
+mod cursor_plane_fill_tests {
+    use std::cell::Cell;
+
+    use super::{allocate_for_fillable_cursor, cursor_plane_can_fill};
+    use crate::backend::{
+        allocator::{
+            dmabuf::{Dmabuf, DmabufFlags},
+            Fourcc, Modifier,
+        },
+        renderer::element::{memory::MemoryBuffer, UnderlyingStorage},
+    };
+
+    fn dmabuf() -> Dmabuf {
+        let fd = rustix::fs::memfd_create("cursor-plane-fill-test", rustix::fs::MemfdFlags::CLOEXEC)
+            .expect("memfd");
+        let mut builder = Dmabuf::builder((64, 64), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(fd, 0, 0, 256));
+        builder.build().expect("dmabuf")
+    }
+
+    /// Counts what the cursor plane would allocate for one element.
+    fn allocations_for(storage: Option<&UnderlyingStorage<'_>>) -> (bool, usize) {
+        let allocations = Cell::new(0);
+        let buffer = allocate_for_fillable_cursor(storage, || {
+            allocations.set(allocations.get() + 1);
+            Some(())
+        });
+        (buffer.is_some(), allocations.get())
+    }
+
+    #[test]
+    fn cursor_plane_fill_allocates_for_memory_storage() {
+        let memory = MemoryBuffer::new(Fourcc::Argb8888, (64, 64));
+        let storage = UnderlyingStorage::Memory(&memory);
+        assert!(cursor_plane_can_fill(&storage));
+        assert_eq!(allocations_for(Some(&storage)), (true, 1));
+    }
+
+    #[test]
+    fn cursor_plane_fill_refuses_a_dmabuf_before_allocating() {
+        let dmabuf = dmabuf();
+        let storage = UnderlyingStorage::Dmabuf(&dmabuf);
+        assert!(!cursor_plane_can_fill(&storage));
+        // Before the guard the plane created a buffer and a framebuffer here,
+        // then dropped both, on every frame the element was shown.
+        assert_eq!(allocations_for(Some(&storage)), (false, 0));
+    }
+
+    #[test]
+    fn cursor_plane_fill_refuses_an_element_without_storage() {
+        assert_eq!(allocations_for(None), (false, 0));
+    }
 }

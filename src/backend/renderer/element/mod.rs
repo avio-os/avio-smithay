@@ -208,6 +208,12 @@ pub enum UnderlyingStorage<'a> {
     /// A memory backed buffer
     Memory(&'a memory::MemoryBuffer),
     /// A DMA-BUF backed buffer
+    ///
+    /// Planes may scan it out directly. The DRM compositor's cursor plane
+    /// never fills its own buffer from it: that would need a GPU copy, or a
+    /// CPU map and sync of a buffer another device may still be writing.
+    /// Such a CPU read belongs to the element's owner, off any real-time
+    /// thread; an element that wants the cursor plane hands it memory.
     Dmabuf(&'a Dmabuf),
 }
 
