@@ -589,7 +589,11 @@ impl Frame for PixmanFrame<'_, '_> {
             };
 
             src_image.set_filter(filter, &[])?;
-            src_image.set_repeat(Repeat::None);
+            // Clamp to the edge, as the GLES and Vulkan renderers' samplers
+            // do. With `Repeat::None` a filtered sample past the image's last
+            // texel blends in transparency, so a scaled element's outermost
+            // ring drew lighter here than on a GPU renderer.
+            src_image.set_repeat(Repeat::Pad);
 
             let has_alpha = DrmFourcc::try_from(src_image.format())
                 .ok()
@@ -1276,5 +1280,61 @@ impl Bind<Image<'static, 'static>> for PixmanRenderer {
         });
 
         Some(RENDER_BUFFER_FORMATS.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PixmanRenderer;
+    use crate::backend::{
+        allocator::Fourcc,
+        renderer::{Bind, Color32F, Frame, ImportMem, Offscreen, Renderer},
+    };
+    use crate::utils::{Rectangle, Size, Transform};
+
+    /// A texture scaled with bilinear filtering samples its edge texels the
+    /// way the GLES and Vulkan renderers do (clamp to edge). Sampling outside
+    /// the image as transparent fades the outermost destination ring of an
+    /// opaque texture, so the same element would draw differently on a
+    /// pixman target than on a GPU one.
+    #[test]
+    fn a_scaled_texture_keeps_its_edge_texels() {
+        let mut renderer = PixmanRenderer::new().unwrap();
+        // Four opaque texels a side drawn into seven pixels: scale 1.75.
+        let texture = renderer
+            .import_memory(&[0xff; 4 * 4 * 4], Fourcc::Argb8888, Size::from((4, 4)), false)
+            .unwrap();
+        let mut target = renderer
+            .create_buffer(Fourcc::Argb8888, Size::from((7, 7)))
+            .unwrap();
+        {
+            let mut framebuffer = renderer.bind(&mut target).unwrap();
+            let mut frame = renderer
+                .render(&mut framebuffer, Size::from((7, 7)), Transform::Normal)
+                .unwrap();
+            let dst = Rectangle::from_size(Size::from((7, 7)));
+            frame.clear(Color32F::TRANSPARENT, &[dst]).unwrap();
+            frame
+                .render_texture_from_to(
+                    &texture,
+                    Rectangle::from_size(Size::from((4.0, 4.0))),
+                    dst,
+                    &[dst],
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                )
+                .unwrap();
+            let _sync = frame.finish().unwrap();
+        }
+        // SAFETY: the image owns `stride * height` bytes and the frame above
+        // finished drawing it.
+        let pixels = unsafe { std::slice::from_raw_parts(target.data() as *const u8, target.stride() * 7) };
+        for y in 0..7 {
+            for x in 0..7 {
+                let at = y * target.stride() + x * 4;
+                assert_eq!(pixels[at..at + 4], [0xff; 4], "pixel ({x}, {y})");
+            }
+        }
     }
 }
