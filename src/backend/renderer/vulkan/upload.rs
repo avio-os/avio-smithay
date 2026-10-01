@@ -922,6 +922,59 @@ mod tests {
         assert!(renderer.stage_memory_update(&texture, outside).is_err());
     }
 
+    /// A queued upload whose texture is gone before any submission is
+    /// dropped: a run of replaced images (a cursor bitmap changing while an
+    /// output scans out without composition) holds neither batch slots nor
+    /// staging, and never reaches the GPU. A live texture keeps its upload.
+    #[test]
+    fn an_upload_no_texture_can_sample_is_dropped_before_submission() {
+        let Some((mut renderer, _allocator)) = init_renderer_and_allocator() else {
+            return;
+        };
+        let format = crate::backend::allocator::Fourcc::Argb8888;
+        let size: Size<i32, BufferCoord> = Size::from((16, 16));
+        let bytes = 16 * 16 * 4;
+        let in_use = renderer.diagnostics().uploads.arena_in_use_bytes;
+        // More than one batch (256 operations): before the drop, import 257
+        // failed with UploadBatchFull, with every replaced image allocated.
+        for shade in 0..300_u32 {
+            let texture = renderer
+                .import_memory(&vec![shade as u8; bytes], format, size, false)
+                .expect("a replaced upload frees its batch slot");
+            drop(texture);
+        }
+        // Only dead work is pending: nothing is submitted for it.
+        assert!(!matches!(
+            renderer.memory_upload_capacity_edge(),
+            Ok(MemoryUploadCapacityEdge::Submitted(_))
+        ));
+        let uploads = renderer.diagnostics().uploads;
+        assert_eq!(uploads.pending_operations, 0);
+        assert_eq!(uploads.arena_in_use_bytes, in_use);
+        assert_eq!(renderer.diagnostics().submissions.total_submissions, 0);
+
+        let live = renderer
+            .import_memory(&vec![0xff; bytes], format, size, false)
+            .expect("live import");
+        let held = renderer
+            .import_memory(&vec![0x40; bytes], format, size, false)
+            .expect("second live import");
+        let held_image = held.image_resource().expect("upload image").clone();
+        drop(held);
+        let replaced = renderer
+            .import_memory(&vec![0x80; bytes], format, size, false)
+            .expect("replaced import");
+        drop(replaced);
+        // The submission carries the live uploads, including the one whose
+        // image is still held without a texture, and not the replaced one.
+        assert_eq!(read_pixel(&mut renderer, &live, 3, 3), [0xff; 4]);
+        let uploads = renderer.diagnostics().uploads;
+        assert_eq!(uploads.pending_operations, 0);
+        assert_eq!(uploads.submitted_batches, 1);
+        assert_eq!(uploads.submitted_operations, 2);
+        drop(held_image);
+    }
+
     #[test]
     fn import_memory_update_and_render_path_succeeds() {
         let Some((mut renderer, mut allocator)) = init_renderer_and_allocator() else {

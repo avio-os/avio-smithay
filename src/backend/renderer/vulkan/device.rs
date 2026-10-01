@@ -116,6 +116,45 @@ impl PendingUploadBatch {
             .find(|operation| operation.image.id() == image_id)
             .map(|_| vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
     }
+
+    /// Drop every operation whose image only this batch still holds, and
+    /// return its staging to `arena`.
+    ///
+    /// Such an image has no texture, no frame recording, no blit and no
+    /// submission that could sample it, so its copy is dead work. Nothing
+    /// was submitted for it: the GPU has never read the image or the
+    /// staging span, and dropping the last reference destroys the image
+    /// unused. Without this, a renderer that queues uploads but submits
+    /// nothing (an output scanned out without composition while a cursor
+    /// bitmap changes) keeps every superseded image and its staging until
+    /// the batch is full, and the next upload has to wait on a capacity
+    /// edge.
+    fn drop_unsampleable(&mut self, arena: &mut UploadArena) {
+        let mut index = 0;
+        while let Some(operation) = self.operations.get(index) {
+            let held_here = self
+                .operations
+                .iter()
+                .filter(|other| Arc::ptr_eq(&other.image, &operation.image))
+                .count();
+            if Arc::strong_count(&operation.image) > held_here {
+                index += 1;
+                continue;
+            }
+            // Every operation on this image is at or after `index`: an
+            // earlier one would have been dropped with the same decision.
+            let image = Arc::clone(&operation.image);
+            let bytes = &mut self.bytes;
+            self.operations.retain(|other| {
+                if !Arc::ptr_eq(&other.image, &image) {
+                    return true;
+                }
+                *bytes = bytes.saturating_sub(other.reservation.len());
+                arena.release(other.reservation);
+                false
+            });
+        }
+    }
 }
 
 struct RecordedUploadBatch {
@@ -578,6 +617,7 @@ impl DeviceState {
             ));
         }
         self.reclaim_completed_submissions()?;
+        self.drop_unsampleable_uploads();
         if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
             return Err(VulkanRendererError::UploadBatchFull {
                 limit: MAX_UPLOAD_BATCH_OPERATIONS,
@@ -630,6 +670,7 @@ impl DeviceState {
             ));
         }
         self.reclaim_completed_submissions()?;
+        self.drop_unsampleable_uploads();
         let reservation = self
             .upload_arena
             .reserve(&self.physical_device, self.device.clone(), len)?;
@@ -651,6 +692,7 @@ impl DeviceState {
         reservation: StagingReservation,
         region: vk::BufferImageCopy,
     ) -> Result<(), VulkanRendererError> {
+        self.drop_unsampleable_uploads();
         if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
             self.upload_arena.release(reservation);
             return Err(VulkanRendererError::UploadBatchFull {
@@ -681,7 +723,16 @@ impl DeviceState {
         self.upload_arena.release(reservation);
     }
 
+    /// Drop the pending uploads whose image nothing can sample any more
+    /// (see [`PendingUploadBatch::drop_unsampleable`]). Runs before an
+    /// upload claims batch or staging capacity and before a batch is
+    /// recorded, so dead uploads neither fill the batch nor reach the GPU.
+    fn drop_unsampleable_uploads(&mut self) {
+        self.pending_uploads.drop_unsampleable(&mut self.upload_arena);
+    }
+
     fn record_pending_uploads(&mut self) -> Result<Option<RecordedUploadBatch>, VulkanRendererError> {
+        self.drop_unsampleable_uploads();
         if self.pending_uploads.operations.is_empty() {
             return Ok(None);
         }
@@ -761,6 +812,7 @@ impl DeviceState {
     pub(crate) fn memory_upload_capacity_edge(
         &mut self,
     ) -> Result<MemoryUploadCapacityEdge, VulkanRendererError> {
+        self.drop_unsampleable_uploads();
         if self.pending_uploads.operations.is_empty() {
             return Ok(self
                 .in_flight_submissions
