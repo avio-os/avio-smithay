@@ -98,7 +98,7 @@ pub use error::Error as DrmError;
 use indexmap::IndexSet;
 #[cfg(feature = "backend_gbm")]
 pub use surface::gbm::{Error as GbmBufferedSurfaceError, GbmBufferedSurface};
-pub use surface::{DrmSurface, PlaneConfig, PlaneDamageClips, PlaneState, VrrSupport};
+pub use surface::{live_mode_blobs, DrmSurface, PlaneConfig, PlaneDamageClips, PlaneState, VrrSupport};
 
 use drm::{
     control::{crtc, framebuffer, plane, Device as ControlDevice, PlaneType},

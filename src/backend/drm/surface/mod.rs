@@ -12,6 +12,7 @@ pub(super) mod atomic;
 #[cfg(feature = "backend_gbm")]
 pub(super) mod gbm;
 pub(super) mod legacy;
+mod mode_blob;
 use super::{
     device::PlaneClaimStorage, error::Error, plane_type, DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType,
     Planes,
@@ -20,6 +21,7 @@ use crate::utils::DevPath;
 use crate::utils::{Buffer, Physical, Point, Rectangle, Transform};
 use atomic::AtomicDrmSurface;
 use legacy::LegacyDrmSurface;
+pub use mode_blob::live_mode_blobs;
 
 /// An open crtc + plane combination that can be used for scan-out
 #[derive(Debug)]

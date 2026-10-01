@@ -34,13 +34,15 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
-use super::{PlaneConfig, PlaneState, VrrSupport};
+use super::{mode_blob::ModeBlob, PlaneConfig, PlaneState, VrrSupport};
 
 #[derive(Debug, Clone)]
 pub struct State {
     pub active: bool,
     pub mode: Mode,
-    pub blob: property::Value<'static>,
+    /// The blob that sets `mode`. A committed state shares the pending state's
+    /// blob; a state read back from KMS owns none, because no request names it.
+    pub blob: Option<ModeBlob>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
 }
@@ -74,16 +76,6 @@ impl State {
         // we need to be sure, we require a mode to always be set without relying on the compiler.
         // So we cheat, because it works and is easier to handle later.
         let current_mode = crtc_info.mode().unwrap_or_else(|| unsafe { std::mem::zeroed() });
-        let current_blob = match crtc_info.mode() {
-            Some(mode) => fd.create_property_blob(&mode).map_err(|source| {
-                Error::Access(AccessError {
-                    errmsg: "Failed to create Property Blob for mode",
-                    dev: fd.dev_path(),
-                    source,
-                })
-            })?,
-            None => property::Value::Unknown(0),
-        };
 
         let res_handles = fd.resource_handles().map_err(|source| {
             Error::Access(AccessError {
@@ -140,21 +132,56 @@ impl State {
             }
         }
 
-        Ok(State {
+        Ok(State::read_back(
+            current_mode,
             // If we don't know the active state we just assume off.
             // This is highly unlikely, but having a false negative should do no harm.
-            active: active.unwrap_or(false),
-            mode: current_mode,
-            blob: current_blob,
+            active.unwrap_or(false),
             // If we don't know the VRR state, the driver doesn't support the property
-            vrr: vrr.unwrap_or(false),
-            connectors: current_connectors,
-        })
+            vrr.unwrap_or(false),
+            current_connectors,
+        ))
+    }
+
+    /// The state KMS reports for a CRTC. It owns no blob: requests only ever
+    /// name the pending blob, so a state read back from KMS needs none.
+    /// Creating one here leaked a blob on every `reset_state`.
+    fn read_back(mode: Mode, active: bool, vrr: bool, connectors: HashSet<connector::Handle>) -> Self {
+        State {
+            active,
+            mode,
+            blob: None,
+            vrr,
+            connectors,
+        }
+    }
+
+    /// A pending state that sets `mode` through its own `blob`.
+    fn with_mode(mode: Mode, blob: ModeBlob, connectors: &[connector::Handle]) -> Self {
+        State {
+            active: true,
+            mode,
+            blob: Some(blob),
+            vrr: false,
+            connectors: connectors.iter().copied().collect(),
+        }
+    }
+
+    /// Take `mode`, set through `blob`. The superseded blob is destroyed,
+    /// unless the committed state still shares it.
+    fn set_mode(&mut self, mode: Mode, blob: ModeBlob) {
+        self.mode = mode;
+        self.blob = Some(blob);
+    }
+
+    /// The `MODE_ID` value a request sets for this state.
+    fn mode_id(&self) -> Option<property::Value<'static>> {
+        self.blob.as_ref().map(ModeBlob::value)
     }
 
     fn clear(&mut self) {
         self.mode = unsafe { std::mem::zeroed() };
-        self.blob = property::Value::Unknown(0);
+        self.blob = None;
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
@@ -194,20 +221,7 @@ impl AtomicDrmSurface {
         );
 
         let state = State::current_state(&*fd, crtc, &mut prop_mapping.write().unwrap())?;
-        let blob = fd.create_property_blob(&mode).map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Failed to create Property Blob for mode",
-                dev: fd.dev_path(),
-                source,
-            })
-        })?;
-        let pending = State {
-            active: true,
-            mode,
-            blob,
-            vrr: false,
-            connectors: connectors.iter().copied().collect(),
-        };
+        let pending = State::with_mode(mode, ModeBlob::new(fd.device_fd(), &mode)?, connectors);
 
         drop(_guard);
         let surface = AtomicDrmSurface {
@@ -361,7 +375,7 @@ impl AtomicDrmSurface {
             let req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
-                Some(pending.blob),
+                pending.mode_id(),
                 pending.vrr,
                 &connectors,
                 [],
@@ -420,7 +434,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            pending.mode_id(),
             pending.vrr,
             &connectors,
             [&conn],
@@ -477,7 +491,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            pending.mode_id(),
             pending.vrr,
             &conns,
             removed,
@@ -504,14 +518,8 @@ impl AtomicDrmSurface {
 
         let mut pending = self.pending.write().unwrap();
 
-        // check if new config is supported
-        let new_blob = self.fd.create_property_blob(&mode).map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Failed to create Property Blob for mode",
-                dev: self.fd.dev_path(),
-                source,
-            })
-        })?;
+        // check if new config is supported; a failed test drops (destroys) the new blob
+        let new_blob = ModeBlob::new(self.fd.device_fd(), &mode)?;
 
         let test_buffer = self.create_test_buffer(mode.size(), self.plane)?;
 
@@ -531,27 +539,21 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(new_blob),
+            Some(new_blob.value()),
             pending.vrr,
             pending.connectors.iter(),
             [],
             [&plane_state],
         )?;
-        if let Err(err) = self
-            .fd
+        self.fd
             .atomic_commit(
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                 req.build()?,
             )
-            .map_err(|_| Error::TestFailed(self.crtc))
-        {
-            let _ = self.fd.destroy_property_blob(new_blob.into());
-            return Err(err);
-        }
+            .map_err(|_| Error::TestFailed(self.crtc))?;
 
         // seems to be, lets change the mode
-        pending.mode = mode;
-        pending.blob = new_blob;
+        pending.set_mode(mode, new_blob);
 
         Ok(())
     }
@@ -654,7 +656,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            pending.mode_id(),
             value,
             &pending.connectors,
             &[],
@@ -724,7 +726,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            pending.mode_id(),
             pending.vrr,
             &pending_conns,
             removed,
@@ -796,7 +798,7 @@ impl AtomicDrmSurface {
             let req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
-                Some(pending.blob),
+                pending.mode_id(),
                 pending.vrr,
                 &pending_conns,
                 removed,
@@ -811,12 +813,6 @@ impl AtomicDrmSurface {
 
                 return Err(Error::TestFailed(self.crtc));
             } else {
-                if current.mode != pending.mode {
-                    if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
-                        warn!("Failed to destroy old mode property blob: {}", err);
-                    }
-                }
-
                 // new config
                 req
             }
@@ -855,6 +851,8 @@ impl AtomicDrmSurface {
 
         if result.is_ok() {
             *self.last_out_fence.lock().unwrap() = consume_out_fence(requested_out_fence, out_fence_fd);
+            // Share the pending blob; the replaced state's blob is destroyed
+            // unless pending still names it.
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -1011,6 +1009,9 @@ impl AtomicDrmSurface {
         res
     }
 
+    /// Re-read the current state from KMS. The re-read state owns no mode
+    /// blob, so a reset creates none; the replaced state's blob is destroyed
+    /// unless the pending state still names it.
     pub(crate) fn reset_state<B: DevPath + ControlDevice + 'static>(
         &self,
         fd: Option<&B>,
@@ -1110,6 +1111,215 @@ impl From<Transform> for DrmRotation {
             Transform::Flipped180 => DrmRotation::REFLECT_Y | DrmRotation::ROTATE_180,
             Transform::Flipped270 => DrmRotation::REFLECT_Y | DrmRotation::ROTATE_270,
         }
+    }
+}
+
+/// The mode-blob ownership of [`State`] through the transitions an
+/// [`AtomicDrmSurface`] performs: `new` (current read back, pending with its
+/// own blob), `use_mode` (`set_mode`, or a dropped blob when the test commit
+/// fails), `commit` (`*current = pending.clone()`), `reset_state` (current
+/// replaced by a state read back from KMS, which owns no blob), `clear` and
+/// drop. The device records each blob's destroys instead of reaching a kernel.
+#[cfg(test)]
+mod mode_blob_ownership {
+    use std::collections::HashSet;
+
+    use drm::control::{property, Mode};
+
+    use super::State;
+    use crate::backend::drm::surface::mode_blob::{
+        live_mode_blobs,
+        test_device::{serial, BlobLedgerDevice},
+        ModeBlob,
+    };
+
+    fn mode(hdisplay: u16) -> Mode {
+        Mode::from(drm_ffi::drm_mode_modeinfo {
+            hdisplay,
+            // SAFETY: drm_mode_modeinfo is plain old data; zero is valid.
+            ..unsafe { std::mem::zeroed() }
+        })
+    }
+
+    fn blob(device: &BlobLedgerDevice, mode: &Mode) -> ModeBlob {
+        ModeBlob::new(device, mode).unwrap()
+    }
+
+    fn blob_id(state: &State) -> Option<u64> {
+        state.blob.as_ref().map(ModeBlob::id)
+    }
+
+    /// The state `State::current_state` builds from KMS, through the same
+    /// constructor.
+    fn read_back(mode: Mode) -> State {
+        State::read_back(mode, true, false, HashSet::new())
+    }
+
+    /// `commit` after the kernel accepted the request.
+    fn commit(current: &mut State, pending: &State) {
+        *current = pending.clone();
+    }
+
+    /// `reset_state`.
+    fn reset(current: &mut State) {
+        *current = read_back(current.mode);
+    }
+
+    /// `AtomicDrmSurface::new` followed by its first successful commit.
+    fn committed_surface(device: &BlobLedgerDevice, mode: Mode) -> (State, State) {
+        let pending = State::with_mode(mode, blob(device, &mode), &[]);
+        // `new` reads the current state back from KMS, owning no blob; the
+        // commit replaces it with a clone of pending.
+        assert_eq!(blob_id(&read_back(mode)), None);
+        (pending.clone(), pending)
+    }
+
+    #[test]
+    fn resets_and_commits_leave_only_the_pending_blob_alive() {
+        let _serial = serial();
+        let start = live_mode_blobs();
+        let device = BlobLedgerDevice::new();
+        let (mut current, pending) = committed_surface(&device, mode(1920));
+        let pending_blob = blob_id(&pending).unwrap();
+
+        for _ in 0..64 {
+            reset(&mut current);
+            assert_eq!(blob_id(&current), None);
+            commit(&mut current, &pending);
+        }
+
+        assert_eq!(device.alive(), 1);
+        assert_eq!(live_mode_blobs(), start + 1);
+        assert_eq!(device.destroys(pending_blob), 0);
+        assert_eq!(pending.mode_id(), Some(property::Value::Blob(pending_blob)));
+
+        drop(current);
+        drop(pending);
+        assert_eq!(device.destroys(pending_blob), 1);
+        assert_eq!(live_mode_blobs(), start);
+    }
+
+    #[test]
+    fn a_mode_change_destroys_the_old_blob_exactly_once() {
+        let _serial = serial();
+        let device = BlobLedgerDevice::new();
+        let (mut current, mut pending) = committed_surface(&device, mode(1920));
+        let old = blob_id(&pending).unwrap();
+
+        pending.set_mode(mode(1280), blob(&device, &mode(1280)));
+        let new = blob_id(&pending).unwrap();
+        // The committed state still names the old blob.
+        assert_eq!(device.destroys(old), 0);
+
+        commit(&mut current, &pending);
+        assert_eq!(device.destroys(old), 1);
+        assert_eq!(device.destroys(new), 0);
+
+        reset(&mut current);
+        assert_eq!(device.destroys(new), 0);
+        commit(&mut current, &pending);
+        assert_eq!(device.destroys(old), 1);
+        assert_eq!(device.alive(), 1);
+        drop((current, pending));
+        assert_eq!(device.destroys(new), 1);
+    }
+
+    #[test]
+    fn a_failed_test_commit_destroys_its_blob() {
+        let _serial = serial();
+        let device = BlobLedgerDevice::new();
+        let (current, pending) = committed_surface(&device, mode(1920));
+        let kept = blob_id(&pending).unwrap();
+
+        // `use_mode` returns the test commit's error before `set_mode`.
+        let candidate = blob(&device, &mode(1280));
+        let candidate_id = candidate.id();
+        drop(candidate);
+
+        assert_eq!(device.destroys(candidate_id), 1);
+        assert_eq!(blob_id(&pending), Some(kept));
+        assert_eq!(device.destroys(kept), 0);
+        drop((current, pending));
+        assert_eq!(device.alive(), 0);
+    }
+
+    #[test]
+    fn clear_then_drop_never_destroys_twice() {
+        let _serial = serial();
+        let device = BlobLedgerDevice::new();
+
+        // Current shares pending's blob.
+        let (mut current, pending) = committed_surface(&device, mode(1920));
+        let shared = blob_id(&pending).unwrap();
+        current.clear();
+        assert_eq!(device.destroys(shared), 0);
+        drop((current, pending));
+        assert_eq!(device.destroys(shared), 1);
+
+        // Current owns the blob pending has moved away from.
+        let (mut current, mut pending) = committed_surface(&device, mode(1920));
+        let old = blob_id(&current).unwrap();
+        pending.set_mode(mode(1280), blob(&device, &mode(1280)));
+        current.clear();
+        assert_eq!(device.destroys(old), 1);
+        drop((current, pending));
+        assert_eq!(device.destroys(old), 1);
+        assert_eq!(device.alive(), 0);
+    }
+
+    #[test]
+    fn dropping_the_surface_states_destroys_every_blob() {
+        let _serial = serial();
+        let start = live_mode_blobs();
+        let device = BlobLedgerDevice::new();
+        let (current, mut pending) = committed_surface(&device, mode(1920));
+        let old = blob_id(&current).unwrap();
+        pending.set_mode(mode(1280), blob(&device, &mode(1280)));
+        let new = blob_id(&pending).unwrap();
+        assert_eq!(live_mode_blobs(), start + 2);
+
+        drop((current, pending));
+        assert_eq!(device.destroys(old), 1);
+        assert_eq!(device.destroys(new), 1);
+        assert_eq!(live_mode_blobs(), start);
+    }
+
+    #[test]
+    fn using_the_current_mode_then_committing_leaves_one_live_blob() {
+        let _serial = serial();
+        let device = BlobLedgerDevice::new();
+        let (mut current, mut pending) = committed_surface(&device, mode(1920));
+        let old = blob_id(&pending).unwrap();
+
+        pending.set_mode(mode(1920), blob(&device, &mode(1920)));
+        commit(&mut current, &pending);
+
+        assert_eq!(device.destroys(old), 1);
+        assert_eq!(device.alive(), 1);
+        drop((current, pending));
+        assert_eq!(device.alive(), 0);
+    }
+
+    #[test]
+    fn using_a_mode_twice_before_commit_destroys_the_superseded_pending_blob() {
+        let _serial = serial();
+        let device = BlobLedgerDevice::new();
+        let (mut current, mut pending) = committed_surface(&device, mode(1920));
+        let committed = blob_id(&pending).unwrap();
+
+        pending.set_mode(mode(1280), blob(&device, &mode(1280)));
+        let superseded = blob_id(&pending).unwrap();
+        pending.set_mode(mode(800), blob(&device, &mode(800)));
+
+        assert_eq!(device.destroys(superseded), 1);
+        assert_eq!(device.destroys(committed), 0);
+        assert_eq!(device.alive(), 2);
+
+        commit(&mut current, &pending);
+        assert_eq!(device.destroys(committed), 1);
+        assert_eq!(device.alive(), 1);
+        drop((current, pending));
+        assert_eq!(device.alive(), 0);
     }
 }
 
