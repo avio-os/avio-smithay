@@ -41,6 +41,9 @@ pub mod vulkan;
 mod color;
 pub use color::Color32F;
 
+mod staged_cpu;
+pub use staged_cpu::MemoryUploadCpuCompletion;
+
 mod staged;
 pub use staged::{StagedMemoryRows, StagedMemoryUpdate};
 
@@ -721,14 +724,21 @@ pub enum MemoryUploadErrorKind {
 /// Normal rendering does not use this path: implementations batch memory
 /// copies into the next real render submission. A renderer that reports
 /// [`MemoryUploadErrorKind::DeferredCapacity`] must return one exact completion
-/// edge here: either the pending upload prefix is sealed, or the newest
-/// submission retaining staging capacity is identified. Queue ordering then
-/// guarantees that reaching the edge returns all capacity retained before it.
+/// edge here: a pending upload prefix, the newest staging-owning submission,
+/// or the exact detached CPU writers. GPU queue ordering and CPU row-return
+/// custody determine when an owner retry can reuse or reconfigure the ring.
+/// `Available` also permits a retry when reclamation won the edge-query race.
 #[derive(Debug, Clone)]
 pub enum MemoryUploadCapacityEdge {
     /// This renderer does not implement deferred upload custody. It must never
     /// classify an upload error as [`MemoryUploadErrorKind::DeferredCapacity`].
     NotApplicable,
+    /// Reclamation already returned all upload reservations. Retry owner
+    /// preparation on a control turn; no completion wait is necessary.
+    Available,
+    /// Exact detached CPU writers still own unsubmitted or cancelled spans.
+    /// Register the returned readiness snapshot after retaining accepted work.
+    CpuWriterPending(MemoryUploadCpuCompletion),
     /// One renderer submission owns every pending upload and the returned
     /// completion point is the sole safe staging-reuse edge.
     Submitted(sync::SyncPoint),

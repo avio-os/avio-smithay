@@ -890,7 +890,15 @@ impl DeviceState {
                 .map(|submission| {
                     MemoryUploadCapacityEdge::InFlight(SyncPoint::from(submission.fence.clone()))
                 })
-                .unwrap_or(MemoryUploadCapacityEdge::NotApplicable));
+                .unwrap_or_else(|| {
+                    if let Some(completion) = self.upload_arena.cpu_completion() {
+                        MemoryUploadCapacityEdge::CpuWriterPending(completion)
+                    } else if self.upload_arena.stats().in_use_bytes == 0 {
+                        MemoryUploadCapacityEdge::Available
+                    } else {
+                        MemoryUploadCapacityEdge::NotApplicable
+                    }
+                }));
         }
 
         let command_buffer = self.acquire_command_buffer()?;

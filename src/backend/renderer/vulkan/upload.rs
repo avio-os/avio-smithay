@@ -132,7 +132,10 @@ impl UploadState {
         };
         // SAFETY: The whole-generation reservation bounds these rows. Only
         // this exclusive writer can access them; `memory` owns the mapping.
-        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, ticket, memory) };
+        let completion = memory.completion();
+        let rows = unsafe {
+            StagedMemoryRows::new_with_completion(ptr, row_bytes, rows, ticket, memory, completion)
+        };
         Ok((
             VulkanTexture::from_renderer_image(image, size, format, flipped, true),
             StagedMemoryUpdate::new(ticket, region, Box::new(staged)),
@@ -153,7 +156,16 @@ impl UploadState {
         let rows = size.h as usize;
         let (reservation, ptr, memory) = device.reserve_staged_upload(len)?;
         // SAFETY: The complete reservation bounds these exclusive rows.
-        let rows = unsafe { StagedMemoryRows::new(ptr, len / rows, rows, 0, memory.clone()) };
+        let rows = unsafe {
+            StagedMemoryRows::new_with_completion(
+                ptr,
+                len / rows,
+                rows,
+                0,
+                memory.clone(),
+                memory.completion(),
+            )
+        };
         if !fill_reserved_rows(device, reservation, rows, &memory, fill) {
             return Ok(MemoryRowUpload::SourceFailed);
         }
@@ -187,7 +199,16 @@ impl UploadState {
         let row_bytes = len / rows;
         let (reservation, ptr, memory) = device.stage_image_upload(image, len)?;
         // SAFETY: The region reservation bounds these exclusive rows.
-        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, 0, memory.clone()) };
+        let rows = unsafe {
+            StagedMemoryRows::new_with_completion(
+                ptr,
+                row_bytes,
+                rows,
+                0,
+                memory.clone(),
+                memory.completion(),
+            )
+        };
         if !fill_reserved_rows(device, reservation, rows, &memory, fill) {
             return Ok(MemoryRowUpload::SourceFailed);
         }
@@ -228,7 +249,10 @@ impl UploadState {
         // SAFETY: The reservation is `len` bytes of the chunk's persistent
         // mapping, owned by this update until it is submitted or cancelled;
         // `memory` keeps that mapping alive wherever the rows go.
-        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, ticket, memory) };
+        let completion = memory.completion();
+        let rows = unsafe {
+            StagedMemoryRows::new_with_completion(ptr, row_bytes, rows, ticket, memory, completion)
+        };
         Ok((StagedMemoryUpdate::new(ticket, region, Box::new(staged)), rows))
     }
 

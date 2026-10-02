@@ -448,3 +448,14 @@ permit retirement, and a changed real owner extent permits replacement. One
 arena supplies both the arena and owner capacity diagnostics. Hardware tests
 provision their actual fixture output extent explicitly and retain the required
 Vulkan device policy; no missing owner or import error is a capability skip.
+
+CPU-only upload pressure has an exact evented completion distinct from GPU
+fences: `CpuWriterPending(MemoryUploadCpuCompletion)` captures readiness for
+current writers. `on_ready` registers without a lost-return race and fires
+once only when the whole snapshot has returned. A row guard releases its
+mapping/token before marking readiness; the snapshot retains no mapping or GPU
+object. Owner code installs accepted-work custody before registering and
+nonblocking-collects returned staged rows before retrying storage configuration.
+`Available` handles cancellation/reclamation finishing between an unsuccessful
+configuration attempt and its completion-edge query. Neither edge waits or
+requires a retry timer.

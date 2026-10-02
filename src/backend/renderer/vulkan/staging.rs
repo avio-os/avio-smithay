@@ -2,7 +2,10 @@ use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 
 use ash::vk;
 
-use crate::backend::vulkan::PhysicalDevice;
+use crate::backend::{
+    renderer::{staged_cpu::MemoryUploadCpuSignal, MemoryUploadCpuCompletion},
+    vulkan::PhysicalDevice,
+};
 
 use super::{
     allocation::{AllocationGuard, VulkanAllocationReason},
@@ -214,6 +217,7 @@ impl UploadArena {
         let ptr = unsafe { chunk.memory.mapped.0.add(reservation.offset) };
         let writer = Arc::new(ReservationWriter {
             _memory: Arc::clone(&chunk.memory),
+            completion: Arc::new(MemoryUploadCpuSignal::default()),
         });
         chunk.ranges.attach_writer(reservation.offset, writer.clone());
         Ok((ptr, writer))
@@ -247,6 +251,26 @@ impl UploadArena {
         }
     }
 
+    pub(crate) fn cpu_completion(&self) -> Option<MemoryUploadCpuCompletion> {
+        let signals = self
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .ranges
+                    .writers
+                    .values()
+                    .chain(chunk.ranges.parked.iter().map(|(_, _, writer)| writer))
+                    .map(|writer| writer.completion())
+            })
+            .collect::<Vec<_>>();
+        if signals.is_empty() {
+            None
+        } else {
+            Some(MemoryUploadCpuCompletion::new(signals))
+        }
+    }
+
     pub(crate) fn stats(&self) -> UploadArenaStats {
         self.stats
     }
@@ -262,6 +286,13 @@ struct StagingChunk {
 /// these rows are being written or while cancellation awaits their return.
 pub(crate) struct ReservationWriter {
     _memory: Arc<ChunkMemory>,
+    completion: Arc<MemoryUploadCpuSignal>,
+}
+
+impl ReservationWriter {
+    pub(crate) fn completion(&self) -> Arc<MemoryUploadCpuSignal> {
+        self.completion.clone()
+    }
 }
 
 /// Span ownership, including cancelled reservations still writable elsewhere.
@@ -773,6 +804,17 @@ mod tests {
             !renderer.configure_memory_upload_capacity(2048).unwrap(),
             "a detached writer still owns the mapping"
         );
+        let crate::backend::renderer::MemoryUploadCapacityEdge::CpuWriterPending(completion) =
+            renderer.memory_upload_capacity_edge().unwrap()
+        else {
+            panic!("parked writer must expose its CPU completion");
+        };
+        assert!(!completion.is_ready());
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = returned.clone();
+        completion.on_ready(Arc::new(move || {
+            observed.store(true, std::sync::atomic::Ordering::Release);
+        }));
         let (_, unrelated, unrelated_rows) = renderer
             .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
             .unwrap()
@@ -786,6 +828,8 @@ mod tests {
         assert_eq!(renderer.diagnostics().uploads.arena_growth_count, 0);
         drop(slice);
         drop(rows);
+        assert!(returned.load(std::sync::atomic::Ordering::Acquire));
+        assert!(completion.is_ready());
         assert!(renderer.configure_memory_upload_capacity(2048).unwrap());
         assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);
         assert!(renderer.configure_memory_upload_capacity(0).unwrap());
