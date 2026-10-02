@@ -5,9 +5,14 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use crate::backend::renderer::ErasedContextId;
+
 #[derive(Debug)]
 pub(super) struct ImportCustody<T> {
-    resources: Mutex<HashMap<usize, Arc<T>>>,
+    // Contexts can share a device while importing distinct images. The
+    // existing cold context token also prevents identity reuse while this
+    // source still owns an import, without retaining a renderer or client.
+    resources: Mutex<HashMap<ErasedContextId, Arc<T>>>,
 }
 
 impl<T> Default for ImportCustody<T> {
@@ -19,20 +24,20 @@ impl<T> Default for ImportCustody<T> {
 }
 
 impl<T> ImportCustody<T> {
-    pub(super) fn insert(&self, device: usize, resource: Arc<T>) {
-        let previous = self.resources.lock().unwrap().insert(device, resource);
+    pub(super) fn insert(&self, context: ErasedContextId, resource: Arc<T>) {
+        let previous = self.resources.lock().unwrap().insert(context, resource);
         // Driver destruction must happen after releasing the custody lock.
         drop(previous);
     }
 
-    pub(super) fn remove(&self, device: usize, expected: &Weak<T>) {
+    pub(super) fn remove(&self, context: &ErasedContextId, expected: &Weak<T>) {
         let removed = {
             let mut resources = self.resources.lock().unwrap();
             if resources
-                .get(&device)
+                .get(context)
                 .is_some_and(|resource| Weak::ptr_eq(&Arc::downgrade(resource), expected))
             {
-                resources.remove(&device)
+                resources.remove(context)
             } else {
                 None
             }
@@ -49,6 +54,10 @@ mod tests {
         Fourcc, Modifier,
     };
 
+    fn context() -> ErasedContextId {
+        crate::backend::renderer::ContextId::<crate::backend::renderer::vulkan::VulkanTexture>::new().erased()
+    }
+
     fn buffer() -> Dmabuf {
         let fd = rustix::fs::memfd_create("import-custody", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
         let mut buffer = Dmabuf::builder((1, 1), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
@@ -61,7 +70,9 @@ mod tests {
         let buffer = buffer();
         let resource = Arc::new(1u8);
         let weak = Arc::downgrade(&resource);
-        buffer.resource_custody::<ImportCustody<u8>>().insert(1, resource);
+        buffer
+            .resource_custody::<ImportCustody<u8>>()
+            .insert(context(), resource);
         assert_eq!(weak.strong_count(), 1);
         drop(buffer);
         assert!(weak.upgrade().is_none());
@@ -74,7 +85,7 @@ mod tests {
         let weak = Arc::downgrade(&reader);
         buffer
             .resource_custody::<ImportCustody<u8>>()
-            .insert(1, reader.clone());
+            .insert(context(), reader.clone());
         drop(buffer);
         assert_eq!(weak.strong_count(), 1);
         drop(reader);
@@ -85,21 +96,23 @@ mod tests {
     fn renderer_retirement_removes_only_its_own_exact_import() {
         let buffer = buffer();
         let custody = buffer.resource_custody::<ImportCustody<u8>>();
+        let first_context = context();
+        let other_context = context();
         let first = Arc::new(1u8);
         let first_weak = Arc::downgrade(&first);
         let other = Arc::new(2u8);
         let other_weak = Arc::downgrade(&other);
-        custody.insert(1, first);
-        custody.insert(2, other);
+        custody.insert(first_context.clone(), first);
+        custody.insert(other_context.clone(), other);
         let replacement = Arc::new(3u8);
         let replacement_weak = Arc::downgrade(&replacement);
-        custody.insert(1, replacement);
-        custody.remove(1, &first_weak);
+        custody.insert(first_context.clone(), replacement);
+        custody.remove(&first_context, &first_weak);
         assert!(replacement_weak.upgrade().is_some());
-        custody.remove(1, &replacement_weak);
+        custody.remove(&first_context, &replacement_weak);
         assert!(replacement_weak.upgrade().is_none());
         assert!(other_weak.upgrade().is_some());
-        custody.remove(2, &other_weak);
+        custody.remove(&other_context, &other_weak);
         assert!(other_weak.upgrade().is_none());
     }
 
@@ -124,7 +137,7 @@ mod tests {
         let (device, events) = device();
         buffer
             .resource_custody::<ImportCustody<VulkanImage>>()
-            .insert(1, image(device.clone(), 50));
+            .insert(context(), image(device.clone(), 50));
         let dropping_thread = std::thread::spawn(move || {
             let thread = std::thread::current().id();
             drop(buffer);

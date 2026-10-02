@@ -15,7 +15,18 @@ fn metadata_buffer() -> Dmabuf {
     builder.build().unwrap()
 }
 
-fn metadata_entry(buffer: &Dmabuf, pins: usize) -> super::CachedDmabuf {
+fn metadata_state() -> DmabufState {
+    DmabufState::new(
+        crate::backend::renderer::ContextId::<crate::backend::renderer::vulkan::VulkanTexture>::new()
+            .erased(),
+    )
+}
+
+fn metadata_entry(
+    buffer: &Dmabuf,
+    pins: usize,
+    context: crate::backend::renderer::ErasedContextId,
+) -> super::CachedDmabuf {
     super::CachedDmabuf {
         handle: buffer.weak(),
         signature: super::DmabufSignature {
@@ -29,7 +40,7 @@ fn metadata_entry(buffer: &Dmabuf, pins: usize) -> super::CachedDmabuf {
         },
         imported: std::sync::Weak::new(),
         custody: std::sync::Weak::new(),
-        device: 0,
+        context,
         pins,
         last_used: std::time::Instant::now(),
     }
@@ -40,9 +51,11 @@ fn capacity_eviction_skips_pinned_metadata_even_above_the_capacity() {
     let buffers = (0..super::MAX_DMABUF_CACHE_ENTRIES + 2)
         .map(|_| metadata_buffer())
         .collect::<Vec<_>>();
-    let mut state = DmabufState::default();
+    let mut state = metadata_state();
     for buffer in &buffers {
-        state.cache.insert(buffer.weak(), metadata_entry(buffer, 1));
+        state
+            .cache
+            .insert(buffer.weak(), metadata_entry(buffer, 1, state.context.clone()));
     }
     state.evict_to_capacity();
     assert_eq!(
@@ -60,8 +73,10 @@ fn capacity_eviction_skips_pinned_metadata_even_above_the_capacity() {
 fn pins_balance_exact_source_identity_without_underflow() {
     let buffer = metadata_buffer();
     let other = metadata_buffer();
-    let mut state = DmabufState::default();
-    state.cache.insert(buffer.weak(), metadata_entry(&buffer, 2));
+    let mut state = metadata_state();
+    state
+        .cache
+        .insert(buffer.weak(), metadata_entry(&buffer, 2, state.context.clone()));
     assert!(!state.unpin(&other));
     assert!(state.unpin_weak(&buffer.weak()));
     assert_eq!(state.cache[&buffer.weak()].pins, 1);

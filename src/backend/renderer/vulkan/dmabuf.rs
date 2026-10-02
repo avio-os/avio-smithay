@@ -15,6 +15,7 @@ use crate::{
         dmabuf::{Dmabuf, WeakDmabuf, MAX_PLANES},
         Buffer, Format, Modifier,
     },
+    backend::renderer::ErasedContextId,
     utils::{Buffer as BufferCoord, Size},
 };
 
@@ -122,7 +123,7 @@ pub(crate) struct CachedDmabuf {
     signature: DmabufSignature,
     imported: Weak<VulkanImage>,
     custody: Weak<ImportCustody<VulkanImage>>,
-    device: usize,
+    context: ErasedContextId,
     /// Balanced owner membership, independent of a temporary texture reader.
     pins: usize,
     /// When a caller last imported or bound this entry. Stamped only where the
@@ -134,7 +135,7 @@ pub(crate) struct CachedDmabuf {
 impl Drop for CachedDmabuf {
     fn drop(&mut self) {
         if let Some(custody) = self.custody.upgrade() {
-            custody.remove(self.device, &self.imported);
+            custody.remove(&self.context, &self.imported);
         }
     }
 }
@@ -146,8 +147,11 @@ struct DmabufImportDescriptor {
     format_features: vk::FormatFeatureFlags,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct DmabufState {
+    /// The renderer's existing context identity, independent of its shared
+    /// logical device and stable across moves. Each context owns its imports.
+    context: ErasedContextId,
     cache: IndexMap<WeakDmabuf, CachedDmabuf>,
     next_import_id: u64,
     imports_since_cleanup: u32,
@@ -187,6 +191,26 @@ fn dmabuf_is_disjoint(dmabuf: &Dmabuf) -> Result<bool, VulkanRendererError> {
 }
 
 impl DmabufState {
+    pub(crate) fn new(context: ErasedContextId) -> Self {
+        Self {
+            context,
+            cache: IndexMap::new(),
+            next_import_id: 0,
+            imports_since_cleanup: 0,
+            import_attempts_total: 0,
+            cleanup_runs: 0,
+            cleanup_scanned: 0,
+            cleanup_stale_evictions: 0,
+            capacity_evictions: 0,
+            idle_evictions: 0,
+            max_cache_len: 0,
+            cache_stats: VulkanCacheStats::default(),
+            frame_client_sources: HashSet::new(),
+            frame_client_scope: false,
+            client_first_imports_on_frame: Default::default(),
+        }
+    }
+
     pub(crate) fn import_texture(
         &mut self,
         device: &DeviceState,
@@ -380,8 +404,7 @@ impl DmabufState {
         }
         drop(exclusion);
         let custody = dmabuf.resource_custody::<ImportCustody<VulkanImage>>();
-        let device_key = Arc::as_ptr(&device.shared_device()) as usize;
-        custody.insert(device_key, imported.clone());
+        custody.insert(self.context.clone(), imported.clone());
         let _ = self.cache.shift_remove(&key);
         self.cache.insert(
             key.clone(),
@@ -390,7 +413,7 @@ impl DmabufState {
                 signature: descriptor.signature,
                 imported: Arc::downgrade(&imported),
                 custody: Arc::downgrade(&custody),
-                device: device_key,
+                context: self.context.clone(),
                 pins,
                 last_used: Instant::now(),
             },
@@ -959,6 +982,7 @@ mod tests {
 
     include!("dmabuf/idle_eviction_tests.rs");
     include!("dmabuf/pin_tests.rs");
+    include!("dmabuf/context_custody_tests.rs");
 
     #[test]
     fn capture_target_usage_covers_direct_materials_and_terminal_blits() {

@@ -406,14 +406,16 @@ impl VulkanRenderer {
 
         let formats = FormatCapabilities::new(physical_device)?;
         let readback = ReadbackState::new(device.shared_device().offscreen_ids());
+        let context_id = ContextId::new();
+        let dmabuf = DmabufState::new(context_id.erased());
         Ok(Self {
-            context_id: ContextId::new(),
+            context_id,
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
             device,
             formats,
-            dmabuf: DmabufState::default(),
+            dmabuf,
             upload: UploadState::default(),
             readback,
             blit: BlitState,
