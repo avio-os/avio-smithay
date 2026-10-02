@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     allocation::VulkanAllocationReason,
-    device::{DeviceHandle, DeviceState},
+    device::{DeviceHandle, DeviceState, ImageUpload},
     format::{optimal_tiling_features, texture_view_components, ColorEncoding},
     image::VulkanImage,
     staging::{ReservationWriter, StagingReservation},
@@ -80,8 +80,16 @@ impl UploadState {
             ));
         }
 
-        let image = create_upload_image(device, self.next_upload_id(), format, size, flipped)?;
-        upload_region_to_image(device, &image, format, data, Rectangle::from_size(size))?;
+        let upload = memory_image_upload(size, format, data, Rectangle::from_size(size))?;
+        let reservation = device.reserve_image_upload(expected_len)?;
+        let image = match create_upload_image(device, self.next_upload_id(), format, size, flipped) {
+            Ok(image) => image,
+            Err(error) => {
+                device.release_staged_image_upload(reservation);
+                return Err(error);
+            }
+        };
+        device.queue_reserved_image_upload(image.clone(), reservation, upload)?;
 
         Ok(VulkanTexture::from_renderer_image(
             image, size, format, flipped, true,
@@ -821,7 +829,7 @@ fn buffer_image_copy(region: Rectangle<i32, BufferCoord>) -> vk::BufferImageCopy
 
 fn upload_region_to_image(
     device: &mut DeviceState,
-    image: &std::sync::Arc<VulkanImage>,
+    image: &Arc<VulkanImage>,
     format: Fourcc,
     data: &[u8],
     region: Rectangle<i32, BufferCoord>,
@@ -830,7 +838,16 @@ fn upload_region_to_image(
     if region.is_empty() {
         return Ok(());
     }
+    let upload = memory_image_upload(image.size(), format, data, region)?;
+    device.queue_image_upload(image.clone(), upload)
+}
 
+fn memory_image_upload(
+    size: Size<i32, BufferCoord>,
+    format: Fourcc,
+    data: &[u8],
+    region: Rectangle<i32, BufferCoord>,
+) -> Result<ImageUpload<'_>, VulkanRendererError> {
     let bytes_per_pixel = bytes_per_pixel(format)?;
     let upload_width = usize::try_from(region.size.w)
         .map_err(|_| VulkanRendererError::InvalidMemoryUpload("upload width could not be represented"))?;
@@ -842,7 +859,7 @@ fn upload_region_to_image(
             .ok_or(VulkanRendererError::InvalidMemoryUpload(
                 "upload row byte count overflowed",
             ))?;
-    let texture_width = usize::try_from(image.size().w)
+    let texture_width = usize::try_from(size.w)
         .map_err(|_| VulkanRendererError::InvalidMemoryUpload("texture width conversion failed"))?;
     let region_x = usize::try_from(region.loc.x)
         .map_err(|_| VulkanRendererError::InvalidMemoryUpload("region x conversion failed"))?;
@@ -883,17 +900,14 @@ fn upload_region_to_image(
             depth: 1,
         });
 
-    device.queue_image_upload(
-        std::sync::Arc::clone(image),
-        super::device::ImageUpload {
-            data,
-            source_offset: src_offset,
-            source_stride: src_stride,
-            row_bytes: upload_row_bytes,
-            rows: upload_height,
-            region: copy_region,
-        },
-    )
+    Ok(ImageUpload {
+        data,
+        source_offset: src_offset,
+        source_stride: src_stride,
+        row_bytes: upload_row_bytes,
+        rows: upload_height,
+        region: copy_region,
+    })
 }
 
 fn validate_memory_format(format: Fourcc) -> Result<vk::Format, VulkanRendererError> {
@@ -1186,7 +1200,6 @@ mod tests {
                 Allocator,
             },
             renderer::{Color32F, Frame, ImportMem, MemoryUploadCapacityEdge, Renderer},
-            vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
@@ -1194,14 +1207,16 @@ mod tests {
     use super::VulkanRenderer;
 
     fn init_renderer_and_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        let renderer = VulkanRenderer::new(&physical_device).ok()?;
+        let physical_device = super::super::test_support::physical_device()?;
+        let mut renderer = super::super::test_support::renderer(&physical_device)?;
+        assert!(renderer
+            .configure_memory_upload_capacity(2 * 32 * 32 * 4)
+            .expect("provision fixture output ring"));
         let allocator = VulkanAllocator::new(
             &physical_device,
             ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
         )
-        .ok()?;
+        .expect("required fixture allocator");
         Some((renderer, allocator))
     }
 
@@ -1228,10 +1243,9 @@ mod tests {
         };
         let format = crate::backend::allocator::Fourcc::Argb8888;
         let size: Size<i32, BufferCoord> = Size::from((16, 16));
-        let texture = match renderer.import_memory(&vec![0u8; 16 * 16 * 4], format, size, false) {
-            Ok(texture) => texture,
-            Err(_) => return,
-        };
+        let texture = renderer
+            .import_memory(&vec![0u8; 16 * 16 * 4], format, size, false)
+            .expect("fixture import");
         let region = Rectangle::<i32, BufferCoord>::new((4, 4).into(), Size::from((8, 8)));
         let (update, rows) = renderer
             .stage_memory_update(&texture, region)
@@ -1264,12 +1278,20 @@ mod tests {
         assert_eq!(read_pixel(&mut renderer, &texture, 12, 12), [0; 4]);
 
         let in_use = renderer.diagnostics().uploads.arena_in_use_bytes;
-        let (update, _rows) = renderer
+        let (update, rows) = renderer
             .stage_memory_update(&texture, region)
             .expect("in-bounds staged update")
             .expect("the Vulkan renderer stages");
         assert!(renderer.diagnostics().uploads.arena_in_use_bytes > in_use);
         renderer.cancel_staged_memory_update(update);
+        assert!(
+            renderer.diagnostics().uploads.arena_in_use_bytes > in_use,
+            "cancelled writer remains parked"
+        );
+        drop(rows);
+        renderer
+            .memory_upload_capacity_edge()
+            .expect("reap returned writer");
         assert_eq!(renderer.diagnostics().uploads.arena_in_use_bytes, in_use);
 
         let outside = Rectangle::<i32, BufferCoord>::new((12, 12).into(), Size::from((8, 8)));
@@ -1342,10 +1364,9 @@ mod tests {
         let size: Size<i32, BufferCoord> = Size::from((16, 16));
         let data = vec![255u8; (size.w * size.h * 4) as usize];
 
-        let texture = match renderer.import_memory(&data, format, size, false) {
-            Ok(texture) => texture,
-            Err(_) => return,
-        };
+        let texture = renderer
+            .import_memory(&data, format, size, false)
+            .expect("fixture import");
         let upload_image = texture
             .image_resource()
             .expect("memory upload must create an image resource")

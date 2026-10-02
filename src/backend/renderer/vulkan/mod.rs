@@ -234,7 +234,7 @@ pub struct VulkanSubmissionStats {
 /// Persistent memory-upload arena and batching diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanUploadStats {
-    /// Capacity of the owner-sized mapped-row chunk, independent of slice uploads.
+    /// Capacity of the sole owner-sized chunk serving slice and mapped-row uploads.
     pub owner_capacity_bytes: usize,
     /// Structural capacity declared by the live source/output owner.
     pub owner_structural_bytes: usize,
@@ -242,7 +242,7 @@ pub struct VulkanUploadStats {
     pub owner_extent_exception_bytes: usize,
     /// Successful transitions into a distinct larger-source extent exception.
     pub owner_extent_exceptions_total: u64,
-    /// Aggregate bytes mapped across all arena chunks.
+    /// Bytes mapped by the sole owner-provisioned arena chunk.
     pub arena_capacity_bytes: usize,
     /// Bytes retained by pending or in-flight upload operations.
     pub arena_in_use_bytes: usize,
@@ -250,7 +250,7 @@ pub struct VulkanUploadStats {
     pub arena_high_water_bytes: usize,
     /// Number of persistent mapped chunks.
     pub arena_chunk_count: usize,
-    /// Number of bounded geometric arena growth operations.
+    /// Frame-path growth count; always zero for owner-provisioned storage.
     pub arena_growth_count: u64,
     /// Number of reservations deferred by the arena byte/chunk bounds.
     pub arena_deferred_count: u64,
@@ -702,9 +702,10 @@ impl VulkanRenderer {
     /// still owns the current storage. Its completion/return must trigger a
     /// later lifecycle retry; this method never waits or cancels live work.
     /// Allocation failure preserves the previous mode and storage.
-    /// The configured chunk serves mapped-row imports and updates; ordinary
-    /// slice uploads use their independent arena and remain available after
-    /// the mapped-row owner's last source leaves.
+    /// All memory imports and updates, including slices, require this one
+    /// chunk. A new renderer starts with zero upload storage; no upload path
+    /// provisions storage or falls back to a separate arena. The owner must
+    /// account for every live SHM, cursor, and raster source before frame work.
     pub fn configure_memory_upload_capacity(&mut self, capacity: usize) -> Result<bool, VulkanRendererError> {
         self.device.configure_memory_upload_capacity(capacity)
     }

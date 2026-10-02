@@ -432,3 +432,19 @@ are reported explicitly after those prerequisites succeed. In particular, a
 device advertising no exportable shared multi-plane modifier for both sampling
 and rendering has a valid negative capability result; an advertised, exportable
 candidate must still pass the real shared-allocation texture and target imports.
+
+## Sole owner-sized upload storage
+
+Each renderer begins with an empty upload ring. Before any slice, mapped-row,
+staged or Wayland memory import/update, its owner declares the structural
+output extent and largest live generation on a preparation turn. That one
+persistently mapped chunk serves every upload form. Admission only reserves a
+whole span and cannot allocate another chunk: there is no geometric ladder,
+second arena or unconfigured fallback. Initial slice imports admit their span
+before allocating an image, so pressure cannot allocate/discard a texture.
+
+The last upload owner configures zero; completion and returned writer custody
+permit retirement, and a changed real owner extent permits replacement. One
+arena supplies both the arena and owner capacity diagnostics. Hardware tests
+provision their actual fixture output extent explicitly and retain the required
+Vulkan device policy; no missing owner or import error is a capability skip.
