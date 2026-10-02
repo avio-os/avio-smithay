@@ -227,6 +227,9 @@ pub(crate) struct DeviceState {
     in_flight_submissions: VecDeque<InFlightSubmission>,
     upload_arena: UploadArena,
     owner_upload_arena: Option<UploadArena>,
+    owner_upload_structural_bytes: usize,
+    owner_upload_exception_bytes: usize,
+    owner_upload_extent_exceptions: u64,
     pending_uploads: PendingUploadBatch,
     pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
@@ -543,6 +546,9 @@ impl DeviceState {
             in_flight_submissions: VecDeque::new(),
             upload_arena,
             owner_upload_arena: None,
+            owner_upload_structural_bytes: 0,
+            owner_upload_exception_bytes: 0,
+            owner_upload_extent_exceptions: 0,
             pending_uploads: PendingUploadBatch::default(),
             pending_waits: Vec::new(),
             next_submission_id: 0,
@@ -629,11 +635,50 @@ impl DeviceState {
         &mut self,
         capacity: usize,
     ) -> Result<bool, VulkanRendererError> {
+        self.configure_memory_upload_capacity_for_extent(capacity, 0)
+    }
+
+    pub(crate) fn owner_upload_extent_stats(&self) -> (usize, usize, usize, u64) {
+        (
+            self.owner_upload_arena
+                .as_ref()
+                .map_or(0, |arena| arena.stats().capacity_bytes),
+            self.owner_upload_structural_bytes,
+            self.owner_upload_exception_bytes,
+            self.owner_upload_extent_exceptions,
+        )
+    }
+
+    pub(crate) fn configure_memory_upload_capacity_for_extent(
+        &mut self,
+        structural_bytes: usize,
+        generation_bytes: usize,
+    ) -> Result<bool, VulkanRendererError> {
         self.reclaim_completed_submissions()?;
         self.drop_unsampleable_uploads();
-        self.owner_upload_arena
+        let capacity = structural_bytes.max(generation_bytes);
+        let configured = self
+            .owner_upload_arena
             .get_or_insert_with(|| UploadArena::owner_sized(&self.physical_device))
-            .configure_fixed(&self.physical_device, self.device.clone(), capacity)
+            .configure_fixed(&self.physical_device, self.device.clone(), capacity)?;
+        if configured {
+            let exception_bytes = capacity.saturating_sub(structural_bytes);
+            if exception_bytes != 0
+                && (self.owner_upload_structural_bytes != structural_bytes
+                    || self.owner_upload_exception_bytes != exception_bytes)
+            {
+                self.owner_upload_extent_exceptions = self.owner_upload_extent_exceptions.saturating_add(1);
+                trace!(
+                    structural_bytes,
+                    generation_bytes,
+                    exception_bytes,
+                    "owner-sized upload extent exception"
+                );
+            }
+            self.owner_upload_structural_bytes = structural_bytes;
+            self.owner_upload_exception_bytes = exception_bytes;
+        }
+        Ok(configured)
     }
 
     fn upload_storage(&self, reservation: StagingReservation) -> &UploadArena {

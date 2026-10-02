@@ -232,6 +232,14 @@ pub struct VulkanSubmissionStats {
 /// Persistent memory-upload arena and batching diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanUploadStats {
+    /// Capacity of the owner-sized mapped-row chunk, independent of slice uploads.
+    pub owner_capacity_bytes: usize,
+    /// Structural capacity declared by the live source/output owner.
+    pub owner_structural_bytes: usize,
+    /// Bytes above the structural extent required by the largest live generation.
+    pub owner_extent_exception_bytes: usize,
+    /// Successful transitions into a distinct larger-source extent exception.
+    pub owner_extent_exceptions_total: u64,
     /// Aggregate bytes mapped across all arena chunks.
     pub arena_capacity_bytes: usize,
     /// Bytes retained by pending or in-flight upload operations.
@@ -699,6 +707,18 @@ impl VulkanRenderer {
         self.device.configure_memory_upload_capacity(capacity)
     }
 
+    /// Provision the maximum of a structural extent and a real admitted
+    /// generation. Larger-source exceptions are explicit in upload diagnostics
+    /// and TRACE; the reserve path never changes the configured extent.
+    pub fn configure_memory_upload_capacity_for_extent(
+        &mut self,
+        structural_bytes: usize,
+        generation_bytes: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        self.device
+            .configure_memory_upload_capacity_for_extent(structural_bytes, generation_bytes)
+    }
+
     /// Tags allocations on this thread for this renderer's device until the
     /// returned guard is dropped. The guard holds no renderer borrow and must
     /// stay on this thread; other devices and threads keep their own phases.
@@ -710,6 +730,12 @@ impl VulkanRenderer {
     pub fn diagnostics(&self) -> VulkanRendererDiagnostics {
         let submissions: DeviceDiagnostics = self.device.diagnostics();
         let arena = self.device.upload_arena_stats();
+        let (
+            owner_capacity_bytes,
+            owner_structural_bytes,
+            owner_extent_exception_bytes,
+            owner_extent_exceptions_total,
+        ) = self.device.owner_upload_extent_stats();
         let (pending_operations, pending_bytes) = self.device.pending_upload_stats();
         VulkanRendererDiagnostics {
             allocations: self.device.shared_device().allocation_ledger().snapshot(),
@@ -729,6 +755,10 @@ impl VulkanRenderer {
                 max_completion_ns: submissions.max_completion_ns,
             },
             uploads: VulkanUploadStats {
+                owner_capacity_bytes,
+                owner_structural_bytes,
+                owner_extent_exception_bytes,
+                owner_extent_exceptions_total,
                 arena_capacity_bytes: arena.capacity_bytes,
                 arena_in_use_bytes: arena.in_use_bytes,
                 arena_high_water_bytes: arena.high_water_bytes,
