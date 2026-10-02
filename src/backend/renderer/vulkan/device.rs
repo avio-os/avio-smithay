@@ -15,7 +15,10 @@ use tracing::{instrument, trace, warn};
 
 use crate::backend::{
     renderer::{sync::SyncPoint, MemoryUploadCapacityEdge},
-    vulkan::{version::Version, Instance, PhysicalDevice},
+    vulkan::{
+        create_device_with_queue_priority, version::Version, Instance, PhysicalDevice, QueueGlobalPriority,
+        QueuePriorityGrant, QueuePriorityOutcome,
+    },
 };
 
 use super::{
@@ -214,6 +217,7 @@ pub(crate) struct DeviceState {
     capabilities: DeviceCapabilities,
     queue_family_index: u32,
     queue: vk::Queue,
+    queue_priority: QueuePriorityGrant,
     command_pool: vk::CommandPool,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
@@ -236,6 +240,7 @@ impl fmt::Debug for DeviceState {
             .field("capabilities", &self.capabilities)
             .field("queue_family_index", &self.queue_family_index)
             .field("queue", &self.queue)
+            .field("queue_priority", &self.queue_priority)
             .field("command_pool", &self.command_pool)
             .field("reusable_command_buffers", &self.reusable_command_buffers.len())
             .field("in_flight_submissions", &self.in_flight_submissions.len())
@@ -435,35 +440,58 @@ impl DeviceState {
         extensions
     }
 
+    #[cfg(test)]
     pub(crate) fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
-        let enabled_extensions = Self::validate_required_extensions(physical_device)?;
+        Self::with_queue_priority(physical_device, None)
+    }
+
+    /// Creates the renderer's logical device. Its one queue asks for `requested_priority`, if
+    /// any; a driver refusal falls back once to the default priority (see
+    /// [`create_device_with_queue_priority`]).
+    pub(crate) fn with_queue_priority(
+        physical_device: &PhysicalDevice,
+        requested_priority: Option<QueueGlobalPriority>,
+    ) -> Result<Self, VulkanRendererError> {
+        let mut enabled_extensions = Self::validate_required_extensions(physical_device)?;
         let capabilities = Self::query_capabilities(physical_device, &enabled_extensions);
         Self::validate_required_features(physical_device)?;
 
         let queue_family_index = Self::select_queue_family(physical_device)?;
-        let queue_priority = [1.0f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .queue_priorities(&queue_priority)];
-
-        let extension_ptrs = enabled_extensions
-            .iter()
-            .map(|ext| ext.as_ptr())
-            .collect::<Vec<_>>();
+        let queue_weights = [1.0f32];
         let features = vk::PhysicalDeviceFeatures {
             robust_buffer_access: vk::TRUE,
             ..Default::default()
         };
 
-        let create_info = vk::DeviceCreateInfo::default()
-            .enabled_extension_names(&extension_ptrs)
-            .enabled_features(&features)
-            .queue_create_infos(&queue_info);
-
         let instance = physical_device.instance().handle();
-        // SAFETY: The physical device belongs to this instance and all pointers in create_info
-        // are valid for the duration of this call.
-        let raw_device = unsafe { instance.create_device(physical_device.handle(), &create_info, None) }?;
+        let (raw_device, queue_priority) =
+            create_device_with_queue_priority(physical_device, requested_priority, |request| {
+                let mut extension_ptrs = enabled_extensions
+                    .iter()
+                    .map(|ext| ext.as_ptr())
+                    .collect::<Vec<_>>();
+                let mut global_priority = request.map(|request| request.create_info());
+                let mut queue_info = vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .queue_priorities(&queue_weights);
+                if let (Some(request), Some(global_priority)) = (request, global_priority.as_mut()) {
+                    extension_ptrs.push(request.extension().as_ptr());
+                    queue_info = queue_info.push_next(global_priority);
+                }
+                let queue_infos = [queue_info];
+                let create_info = vk::DeviceCreateInfo::default()
+                    .enabled_extension_names(&extension_ptrs)
+                    .enabled_features(&features)
+                    .queue_create_infos(&queue_infos);
+                // SAFETY: The physical device belongs to this instance and all pointers in
+                // create_info are valid for the duration of this call.
+                unsafe { instance.create_device(physical_device.handle(), &create_info, None) }
+            })?;
+        if queue_priority.outcome == QueuePriorityOutcome::Granted {
+            if let Some(extension) = physical_device.queue_global_priority_extension() {
+                enabled_extensions.push(extension);
+            }
+        }
 
         let queue = {
             // SAFETY: Queue family/index are valid for this device by construction in select_queue_family.
@@ -523,6 +551,7 @@ impl DeviceState {
             capabilities,
             queue_family_index,
             queue,
+            queue_priority,
             command_pool,
             reusable_command_buffers: Vec::new(),
             in_flight_submissions: VecDeque::new(),
@@ -543,6 +572,10 @@ impl DeviceState {
 
     pub(crate) fn queue_family_index(&self) -> u32 {
         self.queue_family_index
+    }
+
+    pub(crate) fn queue_priority(&self) -> QueuePriorityGrant {
+        self.queue_priority
     }
 
     pub(crate) fn capabilities(&self) -> DeviceCapabilities {

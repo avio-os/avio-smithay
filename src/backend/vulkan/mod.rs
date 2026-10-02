@@ -46,6 +46,13 @@
 //! - [Extensions](PhysicalDevice::device_extensions)
 //! - [Features](PhysicalDevice::features) and [limits](PhysicalDevice::limits)
 //!
+//! ## Queue global priority
+//!
+//! A logical device's queues may ask the kernel's GPU scheduler for a priority above the default
+//! (`VK_KHR_global_priority`). [`create_device_with_queue_priority`] makes that request optional:
+//! a driver refusal (`VK_ERROR_NOT_PERMITTED_KHR`, typically without `CAP_SYS_NICE`) falls back once
+//! to the default priority, and the [`QueuePriorityGrant`] reports what the queues run at.
+//!
 //! Physical devices implement [`Eq`][^device_eq], meaning two physical devices can be tested for equality.
 //!
 //! ## Device extensions
@@ -93,8 +100,14 @@ use super::drm::DrmNode;
 
 mod inner;
 mod phd;
+mod queue_priority;
 
 pub mod version;
+
+pub use self::queue_priority::{
+    create_device_with_queue_priority, QueueGlobalPriority, QueuePriorityGrant, QueuePriorityOutcome,
+    QueuePriorityRequest,
+};
 
 static LIBRARY: LazyLock<Result<Entry, LoadError>> =
     LazyLock::new(|| unsafe { Entry::load().map_err(|_| LoadError) });
