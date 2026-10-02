@@ -603,6 +603,22 @@ impl VulkanRenderer {
         self.formats.framebuffer_sampling_supported(format)
     }
 
+    /// Prepare the exact compositing attachment bank for a negotiated format.
+    ///
+    /// Call on the renderer owner's cold resource turn before display or
+    /// sealed-capture rendering. This records no commands and prepares only
+    /// this format's actual linear-blend attachment view, not other formats.
+    pub fn prepare_framebuffer_format(
+        &mut self,
+        format: crate::backend::allocator::Fourcc,
+    ) -> Result<(), VulkanRendererError> {
+        let storage = crate::backend::allocator::vulkan::format::get_vk_format(format)
+            .ok_or(VulkanRendererError::UnsupportedMemoryFormat(format))?;
+        self.pipelines
+            .pipelines_for_format(format::render_view_format(storage))
+            .map(|_| ())
+    }
+
     /// Clone renderer-origin image allocation for an off-frame provisioning helper.
     pub fn offscreen_allocator(&self) -> VulkanOffscreenAllocator {
         self.readback.offscreen_allocator(&self.device)

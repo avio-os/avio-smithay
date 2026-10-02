@@ -609,10 +609,22 @@ impl PipelineState {
             self.per_format.insert(format, pipelines);
         }
 
+        self.prepared_pipelines_for_format(format)
+    }
+
+    /// Frame recording must only borrow a previously admitted format bank.
+    /// A cache miss is a cold resource requirement, never permission to compile
+    /// six native pipelines while an output's render pass is active.
+    pub(crate) fn prepared_pipelines_for_format(
+        &self,
+        format: vk::Format,
+    ) -> Result<PipelineHandles, VulkanRendererError> {
         let set = self
             .per_format
             .get(&format)
-            .expect("pipelines inserted for requested format");
+            .ok_or(VulkanRendererError::TemporaryFailure(
+                "Kawase attachment format was not prepared before frame recording",
+            ))?;
 
         Ok(PipelineHandles {
             render_pass: set.render_pass,

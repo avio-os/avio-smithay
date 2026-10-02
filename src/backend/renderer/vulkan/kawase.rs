@@ -60,6 +60,15 @@ pub enum VulkanKawaseEncoding {
     EncodedSrgb,
 }
 
+impl VulkanKawaseEncoding {
+    fn destination_format(self, storage: vk::Format, render: vk::Format) -> vk::Format {
+        match self {
+            Self::LinearLight => render,
+            Self::EncodedSrgb => storage,
+        }
+    }
+}
+
 impl VulkanKawasePass {
     /// Describes a kawase pass between two renderer textures.
     pub fn new(source: &VulkanTexture, destination: &VulkanTexture, upsample: bool, offset: f32) -> Self {
@@ -194,6 +203,46 @@ pub(super) fn kawase_halfpixel(
 }
 
 impl VulkanRenderer {
+    /// Prepare exactly the attachment-format banks used by these passes.
+    ///
+    /// This may create a render pass and native graphics pipelines and belongs
+    /// on the renderer owner's cold resource turn. It records no commands,
+    /// reads no source pixels, and submits no GPU work. Framebuffer capture
+    /// only looks up these banks and fails if preparation was omitted.
+    pub fn prepare_kawase_passes(&mut self, passes: &[VulkanKawasePass]) -> Result<(), VulkanRendererError> {
+        for pass in passes {
+            self.prepare_kawase_destination(&pass.destination, pass.encoding)?;
+        }
+        Ok(())
+    }
+
+    /// Prepare the encoded-sRGB attachment of a direct first downsample.
+    ///
+    /// Its source is the future active framebuffer, so the cold inventory
+    /// names only the immutable destination. No lower scene is captured here.
+    pub fn prepare_kawase_capture(&mut self, destination: &VulkanTexture) -> Result<(), VulkanRendererError> {
+        self.prepare_kawase_destination(destination, VulkanKawaseEncoding::EncodedSrgb)
+    }
+
+    fn prepare_kawase_destination(
+        &mut self,
+        destination: &VulkanTexture,
+        encoding: VulkanKawaseEncoding,
+    ) -> Result<(), VulkanRendererError> {
+        let image = destination
+            .image_resource()
+            .ok_or(VulkanRendererError::NotImplemented(
+                "Kawase preparation requires an image-backed destination",
+            ))?;
+        if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "Kawase destination image does not support color-attachment usage",
+            ));
+        }
+        let format = encoding.destination_format(image.vk_format(), image.render_format());
+        self.pipelines.pipelines_for_format(format).map(|_| ())
+    }
+
     pub(super) fn resolve_kawase_passes(
         &mut self,
         passes: &[VulkanKawasePass],
@@ -249,17 +298,15 @@ impl VulkanRenderer {
             }
 
             let encoded_srgb = pass.encoding == VulkanKawaseEncoding::EncodedSrgb;
-            let destination_format = if encoded_srgb {
-                destination.vk_format()
-            } else {
-                destination.render_format()
-            };
+            let destination_format = pass
+                .encoding
+                .destination_format(destination.vk_format(), destination.render_format());
             let destination_view = if encoded_srgb {
                 destination.view()
             } else {
                 destination.render_view()
             };
-            let pipelines = self.pipelines.pipelines_for_format(destination_format)?;
+            let pipelines = self.pipelines.prepared_pipelines_for_format(destination_format)?;
             let descriptor_set = self
                 .descriptors
                 .texture_descriptor_set(source.view(), TextureSampler::LINEAR)?;
@@ -303,6 +350,9 @@ impl VulkanRenderer {
             return Ok(SyncPoint::signaled());
         }
 
+        // The standalone chain has no active output pass. Keep its explicit
+        // preparation before recording; in-frame effects never take this path.
+        self.prepare_kawase_passes(passes)?;
         let resolved = match self.resolve_kawase_passes(passes) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -510,7 +560,92 @@ mod tests {
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
 
-    use super::VulkanRenderer;
+    use super::{VulkanKawaseEncoding, VulkanRenderer};
+
+    #[test]
+    fn kawase_preparation_uses_actual_encoded_or_render_attachment_format() {
+        for (storage, render) in [
+            (ash::vk::Format::R8G8B8A8_UNORM, ash::vk::Format::R8G8B8A8_SRGB),
+            (ash::vk::Format::B8G8R8A8_UNORM, ash::vk::Format::B8G8R8A8_SRGB),
+            (
+                ash::vk::Format::R16G16B16A16_SFLOAT,
+                ash::vk::Format::R16G16B16A16_SFLOAT,
+            ),
+        ] {
+            assert_eq!(
+                VulkanKawaseEncoding::EncodedSrgb.destination_format(storage, render),
+                storage
+            );
+            assert_eq!(
+                VulkanKawaseEncoding::LinearLight.destination_format(storage, render),
+                render
+            );
+        }
+    }
+
+    /// The reviewed first-glass trigger: the output clear warmed only SRGB,
+    /// while the real first downsample and filter destinations use UNORM.
+    #[test]
+    #[ignore = "requires native Vulkan; run explicitly for cold/first-glass evidence"]
+    fn first_glass_requires_exact_cold_bank_and_preserves_active_frame_on_refusal() {
+        let physical =
+            crate::backend::renderer::vulkan::test_support::physical_device().expect("native Vulkan device");
+        let mut renderer = VulkanRenderer::new(&physical).expect("native Vulkan renderer");
+        let format = first_working_offscreen_format(&mut renderer).expect("offscreen format");
+        let mut output = renderer.create_buffer(format, (16, 16).into()).unwrap();
+        let capture = renderer.create_buffer(format, (8, 8).into()).unwrap();
+        let filtered = renderer.create_buffer(format, (4, 4).into()).unwrap();
+        let destination = capture.image_resource().unwrap();
+        assert_ne!(
+            destination.vk_format(),
+            destination.render_format(),
+            "fixture needs the native SRGB sibling"
+        );
+        let encoded_format = destination.vk_format();
+        let passes = [VulkanKawasePass::new(&capture, &filtered, false, 1.5).with_encoded_srgb()];
+        let size: Size<i32, Physical> = (16, 16).into();
+        let area = Rectangle::from_size(size);
+        {
+            let mut target = renderer.bind(&mut output).unwrap();
+            let mut frame = renderer.render(&mut target, size, Transform::Normal).unwrap();
+            frame.clear(Color32F::new(0.2, 0.3, 0.4, 1.0), &[area]).unwrap();
+            assert!(frame
+                .capture_and_downsample_framebuffer(area, &capture, (8, 8).into(), 1.5, &passes)
+                .is_err());
+            // Refusal happened before cmdEndRenderPass: the original pass is
+            // still usable and its displayed predecessor can be preserved.
+            frame
+                .draw_solid(area, &[area], Color32F::new(0.4, 0.3, 0.2, 1.0))
+                .unwrap();
+            frame.finish().unwrap().wait().unwrap();
+        }
+        assert!(renderer
+            .pipelines
+            .prepared_pipelines_for_format(encoded_format)
+            .is_err());
+        renderer.prepare_kawase_capture(&capture).unwrap();
+        renderer.prepare_kawase_passes(&passes).unwrap();
+        let prepared = renderer
+            .pipelines
+            .prepared_pipelines_for_format(encoded_format)
+            .unwrap();
+        for _ in 0..2 {
+            let mut target = renderer.bind(&mut output).unwrap();
+            let mut frame = renderer.render(&mut target, size, Transform::Normal).unwrap();
+            frame.clear(Color32F::new(0.2, 0.3, 0.4, 1.0), &[area]).unwrap();
+            frame
+                .capture_and_downsample_framebuffer(area, &capture, (8, 8).into(), 1.5, &passes)
+                .unwrap();
+            frame.finish().unwrap().wait().unwrap();
+            drop(target);
+            let reused = renderer
+                .pipelines
+                .prepared_pipelines_for_format(encoded_format)
+                .unwrap();
+            assert_eq!(reused.render_pass, prepared.render_pass);
+            assert_eq!(reused.kawase_pipeline, prepared.kawase_pipeline);
+        }
+    }
 
     fn init_renderer() -> Option<VulkanRenderer> {
         let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;

@@ -24,6 +24,8 @@ impl VulkanFrame<'_> {
     /// The main render pass is paused and resumed with `LOAD`; no queue submit,
     /// host wait, or second renderer authority is introduced. Every image and
     /// transient framebuffer is retained by the final frame submission.
+    /// [`VulkanRenderer::prepare_kawase_passes`] must admit the exact pass
+    /// formats on a cold resource turn before this frame is opened.
     pub fn capture_and_filter_framebuffer(
         &mut self,
         backdrop_read_area: Rectangle<i32, Physical>,
@@ -35,6 +37,8 @@ impl VulkanFrame<'_> {
 
     /// Freeze the completed lower scene directly into the first downsample,
     /// before any member of this material group is drawn. No full-size copy exists.
+    /// Cold preparation must admit both [`VulkanRenderer::prepare_kawase_capture`]
+    /// and [`VulkanRenderer::prepare_kawase_passes`] before opening the frame.
     pub fn capture_and_downsample_framebuffer(
         &mut self,
         backdrop_read_area: Rectangle<i32, Physical>,
