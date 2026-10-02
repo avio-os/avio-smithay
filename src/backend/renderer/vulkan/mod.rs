@@ -547,6 +547,58 @@ impl VulkanRenderer {
         self.dmabuf.evict_idle_sampled(used_before, max)
     }
 
+    /// Import a pool/member buffer and pin its renderer cache entry until one
+    /// matching [`Self::unpin_dmabuf_import`]. Pins survive usage upgrades and
+    /// exempt metadata from capacity, idle and explicit sampled retirement.
+    /// The caller owns allocation and membership; a texture handle alone is
+    /// submitted-reader custody and does not imply a membership pin.
+    pub fn pin_dmabuf_import(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTexture, VulkanRendererError> {
+        self.dmabuf.pin_texture(&self.device, &self.formats, dmabuf)
+    }
+
+    /// End one exact membership pin. Returns false for an absent/unpinned entry.
+    pub fn unpin_dmabuf_import(&mut self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.unpin(dmabuf)
+    }
+
+    /// End one membership pin by exact weak source identity without extending
+    /// the DMA-BUF lifetime. Used by owners handling source destruction.
+    pub fn unpin_weak_dmabuf_import(&mut self, key: &crate::backend::allocator::dmabuf::WeakDmabuf) -> bool {
+        self.dmabuf.unpin_weak(key)
+    }
+
+    /// Retire exactly the unpinned sampled-only imports named by their source
+    /// identities. No clock or implicit capacity threshold chooses these.
+    /// Targets retain their authored contents; submitted readers retain the
+    /// old imported image independently through their GPU completion.
+    pub fn retire_sampled_dmabuf_imports(
+        &mut self,
+        buffers: &[crate::backend::allocator::dmabuf::WeakDmabuf],
+    ) -> usize {
+        self.dmabuf.retire_sampled(buffers)
+    }
+
+    /// Prepare exact client source identities off-frame for attribution. Pool,
+    /// owned-copy and target imports never count as client first imports.
+    pub fn prepare_frame_client_sources(
+        &mut self,
+        sources: &[crate::backend::allocator::dmabuf::WeakDmabuf],
+    ) {
+        self.dmabuf.prepare_frame_client_sources(sources);
+    }
+
+    /// Bracket only actual frame work, including unsuccessful frame attempts.
+    /// Control/preparation turns leave this false.
+    pub fn set_frame_client_import_scope(&mut self, active: bool) {
+        self.dmabuf.set_frame_client_scope(active);
+    }
+
+    /// Successful first client image creations made inside frame work. Cache
+    /// hits, usage upgrades, failed imports and off-frame creations are omitted.
+    pub fn client_first_imports_on_frame(&self) -> u64 {
+        self.dmabuf.client_first_imports_on_frame()
+    }
+
     /// Take (and drop) any wait semaphores staged via [`Renderer::wait`] that
     /// no submission has consumed yet, returning how many there were.
     ///

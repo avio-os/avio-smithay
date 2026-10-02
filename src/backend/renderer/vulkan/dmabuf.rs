@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
     sync::{Arc, Weak},
     time::Instant,
@@ -28,6 +29,7 @@ use super::{
 };
 
 mod custody;
+mod membership;
 use custody::ImportCustody;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +122,8 @@ pub(crate) struct CachedDmabuf {
     imported: Weak<VulkanImage>,
     custody: Weak<ImportCustody<VulkanImage>>,
     device: usize,
+    /// Balanced owner membership, independent of a temporary texture reader.
+    pins: usize,
     /// When a caller last imported or bound this entry. Stamped only where the
     /// entry moves to the back of the cache, so it never decreases from front
     /// to back.
@@ -154,6 +158,9 @@ pub(crate) struct DmabufState {
     idle_evictions: u64,
     max_cache_len: usize,
     cache_stats: VulkanCacheStats,
+    frame_client_sources: HashSet<WeakDmabuf>,
+    frame_client_scope: bool,
+    client_first_imports_on_frame: u64,
 }
 
 const MAX_DMABUF_CACHE_ENTRIES: usize = 256;
@@ -185,7 +192,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTexture, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::Texture)?;
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::Texture, false)?;
         Ok(VulkanTexture::from_dmabuf_import(
             imported,
             dmabuf.size(),
@@ -200,7 +207,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::RenderTarget)?;
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::RenderTarget, false)?;
         Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
@@ -214,7 +221,13 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::FramebufferEffectTarget)?;
+        let imported = self.import_or_reuse(
+            device,
+            formats,
+            dmabuf,
+            DmabufRole::FramebufferEffectTarget,
+            false,
+        )?;
         Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
@@ -228,7 +241,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::CaptureTarget)?;
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::CaptureTarget, false)?;
         Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
@@ -261,9 +274,11 @@ impl DmabufState {
             if cached.last_used >= used_before {
                 break;
             }
-            if cached.imported.upgrade().is_some_and(|imported| {
-                idle_evictable_usage(imported.usage()) && Arc::strong_count(&imported) <= 2
-            }) {
+            if cached.pins == 0
+                && cached.imported.upgrade().is_some_and(|imported| {
+                    idle_evictable_usage(imported.usage()) && Arc::strong_count(&imported) <= 2
+                })
+            {
                 let _ = self.cache.shift_remove_index(index);
                 evicted = evicted.saturating_add(1);
             } else {
@@ -287,6 +302,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
         role: DmabufRole,
+        pin: bool,
     ) -> Result<Arc<VulkanImage>, VulkanRendererError> {
         self.import_attempts_total = self.import_attempts_total.saturating_add(1);
         self.maybe_cleanup();
@@ -303,6 +319,10 @@ impl DmabufState {
                 .upgrade()
                 .filter(|imported| imported.usage().contains(requested_usage))
             {
+                if pin {
+                    let cached = self.cache.get_mut(&key).expect("cache hit exists");
+                    cached.pins = cached.pins.checked_add(1).expect("dma-buf import pin overflow");
+                }
                 self.promote_entry(&key);
                 self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
                 trace!(
@@ -326,7 +346,20 @@ impl DmabufState {
             .map(|imported| imported.usage() | requested_usage)
             .unwrap_or(requested_usage);
 
+        let pins = self
+            .cache
+            .get(&key)
+            .map_or(0, |cached| cached.pins)
+            .checked_add(usize::from(pin))
+            .expect("dma-buf import pin overflow");
+        let first_import = !self
+            .cache
+            .get(&key)
+            .is_some_and(|entry| entry.imported.upgrade().is_some());
         let imported = self.create_image_resource(device, dmabuf, &descriptor, usage)?;
+        if first_import && self.frame_client_scope && self.frame_client_sources.contains(&key) {
+            self.client_first_imports_on_frame = self.client_first_imports_on_frame.saturating_add(1);
+        }
         let custody = dmabuf.resource_custody::<ImportCustody<VulkanImage>>();
         let device_key = Arc::as_ptr(&device.shared_device()) as usize;
         custody.insert(device_key, imported.clone());
@@ -339,6 +372,7 @@ impl DmabufState {
                 imported: Arc::downgrade(&imported),
                 custody: Arc::downgrade(&custody),
                 device: device_key,
+                pins,
                 last_used: Instant::now(),
             },
         );
@@ -394,9 +428,10 @@ impl DmabufState {
 
     fn evict_to_capacity(&mut self) {
         while self.cache.len() > MAX_DMABUF_CACHE_ENTRIES {
-            if self.cache.shift_remove_index(0).is_none() {
+            let Some(index) = self.cache.values().position(|cached| cached.pins == 0) else {
                 break;
-            }
+            };
+            self.cache.shift_remove_index(index);
             self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
             self.capacity_evictions = self.capacity_evictions.saturating_add(1);
         }
@@ -884,6 +919,7 @@ mod tests {
     use super::{dmabuf_is_disjoint, idle_evictable_usage, DmabufRole, DmabufState};
 
     include!("dmabuf/idle_eviction_tests.rs");
+    include!("dmabuf/pin_tests.rs");
 
     #[test]
     fn capture_target_usage_covers_direct_materials_and_terminal_blits() {
