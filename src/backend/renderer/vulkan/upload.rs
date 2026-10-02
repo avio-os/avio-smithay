@@ -88,6 +88,46 @@ impl UploadState {
     }
 
     /// Reserve staging for `region` of `texture`, to be written off-thread.
+    pub(crate) fn stage_memory_import(
+        &mut self,
+        device: &mut DeviceState,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+        flipped: bool,
+    ) -> Result<(VulkanTexture, StagedMemoryUpdate, StagedMemoryRows), VulkanRendererError> {
+        validate_memory_format(format)?;
+        let len = expected_len_for_size(format, size)?;
+        // Admit the complete generation before creating its image. Capacity
+        // pressure cannot create and immediately discard a full-size texture.
+        let (reservation, ptr, memory) = device.reserve_staged_upload(len)?;
+        let image = match create_upload_image(device, self.next_upload_id(), format, size, flipped) {
+            Ok(image) => image,
+            Err(error) => {
+                device.release_staged_image_upload(reservation);
+                return Err(error);
+            }
+        };
+        let region = Rectangle::from_size(size);
+        let ticket = self.next_upload_id();
+        let staged = VulkanStagedUpdate {
+            device: Arc::as_ptr(&device.shared_device()),
+            image: Arc::clone(&image),
+            reservation,
+            copy: buffer_image_copy(region),
+        };
+        let row_bytes = usize::try_from(size.w).unwrap() * bytes_per_pixel(format)?;
+        let rows = usize::try_from(size.h).unwrap();
+        // SAFETY: The whole-generation reservation bounds these rows. Only
+        // this exclusive writer can access them; `memory` owns the mapping.
+        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, ticket, memory) };
+        Ok((
+            VulkanTexture::from_renderer_image(image, size, format, flipped, true),
+            StagedMemoryUpdate::new(ticket, region, Box::new(staged)),
+            rows,
+        ))
+    }
+
+    /// Reserve staging for `region` of `texture`, to be written off-thread.
     pub(crate) fn stage_memory_update(
         &mut self,
         device: &mut DeviceState,
@@ -257,6 +297,17 @@ impl ImportMem for VulkanRenderer {
     ) -> Result<Option<(StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
         self.upload
             .stage_memory_update(&mut self.device, texture, region)
+            .map(Some)
+    }
+
+    fn stage_memory_import(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+        flipped: bool,
+    ) -> Result<Option<(Self::TextureId, StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
+        self.upload
+            .stage_memory_import(&mut self.device, format, size, flipped)
             .map(Some)
     }
 

@@ -816,6 +816,23 @@ pub trait ImportMem: Renderer {
         Ok(None)
     }
 
+    /// Create a memory texture and reserve its whole initial generation as
+    /// tightly packed writable rows. The texture must not be sampled until
+    /// [`Self::submit_staged_memory_update`] accepts the returned update.
+    ///
+    /// The caller may fill the rows under guarded SHM access without making a
+    /// second full-image CPU copy. Reservations belong to the same bounded
+    /// storage and completion lifetime as staged updates. `Ok(None)` means
+    /// this implementation requires the ordinary slice import path instead.
+    fn stage_memory_import(
+        &mut self,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+        _flipped: bool,
+    ) -> Result<Option<(Self::TextureId, StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
+        Ok(None)
+    }
+
     /// Apply a staged update whose rows are all written. The whole region
     /// lands at the renderer's next submission, before anything it draws.
     ///

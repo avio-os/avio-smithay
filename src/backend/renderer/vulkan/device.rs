@@ -129,7 +129,7 @@ impl PendingUploadBatch {
     /// bitmap changes) keeps every superseded image and its staging until
     /// the batch is full, and the next upload has to wait on a capacity
     /// edge.
-    fn drop_unsampleable(&mut self, arena: &mut UploadArena) {
+    fn drop_unsampleable(&mut self, arena: &mut UploadArena, owner_sized: &mut Option<UploadArena>) {
         let mut index = 0;
         while let Some(operation) = self.operations.get(index) {
             let held_here = self
@@ -150,7 +150,14 @@ impl PendingUploadBatch {
                     return true;
                 }
                 *bytes = bytes.saturating_sub(other.reservation.len());
-                arena.release(other.reservation);
+                if other.reservation.owner_sized() {
+                    owner_sized
+                        .as_mut()
+                        .expect("owner-sized reservation has live storage")
+                        .release(other.reservation);
+                } else {
+                    arena.release(other.reservation);
+                }
                 false
             });
         }
@@ -218,6 +225,7 @@ pub(crate) struct DeviceState {
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
     upload_arena: UploadArena,
+    owner_upload_arena: Option<UploadArena>,
     pending_uploads: PendingUploadBatch,
     pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
@@ -527,6 +535,7 @@ impl DeviceState {
             reusable_command_buffers: Vec::new(),
             in_flight_submissions: VecDeque::new(),
             upload_arena,
+            owner_upload_arena: None,
             pending_uploads: PendingUploadBatch::default(),
             pending_waits: Vec::new(),
             next_submission_id: 0,
@@ -596,7 +605,49 @@ impl DeviceState {
     }
 
     pub(crate) fn upload_arena_stats(&self) -> UploadArenaStats {
-        self.upload_arena.stats()
+        let mut stats = self.upload_arena.stats();
+        if let Some(owner) = &self.owner_upload_arena {
+            let owner = owner.stats();
+            stats.capacity_bytes = stats.capacity_bytes.saturating_add(owner.capacity_bytes);
+            stats.in_use_bytes = stats.in_use_bytes.saturating_add(owner.in_use_bytes);
+            stats.high_water_bytes = stats.high_water_bytes.saturating_add(owner.high_water_bytes);
+            stats.chunk_count = stats.chunk_count.saturating_add(owner.chunk_count);
+            stats.growth_count = stats.growth_count.saturating_add(owner.growth_count);
+            stats.deferred_count = stats.deferred_count.saturating_add(owner.deferred_count);
+        }
+        stats
+    }
+
+    pub(crate) fn configure_memory_upload_capacity(
+        &mut self,
+        capacity: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        self.reclaim_completed_submissions()?;
+        self.drop_unsampleable_uploads();
+        self.owner_upload_arena
+            .get_or_insert_with(|| UploadArena::owner_sized(&self.physical_device))
+            .configure_fixed(&self.physical_device, self.device.clone(), capacity)
+    }
+
+    fn upload_storage(&self, reservation: StagingReservation) -> &UploadArena {
+        if reservation.owner_sized() {
+            self.owner_upload_arena
+                .as_ref()
+                .expect("owner-sized reservation has live storage")
+        } else {
+            &self.upload_arena
+        }
+    }
+
+    fn release_upload(&mut self, reservation: StagingReservation) {
+        if reservation.owner_sized() {
+            self.owner_upload_arena
+                .as_mut()
+                .expect("owner-sized reservation has live storage")
+                .release(reservation);
+        } else {
+            self.upload_arena.release(reservation);
+        }
     }
 
     pub(crate) fn pending_upload_stats(&self) -> (usize, usize) {
@@ -669,15 +720,21 @@ impl DeviceState {
                 "memory uploads require a renderer-local Vulkan image",
             ));
         }
+        self.reserve_staged_upload(len)
+    }
+
+    pub(crate) fn reserve_staged_upload(
+        &mut self,
+        len: usize,
+    ) -> Result<(StagingReservation, *mut u8, Arc<ChunkMemory>), VulkanRendererError> {
         self.reclaim_completed_submissions()?;
         self.drop_unsampleable_uploads();
-        let reservation = self
-            .upload_arena
-            .reserve(&self.physical_device, self.device.clone(), len)?;
-        match self.upload_arena.detach(reservation) {
+        let arena = self.owner_upload_arena.as_mut().unwrap_or(&mut self.upload_arena);
+        let reservation = arena.reserve(&self.physical_device, self.device.clone(), len)?;
+        match arena.detach(reservation) {
             Ok((ptr, memory)) => Ok((reservation, ptr, memory)),
             Err(error) => {
-                self.upload_arena.release(reservation);
+                arena.release(reservation);
                 Err(error)
             }
         }
@@ -694,13 +751,13 @@ impl DeviceState {
     ) -> Result<(), VulkanRendererError> {
         self.drop_unsampleable_uploads();
         if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
-            self.upload_arena.release(reservation);
+            self.release_upload(reservation);
             return Err(VulkanRendererError::UploadBatchFull {
                 limit: MAX_UPLOAD_BATCH_OPERATIONS,
             });
         }
-        if let Err(error) = self.upload_arena.flush(reservation) {
-            self.upload_arena.release(reservation);
+        if let Err(error) = self.upload_storage(reservation).flush(reservation) {
+            self.release_upload(reservation);
             return Err(error);
         }
         let old_layout = self
@@ -720,7 +777,7 @@ impl DeviceState {
 
     /// Release a staged reservation that will not be queued.
     pub(crate) fn release_staged_image_upload(&mut self, reservation: StagingReservation) {
-        self.upload_arena.release(reservation);
+        self.release_upload(reservation);
     }
 
     /// Drop the pending uploads whose image nothing can sample any more
@@ -728,7 +785,8 @@ impl DeviceState {
     /// upload claims batch or staging capacity and before a batch is
     /// recorded, so dead uploads neither fill the batch nor reach the GPU.
     fn drop_unsampleable_uploads(&mut self) {
-        self.pending_uploads.drop_unsampleable(&mut self.upload_arena);
+        self.pending_uploads
+            .drop_unsampleable(&mut self.upload_arena, &mut self.owner_upload_arena);
     }
 
     fn record_pending_uploads(&mut self) -> Result<Option<RecordedUploadBatch>, VulkanRendererError> {
@@ -764,7 +822,8 @@ impl DeviceState {
             unsafe {
                 self.device.handle().cmd_copy_buffer_to_image(
                     command_buffer,
-                    self.upload_arena.buffer(operation.reservation),
+                    self.upload_storage(operation.reservation)
+                        .buffer(operation.reservation),
                     operation.image.image(),
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[copy_region],
@@ -1282,7 +1341,7 @@ impl DeviceState {
 
         let (upload_operation_count, upload_bytes) = if let Some(recorded_uploads) = recorded_uploads {
             for operation in &recorded_uploads.batch.operations {
-                self.upload_arena.release(operation.reservation);
+                self.release_upload(operation.reservation);
             }
             let operation_count = recorded_uploads.batch.operations.len();
             self.diagnostics.upload_batches = self.diagnostics.upload_batches.saturating_add(1);
@@ -1526,7 +1585,7 @@ impl DeviceState {
             }
         });
         for reservation in staging_reservations {
-            self.upload_arena.release(reservation);
+            self.release_upload(reservation);
         }
 
         self.device.mark_submission_completed();

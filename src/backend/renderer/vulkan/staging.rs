@@ -10,8 +10,48 @@ const INITIAL_UPLOAD_ARENA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UPLOAD_ARENA_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UPLOAD_ARENA_CHUNKS: usize = 4;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ArenaMode {
+    #[default]
+    Growing,
+    /// The owner provisions the one chunk outside frame work. Reservations
+    /// never allocate, even when the chunk is empty or exhausted.
+    Fixed { capacity: usize },
+}
+
+impl ArenaMode {
+    fn next_chunk(
+        self,
+        previous: Option<usize>,
+        requested: usize,
+        capacity: usize,
+        chunks: usize,
+    ) -> Option<usize> {
+        match self {
+            Self::Growing if chunks < MAX_UPLOAD_ARENA_CHUNKS => Some(bounded_chunk_size(
+                previous,
+                requested,
+                MAX_UPLOAD_ARENA_BYTES.saturating_sub(capacity),
+                chunks,
+            )),
+            _ => None,
+        }
+    }
+
+    fn max_contiguous(self, existing: usize, capacity: usize, chunks: usize) -> usize {
+        match self {
+            Self::Growing if chunks < MAX_UPLOAD_ARENA_CHUNKS => {
+                existing.max(MAX_UPLOAD_ARENA_BYTES.saturating_sub(capacity))
+            }
+            Self::Fixed { capacity } => capacity,
+            _ => existing,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StagingReservation {
+    owner_sized: bool,
     chunk: usize,
     offset: usize,
     len: usize,
@@ -19,6 +59,9 @@ pub(crate) struct StagingReservation {
 }
 
 impl StagingReservation {
+    pub(crate) fn owner_sized(self) -> bool {
+        self.owner_sized
+    }
     pub(crate) fn offset(self) -> vk::DeviceSize {
         self.offset as vk::DeviceSize
     }
@@ -47,6 +90,8 @@ pub(crate) struct UploadArena {
     chunks: Vec<StagingChunk>,
     atom_size: usize,
     stats: UploadArenaStats,
+    mode: ArenaMode,
+    owner_sized: bool,
 }
 
 impl fmt::Debug for UploadArena {
@@ -54,6 +99,7 @@ impl fmt::Debug for UploadArena {
         f.debug_struct("UploadArena")
             .field("atom_size", &self.atom_size)
             .field("stats", &self.stats)
+            .field("mode", &self.mode)
             .finish()
     }
 }
@@ -67,7 +113,61 @@ impl UploadArena {
             chunks: Vec::new(),
             atom_size,
             stats: UploadArenaStats::default(),
+            mode: ArenaMode::default(),
+            owner_sized: false,
         }
+    }
+
+    pub(crate) fn owner_sized(physical_device: &PhysicalDevice) -> Self {
+        Self {
+            mode: ArenaMode::Fixed { capacity: 0 },
+            owner_sized: true,
+            ..Self::new(physical_device)
+        }
+    }
+
+    /// Provision, shrink, or retire owner-sized storage. This is a lifecycle
+    /// operation, never a reservation-path fallback. A detached writer keeps
+    /// the old mapping alive even after cancellation; it must return before
+    /// storage can be replaced. No completion source is waited on here.
+    pub(crate) fn configure_fixed(
+        &mut self,
+        physical_device: &PhysicalDevice,
+        device: Arc<DeviceHandle>,
+        capacity: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        let capacity = align_up(capacity, self.atom_size).ok_or(VulkanRendererError::InvalidMemoryUpload(
+            "fixed upload capacity overflowed",
+        ))?;
+        if self.mode == (ArenaMode::Fixed { capacity }) {
+            return Ok(true);
+        }
+        if self.stats.in_use_bytes != 0
+            || self
+                .chunks
+                .iter()
+                .any(|chunk| Arc::strong_count(&chunk.memory) != 1)
+        {
+            return Ok(false);
+        }
+        // Failure preserves the old storage and its mode. The replacement is
+        // allocated before the old chunk is destroyed, outside frame work.
+        let replacement = if capacity == 0 {
+            None
+        } else {
+            Some(StagingChunk::new(
+                physical_device,
+                device,
+                capacity,
+                self.atom_size,
+            )?)
+        };
+        self.chunks.clear();
+        self.chunks.extend(replacement);
+        self.mode = ArenaMode::Fixed { capacity };
+        self.stats.capacity_bytes = capacity;
+        self.stats.chunk_count = usize::from(capacity != 0);
+        Ok(true)
     }
 
     pub(crate) fn reserve(
@@ -89,10 +189,12 @@ impl UploadArena {
             return Ok(reservation);
         }
 
-        if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
-            let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
-            let previous = self.chunks.last().map(StagingChunk::capacity);
-            let chunk_size = bounded_chunk_size(previous, reserved_len, remaining, self.chunks.len());
+        if let Some(chunk_size) = self.mode.next_chunk(
+            self.chunks.last().map(StagingChunk::capacity),
+            reserved_len,
+            self.stats.capacity_bytes,
+            self.chunks.len(),
+        ) {
             if chunk_size >= reserved_len {
                 let chunk = StagingChunk::new(
                     physical_device,
@@ -114,14 +216,10 @@ impl UploadArena {
             }
         }
 
-        let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
         let max_existing = self.chunks.iter().map(StagingChunk::capacity).max().unwrap_or(0);
-        let max_future = if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
-            remaining
-        } else {
-            0
-        };
-        let max_contiguous_bytes = max_existing.max(max_future);
+        let max_contiguous_bytes =
+            self.mode
+                .max_contiguous(max_existing, self.stats.capacity_bytes, self.chunks.len());
         if reserved_len > max_contiguous_bytes {
             return Err(VulkanRendererError::UploadExceedsArenaLimit {
                 requested_bytes: len,
@@ -139,12 +237,20 @@ impl UploadArena {
 
     fn reserve_existing(&mut self, len: usize, reserved_len: usize) -> Option<StagingReservation> {
         for (chunk_index, chunk) in self.chunks.iter_mut().enumerate() {
+            // Detached rows are an exclusive writer. Even a prematurely
+            // cancelled ticket cannot make its mapping writable by another
+            // reservation before that writer returns. A fixed owner waits
+            // whole; it never creates a second chunk around this custody.
+            if Arc::strong_count(&chunk.memory) != 1 {
+                continue;
+            }
             let Some(offset) = chunk.ranges.reserve(reserved_len) else {
                 continue;
             };
             self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_add(reserved_len);
             self.stats.high_water_bytes = self.stats.high_water_bytes.max(self.stats.in_use_bytes);
             return Some(StagingReservation {
+                owner_sized: self.owner_sized,
                 chunk: chunk_index,
                 offset,
                 len,
@@ -518,9 +624,87 @@ fn pick_host_visible_memory_type(
 #[cfg(test)]
 mod tests {
     use super::{
-        align_up, bounded_chunk_size, next_chunk_size, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES,
+        align_up, bounded_chunk_size, next_chunk_size, ArenaMode, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES,
         MAX_UPLOAD_ARENA_BYTES,
     };
+
+    #[test]
+    fn owner_sized_ring_never_grows_when_a_whole_generation_waits() {
+        let mode = ArenaMode::Fixed { capacity: 4096 };
+        let mut ring = RangeAllocator::new(4096);
+        let first = ring.reserve(3072).unwrap();
+        assert_eq!(
+            ring.reserve(2048),
+            None,
+            "a generation is never partially admitted"
+        );
+        assert_eq!(mode.next_chunk(Some(4096), 2048, 4096, 1), None);
+        assert_eq!(mode.max_contiguous(4096, 4096, 1), 4096);
+        ring.release(first, 3072);
+        assert_eq!(
+            ring.reserve(2048),
+            Some(0),
+            "completion admits the whole generation"
+        );
+    }
+
+    #[test]
+    fn generation_does_not_land_in_bands_across_fragmented_free_spans() {
+        let mut ring = RangeAllocator::new(4096);
+        let first = ring.reserve(1024).unwrap();
+        let second = ring.reserve(1024).unwrap();
+        let third = ring.reserve(2048).unwrap();
+        ring.release(first, 1024);
+        ring.release(third, 2048);
+        assert_eq!(
+            ring.reserve(3072),
+            None,
+            "enough total free bytes cannot authorize a banded upload"
+        );
+        ring.release(second, 1024);
+        assert_eq!(ring.reserve(3072), Some(0));
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn owner_ring_shrinks_and_retires_only_after_detached_writer_returns() {
+        use crate::backend::allocator::Fourcc;
+        use crate::backend::renderer::ImportMem;
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        assert!(renderer.configure_memory_upload_capacity(4096).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 4096);
+        let (_, update, rows) = renderer
+            .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !renderer.configure_memory_upload_capacity(2048).unwrap(),
+            "a live generation owns its reservation"
+        );
+        renderer.cancel_staged_memory_update(update);
+        assert!(
+            !renderer.configure_memory_upload_capacity(2048).unwrap(),
+            "a detached writer still owns the mapping"
+        );
+        assert!(
+            renderer
+                .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+                .unwrap_err()
+                .is_upload_deferred(),
+            "cancelled bytes cannot be reused while the detached writer exists"
+        );
+        drop(rows);
+        assert!(renderer.configure_memory_upload_capacity(2048).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);
+        assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 0);
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 0);
+    }
 
     #[test]
     fn allocator_never_reuses_a_live_span_and_coalesces_retired_neighbors() {

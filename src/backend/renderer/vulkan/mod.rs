@@ -651,6 +651,21 @@ impl VulkanRenderer {
         VulkanRendererError::not_implemented(operation)
     }
 
+    /// Configure one owner-sized staging chunk, or retire it with zero bytes.
+    ///
+    /// Call only on an upload-owner lifecycle turn, outside render frame work.
+    /// Successful reservations in this mode never allocate or grow storage.
+    /// `Ok(false)` means a queued upload, GPU submission, or detached writer
+    /// still owns the current storage. Its completion/return must trigger a
+    /// later lifecycle retry; this method never waits or cancels live work.
+    /// Allocation failure preserves the previous mode and storage.
+    /// The configured chunk serves mapped-row imports and updates; ordinary
+    /// slice uploads use their independent arena and remain available after
+    /// the mapped-row owner's last source leaves.
+    pub fn configure_memory_upload_capacity(&mut self, capacity: usize) -> Result<bool, VulkanRendererError> {
+        self.device.configure_memory_upload_capacity(capacity)
+    }
+
     /// Returns live diagnostics for cache behavior and command submission timing.
     pub fn diagnostics(&self) -> VulkanRendererDiagnostics {
         let submissions: DeviceDiagnostics = self.device.diagnostics();
