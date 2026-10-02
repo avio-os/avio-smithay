@@ -14,7 +14,6 @@
 //! evidence.
 
 use std::{
-    io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::{mpsc::TrySendError, Arc, Mutex, OnceLock},
     thread,
