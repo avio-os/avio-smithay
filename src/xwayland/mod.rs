@@ -13,9 +13,11 @@
 //! special client, and play the role of an X11 Window Manager.
 //!
 //! Smithay does not provide any helper for doing that yet, but it is planned.
+mod lazy;
 mod x11_sockets;
 mod xserver;
 pub mod xwm;
 
+pub use self::lazy::{LazyXWayland, LazyXWaylandClientScale, LazyXWaylandEvent, XWaylandDisplay};
 pub use self::xserver::{XWayland, XWaylandClientData, XWaylandEvent};
 pub use self::xwm::{X11Surface, X11Wm, XwmHandler};

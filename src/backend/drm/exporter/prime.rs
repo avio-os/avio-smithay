@@ -166,6 +166,11 @@ fn framebuffer_from_prime(
             },
             flags,
         )
+        .inspect(|_| {
+            crate::backend::allocator::note_gpu_allocation(
+                crate::backend::allocator::GpuAllocationKind::DrmFramebuffer,
+            )
+        })
         .map_err(Error::AddFb);
 
     // The framebuffer holds its own reference to the underlying object;

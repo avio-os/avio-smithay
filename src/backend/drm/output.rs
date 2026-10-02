@@ -57,6 +57,7 @@ where
     compositor: CompositorList<A, F, U, G>,
     color_formats: Vec<DrmFourcc>,
     renderer_formats: Vec<DrmFormat>,
+    native_black_enabled: bool,
 }
 
 /// Locked variant of the [`DrmOutputManager`].
@@ -75,6 +76,7 @@ where
     compositor_arc: CompositorList<A, F, U, G>,
     color_formats: &'a [DrmFourcc],
     renderer_formats: &'a [DrmFormat],
+    native_black_enabled: bool,
 }
 
 impl<A, F, U, G> fmt::Debug for DrmOutputManager<A, F, U, G>
@@ -199,6 +201,9 @@ where
     /// The underlying [`DrmCompositor`] returned an error upon rendering a frame
     #[error(transparent)]
     RenderFrame(RenderFrameError<A, B, F, R>),
+    /// Native security-frame configuration could not be established.
+    #[error(transparent)]
+    NativeBlack(super::compositor::NativeBlackError),
 }
 
 /// Result returned by `DrmOutputManager`'s methods
@@ -255,7 +260,15 @@ where
             compositor: Default::default(),
             color_formats: color_formats.into_iter().collect(),
             renderer_formats: renderer_formats.into_iter().collect(),
+            native_black_enabled: false,
         }
+    }
+
+    /// Reserve native-black capability or one immutable initial black target
+    /// for subsequently initialized outputs. Does not change existing outputs.
+    pub fn enable_native_black(mut self) -> Self {
+        self.native_black_enabled = true;
+        self
     }
 
     /// Locks the [`DrmOutputManager`] causing derived [`DrmOutput`]s to stall
@@ -273,6 +286,7 @@ where
             compositor_arc: self.compositor.clone(),
             color_formats: &self.color_formats,
             renderer_formats: &self.renderer_formats,
+            native_black_enabled: self.native_black_enabled,
         }
     }
 }
@@ -366,6 +380,12 @@ where
                         self.gbm.clone(),
                     )
                 }
+                .map(|mut compositor| {
+                    if self.native_black_enabled {
+                        compositor.enable_native_black();
+                    }
+                    compositor
+                })
             };
 
         let compositor = create_compositor(false);
@@ -488,6 +508,13 @@ where
             return Err(err);
         }
 
+        if self.native_black_enabled {
+            if let Err(error) = compositor.configure_native_black(renderer) {
+                self.compositor.remove(&crtc);
+                return Err(DrmOutputManagerError::RenderFrame(error));
+            }
+        }
+
         Ok(DrmOutput {
             compositor: self.compositor_arc.clone(),
             crtc,
@@ -551,46 +578,13 @@ where
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
-        // check if implicit modifiers are in use
-        if self
-            .compositor
-            .values_mut()
-            .any(|c| c.get_mut().unwrap().modifiers() == [DrmModifier::Invalid])
-        {
-            // if so, first lower the bandwidth by disabling planes on all compositors
-            for compositor in self.compositor.values_mut() {
-                let compositor = compositor.get_mut().unwrap();
-                if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
-                    if !matches!(err, DrmOutputManagerError::Frame(FrameError::EmptyFrame)) {
-                        return Err(err);
-                    }
-                }
-            }
-
-            for compositor in self.compositor.values_mut() {
-                let compositor = compositor.get_mut().unwrap();
-                if compositor.modifiers() != [DrmModifier::Invalid] {
-                    continue;
-                }
-
-                let current_format = compositor.format();
-                if let Err(err) = compositor.set_format(
-                    self.allocator.clone(),
-                    current_format,
-                    self.renderer_formats
-                        .iter()
-                        .filter(|f| f.code == current_format)
-                        .map(|f| f.modifier),
-                ) {
-                    tracing::warn!(?err, "failed to reset format");
-                    continue;
-                }
-
-                render_elements.submit_composited_frame(&mut *compositor, renderer)?;
-            }
-        }
-
-        Ok(())
+        restore_modifiers_internal(
+            &mut self.compositor,
+            self.allocator,
+            self.renderer_formats,
+            renderer,
+            render_elements,
+        )
     }
 
     /// Activates a previously paused device.
@@ -760,6 +754,11 @@ where
         self.with_compositor(|compositor| compositor.queue_frame(user_data))
     }
 
+    /// Duplicate the pending commit's OUT_FENCE while preserving recovery's owner.
+    pub fn duplicate_pending_out_fence(&self) -> std::io::Result<Option<OwnedFd>> {
+        self.with_compositor(|compositor| compositor.duplicate_pending_out_fence())
+    }
+
     /// Take the latest DRM out-fence generated by a successful atomic commit, if any.
     pub fn take_out_fence(&self) -> Option<OwnedFd> {
         self.with_compositor(|compositor| compositor.take_out_fence())
@@ -788,6 +787,33 @@ where
     /// and will not generate a vblank event on the underlying device.
     pub fn commit_frame(&mut self) -> FrameResult<(), A, F> {
         self.with_compositor(|compositor| compositor.commit_frame())
+    }
+
+    /// Restore explicit modifiers across this output's device using its
+    /// owner's renderer, after an output has released display bandwidth.
+    ///
+    /// Like [`DrmOutput::use_mode`], this configuration operation holds the
+    /// device-wide compositor lock and may submit frames on other outputs.
+    /// Call it in the renderer owner's command order, outside frame rendering.
+    pub fn try_to_restore_modifiers<R, E>(
+        &mut self,
+        renderer: &mut R,
+        render_elements: &DrmOutputRenderElements<R, E>,
+    ) -> DrmOutputManagerResult<(), A, F, R>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+        let mut write_guard = self.compositor.write().unwrap();
+        restore_modifiers_internal(
+            &mut write_guard,
+            &self.allocator,
+            &self.renderer_formats,
+            renderer,
+            render_elements,
+        )
     }
 
     /// Tries to apply a new [`Mode`] for this `DrmOutput`.
@@ -857,6 +883,69 @@ where
         let mut write_guard = self.compositor.write().unwrap();
         write_guard.remove(&self.crtc);
     }
+}
+
+fn restore_modifiers_internal<A, F, U, G, R, E>(
+    compositor_list: &mut HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>>,
+    allocator: &A,
+    renderer_formats: &[DrmFormat],
+    renderer: &mut R,
+    render_elements: &DrmOutputRenderElements<R, E>,
+) -> DrmOutputManagerResult<(), A, F, R>
+where
+    A: Allocator + Clone + fmt::Debug,
+    A::Buffer: AsDmabuf,
+    A::Error: Send + Sync + 'static,
+    <A::Buffer as AsDmabuf>::Error: Send + Sync + 'static,
+    F: ExportFramebuffer<A::Buffer> + Clone,
+    F::Framebuffer: fmt::Debug + Send + Sync + 'static,
+    F::Error: Send + Sync + 'static,
+    G: AsFd + Clone + 'static,
+    U: 'static,
+    E: RenderElement<R>,
+    R: Renderer + Bind<Dmabuf>,
+    R::TextureId: Texture + 'static,
+    R::Error: Send + Sync + 'static,
+{
+    // check if implicit modifiers are in use
+    if compositor_list
+        .values_mut()
+        .any(|c| c.get_mut().unwrap().modifiers() == [DrmModifier::Invalid])
+    {
+        // if so, first lower the bandwidth by disabling planes on all compositors
+        for compositor in compositor_list.values_mut() {
+            let compositor = compositor.get_mut().unwrap();
+            if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
+                if !matches!(err, DrmOutputManagerError::Frame(FrameError::EmptyFrame)) {
+                    return Err(err);
+                }
+            }
+        }
+
+        for compositor in compositor_list.values_mut() {
+            let compositor = compositor.get_mut().unwrap();
+            if compositor.modifiers() != [DrmModifier::Invalid] {
+                continue;
+            }
+
+            let current_format = compositor.format();
+            if let Err(err) = compositor.set_format(
+                allocator.clone(),
+                current_format,
+                renderer_formats
+                    .iter()
+                    .filter(|f| f.code == current_format)
+                    .map(|f| f.modifier),
+            ) {
+                tracing::warn!(?err, "failed to reset format");
+                continue;
+            }
+
+            render_elements.submit_composited_frame(&mut *compositor, renderer)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn use_mode_internal<'a, A, F, U, G, R, E>(
@@ -956,8 +1045,16 @@ where
             }
             Err(err) => return Err(DrmOutputManagerError::Frame(err)),
         };
+    } else if let Err(err) = res {
+        return Err(DrmOutputManagerError::Frame(err));
     }
 
+    let compositor = compositor_list.get_mut(crtc).unwrap().get_mut().unwrap();
+    if compositor.native_black_enabled() {
+        compositor
+            .configure_native_black(renderer)
+            .map_err(DrmOutputManagerError::RenderFrame)?;
+    }
     Ok(())
 }
 

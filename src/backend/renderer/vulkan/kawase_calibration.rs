@@ -23,7 +23,6 @@ use crate::{
             vulkan::{VulkanKawasePass, VulkanTexture},
             Bind, Color32F, ExportMem, Frame, Offscreen, Renderer,
         },
-        vulkan::{version::Version, Instance, PhysicalDevice},
     },
     utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform},
 };
@@ -276,9 +275,8 @@ impl EdgeProbe {
     /// Returns `None` when no usable Vulkan device is present, so the calibration
     /// skips on hosted runners rather than failing there.
     fn new() -> Option<Self> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        let mut renderer = VulkanRenderer::new(&physical_device).ok()?;
+        let physical_device = super::test_support::physical_device()?;
+        let mut renderer = super::test_support::renderer(&physical_device)?;
         let format = [
             Fourcc::Argb8888,
             Fourcc::Abgr8888,
@@ -288,7 +286,8 @@ impl EdgeProbe {
         .into_iter()
         .find(|format| {
             Offscreen::<VulkanTexture>::create_buffer(&mut renderer, *format, Size::from((4, 4))).is_ok()
-        })?;
+        });
+        let format = super::test_support::present(format, "calibration offscreen format")?;
         Some(Self { renderer, format })
     }
 

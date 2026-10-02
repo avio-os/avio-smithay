@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Instant,
 };
 
@@ -14,10 +15,12 @@ use crate::{
         dmabuf::{Dmabuf, WeakDmabuf, MAX_PLANES},
         Buffer, Format, Modifier,
     },
+    backend::renderer::ErasedContextId,
     utils::{Buffer as BufferCoord, Size},
 };
 
 use super::{
+    allocation::AllocationGuard,
     device::{DeviceHandle, DeviceState},
     format::{
         optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
@@ -26,6 +29,12 @@ use super::{
     image::VulkanImage,
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
+
+mod custody;
+mod import;
+mod membership;
+pub(super) mod preparation;
+use custody::ImportCustody;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmabufRole {
@@ -110,15 +119,27 @@ struct DmabufSignature {
     y_inverted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CachedDmabuf {
     pub(crate) handle: WeakDmabuf,
     signature: DmabufSignature,
-    imported: Arc<VulkanImage>,
+    imported: Weak<VulkanImage>,
+    custody: Weak<ImportCustody<VulkanImage>>,
+    context: ErasedContextId,
+    /// Balanced owner membership, independent of a temporary texture reader.
+    pins: usize,
     /// When a caller last imported or bound this entry. Stamped only where the
     /// entry moves to the back of the cache, so it never decreases from front
     /// to back.
     last_used: Instant,
+}
+
+impl Drop for CachedDmabuf {
+    fn drop(&mut self) {
+        if let Some(custody) = self.custody.upgrade() {
+            custody.remove(&self.context, &self.imported);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,10 +149,13 @@ struct DmabufImportDescriptor {
     format_features: vk::FormatFeatureFlags,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct DmabufState {
+    /// The renderer's existing context identity, independent of its shared
+    /// logical device and stable across moves. Each context owns its imports.
+    context: ErasedContextId,
     cache: IndexMap<WeakDmabuf, CachedDmabuf>,
-    next_import_id: u64,
+    import_ids: Arc<std::sync::atomic::AtomicU64>,
     imports_since_cleanup: u32,
     import_attempts_total: u64,
     cleanup_runs: u64,
@@ -141,9 +165,12 @@ pub(crate) struct DmabufState {
     idle_evictions: u64,
     max_cache_len: usize,
     cache_stats: VulkanCacheStats,
+    frame_client_sources: HashSet<WeakDmabuf>,
+    frame_client_scope: bool,
+    client_first_imports_on_frame: super::client_import_census::ClientImportCounter,
 }
 
-const MAX_DMABUF_CACHE_ENTRIES: usize = 256;
+pub(super) const MAX_DMABUF_CACHE_ENTRIES: usize = 256;
 const DMABUF_CLEANUP_INTERVAL_IMPORTS: u32 = 64;
 const DMABUF_CLEANUP_SCAN_LIMIT: usize = 64;
 const DMABUF_DIAG_LOG_INTERVAL_IMPORTS: u64 = 256;
@@ -166,13 +193,51 @@ fn dmabuf_is_disjoint(dmabuf: &Dmabuf) -> Result<bool, VulkanRendererError> {
 }
 
 impl DmabufState {
+    /// Observe this context's real sampled import without creating, promoting,
+    /// pinning, or claiming readiness from source metadata alone.
+    pub(crate) fn sampled_prepared(&self, dmabuf: &Dmabuf) -> bool {
+        let Some(cached) = self.cache.get(&dmabuf.weak()) else {
+            return false;
+        };
+        cached.context == self.context
+            && cached.signature.size == dmabuf.size()
+            && cached.signature.format == dmabuf.format()
+            && cached.imported.upgrade().is_some_and(|image| {
+                image.image() != vk::Image::null()
+                    && image.view() != vk::ImageView::null()
+                    && image.size() == dmabuf.size()
+                    && image.format() == dmabuf.format()
+                    && image.usage().contains(DmabufRole::Texture.required_usage())
+            })
+    }
+
+    pub(crate) fn new(context: ErasedContextId) -> Self {
+        Self {
+            context,
+            cache: IndexMap::with_capacity(MAX_DMABUF_CACHE_ENTRIES),
+            import_ids: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            imports_since_cleanup: 0,
+            import_attempts_total: 0,
+            cleanup_runs: 0,
+            cleanup_scanned: 0,
+            cleanup_stale_evictions: 0,
+            capacity_evictions: 0,
+            idle_evictions: 0,
+            max_cache_len: 0,
+            cache_stats: VulkanCacheStats::default(),
+            frame_client_sources: HashSet::new(),
+            frame_client_scope: false,
+            client_first_imports_on_frame: Default::default(),
+        }
+    }
+
     pub(crate) fn import_texture(
         &mut self,
         device: &DeviceState,
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTexture, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::Texture)?;
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::Texture, false)?;
         Ok(VulkanTexture::from_dmabuf_import(
             imported,
             dmabuf.size(),
@@ -187,7 +252,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::RenderTarget)?;
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::RenderTarget, false)?;
         Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
@@ -201,7 +266,13 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::FramebufferEffectTarget)?;
+        let imported = self.import_or_reuse(
+            device,
+            formats,
+            dmabuf,
+            DmabufRole::FramebufferEffectTarget,
+            false,
+        )?;
         Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
@@ -215,7 +286,7 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
     ) -> Result<VulkanTarget, VulkanRendererError> {
-        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::CaptureTarget)?;
+        let imported = self.import_or_reuse(device, formats, dmabuf, DmabufRole::CaptureTarget, false)?;
         Ok(VulkanTarget::from_image_resource(
             imported,
             dmabuf.size(),
@@ -248,7 +319,11 @@ impl DmabufState {
             if cached.last_used >= used_before {
                 break;
             }
-            if idle_evictable_usage(cached.imported.usage()) && Arc::strong_count(&cached.imported) <= 1 {
+            if cached.pins == 0
+                && cached.imported.upgrade().is_some_and(|imported| {
+                    idle_evictable_usage(imported.usage()) && Arc::strong_count(&imported) <= 2
+                })
+            {
                 let _ = self.cache.shift_remove_index(index);
                 evicted = evicted.saturating_add(1);
             } else {
@@ -272,19 +347,32 @@ impl DmabufState {
         formats: &FormatCapabilities,
         dmabuf: &Dmabuf,
         role: DmabufRole,
+        pin: bool,
     ) -> Result<Arc<VulkanImage>, VulkanRendererError> {
         self.import_attempts_total = self.import_attempts_total.saturating_add(1);
-        self.maybe_cleanup();
-
-        let requested_usage = role.required_usage();
+        let mut requested_usage = role.required_usage();
+        if matches!(
+            role,
+            DmabufRole::FramebufferEffectTarget | DmabufRole::CaptureTarget
+        ) && formats.has_sampled_framebuffer_format(dmabuf.format())
+        {
+            requested_usage |= vk::ImageUsageFlags::SAMPLED;
+        }
         let key = dmabuf.weak();
 
         if let Some(cached) = self.cache.get(&key) {
             // Dmabuf plane metadata is immutable after construction and the weak key
             // identifies that exact allocation. Avoid repeating fstat topology checks
             // for every frame once this buffer and usage have been validated.
-            if cached.imported.usage().contains(requested_usage) {
-                let imported = cached.imported.clone();
+            if let Some(imported) = cached
+                .imported
+                .upgrade()
+                .filter(|imported| imported.usage().contains(requested_usage))
+            {
+                if pin {
+                    let cached = self.cache.get_mut(&key).expect("cache hit exists");
+                    cached.pins = cached.pins.checked_add(1).expect("dma-buf import pin overflow");
+                }
                 self.promote_entry(&key);
                 self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
                 trace!(
@@ -298,23 +386,56 @@ impl DmabufState {
             }
         }
 
+        // Validated cache hits are warm and must not dispose unrelated cache
+        // signatures. Native miss preparation retains the legacy cold cleanup.
+        self.maybe_cleanup();
         let descriptor = Self::validate_dmabuf(device, dmabuf, formats, role)?;
         self.cache_stats.misses = self.cache_stats.misses.saturating_add(1);
         let usage = self
             .cache
             .get(&key)
             .filter(|cached| cached.signature == descriptor.signature)
-            .map(|cached| cached.imported.usage() | requested_usage)
+            .and_then(|cached| cached.imported.upgrade())
+            .map(|imported| imported.usage() | requested_usage)
             .unwrap_or(requested_usage);
 
-        let imported = self.create_image_resource(device, dmabuf, &descriptor, usage)?;
+        let pins = self
+            .cache
+            .get(&key)
+            .map_or(0, |cached| cached.pins)
+            .checked_add(usize::from(pin))
+            .expect("dma-buf import pin overflow");
+        let first_import = self
+            .cache
+            .get(&key)
+            .is_none_or(|entry| entry.imported.upgrade().is_none());
+        let first_client =
+            first_import && self.frame_client_scope && self.frame_client_sources.contains(&key);
+        let mut exclusion = first_client.then(|| {
+            crate::backend::allocator::GpuFrameAllocationExclusionScope::enter(
+                crate::backend::allocator::GpuFrameAllocationExclusion::ClientFirstImport,
+            )
+        });
+        let imported = Self::create_image_resource(&self.import_ids, device, dmabuf, &descriptor, usage)?;
+        if first_client {
+            self.client_first_imports_on_frame.created();
+            if let Some(exclusion) = &mut exclusion {
+                exclusion.accepted();
+            }
+        }
+        drop(exclusion);
+        let custody = dmabuf.resource_custody::<ImportCustody<VulkanImage>>();
+        custody.insert(self.context.clone(), imported.clone());
         let _ = self.cache.shift_remove(&key);
         self.cache.insert(
             key.clone(),
             CachedDmabuf {
                 handle: key,
                 signature: descriptor.signature,
-                imported: imported.clone(),
+                imported: Arc::downgrade(&imported),
+                custody: Arc::downgrade(&custody),
+                context: self.context.clone(),
+                pins,
                 last_used: Instant::now(),
             },
         );
@@ -353,7 +474,7 @@ impl DmabufState {
             let remove = self
                 .cache
                 .get_index(index)
-                .map(|(_, cached)| cached.handle.is_gone() && Arc::strong_count(&cached.imported) <= 1)
+                .map(|(_, cached)| cached.handle.is_gone())
                 .unwrap_or(false);
             scanned = scanned.saturating_add(1);
 
@@ -370,9 +491,10 @@ impl DmabufState {
 
     fn evict_to_capacity(&mut self) {
         while self.cache.len() > MAX_DMABUF_CACHE_ENTRIES {
-            if self.cache.shift_remove_index(0).is_none() {
+            let Some(index) = self.cache.values().position(|cached| cached.pins == 0) else {
                 break;
-            }
+            };
+            self.cache.shift_remove_index(index);
             self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(1);
             self.capacity_evictions = self.capacity_evictions.saturating_add(1);
         }
@@ -412,343 +534,6 @@ impl DmabufState {
         );
     }
 
-    fn validate_dmabuf(
-        device: &DeviceState,
-        dmabuf: &Dmabuf,
-        formats: &FormatCapabilities,
-        role: DmabufRole,
-    ) -> Result<DmabufImportDescriptor, VulkanRendererError> {
-        let size = dmabuf.size();
-        if size.w <= 0 || size.h <= 0 {
-            return Err(VulkanRendererError::InvalidDmabuf(
-                "dma-buf dimensions must be positive",
-            ));
-        }
-
-        let format = dmabuf.format();
-        if !role.format_supported(formats, format) {
-            return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
-        }
-
-        let num_planes = dmabuf.num_planes();
-        if num_planes == 0 || num_planes > MAX_PLANES {
-            return Err(VulkanRendererError::InvalidDmabuf(
-                "dma-buf plane count is outside supported range",
-            ));
-        }
-
-        let offsets = dmabuf.offsets().collect::<Vec<_>>();
-        let strides = dmabuf.strides().collect::<Vec<_>>();
-        if offsets.len() != num_planes || strides.len() != num_planes {
-            return Err(VulkanRendererError::InvalidDmabuf(
-                "dma-buf plane metadata is inconsistent",
-            ));
-        }
-
-        if strides.contains(&0) {
-            return Err(VulkanRendererError::InvalidDmabuf(
-                "dma-buf stride must be non-zero for all planes",
-            ));
-        }
-
-        if dmabuf.handles().count() != num_planes {
-            return Err(VulkanRendererError::InvalidDmabuf(
-                "dma-buf fd count does not match plane count",
-            ));
-        }
-        let disjoint = dmabuf_is_disjoint(dmabuf)?;
-
-        let Some(vk_format) = crate::backend::allocator::vulkan::format::get_vk_format(format.code) else {
-            return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
-        };
-
-        let format_features = if format.modifier == Modifier::Invalid {
-            if !role.supports_implicit_modifier(formats, format.code) {
-                return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
-            }
-            if num_planes != 1 {
-                return Err(VulkanRendererError::InvalidDmabuf(
-                    "implicit-modifier dma-bufs must contain exactly one memory plane",
-                ));
-            }
-            optimal_tiling_features(device.physical_device(), vk_format)
-        } else {
-            let modifier_caps = formats.modifier_capabilities(format.code);
-            let Some(modifier_cap) = modifier_caps.iter().find(|cap| cap.modifier == format.modifier) else {
-                return Err(VulkanRendererError::UnsupportedDmabufFormat(format));
-            };
-
-            if modifier_cap.drm_format_modifier_plane_count as usize != num_planes {
-                return Err(VulkanRendererError::DmabufPlaneCountMismatch {
-                    modifier: format.modifier,
-                    expected: modifier_cap.drm_format_modifier_plane_count,
-                    actual: num_planes,
-                });
-            }
-
-            if disjoint && !role.supports_disjoint(modifier_cap) {
-                return Err(VulkanRendererError::UnsupportedDmabufDisjoint);
-            }
-            modifier_cap.drm_format_modifier_tiling_features
-        };
-
-        Ok(DmabufImportDescriptor {
-            signature: DmabufSignature {
-                size,
-                format,
-                num_planes,
-                offsets,
-                strides,
-                disjoint,
-                y_inverted: dmabuf.y_inverted(),
-            },
-            vk_format,
-            format_features,
-        })
-    }
-
-    fn create_image_resource(
-        &mut self,
-        device: &DeviceState,
-        dmabuf: &Dmabuf,
-        descriptor: &DmabufImportDescriptor,
-        usage: vk::ImageUsageFlags,
-    ) -> Result<Arc<VulkanImage>, VulkanRendererError> {
-        let device_handle = device.shared_device();
-        let vk_device = device_handle.handle();
-        let format = descriptor.signature.format;
-        let size = descriptor.signature.size;
-        let disjoint = descriptor.signature.disjoint;
-        let external_memory_fd =
-            khr::external_memory_fd::Device::new(device.physical_device().instance().handle(), vk_device);
-
-        let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
-        let mut explicit_modifier_info;
-        let plane_layouts;
-        // The image keeps its encoded storage format; MUTABLE_FORMAT only lets the
-        // colour attachment view reinterpret those same bytes as `_SRGB` so blending
-        // happens in linear light. Storage, stride and DRM modifier are untouched.
-        let view_formats = srgb_view_format_list(descriptor.vk_format);
-        let mut format_list_info;
-        let mut create_flags = if disjoint {
-            vk::ImageCreateFlags::DISJOINT
-        } else {
-            vk::ImageCreateFlags::empty()
-        };
-        if view_formats.is_some() {
-            create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
-        }
-        let mut image_create_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(descriptor.vk_format)
-            .extent(vk::Extent3D {
-                width: size.w as u32,
-                height: size.h as u32,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .usage(usage)
-            .flags(create_flags)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        if let Some(formats) = view_formats.as_ref() {
-            format_list_info = vk::ImageFormatListCreateInfo::default().view_formats(formats);
-            image_create_info = image_create_info.push_next(&mut format_list_info);
-        }
-
-        if format.modifier == Modifier::Invalid {
-            image_create_info = image_create_info.tiling(vk::ImageTiling::OPTIMAL);
-        } else {
-            plane_layouts = descriptor
-                .signature
-                .offsets
-                .iter()
-                .zip(descriptor.signature.strides.iter())
-                .map(|(offset, stride)| {
-                    vk::SubresourceLayout::default()
-                        .offset(*offset as u64)
-                        .row_pitch(*stride as u64)
-                })
-                .collect::<Vec<_>>();
-
-            explicit_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                .drm_format_modifier(format.modifier.into())
-                .plane_layouts(&plane_layouts);
-
-            image_create_info = image_create_info
-                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .push_next(&mut explicit_modifier_info);
-        }
-
-        image_create_info = image_create_info.push_next(&mut external_memory_image_info);
-
-        let image =
-            match device_handle.observe_result(unsafe { vk_device.create_image(&image_create_info, None) }) {
-                Ok(image) => image,
-                Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
-                    return Err(VulkanRendererError::UnsupportedDmabufFormat(format))
-                }
-                Err(err) => return Err(err.into()),
-            };
-
-        let handles = dmabuf.handles().collect::<Vec<_>>();
-        let memory_count = if disjoint {
-            descriptor.signature.num_planes
-        } else {
-            1
-        };
-        let mut memories = Vec::with_capacity(memory_count);
-
-        for plane_index in 0..memory_count {
-            let requirements =
-                match Self::image_memory_requirements(vk_device, image, disjoint.then_some(plane_index)) {
-                    Ok(requirements) => requirements,
-                    Err(err) => {
-                        Self::destroy_image_and_memories(&device_handle, image, &memories);
-                        return Err(err);
-                    }
-                };
-            let Some(fd) = handles.get(plane_index).copied() else {
-                Self::destroy_image_and_memories(&device_handle, image, &memories);
-                return Err(VulkanRendererError::InvalidDmabuf(
-                    "dma-buf fd count does not match memory binding count",
-                ));
-            };
-
-            match Self::allocate_imported_memory(&device_handle, &external_memory_fd, image, fd, requirements)
-            {
-                Ok(memory) => memories.push(memory),
-                Err(err) => {
-                    Self::destroy_image_and_memories(&device_handle, image, &memories);
-                    return Err(err);
-                }
-            }
-        }
-
-        trace!(
-            plane_count = descriptor.signature.num_planes,
-            memory_bindings = memories.len(),
-            disjoint,
-            ?format,
-            ?usage,
-            "binding imported dma-buf memory to Vulkan image"
-        );
-
-        let bind_result = if disjoint {
-            let mut plane_infos = match (0..memories.len())
-                .map(|plane_index| {
-                    Self::memory_plane_aspect(plane_index)
-                        .map(|aspect| vk::BindImagePlaneMemoryInfo::default().plane_aspect(aspect))
-                })
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(plane_infos) => plane_infos,
-                Err(err) => {
-                    Self::destroy_image_and_memories(&device_handle, image, &memories);
-                    return Err(err);
-                }
-            };
-            let bind_infos = plane_infos
-                .iter_mut()
-                .zip(memories.iter().copied())
-                .map(|(plane_info, memory)| {
-                    vk::BindImageMemoryInfo::default()
-                        .image(image)
-                        .memory(memory)
-                        .memory_offset(0)
-                        .push_next(plane_info)
-                })
-                .collect::<Vec<_>>();
-            device_handle.observe_result(unsafe { vk_device.bind_image_memory2(&bind_infos) })
-        } else {
-            device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memories[0], 0) })
-        };
-
-        if let Err(err) = bind_result {
-            Self::destroy_image_and_memories(&device_handle, image, &memories);
-            return Err(err.into());
-        }
-
-        let sampled_view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(descriptor.vk_format)
-            .components(texture_view_components(format.code, usage))
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            );
-
-        let sampled_view = match device_handle
-            .observe_result(unsafe { vk_device.create_image_view(&sampled_view_info, None) })
-        {
-            Ok(view) => view,
-            Err(err) => {
-                Self::destroy_image_and_memories(&device_handle, image, &memories);
-                return Err(err.into());
-            }
-        };
-
-        let render_view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            // Linear-light blending: the hardware decodes the destination through this
-            // view and re-encodes the blended result on store.
-            .format(render_view_format(descriptor.vk_format))
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            );
-
-        let render_view = match device_handle
-            .observe_result(unsafe { vk_device.create_image_view(&render_view_info, None) })
-        {
-            Ok(view) => view,
-            Err(err) => {
-                device_handle.destroy_with(|vk_device| unsafe {
-                    vk_device.destroy_image_view(sampled_view, None);
-                });
-                Self::destroy_image_and_memories(&device_handle, image, &memories);
-                return Err(err.into());
-            }
-        };
-
-        let import_id = self.next_import_id;
-        self.next_import_id = self.next_import_id.wrapping_add(1);
-
-        Ok(Arc::new(VulkanImage::new_external_dmabuf(
-            import_id,
-            image,
-            memories,
-            sampled_view,
-            render_view,
-            size,
-            format,
-            descriptor.vk_format,
-            descriptor.format_features,
-            // Imported buffers are authored outside the compositor: Wayland clients and
-            // the Flutter shell both premultiply in electrical values.
-            ColorEncoding::ElectricalPremultiplied,
-            usage,
-            descriptor.signature.y_inverted,
-            vk::ImageLayout::UNDEFINED,
-            device_handle,
-        )))
-    }
-
     fn image_memory_requirements(
         device: &ash::Device,
         image: vk::Image,
@@ -774,7 +559,8 @@ impl DmabufState {
         image: vk::Image,
         fd: BorrowedFd<'_>,
         requirements: vk::MemoryRequirements,
-    ) -> Result<vk::DeviceMemory, VulkanRendererError> {
+        backing: Arc<crate::backend::allocator::dmabuf::DmabufBackingMetadata>,
+    ) -> Result<(vk::DeviceMemory, AllocationGuard), VulkanRendererError> {
         let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
         device.observe_result(unsafe {
             external_memory_fd.get_memory_fd_properties(
@@ -802,10 +588,16 @@ impl DmabufState {
             .push_next(&mut import_info)
             .push_next(&mut dedicated_info);
 
-        let memory = device.observe_result(unsafe { device.handle().allocate_memory(&alloc_info, None) })?;
+        let memory = device.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { device.handle().allocate_memory(&alloc_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        ))?;
         // A successful import transfers ownership of the duplicated FD to Vulkan.
         let _ = ScopeGuard::into_inner(import_fd_guard);
-        Ok(memory)
+        let allocation = device
+            .allocation_ledger()
+            .record_import(requirements.size, backing);
+        Ok((memory, allocation))
     }
 
     fn memory_plane_aspect(plane_index: usize) -> Result<vk::ImageAspectFlags, VulkanRendererError> {
@@ -860,6 +652,9 @@ mod tests {
     use super::{dmabuf_is_disjoint, idle_evictable_usage, DmabufRole, DmabufState};
 
     include!("dmabuf/idle_eviction_tests.rs");
+    include!("dmabuf/pin_tests.rs");
+    include!("dmabuf/context_custody_tests.rs");
+    include!("dmabuf/prepared_tests.rs");
 
     #[test]
     fn capture_target_usage_covers_direct_materials_and_terminal_blits() {
@@ -906,17 +701,8 @@ mod tests {
     }
 
     fn renderer_and_device() -> Option<(PhysicalDevice, VulkanRenderer)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        let renderer = match VulkanRenderer::new(&physical_device) {
-            Ok(renderer) => renderer,
-            Err(
-                VulkanRendererError::MissingDeviceExtensions(_)
-                | VulkanRendererError::MissingDeviceFeature(_)
-                | VulkanRendererError::MissingQueueFamily { .. },
-            ) => return None,
-            Err(err) => panic!("unexpected Vulkan renderer init failure: {err}"),
-        };
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        let renderer = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)?;
         Some((physical_device, renderer))
     }
 
@@ -967,7 +753,16 @@ mod tests {
             .iter()
             .copied()
             .filter(|format| {
-                renderer.has_dmabuf_render_format(*format) && format.modifier != Modifier::Invalid
+                renderer.has_dmabuf_render_format(*format)
+                    && format.modifier != Modifier::Invalid
+                    && renderer
+                        .formats
+                        .modifier_capabilities(format.code)
+                        .iter()
+                        .any(|capability| {
+                            capability.modifier == format.modifier
+                                && capability.drm_format_modifier_plane_count > 1
+                        })
             })
             .collect::<Vec<_>>();
         let mut allocator = match VulkanAllocator::new(
@@ -975,7 +770,7 @@ mod tests {
             ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
         ) {
             Ok(allocator) => allocator,
-            Err(_) => return,
+            Err(error) => panic!("required Vulkan allocator initialization failed: {error}"),
         };
 
         for format in candidates {
@@ -1000,6 +795,9 @@ mod tests {
                 .expect("shared multi-plane target bind should succeed");
             return;
         }
+        super::super::test_support::capability_unavailable(
+            "no exportable shared multi-plane DMA-BUF modifier supporting both sampling and rendering",
+        );
     }
 
     /// Exercises the allocator and a separate import device, including drivers
@@ -1075,7 +873,8 @@ mod tests {
                     .find(|format| renderer.has_dmabuf_render_format(*format))
             });
 
-        let Some(format) = candidate else {
+        let Some(format) = super::super::test_support::present(candidate, "sampled/render DMA-BUF format")
+        else {
             return;
         };
 
@@ -1084,17 +883,26 @@ mod tests {
             ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
         ) {
             Ok(allocator) => allocator,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let dmabuf = match buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let texture_first = renderer
@@ -1121,11 +929,17 @@ mod tests {
         for _ in 0..32 {
             let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
                 Ok(buffer) => buffer,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
             let dmabuf = match buffer.export() {
                 Ok(dmabuf) => dmabuf,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             let _texture = renderer

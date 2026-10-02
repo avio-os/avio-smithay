@@ -410,3 +410,52 @@ Minimum matrix before production recommendation:
 - [x] Diagnostics and profiling complete.
 - [ ] Documentation complete.
 - [ ] Test matrix and release gates complete.
+
+## Upload reservation custody
+
+Detached mapped rows hold a token for their exact reserved span, rather than
+exclusive custody of the whole mapped chunk. Cancellation parks that span
+until its writer token returns; reservation/reclamation and owner configuration
+reap parked spans exactly once. Other ranges remain available during the copy.
+Whole-chunk mapping custody still prevents resizing or retiring the mapping.
+The synchronous row-fill callback checks its own token before a GPU read, so
+swapping an unrelated row guard cannot submit bytes still writable elsewhere.
+
+Pure span tests exercise cancellation, a writer returning from another thread,
+nonoverlapping admission, whole-generation admission and exact coalescing. The
+explicit laptop fixture reproduces a 4 MiB import, a held 4 MiB writer, and a
+16 KiB slice upload and requires one chunk with no additional growth.
+
+Required-device test policy covers instance/device creation, the renderer's
+required extensions, feature and queue family. Optional modifier capabilities
+are reported explicitly after those prerequisites succeed. In particular, a
+device advertising no exportable shared multi-plane modifier for both sampling
+and rendering has a valid negative capability result; an advertised, exportable
+candidate must still pass the real shared-allocation texture and target imports.
+
+## Sole owner-sized upload storage
+
+Each renderer begins with an empty upload ring. Before any slice, mapped-row,
+staged or Wayland memory import/update, its owner declares the structural
+output extent and largest live generation on a preparation turn. That one
+persistently mapped chunk serves every upload form. Admission only reserves a
+whole span and cannot allocate another chunk: there is no geometric ladder,
+second arena or unconfigured fallback. Initial slice imports admit their span
+before allocating an image, so pressure cannot allocate/discard a texture.
+
+The last upload owner configures zero; completion and returned writer custody
+permit retirement, and a changed real owner extent permits replacement. One
+arena supplies both the arena and owner capacity diagnostics. Hardware tests
+provision their actual fixture output extent explicitly and retain the required
+Vulkan device policy; no missing owner or import error is a capability skip.
+
+CPU-only upload pressure has an exact evented completion distinct from GPU
+fences: `CpuWriterPending(MemoryUploadCpuCompletion)` captures readiness for
+current writers. `on_ready` registers without a lost-return race and fires
+once only when the whole snapshot has returned. A row guard releases its
+mapping/token before marking readiness; the snapshot retains no mapping or GPU
+object. Owner code installs accepted-work custody before registering and
+nonblocking-collects returned staged rows before retrying storage configuration.
+`Available` handles cancellation/reclamation finishing between an unsuccessful
+configuration attempt and its completion-edge query. Neither edge waits or
+requires a retry timer.

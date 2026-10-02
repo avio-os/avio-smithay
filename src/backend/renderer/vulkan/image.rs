@@ -12,8 +12,10 @@ use crate::{
 };
 
 use super::{
+    allocation::AllocationGuard,
     device::DeviceHandle,
     format::{render_view_format, ColorEncoding},
+    retirement::RetirementNode,
 };
 
 /// Immutable origin of a Vulkan image resource.
@@ -41,8 +43,9 @@ impl VulkanImageOrigin {
 /// the image was allocated or whether a FOREIGN transfer is legal.
 pub(crate) struct VulkanImage {
     resource_id: u64,
+    incarnation: std::num::NonZeroU64,
     image: vk::Image,
-    memories: Vec<vk::DeviceMemory>,
+    retirement: Option<Box<RetirementNode<super::device_handle::DeviceRetirement>>>,
     sampled_view: vk::ImageView,
     render_view: vk::ImageView,
     size: Size<i32, BufferCoord>,
@@ -63,7 +66,7 @@ impl std::fmt::Debug for VulkanImage {
         f.debug_struct("VulkanImage")
             .field("resource_id", &self.resource_id)
             .field("image", &self.image)
-            .field("memories", &self.memories)
+            .field("retirement_pending", &self.retirement.is_some())
             .field("sampled_view", &self.sampled_view)
             .field("render_view", &self.render_view)
             .field("size", &self.size)
@@ -83,6 +86,7 @@ impl VulkanImage {
         resource_id: u64,
         image: vk::Image,
         memory: vk::DeviceMemory,
+        allocation: AllocationGuard,
         sampled_view: vk::ImageView,
         render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
@@ -94,11 +98,12 @@ impl VulkanImage {
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
-    ) -> Self {
+    ) -> Result<Self, super::VulkanRendererError> {
         Self::new(
             resource_id,
             image,
             vec![memory],
+            vec![allocation],
             sampled_view,
             render_view,
             size,
@@ -119,6 +124,7 @@ impl VulkanImage {
         resource_id: u64,
         image: vk::Image,
         memories: Vec<vk::DeviceMemory>,
+        allocations: Vec<AllocationGuard>,
         sampled_view: vk::ImageView,
         render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
@@ -130,11 +136,12 @@ impl VulkanImage {
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
-    ) -> Self {
+    ) -> Result<Self, super::VulkanRendererError> {
         Self::new(
             resource_id,
             image,
             memories,
+            allocations,
             sampled_view,
             render_view,
             size,
@@ -155,6 +162,7 @@ impl VulkanImage {
         resource_id: u64,
         image: vk::Image,
         memories: Vec<vk::DeviceMemory>,
+        allocations: Vec<AllocationGuard>,
         sampled_view: vk::ImageView,
         render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
@@ -167,11 +175,28 @@ impl VulkanImage {
         origin: VulkanImageOrigin,
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
-    ) -> Self {
-        Self {
-            resource_id,
+    ) -> Result<Self, super::VulkanRendererError> {
+        let retirement = RetirementNode::new(super::device_handle::DeviceRetirement::Image(RetiredImage {
             image,
+            sampled_view,
+            render_view,
             memories,
+            _allocations: allocations,
+        }));
+        let incarnation = match device.reserve_image_incarnation() {
+            Ok(incarnation) => incarnation,
+            Err(error) => {
+                // The native image already exists. Exhaustion returns its exact
+                // owner to the same cold actor before rejecting construction.
+                device.retire_resource(retirement);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            resource_id,
+            incarnation,
+            image,
+            retirement: Some(retirement),
             sampled_view,
             render_view,
             size,
@@ -185,7 +210,11 @@ impl VulkanImage {
             layout: AtomicI32::new(initial_layout.as_raw()),
             owned_by_foreign: AtomicBool::new(origin.uses_foreign_queue()),
             device,
-        }
+        })
+    }
+
+    pub(crate) fn incarnation(&self) -> std::num::NonZeroU64 {
+        self.incarnation
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -282,15 +311,39 @@ impl VulkanImage {
 
 impl Drop for VulkanImage {
     fn drop(&mut self) {
-        self.device.note_view_retired(self.sampled_view);
-        self.device.destroy_with(|device| unsafe {
+        // Submitted work retains this image until completion. The final Arc
+        // may then drop on Wayland, input, or frame work, so transfer its
+        // preallocated node without any driver call, allocation or wait.
+        if let Some(retirement) = self.retirement.take() {
+            self.device.retire_resource(retirement);
+        }
+    }
+}
+
+/// Contains no device Arc: queued children must not keep their own queue open.
+pub(super) struct RetiredImage {
+    image: vk::Image,
+    pub(super) sampled_view: vk::ImageView,
+    render_view: vk::ImageView,
+    memories: Vec<vk::DeviceMemory>,
+    // Queued memory remains live in the allocation census until its actual
+    // destruction turn (or the existing lost-device quarantine gate).
+    _allocations: Vec<AllocationGuard>,
+}
+
+impl RetiredImage {
+    pub(super) fn destroy(self, device: &ash::Device) {
+        // SAFETY: Only final image drop can enqueue this exact bundle. Every
+        // submitted reader has already relinquished its image Arc, and all
+        // views and memory belong to this logical device.
+        unsafe {
             device.destroy_image_view(self.sampled_view, None);
             device.destroy_image_view(self.render_view, None);
             device.destroy_image(self.image, None);
             for memory in &self.memories {
                 device.free_memory(*memory, None);
             }
-        });
+        }
     }
 }
 

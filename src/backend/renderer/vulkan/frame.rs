@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use ash::vk;
-use indexmap::IndexMap;
 use tracing::{instrument, trace, warn};
 
 use crate::{
@@ -50,28 +49,34 @@ pub(crate) enum VulkanFrameState {
 struct FrameRecording {
     command_buffer: vk::CommandBuffer,
     framebuffer: vk::Framebuffer,
-    effect_framebuffers: Vec<vk::Framebuffer>,
+    storage: super::recording_storage::RecordingStorageLease,
     target: Arc<VulkanImage>,
     encoding: VulkanTargetEncoding,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
     size: Size<i32, Physical>,
-    pending_layouts: IndexMap<u64, (Arc<VulkanImage>, vk::ImageLayout)>,
-    /// Imported images that must return to their external owner after the
-    /// frame's final access. This spans flushed command-buffer segments.
-    foreign_release_images: IndexMap<u64, Arc<VulkanImage>>,
-    /// FOREIGN acquisitions encoded only in the current, unsubmitted command
-    /// buffer. Abort paths restore their CPU-side ownership bookkeeping.
-    unsubmitted_foreign_acquires: IndexMap<u64, Arc<VulkanImage>>,
 }
 
+impl std::ops::Deref for FrameRecording {
+    type Target = super::recording_storage::RecordingStorage;
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+impl std::ops::DerefMut for FrameRecording {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
 impl FrameRecording {
-    fn take_framebuffers(&mut self) -> Vec<vk::Framebuffer> {
-        let mut framebuffers = Vec::with_capacity(1 + self.effect_framebuffers.len());
-        framebuffers.push(self.framebuffer);
-        framebuffers.append(&mut self.effect_framebuffers);
-        framebuffers
+    fn prepare_framebuffers(&mut self) {
+        let framebuffer = self.framebuffer;
+        let storage = &mut *self.storage;
+        storage.submitted_framebuffers.push(framebuffer);
+        storage
+            .submitted_framebuffers
+            .append(&mut storage.effect_framebuffers);
     }
 }
 
@@ -91,6 +96,11 @@ pub struct VulkanFrame<'frame> {
     renderer: &'frame mut VulkanRenderer,
     state: VulkanFrameState,
     recording: Option<FrameRecording>,
+    draw_alpha: f32,
+    outer_rounded_clip: Option<RoundedClip>,
+    owner_sample_replay: Option<OwnerSampleReplay>,
+    resolved_sample_texture: bool,
+    submitted_segment: bool,
 }
 
 impl RendererSuper for VulkanRenderer {
@@ -178,6 +188,7 @@ impl Renderer for VulkanRenderer {
             .pipelines
             .pipelines_for_format(target.encoding.format(target_image.vk_format()))?;
 
+        let storage = self.device.acquire_recording_storage()?;
         let command_buffer = self.device.acquire_command_buffer()?;
         let begin_info =
             vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -209,19 +220,21 @@ impl Renderer for VulkanRenderer {
         let mut frame = VulkanFrame {
             renderer: self,
             state: VulkanFrameState::Recording,
+            submitted_segment: false,
+            draw_alpha: 1.0,
+            outer_rounded_clip: None,
+            owner_sample_replay: None,
+            resolved_sample_texture: false,
             recording: Some(FrameRecording {
                 command_buffer,
                 framebuffer,
-                effect_framebuffers: Vec::new(),
+                storage,
                 target: target_image,
                 encoding: target.encoding,
                 pipelines,
                 transform: dst_transform,
                 output_size,
                 size: transformed_size,
-                pending_layouts: IndexMap::new(),
-                foreign_release_images: IndexMap::new(),
-                unsubmitted_foreign_acquires: IndexMap::new(),
             }),
         };
 
@@ -328,6 +341,11 @@ impl Frame for VulkanFrame<'_> {
     #[instrument(level = "trace", skip(self, at))]
     #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+        if self.owner_sample_replay.is_some() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner replay cannot clear its frozen prefix",
+            ));
+        }
         let (command_buffer, transform, output_size, size, linear_blending) = {
             let recording = self.recording()?;
             (
@@ -339,14 +357,15 @@ impl Frame for VulkanFrame<'_> {
             )
         };
 
-        let clear_regions = Self::transformed_damage_rects(
+        let mut clear_regions = Self::transformed_damage_rects(
             transform,
             output_size,
             size,
             Rectangle::from_size(output_size),
             at,
-        );
-        if clear_regions.is_empty() {
+        )
+        .peekable();
+        if clear_regions.peek().is_none() {
             return Ok(());
         }
 
@@ -362,16 +381,6 @@ impl Frame for VulkanFrame<'_> {
                 },
             })];
 
-        let clear_rects = clear_regions
-            .iter()
-            .map(|rect| {
-                vk::ClearRect::default()
-                    .rect(to_vk_rect(*rect))
-                    .base_array_layer(0)
-                    .layer_count(1)
-            })
-            .collect::<Vec<_>>();
-
         // SAFETY: Command buffer recording is active and clear regions are inside the current render area.
         unsafe {
             self.renderer.device.insert_debug_label(
@@ -379,11 +388,17 @@ impl Frame for VulkanFrame<'_> {
                 c"vulkan.frame.clear",
                 [0.26, 0.73, 0.31, 1.0],
             );
-            self.renderer.device.device_handle().cmd_clear_attachments(
-                command_buffer,
-                &clear_attachments,
-                &clear_rects,
-            );
+            for rect in clear_regions {
+                let clear = vk::ClearRect::default()
+                    .rect(to_vk_rect(rect))
+                    .base_array_layer(0)
+                    .layer_count(1);
+                self.renderer.device.device_handle().cmd_clear_attachments(
+                    command_buffer,
+                    &clear_attachments,
+                    &[clear],
+                );
+            }
         }
 
         Ok(())
@@ -397,6 +412,11 @@ impl Frame for VulkanFrame<'_> {
         damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), Self::Error> {
+        if self.outer_rounded_clip.is_some() && self.owner_sample_replay.is_none() {
+            return Err(VulkanRendererError::NotImplemented(
+                "solid draws require an explicit owner-mask packet",
+            ));
+        }
         if damage.is_empty() {
             return Ok(());
         }
@@ -412,15 +432,28 @@ impl Frame for VulkanFrame<'_> {
             )
         };
 
-        let Some(viewport_rect) = framebuffer_rect(transform, output_size, size, dst) else {
+        let size = self.geometry_frame_size(size);
+        let Some(viewport_rect) = self.draw_viewport_rect(transform, output_size, size, dst) else {
             return Ok(());
         };
 
         let draw_damage = Self::transformed_damage_rects(transform, output_size, size, dst, damage);
-        if draw_damage.is_empty() {
+        let replay = self.owner_sample_replay;
+        let mut draw_damage = draw_damage
+            .filter_map(move |mut rect| {
+                if let Some(replay) = replay {
+                    rect.loc += replay.translation;
+                    rect.intersection(replay.bounds)
+                } else {
+                    Some(rect)
+                }
+            })
+            .peekable();
+        if draw_damage.peek().is_none() {
             return Ok(());
         }
 
+        let color = color * self.draw_alpha;
         let pipeline = if color.is_opaque() {
             pipelines.solid_opaque_pipeline
         } else {
@@ -429,14 +462,26 @@ impl Frame for VulkanFrame<'_> {
 
         // The shader premultiplies by alpha; linearizing the channels first makes that
         // a premultiplied-*linear* value, which is what a linear-light blend expects.
-        let constants = SolidPushConstants {
+        let mut constants = SolidPushConstants {
             color: encode_color_for_target(
                 color,
                 self.recording()?
                     .encoding
                     .blends_in_linear_light(&self.recording()?.target),
             ),
+            owner_radius: -1.0,
+            ..SolidPushConstants::default()
         };
+        if let Some(TransformedAnalyticClip::Rounded(clip)) = self.outer_rounded_clip.map(|clip| {
+            self.shift_analytic_clip(transform_analytic_clip(
+                transform,
+                output_size,
+                AnalyticClip::Rounded(clip),
+            ))
+        }) {
+            constants.owner_rect = analytic_clip_rect_push_constant(clip.rect);
+            constants.owner_radius = clip.radius;
+        }
 
         // SAFETY: Command buffer recording is active and all pipeline/layout handles are valid.
         unsafe {
@@ -454,7 +499,7 @@ impl Frame for VulkanFrame<'_> {
             self.renderer.device.device_handle().cmd_set_viewport(
                 command_buffer,
                 0,
-                &[to_vk_viewport(viewport_rect)],
+                &[self.sample_viewport(viewport_rect)],
             );
 
             self.renderer.device.device_handle().cmd_push_constants(
@@ -465,11 +510,11 @@ impl Frame for VulkanFrame<'_> {
                 push_constants_bytes(&constants),
             );
 
-            for rect in &draw_damage {
+            for rect in draw_damage {
                 self.renderer
                     .device
                     .device_handle()
-                    .cmd_set_scissor(command_buffer, 0, &[to_vk_rect(*rect)]);
+                    .cmd_set_scissor(command_buffer, 0, &[to_vk_rect(rect)]);
                 self.renderer
                     .device
                     .device_handle()
@@ -478,6 +523,38 @@ impl Frame for VulkanFrame<'_> {
         }
 
         Ok(())
+    }
+
+    fn canonical_coverage_lane(&self) -> Option<usize> {
+        VulkanFrame::canonical_coverage_lane(self)
+    }
+
+    fn render_texture_from_to_resolved_sample_lane(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+    ) -> Result<(), Self::Error> {
+        let previous = self.resolved_sample_texture;
+        self.resolved_sample_texture = true;
+        let result = self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            &[],
+            src_transform,
+            alpha,
+            None,
+            TextureRenderEffect::NONE,
+            None,
+            None,
+        );
+        self.resolved_sample_texture = previous;
+        result
     }
 
     #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
@@ -502,6 +579,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             None,
             TextureRenderEffect::NONE,
+            None,
             None,
         )
     }
@@ -530,6 +608,7 @@ impl Frame for VulkanFrame<'_> {
             Some(AnalyticClip::Rounded(rounded_clip)),
             TextureRenderEffect::NONE,
             None,
+            None,
         )
     }
 
@@ -557,6 +636,7 @@ impl Frame for VulkanFrame<'_> {
             Some(AnalyticClip::BottomEdge(bottom_edge_clip)),
             TextureRenderEffect::NONE,
             None,
+            None,
         )
     }
 
@@ -583,6 +663,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             None,
             effect,
+            None,
             None,
         )
     }
@@ -612,6 +693,7 @@ impl Frame for VulkanFrame<'_> {
             Some(AnalyticClip::Rounded(rounded_clip)),
             effect,
             None,
+            None,
         )
     }
 
@@ -632,6 +714,10 @@ impl Frame for VulkanFrame<'_> {
         )
     }
 
+    fn completion_unobservable_on_error(&self) -> bool {
+        self.submitted_segment
+    }
+
     #[instrument(level = "trace", skip(self))]
     #[profiling::function]
     fn finish(mut self) -> Result<SyncPoint, Self::Error> {
@@ -647,8 +733,16 @@ fn wait_on_sync_point(
     if sync.is_reached() {
         return Ok(());
     }
+    if renderer.device.external_wait_already_staged(sync) {
+        return Ok(());
+    }
 
     if let Some(vulkan_fence) = sync.get::<VulkanFence>() {
+        if vulkan_fence.belongs_to(&renderer.device.shared_device()) {
+            // All contexts of this origin submit to one serialized native
+            // queue. A completion exists only after its producer submitted.
+            return Ok(());
+        }
         // Exported render completions are queue dependencies, including when
         // a sibling renderer reads an immutable image copy. Never turn that
         // acquire into a host wait, or silently block after an import error.
@@ -656,9 +750,16 @@ fn wait_on_sync_point(
             let sync_file = sync.export().ok_or(VulkanRendererError::TemporaryFailure(
                 "could not retain exported Vulkan completion",
             ))?;
-            return renderer
-                .device
-                .queue_wait_on_sync_file_with_stage(sync_file, wait_stage_mask);
+            return renderer.device.queue_wait_on_sync_file_with_stage(
+                sync_file,
+                wait_stage_mask,
+                Some(sync),
+            );
+        }
+        if renderer.device.external_wait_storage_is_prepared() {
+            return Err(VulkanRendererError::NotImplemented(
+                "prepared external waits require an exportable foreign fence",
+            ));
         }
         return vulkan_fence.wait_vk().map_err(Into::into);
     }
@@ -667,11 +768,13 @@ fn wait_on_sync_point(
         if let Some(sync_file) = sync.export() {
             match renderer
                 .device
-                .queue_wait_on_sync_file_with_stage(sync_file, wait_stage_mask)
+                .queue_wait_on_sync_file_with_stage(sync_file, wait_stage_mask, Some(sync))
             {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    if err.kind() == VulkanRendererErrorKind::ContextLost {
+                    if renderer.device.external_wait_storage_is_prepared()
+                        || err.kind() == VulkanRendererErrorKind::ContextLost
+                    {
                         return Err(err);
                     }
 
@@ -682,6 +785,12 @@ fn wait_on_sync_point(
                 }
             }
         }
+    }
+
+    if renderer.device.external_wait_storage_is_prepared() {
+        return Err(VulkanRendererError::NotImplemented(
+            "prepared external waits require an exportable native fence",
+        ));
     }
 
     if renderer.device.supports_sync_file_fence_import() {
@@ -716,6 +825,11 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<(), Self::Error> {
+        if self.owner_sample_replay.is_some() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner replay cannot submit a partial recording",
+            ));
+        }
         let resume_context = self.flush_recording_segment()?;
         let resume_target = Self::frame_target_from_context(&resume_context);
         let blit_result = self.renderer.blit(&resume_target, to, src, dst, filter);
@@ -740,6 +854,11 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<(), Self::Error> {
+        if self.owner_sample_replay.is_some() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner replay cannot submit a partial recording",
+            ));
+        }
         let resume_context = self.flush_recording_segment()?;
         let mut resume_target = Self::frame_target_from_context(&resume_context);
         let blit_result = self.renderer.blit(from, &mut resume_target, src, dst, filter);
@@ -757,6 +876,18 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
 }
 
 impl VulkanFrame<'_> {
+    /// Borrow one cold rectangle packet while allowing nested frame drawing.
+    /// Bounds are checked before the callback; backing returns on every error
+    /// and panic without changing draw order or splitting damage into draws.
+    pub fn with_damage_scratch<T>(
+        &mut self,
+        required: usize,
+        draw: impl FnOnce(&mut Self, &mut Vec<Rectangle<i32, Physical>>) -> Result<T, VulkanRendererError>,
+    ) -> Result<T, VulkanRendererError> {
+        let mut scratch = self.renderer.device.acquire_damage_scratch(required)?;
+        draw(self, &mut scratch)
+    }
+
     /// Interpolate the completed accumulator with its saved lower prefix.
     ///
     /// `group_opacity` weights the current attachment; the saved prefix gets
@@ -778,12 +909,14 @@ impl VulkanFrame<'_> {
         if !group_opacity.is_finite() || !(0.0..=1.0).contains(&group_opacity) {
             return Err(VulkanRendererError::TemporaryFailure("invalid group opacity"));
         }
-        let (transform, output_size, frame_size) = {
-            let recording = self.recording()?;
-            (recording.transform, recording.output_size, recording.size)
+        let Some(region) = self
+            .owner_sample_replay
+            .map_or(Some(region), |replay| replay.clip_output_region(region))
+        else {
+            return Ok(());
         };
         // The capture blitted exactly this framebuffer area to the origin.
-        let Some(captured) = framebuffer_rect(transform, output_size, frame_size, region) else {
+        let Some(captured) = self.effect_framebuffer_rect(region)? else {
             return Ok(());
         };
         let prefix_size = prefix.size();
@@ -794,7 +927,9 @@ impl VulkanFrame<'_> {
         }
         let source =
             Rectangle::from_size(Size::<i32, BufferCoord>::from((captured.size.w, captured.size.h)).to_f64());
-        self.render_texture_from_to_internal(
+        let previous = self.resolved_sample_texture;
+        self.resolved_sample_texture = self.owner_sample_replay.is_some();
+        let result = self.render_texture_from_to_internal(
             prefix,
             source,
             region,
@@ -805,197 +940,10 @@ impl VulkanFrame<'_> {
             None,
             TextureRenderEffect::NONE,
             Some(1.0 - group_opacity),
-        )
-    }
-
-    /// Capture a bounded rectangle from the current output prefix and execute
-    /// a Kawase filter graph in this frame's active command buffer.
-    ///
-    /// The main render pass is paused and resumed with `LOAD`; no queue submit,
-    /// host wait, or second renderer authority is introduced. Every image and
-    /// transient framebuffer is retained by the final frame submission.
-    pub fn capture_and_filter_framebuffer(
-        &mut self,
-        backdrop_read_area: Rectangle<i32, Physical>,
-        capture: &VulkanTexture,
-        passes: &[VulkanKawasePass],
-    ) -> Result<(), VulkanRendererError> {
-        let Some(capture_image) = capture.image_resource().cloned() else {
-            return Err(VulkanRendererError::NotImplemented(
-                "framebuffer-effect capture requires an image-backed Vulkan texture",
-            ));
-        };
-        if !capture_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture texture lacks transfer-destination usage",
-            ));
-        }
-
-        let resolved = self.renderer.resolve_kawase_passes(passes)?;
-        let (command_buffer, target, transform, output_size, frame_size, main_render_pass, main_framebuffer) = {
-            let recording = self.recording()?;
-            (
-                recording.command_buffer,
-                recording.target.clone(),
-                recording.transform,
-                recording.output_size,
-                recording.size,
-                recording.pipelines.render_pass,
-                recording.framebuffer,
-            )
-        };
-        let Some(source_area) = framebuffer_rect(transform, output_size, frame_size, backdrop_read_area)
-        else {
-            return Ok(());
-        };
-        let capture_size = capture_image.size();
-        let capture_area: Rectangle<i32, Physical> = Rectangle::from_size(source_area.size);
-        if capture_size.w < source_area.size.w || capture_size.h < source_area.size.h {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture capacity is smaller than transformed read area",
-            ));
-        }
-        if target.vk_format() != capture_image.vk_format() {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture format must match the active target format",
-            ));
-        }
-
-        self.renderer.blit.validate_blit_images(
-            &target,
-            &capture_image,
-            source_area,
-            capture_area,
-            TextureFilter::Linear,
-        )?;
-
-        // SAFETY: The frame owns an active render pass in this command buffer.
-        unsafe {
-            self.renderer.device.insert_debug_label(
-                command_buffer,
-                c"vulkan.frame.framebuffer_effect",
-                [0.67, 0.34, 0.91, 1.0],
-            );
-            self.renderer
-                .device
-                .device_handle()
-                .cmd_end_render_pass(command_buffer);
-        }
-
-        self.transition_image_layout(&target, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
-        self.transition_image_layout(&capture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
-        record_image_blit(
-            self.renderer.device.device_handle(),
-            command_buffer,
-            &target,
-            &capture_image,
-            source_area,
-            capture_area,
-            TextureFilter::Linear,
+            None,
         );
-
-        for pass in &resolved {
-            self.record_kawase_pass(command_buffer, pass)?;
-        }
-
-        self.transition_image_layout(&target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
-        let render_pass_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(main_render_pass)
-            .framebuffer(main_framebuffer)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: frame_size.w.max(1) as u32,
-                    height: frame_size.h.max(1) as u32,
-                },
-            });
-        // SAFETY: Main framebuffer/render pass are live for the frame and use
-        // LOAD, preserving the completed lower scene captured above.
-        unsafe {
-            self.renderer.device.device_handle().cmd_begin_render_pass(
-                command_buffer,
-                &render_pass_begin,
-                vk::SubpassContents::INLINE,
-            );
-        }
-        Ok(())
-    }
-
-    fn record_kawase_pass(
-        &mut self,
-        command_buffer: vk::CommandBuffer,
-        pass: &ResolvedKawasePass,
-    ) -> Result<(), VulkanRendererError> {
-        self.transition_image_layout(&pass.source, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
-        self.transition_image_layout(&pass.destination, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
-
-        let destination_size = pass.destination_extent;
-        let extent = vk::Extent2D {
-            width: destination_size.w.max(1) as u32,
-            height: destination_size.h.max(1) as u32,
-        };
-        let attachments = [pass.destination_view];
-        let framebuffer_info = vk::FramebufferCreateInfo::default()
-            .render_pass(pass.render_pass)
-            .attachments(&attachments)
-            .width(extent.width)
-            .height(extent.height)
-            .layers(1);
-        // SAFETY: Device and render-pass handles are live for this renderer.
-        let framebuffer = unsafe {
-            self.renderer
-                .device
-                .device_handle()
-                .create_framebuffer(&framebuffer_info, None)
-        }?;
-        self.recording_mut()?.effect_framebuffers.push(framebuffer);
-
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
-        let render_pass_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(pass.render_pass)
-            .framebuffer(framebuffer)
-            .render_area(render_area);
-        // SAFETY: All handles are valid, recording is active, and every pass
-        // overwrites its complete destination.
-        unsafe {
-            let device = self.renderer.device.device_handle();
-            device.cmd_begin_render_pass(command_buffer, &render_pass_begin, vk::SubpassContents::INLINE);
-            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pass.pipeline);
-            device.cmd_set_viewport(
-                command_buffer,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            device.cmd_set_scissor(command_buffer, 0, &[render_area]);
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                pass.layout,
-                0,
-                &[pass.descriptor_set],
-                &[],
-            );
-            device.cmd_push_constants(
-                command_buffer,
-                pass.layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                push_constants_bytes(&pass.constants),
-            );
-            device.cmd_draw(command_buffer, 4, 1, 0, 0);
-            device.cmd_end_render_pass(command_buffer);
-        }
-        Ok(())
+        self.resolved_sample_texture = previous;
+        result
     }
 
     fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
@@ -1041,6 +989,7 @@ impl VulkanFrame<'_> {
     ) -> Result<(), VulkanRendererError> {
         let (command_buffer, old_layout) = {
             let recording = self.recording_mut()?;
+            recording.admit_image(image.id())?;
             if image.uses_foreign_queue() {
                 recording
                     .foreign_release_images
@@ -1126,34 +1075,33 @@ impl VulkanFrame<'_> {
         }
 
         let new_layout = vk::ImageLayout::GENERAL;
-        let barriers = recording
-            .foreign_release_images
-            .values()
-            .map(|image| {
-                let old_layout = recording
-                    .pending_layouts
-                    .get(&image.id())
-                    .map(|(_, layout)| *layout)
-                    .unwrap_or_else(|| image.current_layout());
-                let (_, src_access_mask) = stage_access_for_layout(old_layout);
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(old_layout)
-                    .new_layout(new_layout)
-                    .src_queue_family_index(self.renderer.device.queue_family_index())
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                    .image(image.image())
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .src_access_mask(src_access_mask)
-                    .dst_access_mask(vk::AccessFlags::empty())
-            })
-            .collect::<Vec<_>>();
+        let storage = &mut *recording.storage;
+        storage.barriers.clear();
+        let layouts = &storage.pending_layouts;
+        let foreign = &storage.foreign_release_images;
+        storage.barriers.extend(foreign.values().map(|image| {
+            let old_layout = layouts
+                .get(&image.id())
+                .map(|(_, layout)| *layout)
+                .unwrap_or_else(|| image.current_layout());
+            let (_, src_access_mask) = stage_access_for_layout(old_layout);
+            vk::ImageMemoryBarrier::default()
+                .old_layout(old_layout)
+                .new_layout(new_layout)
+                .src_queue_family_index(self.renderer.device.queue_family_index())
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .image(image.image())
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .src_access_mask(src_access_mask)
+                .dst_access_mask(vk::AccessFlags::empty())
+        }));
 
         // SAFETY: Command buffer recording is active after the render pass has ended.
         // All imported images remain alive through submission. The release
@@ -1167,12 +1115,12 @@ impl VulkanFrame<'_> {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &barriers,
+                &storage.barriers,
             );
         }
 
-        for image in recording.foreign_release_images.values() {
-            recording
+        for image in storage.foreign_release_images.values() {
+            storage
                 .pending_layouts
                 .insert(image.id(), (image.clone(), new_layout));
         }
@@ -1182,6 +1130,41 @@ impl VulkanFrame<'_> {
         for (_, image) in recording.unsubmitted_foreign_acquires.drain(..) {
             image.set_foreign_ownership();
         }
+    }
+
+    /// Jointly evaluate an immutable owner mask with a draw's existing clip
+    /// at Vulkan's canonical four sample identities, before resolving coverage.
+    /// This scope records no image, descriptor, or allocation of its own.
+    pub fn with_outer_rounded_clip<T>(
+        &mut self,
+        clip: Option<RoundedClip>,
+        draw: impl FnOnce(&mut Self) -> Result<T, VulkanRendererError>,
+    ) -> Result<T, VulkanRendererError> {
+        let previous = self.outer_rounded_clip;
+        if previous.is_some() && clip.is_some() && previous != clip {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "nested distinct outer clips exceed the declared sample-mask packet",
+            ));
+        }
+        self.outer_rounded_clip = clip.or(previous);
+        let result = draw(self);
+        self.outer_rounded_clip = previous;
+        result
+    }
+
+    /// Apply a group opacity to independent source-over primitives whose
+    /// destination supports are disjoint. Framebuffer effects must retain their
+    /// ordinary prefix-interpolation path; they cannot use this operation.
+    pub fn with_draw_alpha<T>(
+        &mut self,
+        alpha: f32,
+        draw: impl FnOnce(&mut Self) -> Result<T, VulkanRendererError>,
+    ) -> Result<T, VulkanRendererError> {
+        let previous = self.draw_alpha;
+        self.draw_alpha *= alpha;
+        let result = draw(self);
+        self.draw_alpha = previous;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1197,7 +1180,9 @@ impl VulkanFrame<'_> {
         analytic_clip: Option<AnalyticClip>,
         effect: TextureRenderEffect,
         prefix_weight: Option<f32>,
+        material_operation: Option<MaterialTextureOperation>,
     ) -> Result<(), VulkanRendererError> {
+        let alpha = alpha * self.draw_alpha;
         if damage.is_empty() {
             return Ok(());
         }
@@ -1222,17 +1207,47 @@ impl VulkanFrame<'_> {
             )
         };
 
-        let Some(viewport_rect) = framebuffer_rect(transform, output_size, size, dst) else {
+        let size = self.geometry_frame_size(size);
+        let Some(viewport_rect) = self.draw_viewport_rect(transform, output_size, size, dst) else {
             return Ok(());
         };
 
-        let analytic_clip = analytic_clip.map(|clip| transform_analytic_clip(transform, output_size, clip));
+        if prefix_weight.is_some() && self.outer_rounded_clip.is_some() && self.owner_sample_replay.is_none()
+        {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner mask cannot clip a constant-factor prefix resolve",
+            ));
+        }
+        let outer_clip = self
+            .outer_rounded_clip
+            .filter(|_| prefix_weight.is_none())
+            .map(|clip| {
+                self.shift_analytic_clip(transform_analytic_clip(
+                    transform,
+                    output_size,
+                    AnalyticClip::Rounded(clip),
+                ))
+            });
+        let analytic_clip = analytic_clip
+            .map(|clip| self.shift_analytic_clip(transform_analytic_clip(transform, output_size, clip)));
         let has_analytic_clip = analytic_clip
             .map(TransformedAnalyticClip::has_coverage_mask)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || outer_clip.is_some();
 
         let draw_damage = Self::transformed_damage_rects(transform, output_size, size, dst, damage);
-        if draw_damage.is_empty() {
+        let replay = self.owner_sample_replay;
+        let mut draw_damage = draw_damage
+            .filter_map(move |mut rect| {
+                if let Some(replay) = replay {
+                    rect.loc += replay.translation;
+                    rect.intersection(replay.bounds)
+                } else {
+                    Some(rect)
+                }
+            })
+            .peekable();
+        if draw_damage.peek().is_none() {
             return Ok(());
         }
 
@@ -1243,6 +1258,19 @@ impl VulkanFrame<'_> {
             ));
         }
 
+        if let Some(MaterialTextureOperation::Kawase(output)) = material_operation {
+            if output.extent.w <= 0
+                || output.extent.h <= 0
+                || output.extent.w > texture_size.w
+                || output.extent.h > texture_size.h
+                || !output.offset.is_finite()
+                || output.offset < 0.0
+            {
+                return Err(VulkanRendererError::TemporaryFailure(
+                    "invalid fused Kawase source extent",
+                ));
+            }
+        }
         if src.size.w <= 0.0 || src.size.h <= 0.0 {
             return Ok(());
         }
@@ -1257,7 +1285,13 @@ impl VulkanFrame<'_> {
             ));
         }
 
-        let texture_transform = combine_image_transform(src_transform, transform);
+        let texture_transform = if prefix_weight.is_some()
+            || material_operation.is_some_and(MaterialTextureOperation::framebuffer_coordinates)
+        {
+            Transform::Normal
+        } else {
+            combine_image_transform(src_transform, transform)
+        };
         let src_offset = [
             src.loc.x as f32 / texture_size.w as f32,
             src.loc.y as f32 / texture_size.h as f32,
@@ -1276,6 +1310,30 @@ impl VulkanFrame<'_> {
         .with_source_encoding(texture_image.color_encoding(), linear_blending)
         .with_effect(effect);
 
+        if let Some(TransformedAnalyticClip::Rounded(clip)) = outer_clip {
+            push_constants = push_constants.with_outer_rounded_clip(
+                [clip.rect.loc.x as f32, clip.rect.loc.y as f32],
+                [clip.rect.size.w as f32, clip.rect.size.h as f32],
+                clip.radius,
+            );
+        }
+        if let Some(operation) = material_operation {
+            push_constants = match operation {
+                MaterialTextureOperation::Kawase(output) => {
+                    push_constants.with_kawase_output(output, texture_size)
+                }
+                MaterialTextureOperation::FramebufferCopy => push_constants,
+                MaterialTextureOperation::OwnerResolve(extent) => {
+                    push_constants.with_owner_resolve(extent, texture_size)
+                }
+                MaterialTextureOperation::Tint(tint) => {
+                    push_constants.with_material_tone(tint).with_source_encoding(
+                        super::format::ColorEncoding::ElectricalPremultiplied,
+                        linear_blending,
+                    )
+                }
+            };
+        }
         if let Some(clip) = analytic_clip {
             push_constants = match clip {
                 TransformedAnalyticClip::Rounded(clip) => push_constants.with_rounded_clip(
@@ -1303,54 +1361,53 @@ impl VulkanFrame<'_> {
             };
         }
 
-        let sampler = texture_sampler_for_render(
-            src,
-            dst,
-            src_transform,
-            self.renderer.downscale_filter,
-            self.renderer.upscale_filter,
-        );
-        let descriptor_set = self
-            .renderer
-            .descriptors
-            .texture_descriptor_set(texture_image.view(), sampler)?;
+        if self.owner_sample_replay.is_some() {
+            push_constants.rounded_clip_flags |= 1 << 30;
+        }
+        let sampler = if matches!(
+            material_operation,
+            Some(MaterialTextureOperation::OwnerResolve(_))
+        ) || self.resolved_sample_texture
+        {
+            TextureSampler::NEAREST
+        } else if material_operation.is_some() || self.owner_sample_replay.is_some() {
+            TextureSampler::LINEAR
+        } else {
+            texture_sampler_for_render(
+                src,
+                dst,
+                src_transform,
+                self.renderer.downscale_filter,
+                self.renderer.upscale_filter,
+            )
+        };
+        let descriptor_set = self.renderer.descriptors.texture_descriptor_set(
+            texture_image.view(),
+            texture_image.incarnation(),
+            sampler,
+        )?;
 
         let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
-        let has_shader_effect = !effect.is_none();
+        let has_shader_effect = !effect.is_none() || material_operation.is_some();
         let use_opaque_only = prefix_weight.is_none()
             && alpha >= 1.0
             && !texture_has_alpha
             && !has_analytic_clip
             && !has_shader_effect;
 
-        let transformed_opaque =
-            if prefix_weight.is_none() && alpha >= 1.0 && !has_analytic_clip && !has_shader_effect {
-                Self::transformed_damage_rects(transform, output_size, size, dst, opaque_regions)
-            } else {
-                Vec::new()
-            };
-
-        let (opaque_draws, blended_draws) = if use_opaque_only {
-            (draw_damage, Vec::new())
-        } else if !transformed_opaque.is_empty() {
-            let mut opaque = Vec::new();
-            let mut blended = Vec::new();
-
-            for rect in draw_damage {
-                if transformed_opaque
-                    .iter()
-                    .any(|opaque_rect| opaque_rect.contains_rect(rect))
-                {
-                    opaque.push(rect);
-                } else {
-                    blended.push(rect);
-                }
-            }
-
-            (opaque, blended)
-        } else {
-            (Vec::new(), draw_damage)
+        let can_use_opaque =
+            prefix_weight.is_none() && alpha >= 1.0 && !has_analytic_clip && !has_shader_effect;
+        let classify_opaque = |rect: Rectangle<i32, Physical>| {
+            use_opaque_only
+                || (can_use_opaque
+                    && Self::transformed_damage_rects(transform, output_size, size, dst, opaque_regions)
+                        .any(|opaque| opaque.contains_rect(rect)))
         };
+        let mut opaque_draws = draw_damage
+            .clone()
+            .filter(|rect| classify_opaque(*rect))
+            .peekable();
+        let mut blended_draws = draw_damage.filter(|rect| !classify_opaque(*rect)).peekable();
 
         // SAFETY: Command buffer recording is active and all handles belong to this renderer device.
         unsafe {
@@ -1362,10 +1419,10 @@ impl VulkanFrame<'_> {
             self.renderer.device.device_handle().cmd_set_viewport(
                 command_buffer,
                 0,
-                &[to_vk_viewport(viewport_rect)],
+                &[self.sample_viewport(viewport_rect)],
             );
 
-            if !opaque_draws.is_empty() {
+            if opaque_draws.peek().is_some() {
                 self.renderer.device.device_handle().cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -1387,11 +1444,11 @@ impl VulkanFrame<'_> {
                     push_constants_bytes(&push_constants),
                 );
 
-                for rect in &opaque_draws {
+                for rect in opaque_draws {
                     self.renderer.device.device_handle().cmd_set_scissor(
                         command_buffer,
                         0,
-                        &[to_vk_rect(*rect)],
+                        &[to_vk_rect(rect)],
                     );
                     self.renderer
                         .device
@@ -1400,7 +1457,7 @@ impl VulkanFrame<'_> {
                 }
             }
 
-            if !blended_draws.is_empty() {
+            if blended_draws.peek().is_some() {
                 if let Some(weight) = prefix_weight {
                     self.renderer
                         .device
@@ -1432,11 +1489,11 @@ impl VulkanFrame<'_> {
                     push_constants_bytes(&push_constants),
                 );
 
-                for rect in &blended_draws {
+                for rect in blended_draws {
                     self.renderer.device.device_handle().cmd_set_scissor(
                         command_buffer,
                         0,
-                        &[to_vk_rect(*rect)],
+                        &[to_vk_rect(rect)],
                     );
                     self.renderer
                         .device
@@ -1449,33 +1506,30 @@ impl VulkanFrame<'_> {
         Ok(())
     }
 
-    fn transformed_damage_rects(
+    fn transformed_damage_rects<'a>(
         transform: Transform,
         output_size: Size<i32, Physical>,
         target_size: Size<i32, Physical>,
         dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-    ) -> Vec<Rectangle<i32, Physical>> {
+        damage: &'a [Rectangle<i32, Physical>],
+    ) -> impl Iterator<Item = Rectangle<i32, Physical>> + Clone + 'a {
         let dst_bounds = dst;
 
-        damage
-            .iter()
-            .filter_map(|rect| {
-                let absolute = Rectangle::new(
-                    (
-                        dst.loc.x.saturating_add(rect.loc.x),
-                        dst.loc.y.saturating_add(rect.loc.y),
-                    )
-                        .into(),
-                    rect.size,
-                );
+        damage.iter().filter_map(move |rect| {
+            let absolute = Rectangle::new(
+                (
+                    dst.loc.x.saturating_add(rect.loc.x),
+                    dst.loc.y.saturating_add(rect.loc.y),
+                )
+                    .into(),
+                rect.size,
+            );
 
-                absolute
-                    .intersection(dst_bounds)
-                    .and_then(|clipped| framebuffer_rect(transform, output_size, target_size, clipped))
-                    .filter(|region| region.size.w > 0 && region.size.h > 0)
-            })
-            .collect()
+            absolute
+                .intersection(dst_bounds)
+                .and_then(|clipped| framebuffer_rect(transform, output_size, target_size, clipped))
+                .filter(|region| region.size.w > 0 && region.size.h > 0)
+        })
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -1505,6 +1559,7 @@ impl VulkanFrame<'_> {
                 .cmd_end_render_pass(recording.command_buffer);
         }
         self.release_recording_images_to_foreign(&mut recording);
+        recording.prepare_framebuffers();
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
         if let Err(err) = self.renderer.device.shared_device().observe_result(unsafe {
@@ -1513,22 +1568,26 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .end_command_buffer(recording.command_buffer)
         }) {
-            let _ = self
-                .renderer
-                .device
-                .discard_recording_resources(recording.command_buffer, recording.take_framebuffers());
+            let _ = self.renderer.device.discard_recording_resources(
+                recording.command_buffer,
+                &mut recording.storage.submitted_framebuffers,
+            );
             self.renderer.descriptors.abort_recording();
             Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
+            if self.renderer.device.completion_unknown() {
+                self.renderer.device.preserve_failed_recording(recording.storage);
+            }
             return Err(err.into());
         }
 
-        let retained_images = retained_recording_images(&recording);
+        retained_recording_images(&mut recording);
+        let storage = &mut *recording.storage;
         let (submission_id, submission_fence) = match self.renderer.device.submit_with_resources_and_fence(
             recording.command_buffer,
-            recording.take_framebuffers(),
-            retained_images,
+            &mut storage.submitted_framebuffers,
+            &mut storage.retained_images,
         ) {
             Ok(submission) => submission,
             Err(err) => {
@@ -1536,6 +1595,9 @@ impl VulkanFrame<'_> {
                 Self::restore_unsubmitted_foreign_acquires(&mut recording);
                 self.renderer.device.clear_pending_wait_semaphores();
                 self.state = VulkanFrameState::Aborted;
+                if self.renderer.device.completion_unknown() {
+                    self.renderer.device.preserve_failed_recording(recording.storage);
+                }
                 return Err(err);
             }
         };
@@ -1550,7 +1612,7 @@ impl VulkanFrame<'_> {
         recording.unsubmitted_foreign_acquires.clear();
 
         self.state = VulkanFrameState::Finished;
-        Ok(SyncPoint::from(submission_fence))
+        Ok(submission_fence)
     }
 
     fn flush_recording_segment(&mut self) -> Result<FrameResumeContext, VulkanRendererError> {
@@ -1578,6 +1640,7 @@ impl VulkanFrame<'_> {
         // across the standalone blit between segments. This makes every
         // submitted segment independently safe if the blit or resume fails.
         self.release_recording_images_to_foreign(&mut recording);
+        recording.prepare_framebuffers();
 
         // SAFETY: Command buffer recording is valid and render pass has been ended.
         if let Err(err) = self.renderer.device.shared_device().observe_result(unsafe {
@@ -1586,22 +1649,26 @@ impl VulkanFrame<'_> {
                 .device_handle()
                 .end_command_buffer(recording.command_buffer)
         }) {
-            let _ = self
-                .renderer
-                .device
-                .discard_recording_resources(recording.command_buffer, recording.take_framebuffers());
+            let _ = self.renderer.device.discard_recording_resources(
+                recording.command_buffer,
+                &mut recording.storage.submitted_framebuffers,
+            );
             self.renderer.descriptors.abort_recording();
             Self::restore_unsubmitted_foreign_acquires(&mut recording);
             self.renderer.device.clear_pending_wait_semaphores();
             self.state = VulkanFrameState::Aborted;
+            if self.renderer.device.completion_unknown() {
+                self.renderer.device.preserve_failed_recording(recording.storage);
+            }
             return Err(err.into());
         }
 
-        let retained_images = retained_recording_images(&recording);
+        retained_recording_images(&mut recording);
+        let storage = &mut *recording.storage;
         let submission_id = match self.renderer.device.submit_with_resources(
             recording.command_buffer,
-            recording.take_framebuffers(),
-            retained_images,
+            &mut storage.submitted_framebuffers,
+            &mut storage.retained_images,
         ) {
             Ok(submission_id) => submission_id,
             Err(err) => {
@@ -1609,9 +1676,13 @@ impl VulkanFrame<'_> {
                 Self::restore_unsubmitted_foreign_acquires(&mut recording);
                 self.renderer.device.clear_pending_wait_semaphores();
                 self.state = VulkanFrameState::Aborted;
+                if self.renderer.device.completion_unknown() {
+                    self.renderer.device.preserve_failed_recording(recording.storage);
+                }
                 return Err(err);
             }
         };
+        self.submitted_segment = true;
         self.renderer.descriptors.commit_submission(submission_id);
 
         for (_, (image, layout)) in recording.pending_layouts.drain(..) {
@@ -1634,6 +1705,7 @@ impl VulkanFrame<'_> {
     }
 
     fn begin_recording_segment(&mut self, context: FrameResumeContext) -> Result<(), VulkanRendererError> {
+        let storage = self.renderer.device.acquire_recording_storage()?;
         let command_buffer = self.renderer.device.acquire_command_buffer()?;
         let begin_info =
             vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1673,16 +1745,13 @@ impl VulkanFrame<'_> {
         self.recording = Some(FrameRecording {
             command_buffer,
             framebuffer,
-            effect_framebuffers: Vec::new(),
+            storage,
             target: context.target.clone(),
             encoding: context.encoding,
             pipelines: context.pipelines,
             transform: context.transform,
             output_size: context.output_size,
             size: context.size,
-            pending_layouts: IndexMap::new(),
-            foreign_release_images: IndexMap::new(),
-            unsubmitted_foreign_acquires: IndexMap::new(),
         });
         self.state = VulkanFrameState::Recording;
 
@@ -1729,14 +1798,17 @@ impl VulkanFrame<'_> {
         self.renderer.descriptors.abort_recording();
 
         if let Some(mut recording) = self.recording.take() {
-            if let Err(err) = self
-                .renderer
-                .device
-                .discard_recording_resources(recording.command_buffer, recording.take_framebuffers())
-            {
+            recording.prepare_framebuffers();
+            if let Err(err) = self.renderer.device.discard_recording_resources(
+                recording.command_buffer,
+                &mut recording.storage.submitted_framebuffers,
+            ) {
                 warn!(?err, "failed to discard Vulkan frame resources during abort");
             }
             Self::restore_unsubmitted_foreign_acquires(&mut recording);
+            if self.renderer.device.completion_unknown() {
+                self.renderer.device.preserve_failed_recording(recording.storage);
+            }
         }
 
         self.state = VulkanFrameState::Aborted;
@@ -1756,6 +1828,9 @@ fn framebuffer_rect(
         .intersection(Rectangle::from_size(target_size))
 }
 
+include!("frame_material.rs");
+include!("frame_owner.rs");
+
 impl Drop for VulkanFrame<'_> {
     fn drop(&mut self) {
         if self.state != VulkanFrameState::Recording {
@@ -1767,18 +1842,18 @@ impl Drop for VulkanFrame<'_> {
     }
 }
 
-fn retained_recording_images(recording: &FrameRecording) -> Vec<Arc<VulkanImage>> {
-    let mut images = Vec::with_capacity(
-        recording
+fn retained_recording_images(recording: &mut FrameRecording) {
+    let storage = &mut *recording.storage;
+    storage.retained_images.push(recording.target.clone());
+    storage.retained_images.extend(
+        storage
             .pending_layouts
-            .len()
-            .saturating_add(recording.foreign_release_images.len())
-            .saturating_add(1),
+            .values()
+            .filter(|(image, _)| image.id() != recording.target.id())
+            .map(|(image, _)| image.clone()),
     );
-    images.push(recording.target.clone());
-    images.extend(recording.pending_layouts.values().map(|(image, _)| image.clone()));
-    images.extend(recording.foreign_release_images.values().cloned());
-    images
+    // Every foreign image was admitted to pending_layouts at its first access.
+    // Retain each image once rather than doubling both maps' native custody.
 }
 
 fn create_framebuffer(
@@ -2086,10 +2161,10 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 #[cfg(test)]
 mod tests {
     include!("frame/window_group_tests.rs");
+    include!("frame/owner_group_tests.rs");
     use super::{
         combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
         AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,
-        VulkanRendererError,
     };
     use crate::{
         backend::{
@@ -2108,26 +2183,17 @@ mod tests {
     };
 
     fn init_renderer_and_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
 
-        let renderer = match VulkanRenderer::new(&physical_device) {
-            Ok(renderer) => renderer,
-            Err(
-                VulkanRendererError::MissingDeviceExtensions(_)
-                | VulkanRendererError::MissingDeviceFeature(_)
-                | VulkanRendererError::MissingQueueFamily { .. },
-            ) => {
-                return None;
-            }
-            Err(_) => return None,
-        };
+        let renderer = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)?;
 
-        let allocator = VulkanAllocator::new(
-            &physical_device,
-            ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
-        )
-        .ok()?;
+        let allocator = super::super::test_support::available(
+            VulkanAllocator::new(
+                &physical_device,
+                ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
+            ),
+            "frame test allocator",
+        )?;
 
         Some((renderer, allocator))
     }
@@ -2156,21 +2222,33 @@ mod tests {
     }
 
     fn init_renderer_and_effect_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+        let instance = super::super::test_support::available(
+            Instance::new(Version::VERSION_1_3, None),
+            "effect test instance",
+        )?;
         // Avio's Vulkan-allocated external targets are the Venus/virtio path.
         // NVIDIA's proprietary driver loses the consumer device when a DMA-BUF
         // exported by a second VkDevice with TRANSFER_SRC usage is first used;
         // physical NVIDIA outputs use GBM allocation instead. Prefer a device
         // that can exercise the Vulkan-export contract this test owns.
-        let physical_device = PhysicalDevice::enumerate(&instance)
-            .ok()?
-            .find(|device| device.properties().vendor_id != 0x10de)?;
-        let renderer = VulkanRenderer::new(&physical_device).ok()?;
-        let allocator = VulkanAllocator::new(
-            &physical_device,
-            ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST,
-        )
-        .ok()?;
+        let physical_device = super::super::test_support::present(
+            super::super::test_support::available(
+                PhysicalDevice::enumerate(&instance),
+                "effect test devices",
+            )?
+            .find(|device| device.properties().vendor_id != 0x10de),
+            "effect test requires a Vulkan-export-compatible non-NVIDIA device",
+        )?;
+        let renderer = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)?;
+        let allocator = super::super::test_support::available(
+            VulkanAllocator::new(
+                &physical_device,
+                ImageUsageFlags::COLOR_ATTACHMENT
+                    | ImageUsageFlags::TRANSFER_SRC
+                    | ImageUsageFlags::TRANSFER_DST,
+            ),
+            "effect test allocator",
+        )?;
         Some((renderer, allocator))
     }
 
@@ -2215,7 +2293,8 @@ mod tests {
                 target_size,
                 source_bounds,
                 &[Rectangle::from_size(output_size)],
-            );
+            )
+            .collect::<Vec<_>>();
             assert_eq!(clear, vec![Rectangle::from_size(target_size)], "{transform:?}");
         }
     }
@@ -2248,7 +2327,8 @@ mod tests {
                 target_size,
                 dst,
                 &[Rectangle::from_size(dst.size)],
-            );
+            )
+            .collect::<Vec<_>>();
             assert_eq!(damage, vec![expected]);
             let clip = BottomEdgeClip {
                 rect: dst.to_f64(),
@@ -2404,11 +2484,17 @@ mod tests {
 
         let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let dmabuf = match buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut target = renderer
@@ -2498,15 +2584,24 @@ mod tests {
 
         let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_dmabuf = match texture_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture: VulkanTexture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
             Ok(texture) => texture,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let transforms = [
@@ -2523,15 +2618,24 @@ mod tests {
         for transform in transforms {
             let target_buffer = match allocator.create_buffer(96, 64, format.code, &[format.modifier]) {
                 Ok(buffer) => buffer,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
             let target_dmabuf = match target_buffer.export() {
                 Ok(dmabuf) => dmabuf,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
             let mut target = match renderer.bind_dmabuf_target(&target_dmabuf) {
                 Ok(target) => target,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             let target_size = Size::from((target.width() as i32, target.height() as i32));
@@ -2539,7 +2643,10 @@ mod tests {
 
             let mut frame = match renderer.render(&mut target, output_size, transform) {
                 Ok(frame) => frame,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             frame
@@ -2601,15 +2708,24 @@ mod tests {
 
         let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_dmabuf = match texture_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture: VulkanTexture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
             Ok(texture) => texture,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_image = texture
             .image_resource()
@@ -2618,21 +2734,33 @@ mod tests {
 
         let target_buffer = match allocator.create_buffer(96, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let target_dmabuf = match target_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut target = match renderer.bind_dmabuf_target(&target_dmabuf) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         for _ in 0..2 {
             let mut frame = match renderer.render(&mut target, Size::from((96, 64)), Transform::Normal) {
                 Ok(frame) => frame,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             frame
@@ -2717,6 +2845,7 @@ mod tests {
         ]
         .into_iter()
         .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok()) else {
+            super::super::test_support::unavailable("frame offscreen format");
             return;
         };
 
@@ -2726,25 +2855,40 @@ mod tests {
 
         let mut frame_tex = match renderer.create_buffer(format, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_tex = match renderer.create_buffer(format, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut frame_target = match renderer.bind(&mut frame_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_target = match renderer.bind(&mut aux_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut frame = match renderer.render(&mut frame_target, physical_size, Transform::Normal) {
             Ok(frame) => frame,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         frame
@@ -2783,13 +2927,22 @@ mod tests {
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
 
-        let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(mut frame_texture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(capture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(capture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut target) = renderer.bind(&mut frame_texture) else {
+        let Some(mut target) = super::super::test_support::available(
+            renderer.bind(&mut frame_texture),
+            "test allocation or binding",
+        ) else {
             return;
         };
 
@@ -2823,13 +2976,22 @@ mod tests {
         let size = Size::from((16, 16));
         let physical_size = Size::<i32, Physical>::from((16, 16));
         let region = Rectangle::from_size(physical_size);
-        let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(mut frame_texture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(capture) = renderer.create_buffer(Fourcc::Abgr8888, size) else {
+        let Some(capture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Abgr8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut target) = renderer.bind(&mut frame_texture) else {
+        let Some(mut target) = super::super::test_support::available(
+            renderer.bind(&mut frame_texture),
+            "test allocation or binding",
+        ) else {
             return;
         };
 
@@ -2875,19 +3037,28 @@ mod tests {
                     .next()
             })
         else {
+            super::super::test_support::unavailable("framebuffer-effect DMA-BUF format");
             return;
         };
         let size = Size::from((16, 16));
         let physical_size = Size::<i32, Physical>::from((16, 16));
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
-        let Ok(buffer) = allocator.create_buffer(16, 16, format.code, &[format.modifier]) else {
+        let Some(buffer) = super::super::test_support::available(
+            allocator.create_buffer(16, 16, format.code, &[format.modifier]),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut dmabuf) = buffer.export() else {
+        let Some(mut dmabuf) =
+            super::super::test_support::available(buffer.export(), "test allocation or binding")
+        else {
             return;
         };
-        let Ok(capture) = renderer.create_buffer(format.code, size) else {
+        let Some(capture) = super::super::test_support::available(
+            renderer.create_buffer(format.code, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
         let mut target = renderer
@@ -2932,17 +3103,26 @@ mod tests {
             .copied()
             .find(|format| format.code == Fourcc::Argb8888)
         else {
+            super::super::test_support::unavailable("framebuffer-effect DMA-BUF format");
             return;
         };
         let size = Size::from((16, 16));
         let rect = Rectangle::<i32, Physical>::from_size((16, 16).into());
-        let Ok(buffer) = allocator.create_buffer(16, 16, format.code, &[format.modifier]) else {
+        let Some(buffer) = super::super::test_support::available(
+            allocator.create_buffer(16, 16, format.code, &[format.modifier]),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut dmabuf) = buffer.export() else {
+        let Some(mut dmabuf) =
+            super::super::test_support::available(buffer.export(), "test allocation or binding")
+        else {
             return;
         };
-        let Ok(mut source_texture) = renderer.create_buffer(format.code, size) else {
+        let Some(mut source_texture) = super::super::test_support::available(
+            renderer.create_buffer(format.code, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
         let mut source = renderer.bind(&mut source_texture).expect("source target");
@@ -2996,15 +3176,24 @@ mod tests {
 
         let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_dmabuf = match texture_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
             Ok(texture) => texture,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_image = texture
             .image_resource()
@@ -3016,24 +3205,39 @@ mod tests {
         let full_damage = Rectangle::from_size(physical_size);
         let mut frame_tex = match renderer.create_buffer(format.code, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_tex = match renderer.create_buffer(format.code, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut frame_target = match renderer.bind(&mut frame_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_target = match renderer.bind(&mut aux_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut frame = match renderer.render(&mut frame_target, physical_size, Transform::Normal) {
             Ok(frame) => frame,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         frame
             .render_texture_from_to(

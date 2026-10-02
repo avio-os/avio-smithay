@@ -39,6 +39,30 @@
 //! - [`crate::backend::renderer::ExportMem`] performs readback through transfer buffers and returns
 //!   deterministic linear pixel data for supported formats.
 //!
+//! # Explicit Device-Memory Census
+//!
+//! [`VulkanRenderer::diagnostics`] reports successful explicit device-memory
+//! allocation owners by texture, render target, import, scratch, and upload
+//! reason. Bytes are the exact Vulkan allocation size rather than pixel-size
+//! estimates. Each image/chunk owns one guard per actual memory binding;
+//! cache aliases, texture clones, and submitted readers share that guard.
+//! Error cleanup and final memory-owner destruction retire it after memory
+//! teardown. Imported bytes describe Vulkan bindings to externally owned
+//! storage and must not be added again to a producer's physical-buffer count.
+//! Driver-internal memory is outside this explicit-allocation census.
+//!
+//! Use [`VulkanRenderer::allocation_phase_scope`] around initialization,
+//! warmup, frame preparation/recording, or maintenance work on its owner
+//! thread. The phase and allocating thread are included in per-event TRACE
+//! records; retirement also records the retiring thread. Phase scopes are
+//! device-specific, nested, and bound to their entering thread. Their fixed
+//! 64-entry thread-local storage never grows; while an overflow scope is live,
+//! all allocations on that thread are tagged `Unspecified`. Snapshots are
+//! read-only atomic samples: a concurrent allocation/free can straddle their
+//! reads, while a quiescent sample is exact. Device-loss teardown intentionally
+//! skips unsafe Vulkan frees, so owner retirement after loss does not establish
+//! that the driver reclaimed the corresponding physical memory.
+//!
 //! # Format And Modifier Expectations
 //!
 //! - Explicit modifier support is queried from Vulkan (`VK_EXT_image_drm_format_modifier`) and cached.
@@ -127,33 +151,72 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod allocation;
+mod client_import_census;
+pub use client_import_census::VulkanClientImportObserver;
 mod blit;
 mod descriptor;
 mod device;
+pub(crate) mod device_handle;
+mod device_origin;
+mod ordered_queue;
+pub use device_origin::VulkanDeviceOrigin;
+mod prepared_resources;
+mod resource_factory;
+pub use prepared_resources::{
+    PreparedAttachmentFormat, PreparedPipelineBank, PreparedResourceAdoption, PreparedSourceImport,
+};
+pub use resource_factory::VulkanResourceFactory;
 mod dmabuf;
 mod error;
 mod format;
 mod frame;
+mod material_tint;
+pub use material_tint::VulkanMaterialTint;
+#[cfg(feature = "wayland_frontend")]
+mod host_memory;
 mod image;
 mod kawase;
 #[cfg(test)]
 mod kawase_calibration;
+mod offscreen;
 mod pipeline;
 mod readback;
+mod retirement_slot;
+pub use retirement_slot::VulkanRetirementSlot;
+mod retirement;
 mod staging;
+pub use staging::VulkanUploadStorage;
+mod bank_return;
+mod command_storage;
+mod damage_scratch;
+mod external_wait_storage;
+mod fence_return;
+mod recording_foreign;
+mod recording_storage;
+#[cfg(test)]
+pub(crate) mod storage_heap_probe;
+mod submission_storage;
+pub use command_storage::VulkanCommandStorage;
 mod sync;
+pub use submission_storage::VulkanCommandStorageLimits;
 mod target;
 mod texture;
 mod upload;
 
+pub use allocation::{
+    VulkanAllocationObserver, VulkanAllocationPhase, VulkanAllocationPhaseGuard, VulkanAllocationReason,
+    VulkanAllocationSnapshot, VulkanAllocationStats, VulkanImportedBackingSnapshot,
+};
 pub use blit::VulkanBlitChainStep;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
 pub use frame::VulkanFrame;
-pub use kawase::{VulkanKawaseEncoding, VulkanKawasePass};
+pub use kawase::{VulkanKawaseEncoding, VulkanKawaseOutput, VulkanKawasePass};
+pub use offscreen::VulkanOffscreenAllocator;
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
 
-use std::{ffi::CStr, time::Instant};
+use std::{ffi::CStr, sync::Arc, time::Instant};
 
 use crate::backend::{
     allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc, Modifier},
@@ -179,9 +242,9 @@ pub struct VulkanCacheStats {
     pub misses: u64,
     /// Number of entries evicted from the cache.
     pub evictions: u64,
-    /// Number of entries retired because their texture's image view was
-    /// destroyed (the death-edge reclaim; these free capacity without any
-    /// quiescence requirement beyond their own last use).
+    /// Descriptor keys retired when a recycled native view handle is observed
+    /// with a different exact image incarnation. Reuse still waits for each
+    /// set's last native submission and current recording reader.
     pub dead_view_reclaims: u64,
 }
 
@@ -207,7 +270,15 @@ pub struct VulkanSubmissionStats {
 /// Persistent memory-upload arena and batching diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanUploadStats {
-    /// Aggregate bytes mapped across all arena chunks.
+    /// Capacity of the sole owner-sized chunk serving slice and mapped-row uploads.
+    pub owner_capacity_bytes: usize,
+    /// Structural capacity declared by the live source/output owner.
+    pub owner_structural_bytes: usize,
+    /// Bytes above the structural extent required by the largest live generation.
+    pub owner_extent_exception_bytes: usize,
+    /// Successful transitions into a distinct larger-source extent exception.
+    pub owner_extent_exceptions_total: u64,
+    /// Bytes mapped by the sole owner-provisioned arena chunk.
     pub arena_capacity_bytes: usize,
     /// Bytes retained by pending or in-flight upload operations.
     pub arena_in_use_bytes: usize,
@@ -215,7 +286,7 @@ pub struct VulkanUploadStats {
     pub arena_high_water_bytes: usize,
     /// Number of persistent mapped chunks.
     pub arena_chunk_count: usize,
-    /// Number of bounded geometric arena growth operations.
+    /// Frame-path growth count; always zero for owner-provisioned storage.
     pub arena_growth_count: u64,
     /// Number of reservations deferred by the arena byte/chunk bounds.
     pub arena_deferred_count: u64,
@@ -268,6 +339,8 @@ pub struct VulkanSubmissionSnapshot {
 /// Aggregated runtime diagnostics for the Vulkan renderer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanRendererDiagnostics {
+    /// Exact successful explicit device-memory allocation owners by reason and creation phase.
+    pub allocations: VulkanAllocationSnapshot,
     /// dma-buf import/bind cache diagnostics.
     pub dmabuf_cache: VulkanCacheStats,
     /// Texture descriptor cache diagnostics.
@@ -290,16 +363,134 @@ pub struct VulkanRenderer {
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
     device: DeviceState,
-    formats: FormatCapabilities,
+    formats: Arc<FormatCapabilities>,
     dmabuf: DmabufState,
     upload: UploadState,
     readback: ReadbackState,
     blit: BlitState,
-    descriptors: DescriptorState,
-    pipelines: PipelineState,
+    descriptors: std::mem::ManuallyDrop<DescriptorState>,
+    pipelines: std::mem::ManuallyDrop<PipelineState>,
+}
+
+impl Drop for VulkanRenderer {
+    fn drop(&mut self) {
+        // Both states are used by submitted command buffers. Their exact
+        // objects follow the command pool to its proven-completion retiree.
+        // SAFETY: Each field is taken once here and ManuallyDrop suppresses
+        // the subsequent field destructor.
+        let pipelines = unsafe { std::mem::ManuallyDrop::take(&mut self.pipelines) };
+        let descriptors = unsafe { std::mem::ManuallyDrop::take(&mut self.descriptors) };
+        self.device.retain_context_state(pipelines, descriptors);
+    }
 }
 
 impl VulkanRenderer {
+    /// Provision this exact context's source-fence semaphore inventory cold.
+    /// The count covers one selected frame, rather than all native slots.
+    pub fn prepare_external_wait_storage(&mut self, count: usize) -> Result<(), VulkanRendererError> {
+        self.device.prepare_external_wait_storage(count)
+    }
+
+    /// Number of actual cold-created native wait semaphores in this context.
+    pub fn external_wait_storage_capacity(&self) -> usize {
+        self.device.external_wait_storage_capacity()
+    }
+
+    /// Whether the context enabled strict prepared external waits, including
+    /// an admitted empty inventory. Legacy renderer users remain compatible.
+    pub fn external_wait_storage_is_prepared(&self) -> bool {
+        self.device.external_wait_storage_is_prepared()
+    }
+
+    /// Admit every external wait in the selected source batch before imports.
+    /// Pressure preserves the original request and exposes its actual native
+    /// loan-owner edge through `command_capacity_edge`.
+    pub fn begin_external_wait_batch(&mut self, required: usize) -> Result<(), VulkanRendererError> {
+        self.device.begin_external_wait_batch(required)
+    }
+
+    /// Adopt a cold bank of this exact origin after every native submission,
+    /// imported wait, pending upload, and external fence reader has returned.
+    /// A deferred token remains owned by the caller; no creation/wait occurs.
+    pub fn adopt_command_storage(
+        &mut self,
+        prepared: &mut VulkanCommandStorage,
+    ) -> Result<bool, VulkanRendererError> {
+        self.device.adopt_command_storage(prepared)
+    }
+
+    /// Exact all-native/all-logical-reader edge for replacing the whole bank.
+    /// Unlike single-slot admission this does not report one free slot as ready.
+    pub fn command_storage_adoption_edge(
+        &mut self,
+    ) -> Result<crate::backend::renderer::sync::SyncPoint, VulkanRendererError> {
+        self.device.command_storage_adoption_edge()
+    }
+
+    /// Rectangle backing cost per admitted capacity across the actual nested
+    /// damage loans. Include this in owning cold workspace-budget admission.
+    pub fn damage_scratch_bytes_per_rectangle(slots: usize) -> Option<usize> {
+        damage_scratch::DamageScratchBank::bytes_per_rectangle(slots)
+    }
+
+    /// Configure the exact nested rectangle loans on the untagged resource
+    /// owner, before admitting a frame. This does not submit or await GPU work.
+    pub fn prepare_damage_scratch_storage(
+        &mut self,
+        slots: usize,
+        rectangles: usize,
+    ) -> Result<(), VulkanRendererError> {
+        self.device.prepare_damage_scratch_storage(slots, rectangles)
+    }
+
+    /// Actual immutable cold command-reader bound for this context, including
+    /// externally held completion epochs. Use it to admit dependent owner banks.
+    pub fn command_storage_limits(&self) -> VulkanCommandStorageLimits {
+        self.device.command_storage_limits()
+    }
+
+    /// Exact native completion or external reader-return edge for occupied
+    /// cold command storage. A ready native FD never substitutes for readers.
+    pub fn command_capacity_edge(
+        &mut self,
+    ) -> Result<Option<crate::backend::renderer::sync::SyncPoint>, VulkanRendererError> {
+        self.device.command_capacity_edge()
+    }
+
+    /// Fixed import-cache policy capacity used by a cold owner membership bank.
+    pub fn sampled_source_capacity(&self) -> usize {
+        dmabuf::MAX_DMABUF_CACHE_ENTRIES
+    }
+
+    /// Whether this exact context already owns the actual native attachment bank.
+    pub fn attachment_format_is_prepared(&self, format: PreparedAttachmentFormat) -> bool {
+        format
+            .native()
+            .is_ok_and(|native| self.pipelines.prepared_pipelines_for_format(native).is_ok())
+    }
+
+    /// Adopt a cold-created bank for this exact context. No Vulkan calls,
+    /// cache mutex acquisition, native eviction or heap growth occur here.
+    pub fn adopt_prepared_pipeline_bank(
+        &mut self,
+        prepared: &mut PreparedPipelineBank,
+        expected_factory: &VulkanResourceFactory,
+        format: PreparedAttachmentFormat,
+        generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.pipelines
+            .adopt_prepared(prepared, expected_factory, generation, format.native()?)
+    }
+
+    /// Actual foreign-host transfer-source support queried from this physical
+    /// device. The returned alignment is a requirement, not a claimed platform
+    /// constant. Each source still needs seal, extent and memory-type validation.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn host_memory_import_alignment(
+        &self,
+    ) -> Result<usize, crate::backend::renderer::MemoryHostUnavailable> {
+        self.device.host_memory_alignment()
+    }
     /// Returns the required device extensions for this renderer.
     pub fn required_extensions(physical_device: &PhysicalDevice) -> Vec<&'static CStr> {
         DeviceState::required_extensions(physical_device)
@@ -308,7 +499,7 @@ impl VulkanRenderer {
     /// Creates a new Vulkan renderer and initializes device/queue infrastructure. Its queue runs
     /// at the default global priority.
     pub fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
-        Self::create(physical_device, None)
+        Self::from_device_state(DeviceState::with_queue_priority(physical_device, None)?)
     }
 
     /// Creates a new Vulkan renderer whose queue asks the GPU scheduler for `priority`.
@@ -321,31 +512,92 @@ impl VulkanRenderer {
         physical_device: &PhysicalDevice,
         priority: QueueGlobalPriority,
     ) -> Result<Self, VulkanRendererError> {
-        Self::create(physical_device, Some(priority))
+        Self::from_device_state(DeviceState::with_queue_priority(physical_device, Some(priority))?)
     }
 
-    fn create(
-        physical_device: &PhysicalDevice,
-        priority: Option<QueueGlobalPriority>,
-    ) -> Result<Self, VulkanRendererError> {
-        let device = DeviceState::with_queue_priority(physical_device, priority)?;
+    /// Creates an output context without creating another logical device.
+    /// It inherits the grant of the origin's exact native queue.
+    pub fn from_device_origin(origin: &VulkanDeviceOrigin) -> Result<Self, VulkanRendererError> {
+        Self::from_device_state(DeviceState::from_origin(origin)?)
+    }
+
+    /// Retains this context's GPU origin for other output contexts/export allocation.
+    pub fn device_origin(&self) -> VulkanDeviceOrigin {
+        VulkanDeviceOrigin::from_state(&self.device)
+    }
+
+    /// Mint immutable exact-context cold preparation authority before RT work.
+    pub fn resource_factory(&self) -> VulkanResourceFactory {
+        self.dmabuf.resource_factory(
+            self.device_origin(),
+            self.formats.clone(),
+            self.pipelines.creation_authority(),
+        )
+    }
+
+    /// Install a cold-prepared sampled import without native creation or cache
+    /// growth. The caller returns the exact result object to the cold helper
+    /// after adoption so displaced owners and signatures are dropped there.
+    pub fn adopt_prepared_source(
+        &mut self,
+        prepared: &mut PreparedSourceImport,
+        source: &Dmabuf,
+        generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.dmabuf
+            .adopt_prepared(&self.device, prepared, source, generation)
+    }
+
+    /// Install an exact prepared import on the unique cold renderer owner.
+    /// This may wait for the buffer's custody registry and must not run on a
+    /// realtime worker. Cache admission and all identity checks match the warm
+    /// adoption path; displaced readers remain in the prepared return packet.
+    pub fn adopt_prepared_source_cold(
+        &mut self,
+        prepared: &mut PreparedSourceImport,
+        source: &Dmabuf,
+        generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.dmabuf
+            .adopt_prepared_cold(&self.device, prepared, source, generation)
+    }
+
+    fn from_device_state(device: DeviceState) -> Result<Self, VulkanRendererError> {
+        let physical_device = device.physical_device();
+        let _initialization = device
+            .shared_device()
+            .allocation_ledger()
+            .enter_phase(VulkanAllocationPhase::Initialization);
         let descriptors = DescriptorState::new(device.shared_device())?;
         let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout())?;
 
+        let formats = Arc::new(FormatCapabilities::new(physical_device)?);
+        let readback = ReadbackState::new(device.shared_device().offscreen_ids());
+        let context_id = ContextId::new();
+        let dmabuf = DmabufState::new(context_id.erased());
         Ok(Self {
-            context_id: ContextId::new(),
+            context_id,
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
             device,
-            formats: FormatCapabilities::new(physical_device)?,
-            dmabuf: DmabufState::default(),
+            formats,
+            dmabuf,
             upload: UploadState::default(),
-            readback: ReadbackState::default(),
+            readback,
             blit: BlitState,
-            descriptors,
-            pipelines,
+            descriptors: std::mem::ManuallyDrop::new(descriptors),
+            pipelines: std::mem::ManuallyDrop::new(pipelines),
         })
+    }
+
+    /// Creates context-local cold command storage with explicit CPU bounds on
+    /// the same native queue/device origin. Call during cold preparation only.
+    pub fn from_device_origin_with_command_storage_limits(
+        origin: &VulkanDeviceOrigin,
+        limits: VulkanCommandStorageLimits,
+    ) -> Result<Self, VulkanRendererError> {
+        Self::from_device_state(DeviceState::from_origin_with_limits(origin, limits)?)
     }
 
     /// Sets runtime debug flags.
@@ -499,6 +751,16 @@ impl VulkanRenderer {
         self.dmabuf.import_texture(&self.device, &self.formats, dmabuf)
     }
 
+    /// Whether this renderer context already owns a live sampled image/view
+    /// for the exact dma-buf backing and its immutable format/extent.
+    ///
+    /// This observation creates no native object, changes no cache recency or
+    /// pin, and performs no driver operation. A source descriptor, another
+    /// context's import, or stale weak metadata alone never establishes warmth.
+    pub fn sampled_dmabuf_is_prepared(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.sampled_prepared(dmabuf)
+    }
+
     /// Bind a dma-buf for render-target usage.
     pub fn bind_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTarget, VulkanRendererError> {
         self.dmabuf
@@ -525,6 +787,33 @@ impl VulkanRenderer {
         let mut target = self.bind_dmabuf_target(dmabuf)?;
         target.encoding = target::VulkanTargetEncoding::PreserveStorage;
         Ok(target)
+    }
+
+    /// Whether every advertised framebuffer-effect/capture modifier for this
+    /// format supports combined sampled and target usage. Mixed sets use copy capture.
+    pub fn framebuffer_sampling_supported(&self, format: crate::backend::allocator::Fourcc) -> bool {
+        self.formats.framebuffer_sampling_supported(format)
+    }
+
+    /// Prepare the exact compositing attachment bank for a negotiated format.
+    ///
+    /// Call on the renderer owner's cold resource turn before display or
+    /// sealed-capture rendering. This records no commands and prepares only
+    /// this format's actual linear-blend attachment view, not other formats.
+    pub fn prepare_framebuffer_format(
+        &mut self,
+        format: crate::backend::allocator::Fourcc,
+    ) -> Result<(), VulkanRendererError> {
+        let storage = crate::backend::allocator::vulkan::format::get_vk_format(format)
+            .ok_or(VulkanRendererError::UnsupportedMemoryFormat(format))?;
+        self.pipelines
+            .pipelines_for_format(format::render_view_format(storage))
+            .map(|_| ())
+    }
+
+    /// Clone renderer-origin image allocation for an off-frame provisioning helper.
+    pub fn offscreen_allocator(&self) -> VulkanOffscreenAllocator {
+        self.readback.offscreen_allocator(&self.device)
     }
 
     /// Bind a dma-buf as the active accumulator for inline framebuffer
@@ -574,6 +863,63 @@ impl VulkanRenderer {
     /// is unchanged.
     pub fn evict_idle_sampled_dmabuf_imports(&mut self, used_before: Instant, max: usize) -> usize {
         self.dmabuf.evict_idle_sampled(used_before, max)
+    }
+
+    /// Import a pool/member buffer and pin its renderer cache entry until one
+    /// matching [`Self::unpin_dmabuf_import`]. Pins survive usage upgrades and
+    /// exempt metadata from capacity, idle and explicit sampled retirement.
+    /// The caller owns allocation and membership; a texture handle alone is
+    /// submitted-reader custody and does not imply a membership pin.
+    pub fn pin_dmabuf_import(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTexture, VulkanRendererError> {
+        self.dmabuf.pin_texture(&self.device, &self.formats, dmabuf)
+    }
+
+    /// End one exact membership pin. Returns false for an absent/unpinned entry.
+    pub fn unpin_dmabuf_import(&mut self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.unpin(dmabuf)
+    }
+
+    /// End one membership pin by exact weak source identity without extending
+    /// the DMA-BUF lifetime. Used by owners handling source destruction.
+    pub fn unpin_weak_dmabuf_import(&mut self, key: &crate::backend::allocator::dmabuf::WeakDmabuf) -> bool {
+        self.dmabuf.unpin_weak(key)
+    }
+
+    /// Retire exactly the unpinned sampled-only imports named by their source
+    /// identities. No clock or implicit capacity threshold chooses these.
+    /// Targets retain their authored contents; submitted readers retain the
+    /// old imported image independently through their GPU completion.
+    pub fn retire_sampled_dmabuf_imports(
+        &mut self,
+        buffers: &[crate::backend::allocator::dmabuf::WeakDmabuf],
+    ) -> usize {
+        self.dmabuf.retire_sampled(buffers)
+    }
+
+    /// Prepare exact client source identities off-frame for attribution. Pool,
+    /// owned-copy and target imports never count as client first imports.
+    pub fn prepare_frame_client_sources(
+        &mut self,
+        sources: &[crate::backend::allocator::dmabuf::WeakDmabuf],
+    ) {
+        self.dmabuf.prepare_frame_client_sources(sources);
+    }
+
+    /// Bracket only actual frame work, including unsuccessful frame attempts.
+    /// Control/preparation turns leave this false.
+    pub fn set_frame_client_import_scope(&mut self, active: bool) {
+        self.dmabuf.set_frame_client_scope(active);
+    }
+
+    /// Successful first client image creations made inside frame work. Cache
+    /// hits, usage upgrades, failed imports and off-frame creations are omitted.
+    pub fn client_first_imports_on_frame(&self) -> u64 {
+        self.dmabuf.client_first_imports_on_frame()
+    }
+
+    /// Weak, numeric-only access to the exact first-client-import owner.
+    pub fn client_import_observer(&self) -> VulkanClientImportObserver {
+        self.dmabuf.client_import_observer()
     }
 
     /// Take (and drop) any wait semaphores staged via [`Renderer::wait`] that
@@ -628,12 +974,72 @@ impl VulkanRenderer {
         VulkanRendererError::not_implemented(operation)
     }
 
+    /// Configure one owner-sized staging chunk, or retire it with zero bytes.
+    ///
+    /// Call only on an upload-owner lifecycle turn, outside render frame work.
+    /// Successful reservations in this mode never allocate or grow storage.
+    /// `Ok(false)` means a queued upload, GPU submission, or detached writer
+    /// still owns the current storage. Its completion/return must trigger a
+    /// later lifecycle retry; this method never waits or cancels live work.
+    /// Allocation failure preserves the previous mode and storage.
+    /// All memory imports and updates, including slices, require this one
+    /// chunk. A new renderer starts with zero upload storage; no upload path
+    /// provisions storage or falls back to a separate arena. The owner must
+    /// account for every live SHM, cursor, and raster source before frame work.
+    pub fn configure_memory_upload_capacity(&mut self, capacity: usize) -> Result<bool, VulkanRendererError> {
+        self.device.configure_memory_upload_capacity(capacity)
+    }
+
+    /// Provision the maximum of a structural extent and a real admitted
+    /// generation. Larger-source exceptions are explicit in upload diagnostics
+    /// and TRACE; the reserve path never changes the configured extent.
+    pub fn configure_memory_upload_capacity_for_extent(
+        &mut self,
+        structural_bytes: usize,
+        generation_bytes: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        self.device
+            .configure_memory_upload_capacity_for_extent(structural_bytes, generation_bytes)
+    }
+
+    /// Exact owner metadata/capacity comparison; performs no GPU work.
+    pub fn memory_upload_storage_matches(&self, structural: usize, generation: usize) -> bool {
+        self.device.memory_upload_storage_matches(structural, generation)
+    }
+    /// Adopt an exact helper result after prior reservations/readers retire.
+    /// No mapping, native allocation, destruction or wait occurs in adoption.
+    pub fn adopt_memory_upload_storage(
+        &mut self,
+        storage: &mut VulkanUploadStorage,
+        structural: usize,
+        generation: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        self.device
+            .adopt_memory_upload_storage(storage, structural, generation)
+    }
+
+    /// Tags allocations on this thread for this renderer's device until the
+    /// returned guard is dropped. The guard holds no renderer borrow and must
+    /// stay on this thread. This thread has 64 fixed scope slots. While any
+    /// overflow guard is live, all allocations on this thread conservatively
+    /// use `Unspecified`; existing device phases return after overflow retires.
+    pub fn allocation_phase_scope(&self, phase: VulkanAllocationPhase) -> VulkanAllocationPhaseGuard {
+        self.device.shared_device().allocation_ledger().enter_phase(phase)
+    }
+
     /// Returns live diagnostics for cache behavior and command submission timing.
     pub fn diagnostics(&self) -> VulkanRendererDiagnostics {
         let submissions: DeviceDiagnostics = self.device.diagnostics();
         let arena = self.device.upload_arena_stats();
+        let (
+            owner_capacity_bytes,
+            owner_structural_bytes,
+            owner_extent_exception_bytes,
+            owner_extent_exceptions_total,
+        ) = self.device.owner_upload_extent_stats();
         let (pending_operations, pending_bytes) = self.device.pending_upload_stats();
         VulkanRendererDiagnostics {
+            allocations: self.device.shared_device().allocation_ledger().snapshot(),
             dmabuf_cache: self.dmabuf.cache_stats(),
             descriptor_cache: self.descriptors.cache_stats(),
             descriptors: self.descriptors.arena_stats(),
@@ -650,6 +1056,10 @@ impl VulkanRenderer {
                 max_completion_ns: submissions.max_completion_ns,
             },
             uploads: VulkanUploadStats {
+                owner_capacity_bytes,
+                owner_structural_bytes,
+                owner_extent_exception_bytes,
+                owner_extent_exceptions_total,
                 arena_capacity_bytes: arena.capacity_bytes,
                 arena_in_use_bytes: arena.in_use_bytes,
                 arena_high_water_bytes: arena.high_water_bytes,
@@ -675,6 +1085,9 @@ fn avg_nanos(total_ns: u64, count: u64) -> u64 {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use ash::vk;
 
@@ -691,7 +1104,7 @@ mod tests {
         utils::{Physical, Rectangle, Size, Transform},
     };
 
-    use super::{VulkanRenderer, VulkanRendererError};
+    use super::VulkanRenderer;
 
     /// Whether this thread's effective capability set holds `CAP_SYS_NICE` (bit 23).
     fn has_cap_sys_nice() -> bool {
@@ -715,6 +1128,9 @@ mod tests {
         )
         .expect("allocator");
         let format = renderer.mem_formats().next().expect("memory formats");
+        assert!(renderer
+            .configure_memory_upload_capacity_for_extent(0, 16 * 16 * 4)
+            .expect("cold texture upload capacity"));
         let texture = renderer
             .import_memory(&[255u8; 16 * 16 * 4], format, Size::from((16, 16)), false)
             .expect("upload");
@@ -791,6 +1207,12 @@ mod tests {
                 "the fallback device is created without the request"
             );
         }
+        let origin = renderer.device_origin();
+        let mut second_context = VulkanRenderer::from_device_origin(&origin)
+            .expect("another output context on the same native queue");
+        assert_eq!(second_context.queue_priority(), grant);
+        assert_eq!(second_context.queue_family_index(), renderer.queue_family_index());
+        render_once(&mut second_context, &physical_device);
         render_once(&mut renderer, &physical_device);
 
         let default = VulkanRenderer::new(&physical_device).unwrap();
@@ -803,30 +1225,14 @@ mod tests {
 
     #[test]
     fn renderer_create_drop_loop() {
-        let instance = match Instance::new(Version::VERSION_1_3, None) {
-            Ok(instance) => instance,
-            Err(_) => return,
+        let Some(physical_device) = crate::backend::renderer::vulkan::test_support::physical_device() else {
+            return;
         };
-
-        let physical_device = match PhysicalDevice::enumerate(&instance) {
-            Ok(mut iter) => match iter.next() {
-                Some(phd) => phd,
-                None => return,
-            },
-            Err(_) => return,
+        let Some(renderer) = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)
+        else {
+            return;
         };
-
-        match VulkanRenderer::new(&physical_device) {
-            Ok(renderer) => drop(renderer),
-            Err(
-                VulkanRendererError::MissingDeviceExtensions(_)
-                | VulkanRendererError::MissingDeviceFeature(_)
-                | VulkanRendererError::MissingQueueFamily { .. },
-            ) => {
-                return;
-            }
-            Err(err) => panic!("unexpected initialization failure for Vulkan renderer: {err}"),
-        }
+        drop(renderer);
 
         for _ in 0..32 {
             let renderer = VulkanRenderer::new(&physical_device)

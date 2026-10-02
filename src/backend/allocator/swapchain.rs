@@ -14,6 +14,7 @@ use crate::utils::user_data::UserDataMap;
 
 use super::dmabuf::{AsDmabuf, Dmabuf};
 
+/// Maximum number of cached or acquired swapchain slots.
 pub const SLOT_CAP: usize = 4;
 
 /// Swapchain handling a fixed set of re-usable buffers e.g. for scan-out.
@@ -55,6 +56,25 @@ pub struct Swapchain<A: Allocator> {
     slots: [Arc<InternalSlot<A::Buffer>>; SLOT_CAP],
 }
 
+/// Cold-created empty slot controls for a dimension change. Adoption swaps
+/// the old controls into this packet; its owning actor disposes them cold.
+#[derive(Debug)]
+pub struct PreparedSwapchainResize<B: Buffer> {
+    width: u32,
+    height: u32,
+    slots: [Arc<InternalSlot<B>>; SLOT_CAP],
+}
+impl<B: Buffer> PreparedSwapchainResize<B> {
+    /// Build all empty controls outside realtime/frame/input threads.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            slots: Default::default(),
+        }
+    }
+}
+
 impl<A: Allocator> fmt::Debug for Swapchain<A> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("Swapchain")
@@ -73,6 +93,43 @@ impl<A: Allocator> fmt::Debug for Swapchain<A> {
 #[derive(Debug)]
 pub struct Slot<B: Buffer>(Arc<InternalSlot<B>>);
 
+/// Buffer and associated framebuffer/import owners detached at a proven
+/// completion edge. Move this value to a non-realtime disposal owner before
+/// dropping it; extraction itself performs no allocation or driver call.
+#[derive(Debug)]
+pub struct RetiredSlot<B: Buffer> {
+    buffer: B,
+    userdata: UserDataMap,
+}
+
+/// Displaced vacant controls retained by a cold composition preparation.
+/// Adoption fills this inline owner without releasing any control on the
+/// rendering thread. Drop it on the preparation/disposal owner.
+#[derive(Debug)]
+pub struct RetiredSwapchainControls<B: Buffer> {
+    slots: [Option<Arc<InternalSlot<B>>>; SLOT_CAP],
+}
+
+impl<B: Buffer> Default for RetiredSwapchainControls<B> {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl<B: Buffer> RetiredSlot<B> {
+    /// Exported buffer metadata retained through off-thread disposal.
+    pub fn userdata(&self) -> &UserDataMap {
+        &self.userdata
+    }
+
+    /// The exact retired allocation.
+    pub fn buffer(&self) -> &B {
+        &self.buffer
+    }
+}
+
 #[derive(Debug)]
 struct InternalSlot<B: Buffer> {
     buffer: Option<B>,
@@ -82,6 +139,17 @@ struct InternalSlot<B: Buffer> {
 }
 
 impl<B: Buffer> Slot<B> {
+    /// Wrap an owner-prepared buffer, preserving resources inserted in its
+    /// userdata for later [`Swapchain::adopt`]. No allocator is called.
+    pub fn new(buffer: B) -> Self {
+        Self(Arc::new(InternalSlot {
+            buffer: Some(buffer),
+            acquired: AtomicBool::new(true),
+            age: AtomicU8::new(0),
+            userdata: UserDataMap::new(),
+        }))
+    }
+
     /// Retrieve userdata for this slot.
     pub fn userdata(&self) -> &UserDataMap {
         &self.0.userdata
@@ -118,10 +186,40 @@ impl<B: Buffer + AsDmabuf> AsDmabuf for Slot<B> {
         let maybe_dmabuf = self.userdata().get::<Dmabuf>();
         if maybe_dmabuf.is_none() {
             let dmabuf = (**self).export()?;
-            self.userdata().insert_if_missing(|| dmabuf);
+            self.userdata().insert_if_missing_threadsafe(|| dmabuf);
         }
 
         Ok(self.userdata().get::<Dmabuf>().cloned().unwrap())
+    }
+}
+
+/// Why owner-prepared slots could not be adopted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionFailure {
+    /// There are fewer vacant slots than supplied buffers.
+    NoVacancies,
+    /// A supplied slot still belongs to another swapchain or frame owner.
+    AlreadyOwned,
+    /// A buffer does not match this swapchain's extent.
+    WrongSize,
+    /// A buffer has an unsupported format or modifier.
+    WrongFormat,
+}
+
+/// Slots rejected atomically by [`Swapchain::adopt`].
+pub struct RejectedSlots<B: Buffer> {
+    /// The validation failure.
+    pub reason: AdoptionFailure,
+    /// The unchanged owner-prepared slots, including their userdata.
+    pub slots: Vec<Slot<B>>,
+}
+
+impl<B: Buffer> fmt::Debug for RejectedSlots<B> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("RejectedSlots")
+            .field("reason", &self.reason)
+            .field("slot_count", &self.slots.len())
+            .finish()
     }
 }
 
@@ -193,6 +291,54 @@ where
         Ok(None)
     }
 
+    /// Acquire only an owner-prepared buffer. Vacant slots stay vacant:
+    /// neither an allocator nor a framebuffer exporter is called here.
+    pub fn acquire_existing(&mut self) -> Option<Slot<A::Buffer>> {
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.buffer.is_some() && !slot.acquired.swap(true, Ordering::SeqCst))
+            .map(|slot| Slot(slot.clone()))
+    }
+
+    /// Number of actual allocations retained by the reusable pool.
+    pub fn allocated_slots(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.buffer.is_some()).count()
+    }
+
+    /// Extract unreferenced allocations into a fixed-size disposal batch.
+    /// In-flight frame owners keep their buffers and framebuffer userdata.
+    /// Empty slot containers are reused, so the completion callback allocates
+    /// no replacement Arcs and makes no framebuffer/GEM destruction call.
+    pub fn take_unreferenced(&mut self) -> [Option<RetiredSlot<A::Buffer>>; SLOT_CAP] {
+        std::array::from_fn(|index| {
+            let slot = &mut self.slots[index];
+            if slot.acquired.load(Ordering::SeqCst) {
+                return None;
+            }
+            let slot = Arc::get_mut(slot)?;
+            let buffer = slot.buffer.take()?;
+            slot.age.store(0, Ordering::SeqCst);
+            Some(RetiredSlot {
+                buffer,
+                userdata: std::mem::take(&mut slot.userdata),
+            })
+        })
+    }
+
+    /// Remove a held buffer from the reusable pool without releasing it.
+    ///
+    /// Owners may use this to reserve an immutable configuration target. Its
+    /// existing readers remain alive, while all four ordinary slots remain
+    /// available for composition. Returns whether this pool owned the buffer.
+    pub fn detach(&mut self, slot: &Slot<A::Buffer>) -> bool {
+        if let Some(entry) = self.slots.iter_mut().find(|entry| Arc::ptr_eq(entry, &slot.0)) {
+            *entry = Default::default();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mark a given buffer as submitted.
     ///
     /// This might effect internal data (e.g. buffer age) and may only be called,
@@ -220,9 +366,11 @@ where
                             Some(0)
                         }
                     });
-                // If the age overflows the slot was not used for a long time. Lets clear it
+                // Age zero forces a full repaint when this admitted buffer is
+                // reused. Keep its exact backing and live readers: idle pool
+                // retirement, rather than submission, owns releasing it.
                 if res.is_err() {
-                    *other_slot = Default::default();
+                    other_slot.age.store(0, Ordering::SeqCst);
                 }
             }
         }
@@ -239,6 +387,108 @@ where
         self.width = width;
         self.height = height;
         self.slots = Default::default();
+    }
+
+    /// Apply a cold-created dimension successor without creating or dropping
+    /// slot controls. Existing acquired/current readers retain their Arcs.
+    pub fn adopt_prepared_resize(&mut self, prepared: &mut PreparedSwapchainResize<A::Buffer>) {
+        if (self.width, self.height) == (prepared.width, prepared.height) {
+            return;
+        }
+        std::mem::swap(&mut self.width, &mut prepared.width);
+        std::mem::swap(&mut self.height, &mut prepared.height);
+        std::mem::swap(&mut self.slots, &mut prepared.slots);
+    }
+
+    /// Swap a cold-created modifier successor and empty controls. Existing
+    /// readers keep their exact slot; displaced metadata returns in the packet.
+    pub fn adopt_prepared_modifiers(
+        &mut self,
+        prepared: &mut PreparedSwapchainResize<A::Buffer>,
+        modifiers: &mut Vec<Modifier>,
+    ) {
+        if self.modifiers == *modifiers {
+            self.adopt_prepared_resize(prepared);
+            return;
+        }
+        std::mem::swap(&mut self.modifiers, modifiers);
+        std::mem::swap(&mut self.width, &mut prepared.width);
+        std::mem::swap(&mut self.height, &mut prepared.height);
+        std::mem::swap(&mut self.slots, &mut prepared.slots);
+    }
+
+    /// Retire cached slots with no outstanding acquisition or frame owner.
+    ///
+    /// Call this at an explicit lifecycle edge. Acquired slots remain valid,
+    /// together with their framebuffer userdata, until their owners drop them.
+    /// Returns the number of allocated buffers retired.
+    pub fn retire_unreferenced(&mut self) -> usize {
+        let mut retired = 0;
+        for slot in &mut self.slots {
+            if slot.buffer.is_some() && !slot.acquired.load(Ordering::SeqCst) && Arc::strong_count(slot) == 1
+            {
+                *slot = Default::default();
+                retired += 1;
+            }
+        }
+        retired
+    }
+
+    /// Adopt buffers prepared by the owner, without allocating or exporting.
+    ///
+    /// Each supplied slot may carry framebuffer userdata prepared off the
+    /// rendering thread. Only vacant slots are populated. Validation is atomic:
+    /// on rejection the existing swapchain and all supplied slots are returned
+    /// unchanged. Imported buffers start at age zero for a full repaint.
+    pub fn adopt(&mut self, slots: Vec<Slot<A::Buffer>>) -> Result<(), RejectedSlots<A::Buffer>> {
+        let mut slots = slots;
+        let mut displaced = RetiredSwapchainControls::default();
+        self.adopt_retained(&mut slots, &mut displaced)
+            .map_err(|reason| RejectedSlots { reason, slots })
+    }
+
+    /// Adopt prepared buffers while retaining all displaced controls and the
+    /// supplied vector backing for cold disposal. Rejection changes neither
+    /// the swapchain nor the preparation. A packet may be adopted only once.
+    pub fn adopt_retained(
+        &mut self,
+        slots: &mut Vec<Slot<A::Buffer>>,
+        displaced: &mut RetiredSwapchainControls<A::Buffer>,
+    ) -> Result<(), AdoptionFailure> {
+        let vacancies = self.slots.iter().filter(|slot| slot.buffer.is_none()).count();
+        let reason = if displaced.slots.iter().any(Option::is_some) || slots.len() > vacancies {
+            Some(AdoptionFailure::NoVacancies)
+        } else if slots.iter().any(|slot| Arc::strong_count(&slot.0) != 1) {
+            Some(AdoptionFailure::AlreadyOwned)
+        } else if slots
+            .iter()
+            .any(|slot| slot.size().w != self.width as i32 || slot.size().h != self.height as i32)
+        {
+            Some(AdoptionFailure::WrongSize)
+        } else if slots.iter().any(|slot| {
+            slot.format().code != self.fourcc
+                || (!self.modifiers.is_empty() && !self.modifiers.contains(&slot.format().modifier))
+        }) {
+            Some(AdoptionFailure::WrongFormat)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(reason);
+        }
+        for ((destination, retired), slot) in self
+            .slots
+            .iter_mut()
+            .filter(|slot| slot.buffer.is_none())
+            .zip(displaced.slots.iter_mut())
+            .zip(slots.drain(..))
+        {
+            *retired = Some(std::mem::replace(destination, slot.0.clone()));
+            destination.age.store(0, Ordering::SeqCst);
+            // Dropping the unique Slot makes the adopted buffer acquirable.
+            drop(slot);
+        }
+        Ok(())
     }
 
     /// Remove all internally cached buffers.
@@ -261,6 +511,11 @@ where
         }
     }
 
+    /// Dimensions required by newly allocated or adopted buffers.
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// Get set format
     pub fn format(&self) -> Fourcc {
         self.fourcc
@@ -271,3 +526,7 @@ where
         &self.modifiers
     }
 }
+
+#[cfg(test)]
+#[path = "swapchain_tests.rs"]
+mod tests;

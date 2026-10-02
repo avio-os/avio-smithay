@@ -12,8 +12,7 @@ use crate::{
 use super::{
     device::DeviceState,
     image::{
-        acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
-        restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
+        commit_foreign_releases, restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
     },
     VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
@@ -51,7 +50,7 @@ impl VulkanBlitChainStep {
 pub(crate) struct BlitState;
 
 #[derive(Debug)]
-struct ResolvedBlitChainStep {
+pub(super) struct ResolvedBlitChainStep {
     source: Arc<VulkanImage>,
     destination: Arc<VulkanImage>,
     source_rect: Rectangle<i32, Physical>,
@@ -77,6 +76,25 @@ impl BlitState {
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
+    ) -> Result<SyncPoint, VulkanRendererError> {
+        let mut storage = device.acquire_recording_storage()?;
+        let result = self.blit_images_in_storage(device, from, to, src, dst, filter, &mut storage);
+        if device.completion_unknown() {
+            device.preserve_failed_recording(storage);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blit_images_in_storage(
+        &mut self,
+        device: &mut DeviceState,
+        from: Arc<VulkanImage>,
+        to: Arc<VulkanImage>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+        storage: &mut super::recording_storage::RecordingStorage,
     ) -> Result<SyncPoint, VulkanRendererError> {
         trace!(?src, ?dst, ?filter, "recording vulkan blit");
         self.validate_blit_images(&from, &to, src, dst, filter)?;
@@ -105,7 +123,7 @@ impl BlitState {
             return Err(err.into());
         }
         device.insert_debug_label(command_buffer, c"vulkan.blit", [0.92, 0.74, 0.13, 1.0]);
-        let mut foreign_images = acquire_images_from_foreign(
+        storage.acquire_foreign_images(
             vk_device,
             command_buffer,
             device.queue_family_index(),
@@ -143,43 +161,39 @@ impl BlitState {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             restore_to_layout,
         );
-        if let Some((_, layout)) = foreign_images.get_mut(&from.id()) {
+        if let Some((_, layout)) = storage.pending_layouts.get_mut(&from.id()) {
             *layout = from_layout;
         }
-        if let Some((_, layout)) = foreign_images.get_mut(&to.id()) {
+        if let Some((_, layout)) = storage.pending_layouts.get_mut(&to.id()) {
             *layout = restore_to_layout;
         }
-        release_images_to_foreign(
-            vk_device,
-            command_buffer,
-            device.queue_family_index(),
-            &foreign_images,
-        );
+        storage.release_foreign_images(vk_device, command_buffer, device.queue_family_index());
 
         // SAFETY: Command buffer recording is valid and all commands were encoded above.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
             let _ = device.discard_command_buffer(command_buffer);
-            restore_unsubmitted_foreign_acquires(&foreign_images);
+            restore_unsubmitted_foreign_acquires(&storage.pending_layouts);
             return Err(err.into());
         }
 
+        storage.retained_images.extend([from.clone(), to.clone()]);
         let (_, submission_fence) = match device.submit_with_resources_and_fence(
             command_buffer,
-            Vec::new(),
-            vec![from.clone(), to.clone()],
+            &mut storage.submitted_framebuffers,
+            &mut storage.retained_images,
         ) {
             Ok(submission) => submission,
             Err(err) => {
-                restore_unsubmitted_foreign_acquires(&foreign_images);
+                restore_unsubmitted_foreign_acquires(&storage.pending_layouts);
                 return Err(err);
             }
         };
 
         from.set_layout(from_layout);
         to.set_layout(restore_to_layout);
-        commit_foreign_releases(&foreign_images);
+        commit_foreign_releases(&storage.pending_layouts);
 
-        Ok(SyncPoint::from(submission_fence))
+        Ok(submission_fence)
     }
 
     #[instrument(level = "trace", skip(self, device, steps))]
@@ -189,12 +203,33 @@ impl BlitState {
         device: &mut DeviceState,
         steps: &[VulkanBlitChainStep],
     ) -> Result<SyncPoint, VulkanRendererError> {
+        let mut storage = device.acquire_recording_storage()?;
+        let result = self.blit_texture_chain_in_storage(device, steps, &mut storage);
+        if device.completion_unknown() {
+            device.preserve_failed_recording(storage);
+        }
+        result
+    }
+
+    fn blit_texture_chain_in_storage(
+        &mut self,
+        device: &mut DeviceState,
+        steps: &[VulkanBlitChainStep],
+        storage: &mut super::recording_storage::RecordingStorage,
+    ) -> Result<SyncPoint, VulkanRendererError> {
         trace!(step_count = steps.len(), "recording vulkan blit chain");
         if steps.is_empty() {
             return Ok(SyncPoint::signaled());
         }
 
-        let mut resolved_steps = Vec::with_capacity(steps.len());
+        if steps.len() > storage.blit_steps.capacity() {
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "blit steps",
+                requested: steps.len(),
+                limit: storage.blit_steps.capacity(),
+            });
+        }
+        let resolved_steps = &mut storage.blit_steps;
         for step in steps {
             let Some(source) = step.source.image_resource().cloned() else {
                 return Err(VulkanRendererError::NotImplemented(
@@ -222,7 +257,7 @@ impl BlitState {
             });
         }
 
-        validate_blit_chain_source_layouts(&resolved_steps)?;
+        validate_blit_chain_source_layouts(resolved_steps)?;
 
         let command_buffer = device.acquire_command_buffer()?;
         let vk_device = device.device_handle();
@@ -234,31 +269,36 @@ impl BlitState {
             return Err(err.into());
         }
         device.insert_debug_label(command_buffer, c"vulkan.blit_chain", [0.94, 0.56, 0.18, 1.0]);
-        let mut foreign_images = acquire_images_from_foreign(
+        // Source handles are cloned into an inline pair iterator; the cold
+        // map/barrier bank holds actual foreign ownership through submit.
+        // Split field borrows for the same exclusive workspace.
+        let mut steps = std::mem::take(&mut storage.blit_steps);
+        storage.acquire_foreign_images(
             vk_device,
             command_buffer,
             device.queue_family_index(),
-            resolved_steps.iter().flat_map(|step| {
+            steps.iter().flat_map(|step| {
                 [
                     (step.source.clone(), step.source.current_layout()),
                     (step.destination.clone(), step.destination.current_layout()),
                 ]
             }),
         );
+        let resolved_steps = &steps;
+        let layouts = &mut storage.blit_layouts;
 
-        let mut layouts = IndexMap::new();
-        for step in &resolved_steps {
+        for step in resolved_steps.iter() {
             transition_tracked_image_layout(
                 vk_device,
                 command_buffer,
-                &mut layouts,
+                layouts,
                 step.source.clone(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
             transition_tracked_image_layout(
                 vk_device,
                 command_buffer,
-                &mut layouts,
+                layouts,
                 step.destination.clone(),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             );
@@ -283,44 +323,45 @@ impl BlitState {
             );
             tracked.current_layout = tracked.restore_layout;
         }
-        for (id, (_, layout)) in foreign_images.iter_mut() {
+        for (id, (_, layout)) in storage.pending_layouts.iter_mut() {
             if let Some(tracked) = layouts.get(id) {
                 *layout = tracked.current_layout;
             }
         }
-        release_images_to_foreign(
-            vk_device,
-            command_buffer,
-            device.queue_family_index(),
-            &foreign_images,
-        );
+        storage.release_foreign_images(vk_device, command_buffer, device.queue_family_index());
+        storage.blit_steps = std::mem::take(&mut steps);
 
         // SAFETY: Command buffer recording is valid and all commands were encoded above.
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
             let _ = device.discard_command_buffer(command_buffer);
-            restore_unsubmitted_foreign_acquires(&foreign_images);
+            restore_unsubmitted_foreign_acquires(&storage.pending_layouts);
             return Err(err.into());
         }
 
-        let retained_images = resolved_steps
-            .iter()
-            .flat_map(|step| [step.source.clone(), step.destination.clone()])
-            .collect::<Vec<_>>();
-        let (_, submission_fence) =
-            match device.submit_with_resources_and_fence(command_buffer, Vec::new(), retained_images) {
-                Ok(submission) => submission,
-                Err(err) => {
-                    restore_unsubmitted_foreign_acquires(&foreign_images);
-                    return Err(err);
-                }
-            };
+        storage.retained_images.extend(
+            storage
+                .blit_steps
+                .iter()
+                .flat_map(|step| [step.source.clone(), step.destination.clone()]),
+        );
+        let (_, submission_fence) = match device.submit_with_resources_and_fence(
+            command_buffer,
+            &mut storage.submitted_framebuffers,
+            &mut storage.retained_images,
+        ) {
+            Ok(submission) => submission,
+            Err(err) => {
+                restore_unsubmitted_foreign_acquires(&storage.pending_layouts);
+                return Err(err);
+            }
+        };
 
-        for tracked in layouts.values() {
+        for tracked in storage.blit_layouts.values() {
             tracked.image.set_layout(tracked.restore_layout);
         }
-        commit_foreign_releases(&foreign_images);
+        commit_foreign_releases(&storage.pending_layouts);
 
-        Ok(SyncPoint::from(submission_fence))
+        Ok(submission_fence)
     }
 
     pub(super) fn validate_blit_images(
@@ -453,19 +494,16 @@ fn validate_rect(
 }
 
 fn validate_blit_chain_source_layouts(steps: &[ResolvedBlitChainStep]) -> Result<(), VulkanRendererError> {
-    let mut layouts = IndexMap::new();
-    for step in steps {
-        let source_layout = layouts
-            .get(&step.source.id())
-            .copied()
-            .unwrap_or_else(|| step.source.current_layout());
-        if source_layout == vk::ImageLayout::UNDEFINED {
+    for (index, step) in steps.iter().enumerate() {
+        if step.source.current_layout() == vk::ImageLayout::UNDEFINED
+            && !steps[..index]
+                .iter()
+                .any(|previous| previous.destination.id() == step.source.id())
+        {
             return Err(VulkanRendererError::TemporaryFailure(
                 "source image contents are undefined and cannot be blitted",
             ));
         }
-        layouts.insert(step.source.id(), vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        layouts.insert(step.destination.id(), vk::ImageLayout::TRANSFER_DST_OPTIMAL);
     }
     Ok(())
 }
@@ -638,7 +676,6 @@ mod tests {
                 vulkan::VulkanBlitChainStep, Bind, Blit, Color32F, ExportMem, Frame, Offscreen, Renderer,
                 TextureFilter,
             },
-            vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
@@ -649,20 +686,22 @@ mod tests {
     use super::{VulkanRenderer, VulkanRendererError};
 
     fn init_renderer() -> Option<VulkanRenderer> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        VulkanRenderer::new(&physical_device).ok()
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        crate::backend::renderer::vulkan::test_support::renderer(&physical_device)
     }
 
     fn first_working_offscreen_format(renderer: &mut VulkanRenderer) -> Option<Fourcc> {
-        [
-            Fourcc::Argb8888,
-            Fourcc::Abgr8888,
-            Fourcc::Xrgb8888,
-            Fourcc::Xbgr8888,
-        ]
-        .into_iter()
-        .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok())
+        super::super::test_support::present(
+            [
+                Fourcc::Argb8888,
+                Fourcc::Abgr8888,
+                Fourcc::Xrgb8888,
+                Fourcc::Xbgr8888,
+            ]
+            .into_iter()
+            .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok()),
+            "no supported offscreen format",
+        )
     }
 
     fn expected_red_pixel(format: Fourcc) -> [u8; 4] {
@@ -736,9 +775,9 @@ mod tests {
                 .end_command_buffer(command_buffer)
                 .expect("test command buffer should end");
         }
-        renderer
+        let _submission = renderer
             .device
-            .submit_with_resources_and_fence(command_buffer, Vec::new(), vec![image.clone()])
+            .submit_with_resources_and_fence(command_buffer, &mut Vec::new(), &mut vec![image.clone()])
             .expect("empty local ownership batch should submit");
         commit_foreign_releases(&acquired);
         assert!(!image.is_owned_by_foreign());
@@ -908,16 +947,27 @@ mod tests {
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
 
-        let Ok(mut source) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(mut source) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut destination) = renderer.create_buffer(Fourcc::Abgr8888, size) else {
+        let Some(mut destination) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Abgr8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut source_target) = renderer.bind(&mut source) else {
+        let Some(mut source_target) =
+            super::super::test_support::available(renderer.bind(&mut source), "test allocation or binding")
+        else {
             return;
         };
-        let Ok(mut destination_target) = renderer.bind(&mut destination) else {
+        let Some(mut destination_target) = super::super::test_support::available(
+            renderer.bind(&mut destination),
+            "test allocation or binding",
+        ) else {
             return;
         };
 

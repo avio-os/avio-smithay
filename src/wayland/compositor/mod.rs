@@ -652,6 +652,14 @@ impl Default for CompositorClientState {
 }
 
 impl CompositorClientState {
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn with_client_scale(scale_override: Arc<AtomicF64>) -> Self {
+        Self {
+            queue: Mutex::new(None),
+            scale_override,
+        }
+    }
+
     /// To be called, when a previously added blocker (via [`add_blocker`])
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.

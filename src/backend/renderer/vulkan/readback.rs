@@ -1,224 +1,115 @@
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 
 use ash::vk;
 use tracing::{instrument, trace};
 
 use crate::{
     backend::{
-        allocator::{format::get_bpp, Format, Fourcc, Modifier},
+        allocator::{format::get_bpp, Fourcc},
         renderer::{Bind, ExportMem, Offscreen, Texture, TextureMapping},
     },
     utils::{Buffer as BufferCoord, Rectangle, Size},
 };
 
 use super::{
-    device::DeviceState,
-    format::{
-        optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
-        ColorEncoding,
-    },
+    allocation::{AllocationGuard, VulkanAllocationReason},
+    device::{BlockingSubmitError, DeviceHandle, DeviceState},
+    device_handle::DeviceRetirement,
     image::{
         acquire_images_from_foreign, commit_foreign_releases, release_images_to_foreign,
         restore_unsubmitted_foreign_acquires, transition_image_layout, VulkanImage,
     },
+    retirement::RetirementNode,
     VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
+/// Readback destinations are real submitted resources. A failed host wait
+/// may return no CPU pixels but cannot end their GPU lifetime.
+pub(super) struct ReadbackBuffer {
+    device: Arc<DeviceHandle>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    coherent: bool,
+    retirement: Option<Box<RetirementNode<DeviceRetirement>>>,
+}
+
+pub(super) struct RetiredReadbackBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    _allocation: AllocationGuard,
+}
+
+impl RetiredReadbackBuffer {
+    pub(super) fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+impl Drop for ReadbackBuffer {
+    fn drop(&mut self) {
+        if let Some(node) = self.retirement.take() {
+            self.device.retire_resource(node);
+        }
+    }
+}
+
+impl ReadbackBuffer {
+    pub(super) fn new(
+        device: Arc<DeviceHandle>,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+        coherent: bool,
+        allocation: AllocationGuard,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            device,
+            buffer,
+            memory,
+            coherent,
+            retirement: Some(RetirementNode::new(DeviceRetirement::ReadbackBuffer(
+                RetiredReadbackBuffer {
+                    buffer,
+                    memory,
+                    _allocation: allocation,
+                },
+            ))),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReadbackState {
-    next_offscreen_id: u64,
+    next_offscreen_id: Arc<AtomicU64>,
 }
 
 impl Default for ReadbackState {
     fn default() -> Self {
         Self {
-            next_offscreen_id: 1u64 << 61,
+            next_offscreen_id: Arc::new(AtomicU64::new(1u64 << 61)),
         }
     }
 }
 
 impl ReadbackState {
-    fn next_offscreen_id(&mut self) -> u64 {
-        let id = self.next_offscreen_id;
-        self.next_offscreen_id = self.next_offscreen_id.wrapping_add(1);
-        id
+    pub(crate) fn new(ids: Arc<AtomicU64>) -> Self {
+        Self {
+            next_offscreen_id: ids,
+        }
+    }
+    pub(crate) fn offscreen_allocator(&self, device: &DeviceState) -> super::VulkanOffscreenAllocator {
+        super::VulkanOffscreenAllocator::new(device, self.next_offscreen_id.clone())
     }
 
-    #[instrument(level = "trace", skip(self, device))]
-    #[profiling::function]
     pub(crate) fn create_offscreen_texture(
         &mut self,
         device: &DeviceState,
         format: Fourcc,
         size: Size<i32, BufferCoord>,
     ) -> Result<VulkanTexture, VulkanRendererError> {
-        trace!(?format, ?size, "creating vulkan offscreen texture");
-        if size.w <= 0 || size.h <= 0 {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "offscreen buffer dimensions must be positive",
-            ));
-        }
-
-        let vk_format = crate::backend::allocator::vulkan::format::get_vk_format(format)
-            .ok_or(VulkanRendererError::UnsupportedMemoryFormat(format))?;
-        let format_features = optimal_tiling_features(device.physical_device(), vk_format);
-        if !format_supports_offscreen_usage(format_features) {
-            return Err(VulkanRendererError::UnsupportedMemoryFormat(format));
-        }
-
-        let device_handle = device.shared_device();
-        let vk_device = device_handle.handle();
-        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::SAMPLED
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST;
-
-        // Offscreens are both rendered into and sampled back, so they carry an `_SRGB`
-        // attachment view alongside the encoded UNORM sampled view.
-        let view_formats = srgb_view_format_list(vk_format);
-        let mut format_list_info;
-        let mut create_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk_format)
-            .extent(vk::Extent3D {
-                width: size.w as u32,
-                height: size.h as u32,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(usage)
-            .flags(match view_formats {
-                Some(_) => vk::ImageCreateFlags::MUTABLE_FORMAT,
-                None => vk::ImageCreateFlags::empty(),
-            })
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        if let Some(formats) = view_formats.as_ref() {
-            format_list_info = vk::ImageFormatListCreateInfo::default().view_formats(formats);
-            create_info = create_info.push_next(&mut format_list_info);
-        }
-
-        // SAFETY: Device is valid and create info references live memory.
-        let image = device_handle.observe_result(unsafe { vk_device.create_image(&create_info, None) })?;
-        // SAFETY: Image belongs to this device and remains valid until explicit destruction.
-        let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
-        let memory_type_index = pick_image_memory_type(device, memory_requirements.memory_type_bits)
-            .ok_or(VulkanRendererError::NoCompatibleMemoryType)?;
-
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(memory_requirements.size)
-            .memory_type_index(memory_type_index);
-        // SAFETY: Device is valid and allocation info references live memory.
-        let memory =
-            match device_handle.observe_result(unsafe { vk_device.allocate_memory(&allocate_info, None) }) {
-                Ok(memory) => memory,
-                Err(err) => {
-                    // SAFETY: Image belongs to this device and has not been bound.
-                    device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_image(image, None) });
-                    return Err(err.into());
-                }
-            };
-
-        // SAFETY: Image and memory belong to this device and offset 0 is valid.
-        if let Err(err) =
-            device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memory, 0) })
-        {
-            // SAFETY: Handles belong to this device and were created above.
-            device_handle.destroy_with(|vk_device| unsafe {
-                vk_device.free_memory(memory, None);
-                vk_device.destroy_image(image, None);
-            });
-            return Err(err.into());
-        }
-
-        let sampled_view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk_format)
-            .components(texture_view_components(format, usage))
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            );
-
-        // SAFETY: Image view create info references a live image handle.
-        let sampled_view = match device_handle
-            .observe_result(unsafe { vk_device.create_image_view(&sampled_view_info, None) })
-        {
-            Ok(view) => view,
-            Err(err) => {
-                // SAFETY: Handles belong to this device and were created above.
-                device_handle.destroy_with(|vk_device| unsafe {
-                    vk_device.free_memory(memory, None);
-                    vk_device.destroy_image(image, None);
-                });
-                return Err(err.into());
-            }
-        };
-
-        let render_view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            // Linear-light blending, same rule as every other colour attachment.
-            .format(render_view_format(vk_format))
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            );
-
-        // SAFETY: Image view create info references a live image handle.
-        let render_view = match device_handle
-            .observe_result(unsafe { vk_device.create_image_view(&render_view_info, None) })
-        {
-            Ok(view) => view,
-            Err(err) => {
-                // SAFETY: Handles belong to this device and were created above.
-                device_handle.destroy_with(|vk_device| unsafe {
-                    vk_device.destroy_image_view(sampled_view, None);
-                    vk_device.free_memory(memory, None);
-                    vk_device.destroy_image(image, None);
-                });
-                return Err(err.into());
-            }
-        };
-
-        let imported = Arc::new(VulkanImage::new_renderer_local(
-            self.next_offscreen_id(),
-            image,
-            memory,
-            sampled_view,
-            render_view,
-            size,
-            Format {
-                code: format,
-                modifier: Modifier::Invalid,
-            },
-            vk_format,
-            format_features,
-            // Offscreens are filled by our own linear-blending render passes, so their
-            // stored bytes are the sRGB encoding of a premultiplied *linear* value.
-            ColorEncoding::LinearPremultiplied,
-            usage,
-            false,
-            vk::ImageLayout::UNDEFINED,
-            device.shared_device(),
-        ));
-
-        Ok(VulkanTexture::from_renderer_image(
-            imported, size, format, false, false,
-        ))
+        self.offscreen_allocator(device).create_buffer(format, size)
     }
 
     #[instrument(level = "trace", skip(self, device, image))]
@@ -253,18 +144,8 @@ impl ReadbackState {
                 "readback buffer size overflowed",
             ))?;
 
-        let (staging_buffer, staging_memory, coherent) = create_readback_buffer(device, src_len)?;
+        let readback = create_readback_buffer(device, src_len)?;
         let cleanup_device = device.shared_device();
-        let cleanup_buffer_device = cleanup_device.clone();
-        let cleanup_buffer = scopeguard::guard(staging_buffer, |buffer| {
-            // SAFETY: Buffer belongs to this device and is no longer referenced after readback completion.
-            cleanup_buffer_device.destroy_with(|device| unsafe { device.destroy_buffer(buffer, None) });
-        });
-        let cleanup_memory_device = cleanup_device.clone();
-        let cleanup_memory = scopeguard::guard(staging_memory, |memory| {
-            // SAFETY: Memory belongs to this device and is no longer referenced after readback completion.
-            cleanup_memory_device.destroy_with(|device| unsafe { device.free_memory(memory, None) });
-        });
 
         let vk_device = cleanup_device.handle();
         let command_buffer = device.acquire_command_buffer()?;
@@ -320,7 +201,7 @@ impl ReadbackState {
                 command_buffer,
                 image.image(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                *cleanup_buffer,
+                readback.buffer,
                 &copy_region,
             );
         }
@@ -349,9 +230,19 @@ impl ReadbackState {
             return Err(err.into());
         }
 
-        if let Err(err) = device.submit_blocking(command_buffer) {
-            restore_unsubmitted_foreign_acquires(&foreign_images);
-            return Err(err);
+        match device.submit_blocking(command_buffer, image.clone(), readback.clone()) {
+            Err(BlockingSubmitError::NotSubmitted(err)) => {
+                restore_unsubmitted_foreign_acquires(&foreign_images);
+                return Err(err);
+            }
+            Err(BlockingSubmitError::Submitted(err)) => {
+                // The transfer/release was queued. Restoring the acquisition
+                // would invent FOREIGN ownership before that queued release.
+                image.set_layout(old_layout);
+                commit_foreign_releases(&foreign_images);
+                return Err(err);
+            }
+            Ok(()) => {}
         }
         image.set_layout(old_layout);
         commit_foreign_releases(&foreign_images);
@@ -360,22 +251,22 @@ impl ReadbackState {
         // SAFETY: Memory belongs to this device and the mapped range is within allocation bounds.
         let mapped = unsafe {
             vk_device.map_memory(
-                *cleanup_memory,
+                readback.memory,
                 0,
                 src_len as vk::DeviceSize,
                 vk::MemoryMapFlags::empty(),
             )
         }?;
 
-        if !coherent {
+        if !readback.coherent {
             let ranges = [vk::MappedMemoryRange::default()
-                .memory(*cleanup_memory)
+                .memory(readback.memory)
                 .offset(0)
                 .size(src_len as vk::DeviceSize)];
             // SAFETY: The mapped range belongs to this memory allocation.
             if let Err(err) = unsafe { vk_device.invalidate_mapped_memory_ranges(&ranges) } {
                 // SAFETY: Memory is currently mapped and must be unmapped before returning.
-                unsafe { vk_device.unmap_memory(*cleanup_memory) };
+                unsafe { vk_device.unmap_memory(readback.memory) };
                 return Err(err.into());
             }
         }
@@ -383,7 +274,7 @@ impl ReadbackState {
         // SAFETY: Source pointer is valid for `src_len` bytes and destination vec has exact capacity.
         unsafe {
             std::ptr::copy_nonoverlapping(mapped as *const u8, raw.as_mut_ptr(), src_len);
-            vk_device.unmap_memory(*cleanup_memory);
+            vk_device.unmap_memory(readback.memory);
         }
 
         let converted = convert_pixels(src_format, dst_format, &raw)?;
@@ -509,7 +400,7 @@ impl ExportMem for VulkanRenderer {
     }
 }
 
-fn format_supports_offscreen_usage(features: vk::FormatFeatureFlags) -> bool {
+pub(super) fn format_supports_offscreen_usage(features: vk::FormatFeatureFlags) -> bool {
     let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
         | vk::FormatFeatureFlags::SAMPLED_IMAGE
         | vk::FormatFeatureFlags::TRANSFER_SRC
@@ -554,7 +445,7 @@ fn validate_region(
 fn create_readback_buffer(
     device: &DeviceState,
     size: usize,
-) -> Result<(vk::Buffer, vk::DeviceMemory, bool), VulkanRendererError> {
+) -> Result<Arc<ReadbackBuffer>, VulkanRendererError> {
     let device_handle = device.shared_device();
     let vk_device = device_handle.handle();
     let create_info = vk::BufferCreateInfo::default()
@@ -563,19 +454,28 @@ fn create_readback_buffer(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     // SAFETY: Device is valid and create info references live data.
-    let buffer = device_handle.observe_result(unsafe { vk_device.create_buffer(&create_info, None) })?;
+    let buffer = device_handle.observe_result(crate::backend::allocator::observe_gpu_allocation(
+        unsafe { vk_device.create_buffer(&create_info, None) },
+        crate::backend::allocator::GpuAllocationKind::VulkanBuffer,
+    ))?;
     // SAFETY: Buffer belongs to this device and remains valid until destroyed.
     let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
 
-    let (memory_type_index, coherent) =
+    let Some((memory_type_index, coherent)) =
         pick_host_visible_memory_type(device, memory_requirements.memory_type_bits)
-            .ok_or(VulkanRendererError::NoCompatibleMemoryType)?;
+    else {
+        device_handle.destroy_with(|raw| unsafe { raw.destroy_buffer(buffer, None) });
+        return Err(VulkanRendererError::NoCompatibleMemoryType);
+    };
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(memory_requirements.size)
         .memory_type_index(memory_type_index);
     // SAFETY: Device is valid and allocation info references live data.
-    let memory = match device_handle.observe_result(unsafe { vk_device.allocate_memory(&alloc_info, None) }) {
+    let memory = match device_handle.observe_result(crate::backend::allocator::observe_gpu_allocation(
+        unsafe { vk_device.allocate_memory(&alloc_info, None) },
+        crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+    )) {
         Ok(memory) => memory,
         Err(err) => {
             // SAFETY: Buffer belongs to this device and allocation failed before binding.
@@ -584,36 +484,28 @@ fn create_readback_buffer(
         }
     };
 
+    let allocation = device_handle
+        .allocation_ledger()
+        .record(VulkanAllocationReason::Scratch, memory_requirements.size);
+
     // SAFETY: Buffer and memory belong to this device and offset 0 is valid for this allocation.
     if let Err(err) = device_handle.observe_result(unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) })
     {
         // SAFETY: Handles belong to this device and were created above.
         device_handle.destroy_with(|vk_device| unsafe {
-            vk_device.free_memory(memory, None);
             vk_device.destroy_buffer(buffer, None);
+            vk_device.free_memory(memory, None);
         });
         return Err(err.into());
     }
 
-    Ok((buffer, memory, coherent))
-}
-
-fn pick_image_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<u32> {
-    let memory_properties = unsafe {
-        device
-            .physical_device()
-            .instance()
-            .handle()
-            .get_physical_device_memory_properties(device.physical_device().handle())
-    };
-
-    pick_memory_type_index(
-        &memory_properties,
-        memory_type_bits,
-        vk::MemoryPropertyFlags::empty(),
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .map(|(index, _)| index)
+    Ok(ReadbackBuffer::new(
+        device_handle,
+        buffer,
+        memory,
+        coherent,
+        allocation,
+    ))
 }
 
 fn pick_host_visible_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<(u32, bool)> {
@@ -634,7 +526,7 @@ fn pick_host_visible_memory_type(device: &DeviceState, memory_type_bits: u32) ->
     .map(|(index, flags)| (index, flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)))
 }
 
-fn pick_memory_type_index(
+pub(super) fn pick_memory_type_index(
     properties: &vk::PhysicalDeviceMemoryProperties,
     memory_type_bits: u32,
     required: vk::MemoryPropertyFlags,
@@ -728,6 +620,56 @@ mod tests {
     };
 
     use super::VulkanRenderer;
+
+    #[test]
+    fn offscreen_memory_census_counts_shared_image_once() {
+        use super::super::{test_support, VulkanAllocationPhase, VulkanAllocationReason};
+        let Some(physical_device) = test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = test_support::renderer(&physical_device) else {
+            return;
+        };
+        let Some(format) = test_support::present(
+            first_working_offscreen_format(&mut renderer),
+            "no supported Vulkan offscreen format for allocation census",
+        ) else {
+            return;
+        };
+        let reason = VulkanAllocationReason::RenderTarget;
+        renderer.device.wait_retirement_drained();
+        let before = renderer.diagnostics().allocations.reason(reason);
+        let _phase = renderer.allocation_phase_scope(VulkanAllocationPhase::Warmup);
+        let texture = renderer.create_buffer(format, Size::from((8, 8))).unwrap();
+        let image = texture.image_resource().unwrap();
+        // SAFETY: The texture keeps the renderer-local image and device alive.
+        let required = unsafe {
+            renderer
+                .device
+                .device_handle()
+                .get_image_memory_requirements(image.image())
+        }
+        .size;
+        let shared_reader = image.clone();
+        drop(texture);
+        let live = renderer.diagnostics().allocations.reason(reason);
+        assert_eq!(live.live_allocations, before.live_allocations + 1);
+        assert_eq!(live.live_bytes, before.live_bytes + required);
+        assert_eq!(live.total_allocations, before.total_allocations + 1);
+        assert_eq!(
+            renderer
+                .diagnostics()
+                .allocations
+                .phase(VulkanAllocationPhase::Warmup)
+                .live_bytes,
+            required
+        );
+        drop(shared_reader);
+        renderer.device.wait_retirement_drained();
+        let retired = renderer.diagnostics().allocations.reason(reason);
+        assert_eq!(retired.live_allocations, before.live_allocations);
+        assert_eq!(retired.live_bytes, before.live_bytes);
+    }
 
     fn init_renderer() -> Option<VulkanRenderer> {
         let instance = Instance::new(Version::VERSION_1_3, None).ok()?;

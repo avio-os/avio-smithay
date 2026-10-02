@@ -23,13 +23,51 @@ use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
 use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "backend_drm")]
+#[cfg(any(feature = "backend_drm", feature = "renderer_vulkan"))]
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
 use std::{error, fmt};
 
 /// Maximum amount of planes this implementation supports
 pub const MAX_PLANES: usize = 4;
+
+/// Allocation provenance supplied by the owning cold export/preparation site.
+#[cfg(feature = "renderer_vulkan")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmabufBackingOrigin {
+    /// A compositor allocation/export factory owns this backing.
+    Compositor,
+    /// A client supplied this backing; import does not change its origin.
+    External,
+}
+
+/// Immutable kernel allocation identity, never inferred from texture geometry.
+#[cfg(feature = "renderer_vulkan")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmabufBackingInfo {
+    /// Kernel dma-buf inode while an actual descriptor was valid.
+    pub inode: u64,
+    /// Exact kernel-exported allocation size, or unsupported on this kernel.
+    pub allocation_bytes: Option<u64>,
+    /// Explicit allocation-owner provenance.
+    pub origin: DmabufBackingOrigin,
+    /// Explicit owner role, without label/format guessing.
+    pub role: &'static str,
+}
+
+/// Numeric identity storage may outlive all FDs with an imported memory guard.
+/// It owns no FD, image, source buffer, or presentation authority.
+#[cfg(feature = "renderer_vulkan")]
+#[derive(Debug, Default)]
+pub struct DmabufBackingMetadata(std::sync::OnceLock<[Option<DmabufBackingInfo>; MAX_PLANES]>);
+
+#[cfg(feature = "renderer_vulkan")]
+impl DmabufBackingMetadata {
+    /// Read metadata previously captured on an explicit cold owner turn.
+    pub fn get(&self) -> Option<&[Option<DmabufBackingInfo>; MAX_PLANES]> {
+        self.0.get()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct DmabufInternal {
@@ -45,6 +83,12 @@ pub(crate) struct DmabufInternal {
     ///
     /// This is a bitflag, to be compared with the `Flags` enum re-exported by this module.
     pub flags: DmabufFlags,
+    /// Renderer resources whose cache residency must end with this buffer.
+    /// The mutex serializes typed initialization across renderer threads.
+    #[cfg(feature = "renderer_vulkan")]
+    resources: Mutex<crate::utils::user_data::UserDataMap>,
+    #[cfg(feature = "renderer_vulkan")]
+    backing_metadata: Arc<DmabufBackingMetadata>,
     /// Presumably compatible device for buffer import
     ///
     /// This is inferred from client apis, however there is no kernel api or guarantee this is correct
@@ -220,6 +264,10 @@ impl Dmabuf {
                 format,
                 modifier,
                 flags,
+                #[cfg(feature = "renderer_vulkan")]
+                resources: Mutex::new(crate::utils::user_data::UserDataMap::new()),
+                #[cfg(feature = "renderer_vulkan")]
+                backing_metadata: Arc::new(DmabufBackingMetadata::default()),
                 #[cfg(feature = "backend_drm")]
                 node: Mutex::new(None),
             },
@@ -229,6 +277,31 @@ impl Dmabuf {
     /// The amount of planes this Dmabuf has
     pub fn num_planes(&self) -> usize {
         self.0.planes.len()
+    }
+
+    /// Capture immutable allocation provenance once, using actual FD/kernel
+    /// metadata on a cold owner turn. Imports never assign ownership by default.
+    #[cfg(feature = "renderer_vulkan")]
+    pub fn set_backing_metadata(&self, metadata: [Option<DmabufBackingInfo>; MAX_PLANES]) -> bool {
+        self.0.backing_metadata.0.set(metadata).is_ok()
+    }
+
+    /// Numeric-only metadata retained independently by exact imported memory
+    /// owners. Cloning this handle cannot extend buffer/FD/GPU resource lifetime.
+    #[cfg(feature = "renderer_vulkan")]
+    pub fn backing_metadata(&self) -> Arc<DmabufBackingMetadata> {
+        self.0.backing_metadata.clone()
+    }
+
+    /// Attach renderer-owned resource custody to this buffer's lifetime.
+    /// Callers retain only weak references to this container in their caches;
+    /// submitted work owns its own resources until GPU completion.
+    #[cfg(feature = "renderer_vulkan")]
+    pub(crate) fn resource_custody<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        let resources = self.0.resources.lock().unwrap();
+        resources
+            .get_or_insert_threadsafe(|| Arc::new(T::default()))
+            .clone()
     }
 
     /// Returns raw handles of the planes of this buffer

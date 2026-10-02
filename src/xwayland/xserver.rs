@@ -18,7 +18,8 @@ use wayland_server::{Client, DisplayHandle};
 
 use crate::{utils::user_data::UserDataMap, wayland::compositor::CompositorClientState};
 
-use super::x11_sockets::{prepare_x11_sockets, X11Lock};
+use super::lazy::{XWaylandDisconnectNotify, XWaylandDisplay};
+use super::x11_sockets::X11Lock;
 
 /// A handle to a running XWayland process. Using XWayland as an xserver for
 /// X11-based clients requires two connections: one wayland socket, where
@@ -86,6 +87,50 @@ pub enum XWaylandEvent {
 }
 
 impl XWayland {
+    #[cfg(test)]
+    pub(super) fn readiness_fixture(
+        dh: &DisplayHandle,
+        prepared: &XWaylandDisplay,
+        scale: Arc<atomic_float::AtomicF64>,
+    ) -> (Self, Client, UnixStream) {
+        // Exercise the actual displayfd source, Wayland client custody and Drop
+        // implementation. This fixture starts no X server or child process.
+        let (display_fd, writer) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC)
+                .unwrap();
+        rustix::io::write(&writer, format!("{}\n", prepared.display_number()).as_bytes()).unwrap();
+        let (x11_socket, _peer) = UnixStream::pair().unwrap();
+        let (wayland, peer) = UnixStream::pair().unwrap();
+        let wrapper = unsafe { calloop::generic::FdWrapper::new(display_fd.as_raw_fd()) };
+        let source = calloop::generic::Generic::new(wrapper, calloop::Interest::READ, calloop::Mode::Level);
+        let inner = Arc::new(Mutex::new(Instance {
+            display_lock: prepared.lock.clone(),
+            display_fd,
+            x11_socket: Some(x11_socket),
+        }));
+        let mut dh = dh.clone();
+        let client = dh
+            .insert_client(
+                wayland,
+                Arc::new(XWaylandClientData {
+                    compositor_state: CompositorClientState::with_client_scale(scale),
+                    data_map: UserDataMap::new(),
+                    child: Mutex::new(None),
+                }),
+            )
+            .unwrap();
+        (
+            Self {
+                inner,
+                source,
+                dh,
+                client: client.clone(),
+            },
+            client,
+            peer,
+        )
+    }
+
     /// Spawns an XWayland server instance. `Xwayland` must be on the `PATH` and
     /// executable.
     ///
@@ -124,11 +169,56 @@ impl XWayland {
         V: AsRef<OsStr>,
         F: FnOnce(&UserDataMap),
     {
+        let prepared = XWaylandDisplay::prepare(display, open_abstract_socket)?;
+        Self::spawn_prepared(dh, &prepared, envs, stdout, stderr, user_data)
+    }
+
+    /// Spawns a server using an existing display reservation. The reservation
+    /// keeps its listening sockets and display lock across last-client exit.
+    pub fn spawn_prepared<K, V, I, F>(
+        dh: &DisplayHandle,
+        prepared: &XWaylandDisplay,
+        envs: I,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
+        Self::spawn_prepared_with_scale(
+            dh,
+            prepared,
+            envs,
+            stdout,
+            stderr,
+            user_data,
+            CompositorClientState::default().clone_client_scale(),
+        )
+    }
+
+    pub(super) fn spawn_prepared_with_scale<K, V, I, F>(
+        dh: &DisplayHandle,
+        prepared: &XWaylandDisplay,
+        envs: I,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+        client_scale: Arc<atomic_float::AtomicF64>,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
         let (x_wm_x11, x_wm_me) = UnixStream::pair()?;
         let (wl_x11, wl_me) = UnixStream::pair()?;
-
-        let (lock, listen_sockets) = prepare_x11_sockets(display.into(), open_abstract_socket)?;
-        let display_number = lock.display_number();
+        let display_number = prepared.display_number();
+        let listen_sockets = &prepared.listen_sockets;
 
         // XWayland writes the the display number and a newline to this pipe when it's ready.
         let (displayfd_recv, displayfd_send) =
@@ -148,7 +238,7 @@ impl XWayland {
             .arg("-displayfd")
             .arg(displayfd_send.as_raw_fd().to_string());
 
-        for socket in &listen_sockets {
+        for socket in listen_sockets {
             command.arg("-listenfd").arg(socket.as_raw_fd().to_string());
         }
 
@@ -192,7 +282,7 @@ impl XWayland {
         let wrapper = unsafe { calloop::generic::FdWrapper::new(displayfd_recv.as_raw_fd()) };
         let source = calloop::generic::Generic::new(wrapper, calloop::Interest::READ, calloop::Mode::Level);
         let inner = Instance {
-            display_lock: lock,
+            display_lock: prepared.lock.clone(),
             display_fd: displayfd_recv,
             x11_socket: Some(x_wm_me),
         };
@@ -209,7 +299,7 @@ impl XWayland {
             wl_me,
             Arc::new(XWaylandClientData {
                 #[cfg(feature = "wayland_frontend")]
-                compositor_state: CompositorClientState::default(),
+                compositor_state: CompositorClientState::with_client_scale(client_scale),
                 data_map,
                 child: Mutex::new(Some(child)),
             }),
@@ -261,7 +351,7 @@ impl XWayland {
 
 #[derive(Debug)]
 struct Instance {
-    display_lock: X11Lock,
+    display_lock: Arc<X11Lock>,
     x11_socket: Option<UnixStream>,
     display_fd: OwnedFd,
 }
@@ -349,7 +439,12 @@ impl Instance {
             trace!(?res, "read from XWayland displayfd");
 
             match res {
-                Ok(0) => return Ok(None),
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Xwayland closed displayfd before readiness",
+                    ))
+                }
                 Ok(len) if (buf[..len]).contains(&b'\n') => return Ok(self.x11_socket.take()),
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(err) => return Err(err.into()),
@@ -375,11 +470,17 @@ impl ClientData for XWaylandClientData {
             error!("Xwayland disconnected: {}", err);
         }
 
-        let mut child = self.child.lock().unwrap().take().unwrap();
+        let notify = self.data_map.get::<XWaylandDisconnectNotify>().cloned();
+        let Some(mut child) = self.child.lock().unwrap().take() else {
+            return;
+        };
         thread::spawn(move || {
             if let Ok(status) = child.wait() {
                 if !status.success() {
                     error!("Xwayland terminated: {}", status);
+                }
+                if let Some(notify) = notify {
+                    notify.disconnected();
                 }
             }
         });

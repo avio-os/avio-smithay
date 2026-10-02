@@ -126,6 +126,15 @@ impl LegacyDrmSurface {
         self.state.read().unwrap().connectors.clone()
     }
 
+    pub(super) fn pending_configuration_matches(
+        &self,
+        mode: Mode,
+        connectors: &HashSet<connector::Handle>,
+    ) -> bool {
+        self.pending
+            .try_read()
+            .is_ok_and(|pending| pending.mode == mode && pending.connectors == *connectors)
+    }
     pub fn pending_connectors(&self) -> HashSet<connector::Handle> {
         self.pending.read().unwrap().connectors.clone()
     }

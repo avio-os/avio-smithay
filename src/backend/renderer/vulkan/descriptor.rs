@@ -42,6 +42,7 @@ impl TextureSampler {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TextureDescriptorKey {
     image_view: vk::ImageView,
+    incarnation: std::num::NonZeroU64,
     sampler: TextureSampler,
 }
 
@@ -133,11 +134,11 @@ impl DescriptorState {
             texture_layout,
             texture_samplers,
             pools: Vec::new(),
-            texture_sets: IndexMap::new(),
-            retired_sets: VecDeque::new(),
-            free_sets: Vec::new(),
-            last_submissions: HashMap::new(),
-            recording_sets: HashSet::new(),
+            texture_sets: IndexMap::with_capacity(max_sets),
+            retired_sets: VecDeque::with_capacity(max_sets),
+            free_sets: Vec::with_capacity(max_sets),
+            last_submissions: HashMap::with_capacity(max_sets),
+            recording_sets: HashSet::with_capacity(max_sets),
             cache_target,
             page_size,
             max_sets,
@@ -155,10 +156,16 @@ impl DescriptorState {
     pub(crate) fn texture_descriptor_set(
         &mut self,
         image_view: vk::ImageView,
+        incarnation: std::num::NonZeroU64,
         sampler: TextureSampler,
     ) -> Result<vk::DescriptorSet, VulkanRendererError> {
+        self.retire_previous_incarnations(image_view, incarnation);
         self.reclaim_rewriteable_sets();
-        let key = TextureDescriptorKey { image_view, sampler };
+        let key = TextureDescriptorKey {
+            image_view,
+            incarnation,
+            sampler,
+        };
 
         if let Some(existing) = self.texture_sets.shift_remove(&key) {
             // Keep hot entries toward the end of insertion order so old entries are evicted first.
@@ -236,44 +243,43 @@ impl DescriptorState {
         self.reclaim_rewriteable_sets();
     }
 
-    /// Drop cache entries whose image view was destroyed. Their sets move
-    /// to the recycle queue and become reusable once their last-use
-    /// submission retires — the cache therefore tracks the *live* working
-    /// set, and capacity pressure only ever means "this many textures are
-    /// genuinely in flight right now".
-    fn retire_dead_views(&mut self) {
-        let retired = self.device.take_retired_views();
-        if retired.is_empty() {
-            return;
-        }
-        for view in retired {
-            let dead: Vec<TextureDescriptorKey> = self
+    /// A native handle may be recycled, but the cold shared image incarnation
+    /// cannot be. Retire every sampler of the old incarnation before looking
+    /// up the new one. Native/recording stamps still gate descriptor rewrites.
+    /// Other stale keys need no notification: ordinary bounded LRU eviction
+    /// reuses their sets after the exact last submitted reader completes.
+    fn retire_previous_incarnations(&mut self, view: vk::ImageView, incarnation: std::num::NonZeroU64) {
+        let mut index = 0;
+        while index < self.texture_sets.len() {
+            if self
                 .texture_sets
-                .keys()
-                .filter(|key| key.image_view == view)
-                .copied()
-                .collect();
-            for key in dead {
-                if let Some(entry) = self.texture_sets.shift_remove(&key) {
-                    self.cache_stats.dead_view_reclaims =
-                        self.cache_stats.dead_view_reclaims.saturating_add(1);
-                    self.retired_sets.push_back(entry.set);
-                }
+                .get_index(index)
+                .is_some_and(|(key, _)| key.image_view == view && key.incarnation != incarnation)
+            {
+                let (_, entry) = self
+                    .texture_sets
+                    .shift_remove_index(index)
+                    .expect("observed descriptor entry");
+                self.retired_sets.push_back(entry.set);
+                self.cache_stats.dead_view_reclaims = self.cache_stats.dead_view_reclaims.saturating_add(1);
+            } else {
+                index += 1;
             }
         }
     }
 
     fn reclaim_rewriteable_sets(&mut self) {
-        self.retire_dead_views();
-        let mut retained = VecDeque::with_capacity(self.retired_sets.len());
-        while let Some(set) = self.retired_sets.pop_front() {
+        for _ in 0..self.retired_sets.len() {
+            let set = self
+                .retired_sets
+                .pop_front()
+                .expect("bounded initial queue length");
             if self.is_rewriteable(set) {
                 self.free_sets.push(set);
             } else {
-                retained.push_back(set);
+                self.retired_sets.push_back(set);
             }
         }
-        self.retired_sets = retained;
 
         while self.texture_sets.len() > self.cache_target {
             let Some(set) = self.evict_oldest_rewriteable_cache_entry() else {
@@ -430,7 +436,6 @@ impl DescriptorState {
     }
 
     pub(crate) fn clear_texture_cache(&mut self) -> Result<(), VulkanRendererError> {
-        self.retire_dead_views();
         if self.texture_sets.is_empty() && self.retired_sets.is_empty() {
             return Ok(());
         }
@@ -443,19 +448,16 @@ impl DescriptorState {
             return Ok(());
         }
 
-        let mut sets = self
-            .texture_sets
-            .values()
-            .map(|entry| entry.set)
-            .collect::<Vec<_>>();
-        sets.extend(self.retired_sets.iter().copied());
-        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(sets.len() as u64);
-        self.texture_sets.clear();
-        self.retired_sets.clear();
-        for set in &sets {
-            self.last_submissions.insert(*set, None);
+        let removed = self.texture_sets.len() + self.retired_sets.len();
+        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(removed as u64);
+        while let Some((_, entry)) = self.texture_sets.pop() {
+            self.last_submissions.insert(entry.set, None);
+            self.free_sets.push(entry.set);
         }
-        self.free_sets.extend(sets);
+        while let Some(set) = self.retired_sets.pop_front() {
+            self.last_submissions.insert(set, None);
+            self.free_sets.push(set);
+        }
 
         Ok(())
     }
@@ -560,7 +562,6 @@ mod tests {
     use ash::vk;
 
     use super::super::device::{DeviceState, SubmissionId};
-    use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
 
     use super::{DescriptorState, TextureSampler};
 
@@ -569,6 +570,7 @@ mod tests {
         image: vk::Image,
         memory: vk::DeviceMemory,
         view: vk::ImageView,
+        incarnation: std::num::NonZeroU64,
     }
 
     impl Drop for TestView {
@@ -582,6 +584,7 @@ mod tests {
     }
 
     fn test_view(device: &DeviceState) -> Option<TestView> {
+        let incarnation = device.shared_device().reserve_image_incarnation().ok()?;
         let handle = device.shared_device();
         let vk_device = handle.handle();
         let image_info = vk::ImageCreateInfo::default()
@@ -599,13 +602,20 @@ mod tests {
             .usage(vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = unsafe { vk_device.create_image(&image_info, None) }.ok()?;
+        let image = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_image(&image_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanImage,
+        )
+        .ok()?;
         let requirements = unsafe { vk_device.get_image_memory_requirements(image) };
         let memory_type = (0..32).find(|index| requirements.memory_type_bits & (1 << index) != 0)?;
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type);
-        let memory = match unsafe { vk_device.allocate_memory(&alloc, None) } {
+        let memory = match crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.allocate_memory(&alloc, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        ) {
             Ok(memory) => memory,
             Err(_) => {
                 unsafe { vk_device.destroy_image(image, None) };
@@ -644,6 +654,7 @@ mod tests {
             image,
             memory,
             view,
+            incarnation,
         })
     }
 
@@ -656,11 +667,15 @@ mod tests {
         page_size: usize,
         max_sets: usize,
     ) -> Option<(DeviceState, DescriptorState)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        let device = DeviceState::new(&physical_device).ok()?;
-        let descriptors =
-            DescriptorState::with_limits(device.shared_device(), cache_target, page_size, max_sets).ok()?;
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        let device = super::super::test_support::available(
+            DeviceState::new(&physical_device),
+            "descriptor test device",
+        )?;
+        let descriptors = super::super::test_support::available(
+            DescriptorState::with_limits(device.shared_device(), cache_target, page_size, max_sets),
+            "descriptor pools",
+        )?;
         Some((device, descriptors))
     }
 
@@ -677,38 +692,30 @@ mod tests {
         let first = test_view(&device).expect("test image");
         let second = test_view(&device).expect("test image");
         descriptors
-            .texture_descriptor_set(first.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(first.view, first.incarnation, TextureSampler::LINEAR)
             .expect("first set");
         descriptors
-            .texture_descriptor_set(second.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(second.view, second.incarnation, TextureSampler::LINEAR)
             .expect("second set");
         descriptors.commit_submission(SubmissionId::for_tests(0));
         assert_eq!(descriptors.texture_sets.len(), 2);
 
-        // The first texture dies. Its set must leave the live cache on the
-        // next drain and, once its last-use submission has retired, serve a
-        // brand-new texture — no global no-pending-submissions requirement.
-        // The third view is created BEFORE the first dies so the driver
-        // cannot reuse the dead handle value for it (that reuse is real,
-        // and the drain-before-insert ordering is what keeps it safe in
-        // production).
+        // Bounded LRU eviction reuses dead entries after their native stamp,
+        // even when another cached texture remains resident.
         let third = test_view(&device).expect("test image");
         let dead_view = first.view;
         let handle = device.shared_device();
-        // Production textures notify through VulkanImage::drop; the
-        // bare test image notifies explicitly.
-        handle.note_view_retired(dead_view);
         drop(first);
         handle.note_submission_completed(SubmissionId::for_tests(0));
         let set = descriptors
-            .texture_descriptor_set(third.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(third.view, third.incarnation, TextureSampler::LINEAR)
             .expect("recycled set");
         assert!(descriptors
             .texture_sets
             .keys()
             .all(|key| key.image_view != dead_view));
         assert_eq!(descriptors.texture_sets.len(), 2);
-        assert_eq!(descriptors.cache_stats().dead_view_reclaims, 1);
+        assert_eq!(descriptors.cache_stats().evictions, 1);
         let _ = set;
     }
 
@@ -721,18 +728,18 @@ mod tests {
         let handle = device.shared_device();
         let first = test_view(&device).expect("test image");
         descriptors
-            .texture_descriptor_set(first.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(first.view, first.incarnation, TextureSampler::LINEAR)
             .expect("first set");
         descriptors.commit_submission(SubmissionId::for_tests(7));
 
         let second = test_view(&device).expect("test image");
         assert!(descriptors
-            .texture_descriptor_set(second.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(second.view, second.incarnation, TextureSampler::LINEAR)
             .is_err());
 
         handle.note_submission_completed(SubmissionId::for_tests(7));
         descriptors
-            .texture_descriptor_set(second.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(second.view, second.incarnation, TextureSampler::LINEAR)
             .expect("evicted a quiescent set");
         assert_eq!(descriptors.texture_sets.len(), 1);
         assert_eq!(descriptors.cache_stats().evictions, 1);
@@ -747,15 +754,15 @@ mod tests {
         let first = test_view(&device).expect("test image");
         let second = test_view(&device).expect("test image");
         descriptors
-            .texture_descriptor_set(first.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(first.view, first.incarnation, TextureSampler::LINEAR)
             .expect("first set");
         assert!(descriptors
-            .texture_descriptor_set(second.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(second.view, second.incarnation, TextureSampler::LINEAR)
             .is_err());
 
         descriptors.abort_recording();
         descriptors
-            .texture_descriptor_set(second.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(second.view, second.incarnation, TextureSampler::LINEAR)
             .expect("aborted use must not invent an in-flight submission");
     }
 
@@ -770,7 +777,7 @@ mod tests {
             .collect::<Vec<_>>();
         for view in &views {
             descriptors
-                .texture_descriptor_set(view.view, TextureSampler::LINEAR)
+                .texture_descriptor_set(view.view, view.incarnation, TextureSampler::LINEAR)
                 .expect("recording may exceed the stable cache target");
         }
 
@@ -803,7 +810,7 @@ mod tests {
             .collect::<Vec<_>>();
         for view in &views {
             descriptors
-                .texture_descriptor_set(view.view, TextureSampler::LINEAR)
+                .texture_descriptor_set(view.view, view.incarnation, TextureSampler::LINEAR)
                 .expect("reserved descriptor");
         }
         descriptors.commit_submission(SubmissionId::for_tests(11));
@@ -847,3 +854,7 @@ mod tests {
         assert!(device.completion_since(snapshot).is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "descriptor/incarnation_tests.rs"]
+mod incarnation_tests;

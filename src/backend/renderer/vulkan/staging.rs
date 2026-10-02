@@ -1,14 +1,19 @@
-use std::{fmt, ops::Range, sync::Arc};
+use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 
 use ash::vk;
 
-use crate::backend::vulkan::PhysicalDevice;
+use crate::backend::{
+    renderer::{staged_cpu::MemoryUploadCpuSignal, MemoryUploadCpuCompletion},
+    vulkan::PhysicalDevice,
+};
 
-use super::{device::DeviceHandle, VulkanRendererError};
-
-const INITIAL_UPLOAD_ARENA_BYTES: usize = 16 * 1024 * 1024;
-const MAX_UPLOAD_ARENA_BYTES: usize = 256 * 1024 * 1024;
-const MAX_UPLOAD_ARENA_CHUNKS: usize = 4;
+use super::{
+    allocation::{AllocationGuard, VulkanAllocationReason},
+    device::DeviceHandle,
+    device_handle::DeviceRetirement,
+    retirement::RetirementNode,
+    VulkanRendererError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StagingReservation {
@@ -40,9 +45,9 @@ pub(crate) struct UploadArenaStats {
 
 /// Renderer-local, persistently mapped staging memory.
 ///
-/// All allocation and release happens on the renderer's one queue-owner
-/// thread. Reservations remain unavailable until the tracked Vulkan
-/// submission that consumed them retires.
+/// Storage is provisioned cold; final native destruction belongs to the
+/// device's existing retirement actor. Reservations remain unavailable until
+/// the tracked Vulkan submission that consumed them retires.
 pub(crate) struct UploadArena {
     chunks: Vec<StagingChunk>,
     atom_size: usize,
@@ -58,6 +63,50 @@ impl fmt::Debug for UploadArena {
     }
 }
 
+/// A same-device fixed arena prepared by an allocation helper. Unused or
+/// replaced storage is disposed on the logical device's retirement actor.
+pub struct VulkanUploadStorage {
+    device: Arc<DeviceHandle>,
+    arena: Option<UploadArena>,
+    retirement: Option<super::VulkanRetirementSlot<UploadArena>>,
+    requested_bytes: usize,
+}
+impl fmt::Debug for VulkanUploadStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VulkanUploadStorage")
+            .field("requested_bytes", &self.requested_bytes)
+            .finish_non_exhaustive()
+    }
+}
+impl VulkanUploadStorage {
+    pub(super) fn prepare(
+        physical: &PhysicalDevice,
+        device: Arc<DeviceHandle>,
+        bytes: usize,
+    ) -> Result<Self, VulkanRendererError> {
+        let retirement = super::VulkanRetirementSlot::new(device.clone());
+        let mut arena = UploadArena::new(physical);
+        arena.configure_fixed(physical, device.clone(), bytes)?;
+        Ok(Self {
+            device,
+            arena: Some(arena),
+            retirement: Some(retirement),
+            requested_bytes: bytes,
+        })
+    }
+    /// Exact unaligned owner request which created this transaction.
+    pub fn requested_bytes(&self) -> usize {
+        self.requested_bytes
+    }
+}
+impl Drop for VulkanUploadStorage {
+    fn drop(&mut self) {
+        if let (Some(arena), Some(retirement)) = (self.arena.take(), self.retirement.take()) {
+            retirement.retire(arena);
+        }
+    }
+}
+
 impl UploadArena {
     pub(crate) fn new(physical_device: &PhysicalDevice) -> Self {
         let atom_size = usize::try_from(physical_device.limits().non_coherent_atom_size)
@@ -70,12 +119,91 @@ impl UploadArena {
         }
     }
 
-    pub(crate) fn reserve(
+    /// Provision, shrink, or retire owner-sized storage. This is a lifecycle
+    /// operation, never a reservation-path fallback. A detached writer keeps
+    /// the old mapping alive even after cancellation; it must return before
+    /// storage can be replaced. No completion source is waited on here.
+    pub(crate) fn configure_fixed(
         &mut self,
         physical_device: &PhysicalDevice,
         device: Arc<DeviceHandle>,
-        len: usize,
-    ) -> Result<StagingReservation, VulkanRendererError> {
+        capacity: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        self.reap_parked();
+        let capacity = align_up(capacity, self.atom_size).ok_or(VulkanRendererError::InvalidMemoryUpload(
+            "fixed upload capacity overflowed",
+        ))?;
+        if self.stats.capacity_bytes == capacity {
+            return Ok(true);
+        }
+        if self.stats.in_use_bytes != 0
+            || self
+                .chunks
+                .iter()
+                .any(|chunk| Arc::strong_count(&chunk.memory) != 1)
+        {
+            return Ok(false);
+        }
+        // Failure preserves the old storage and its mode. The replacement is
+        // allocated before the old chunk is destroyed, outside frame work.
+        let replacement = if capacity == 0 {
+            None
+        } else {
+            Some(StagingChunk::new(
+                physical_device,
+                device,
+                capacity,
+                self.atom_size,
+            )?)
+        };
+        self.chunks.clear();
+        self.chunks.extend(replacement);
+        self.stats.capacity_bytes = capacity;
+        self.stats.chunk_count = usize::from(capacity != 0);
+        Ok(true)
+    }
+
+    pub(crate) fn capacity_matches(&self, bytes: usize) -> bool {
+        align_up(bytes, self.atom_size) == Some(self.stats.capacity_bytes)
+    }
+
+    /// Adoption performs no native allocation or destruction. Failed admission
+    /// leaves both the old arena and the exact prepared replacement untouched.
+    pub(crate) fn adopt(
+        &mut self,
+        device: &Arc<DeviceHandle>,
+        storage: &mut VulkanUploadStorage,
+    ) -> Result<bool, VulkanRendererError> {
+        if !Arc::ptr_eq(device, &storage.device) {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "prepared upload storage belongs to a different logical device",
+            ));
+        }
+        self.reap_parked();
+        if self.stats.in_use_bytes != 0
+            || self
+                .chunks
+                .iter()
+                .any(|chunk| Arc::strong_count(&chunk.memory) != 1)
+        {
+            return Ok(false);
+        }
+        let Some(replacement) = storage.arena.take() else {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "prepared upload storage was already consumed",
+            ));
+        };
+        let old = std::mem::replace(self, replacement);
+        storage
+            .retirement
+            .take()
+            .expect("prepared disposal custody")
+            .retire(old);
+        Ok(true)
+    }
+
+    pub(crate) fn reserve(&mut self, len: usize) -> Result<StagingReservation, VulkanRendererError> {
+        self.reap_parked();
         let reserved_len = align_up(len, self.atom_size).ok_or(VulkanRendererError::InvalidMemoryUpload(
             "staging reservation size overflowed",
         ))?;
@@ -89,39 +217,7 @@ impl UploadArena {
             return Ok(reservation);
         }
 
-        if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
-            let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
-            let previous = self.chunks.last().map(StagingChunk::capacity);
-            let chunk_size = bounded_chunk_size(previous, reserved_len, remaining, self.chunks.len());
-            if chunk_size >= reserved_len {
-                let chunk = StagingChunk::new(
-                    physical_device,
-                    device,
-                    align_up(chunk_size, self.atom_size).ok_or(VulkanRendererError::InvalidMemoryUpload(
-                        "upload arena growth size overflowed",
-                    ))?,
-                    self.atom_size,
-                )?;
-                self.stats.capacity_bytes = self.stats.capacity_bytes.saturating_add(chunk.capacity());
-                self.stats.chunk_count = self.stats.chunk_count.saturating_add(1);
-                self.stats.growth_count = self.stats.growth_count.saturating_add(1);
-                self.chunks.push(chunk);
-                return self.reserve_existing(len, reserved_len).ok_or(
-                    VulkanRendererError::TemporaryFailure(
-                        "new upload arena chunk could not satisfy its triggering reservation",
-                    ),
-                );
-            }
-        }
-
-        let remaining = MAX_UPLOAD_ARENA_BYTES.saturating_sub(self.stats.capacity_bytes);
-        let max_existing = self.chunks.iter().map(StagingChunk::capacity).max().unwrap_or(0);
-        let max_future = if self.chunks.len() < MAX_UPLOAD_ARENA_CHUNKS {
-            remaining
-        } else {
-            0
-        };
-        let max_contiguous_bytes = max_existing.max(max_future);
+        let max_contiguous_bytes = self.stats.capacity_bytes;
         if reserved_len > max_contiguous_bytes {
             return Err(VulkanRendererError::UploadExceedsArenaLimit {
                 requested_bytes: len,
@@ -193,18 +289,23 @@ impl UploadArena {
     /// another thread. The returned mapping owner keeps the bytes valid even if
     /// the arena is dropped first.
     pub(crate) fn detach(
-        &self,
+        &mut self,
         reservation: StagingReservation,
-    ) -> Result<(*mut u8, Arc<ChunkMemory>), VulkanRendererError> {
+    ) -> Result<(*mut u8, Arc<ReservationWriter>), VulkanRendererError> {
         let chunk = self
             .chunks
-            .get(reservation.chunk)
+            .get_mut(reservation.chunk)
             .ok_or(VulkanRendererError::TemporaryFailure(
                 "staging reservation names an unknown chunk",
             ))?;
         // SAFETY: The reservation lies inside the chunk's persistent mapping.
         let ptr = unsafe { chunk.memory.mapped.0.add(reservation.offset) };
-        Ok((ptr, Arc::clone(&chunk.memory)))
+        let writer = Arc::new(ReservationWriter {
+            _memory: Arc::clone(&chunk.memory),
+            completion: Arc::new(MemoryUploadCpuSignal::default()),
+        });
+        chunk.ranges.attach_writer(reservation.offset, writer.clone());
+        Ok((ptr, writer))
     }
 
     /// Make host writes to the reservation visible to the device.
@@ -223,8 +324,36 @@ impl UploadArena {
             .chunks
             .get_mut(reservation.chunk)
             .expect("tracked staging reservation names a live arena chunk");
-        chunk.ranges.release(reservation.offset, reservation.reserved_len);
-        self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_sub(reservation.reserved_len);
+        if chunk.ranges.release(reservation.offset, reservation.reserved_len) {
+            self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_sub(reservation.reserved_len);
+        }
+    }
+
+    pub(crate) fn reap_parked(&mut self) {
+        for chunk in &mut self.chunks {
+            let released = chunk.ranges.reap_parked();
+            self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_sub(released);
+        }
+    }
+
+    pub(crate) fn cpu_completion(&self) -> Option<MemoryUploadCpuCompletion> {
+        let signals = self
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .ranges
+                    .writers
+                    .values()
+                    .chain(chunk.ranges.parked.iter().map(|(_, _, writer)| writer))
+                    .map(|writer| writer.completion())
+            })
+            .collect::<Vec<_>>();
+        if signals.is_empty() {
+            None
+        } else {
+            Some(MemoryUploadCpuCompletion::new(signals))
+        }
     }
 
     pub(crate) fn stats(&self) -> UploadArenaStats {
@@ -234,7 +363,75 @@ impl UploadArena {
 
 struct StagingChunk {
     memory: Arc<ChunkMemory>,
-    ranges: RangeAllocator,
+    ranges: ReservationRanges<ReservationWriter>,
+}
+
+/// Exact writer custody for one span. Its mapping owner is deliberately
+/// separate from the free-range authority: another span may be used while
+/// these rows are being written or while cancellation awaits their return.
+pub(crate) struct ReservationWriter {
+    _memory: Arc<ChunkMemory>,
+    completion: Arc<MemoryUploadCpuSignal>,
+}
+
+impl ReservationWriter {
+    pub(crate) fn completion(&self) -> Arc<MemoryUploadCpuSignal> {
+        self.completion.clone()
+    }
+}
+
+/// Span ownership, including cancelled reservations still writable elsewhere.
+/// The arena owns one token; the exclusive row guard owns the other.
+struct ReservationRanges<T> {
+    free: RangeAllocator,
+    writers: HashMap<usize, Arc<T>>,
+    parked: Vec<(usize, usize, Arc<T>)>,
+}
+
+impl<T> ReservationRanges<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            free: RangeAllocator::new(capacity),
+            writers: HashMap::new(),
+            parked: Vec::new(),
+        }
+    }
+
+    fn reserve(&mut self, len: usize) -> Option<usize> {
+        self.free.reserve(len)
+    }
+
+    fn attach_writer(&mut self, offset: usize, token: Arc<T>) {
+        assert!(
+            self.writers.insert(offset, token).is_none(),
+            "one writer per staging reservation"
+        );
+    }
+
+    /// Returns true only when these bytes have become reusable.
+    fn release(&mut self, offset: usize, len: usize) -> bool {
+        if let Some(token) = self.writers.remove(&offset) {
+            if Arc::strong_count(&token) != 1 {
+                self.parked.push((offset, len, token));
+                return false;
+            }
+        }
+        self.free.release(offset, len);
+        true
+    }
+
+    fn reap_parked(&mut self) -> usize {
+        let mut bytes = 0;
+        self.parked.retain(|(offset, len, token)| {
+            if Arc::strong_count(token) != 1 {
+                return true;
+            }
+            self.free.release(*offset, *len);
+            bytes += len;
+            false
+        });
+        bytes
+    }
 }
 
 /// One chunk's buffer, memory and persistent mapping. Shared with detached
@@ -245,6 +442,28 @@ pub(crate) struct ChunkMemory {
     memory: vk::DeviceMemory,
     mapped: MappedAddress,
     coherent: bool,
+    retirement: Option<Box<RetirementNode<DeviceRetirement>>>,
+}
+
+/// Last row/writer release publishes this preallocated native mapping owner.
+/// It contains no device endpoint, so draining it cannot create an Arc cycle.
+pub(super) struct RetiredStagingBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    _mapped: MappedAddress,
+    _allocation: AllocationGuard,
+}
+
+impl RetiredStagingBuffer {
+    pub(super) fn destroy(self, device: &ash::Device) {
+        // Every mapping reader has returned before ChunkMemory's final drop
+        // publishes this node. Native calls happen only on the device actor.
+        unsafe {
+            device.unmap_memory(self.memory);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
 
 impl StagingChunk {
@@ -258,23 +477,36 @@ impl StagingChunk {
             .size(size as vk::DeviceSize)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = device.observe_result(unsafe { device.handle().create_buffer(&create_info, None) })?;
+        let buffer = device.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { device.handle().create_buffer(&create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanBuffer,
+        ))?;
         let memory_requirements = unsafe { device.handle().get_buffer_memory_requirements(buffer) };
         let (memory_type_index, coherent) =
-            pick_host_visible_memory_type(physical_device, memory_requirements.memory_type_bits)
-                .ok_or(VulkanRendererError::NoCompatibleMemoryType)?;
+            match pick_host_visible_memory_type(physical_device, memory_requirements.memory_type_bits) {
+                Some(memory_type) => memory_type,
+                None => {
+                    device.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
+                    return Err(VulkanRendererError::NoCompatibleMemoryType);
+                }
+            };
         let allocation_size = memory_requirements.size.max(size as vk::DeviceSize);
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(allocation_size)
             .memory_type_index(memory_type_index);
-        let memory =
-            match device.observe_result(unsafe { device.handle().allocate_memory(&allocate_info, None) }) {
-                Ok(memory) => memory,
-                Err(error) => {
-                    device.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
-                    return Err(error.into());
-                }
-            };
+        let memory = match device.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { device.handle().allocate_memory(&allocate_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        )) {
+            Ok(memory) => memory,
+            Err(error) => {
+                device.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
+                return Err(error.into());
+            }
+        };
+        let allocation = device
+            .allocation_ledger()
+            .record(VulkanAllocationReason::Upload, allocation_size);
         if let Err(error) =
             device.observe_result(unsafe { device.handle().bind_buffer_memory(buffer, memory, 0) })
         {
@@ -302,23 +534,43 @@ impl StagingChunk {
         let capacity = usize::try_from(allocation_size).unwrap_or(usize::MAX).min(size);
         let capacity = capacity - (capacity % atom_size);
         Ok(Self {
-            memory: Arc::new(ChunkMemory {
-                device,
-                buffer,
-                memory,
-                mapped,
-                coherent,
-            }),
-            ranges: RangeAllocator::new(capacity),
+            memory: Arc::new(ChunkMemory::new(
+                device, buffer, memory, mapped, coherent, allocation,
+            )),
+            ranges: ReservationRanges::new(capacity),
         })
     }
 
     fn capacity(&self) -> usize {
-        self.ranges.capacity
+        self.ranges.free.capacity
     }
 }
 
 impl ChunkMemory {
+    fn new(
+        device: Arc<DeviceHandle>,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+        mapped: MappedAddress,
+        coherent: bool,
+        allocation: AllocationGuard,
+    ) -> Self {
+        let retirement = RetirementNode::new(DeviceRetirement::StagingBuffer(RetiredStagingBuffer {
+            buffer,
+            memory,
+            _mapped: MappedAddress(mapped.0),
+            _allocation: allocation,
+        }));
+        Self {
+            device,
+            buffer,
+            memory,
+            mapped,
+            coherent,
+            retirement: Some(retirement),
+        }
+    }
+
     fn write_rows(
         &self,
         dst_offset: usize,
@@ -382,26 +634,28 @@ impl ChunkMemory {
 
 impl Drop for ChunkMemory {
     fn drop(&mut self) {
-        self.device.destroy_with(|device| unsafe {
-            device.unmap_memory(self.memory);
-            device.destroy_buffer(self.buffer, None);
-            device.free_memory(self.memory, None);
-        });
+        if let Some(node) = self.retirement.take() {
+            self.device.retire_resource(node);
+        }
     }
 }
 
 /// The Vulkan renderer is moved between worker setup and its final queue-owner
 /// thread, and a detached reservation is written on another thread. Every
 /// write goes to a reserved range no one else touches until it is handed
-/// back; mapping and unmapping stay with the owning chunk memory.
+/// back; the final chunk owner publishes unmapping to the device actor.
 struct MappedAddress(*mut u8);
 
 // SAFETY: See the type-level ownership argument above. The address itself is
 // immutable; disjoint reservations never alias, and the mapping is unmapped
-// only when the last owner of the chunk memory drops it.
+// only after the last owner of the chunk memory publishes native retirement.
 unsafe impl Send for MappedAddress {}
 // SAFETY: As above: shared references only read the base address.
 unsafe impl Sync for MappedAddress {}
+
+#[cfg(test)]
+#[path = "staging/retirement_tests.rs"]
+mod retirement_tests;
 
 struct RangeAllocator {
     capacity: usize,
@@ -467,26 +721,6 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|rounded| rounded / alignment * alignment)
 }
 
-fn next_chunk_size(previous: Option<usize>, requested: usize) -> usize {
-    previous
-        .map_or(INITIAL_UPLOAD_ARENA_BYTES, |size| size.saturating_mul(2))
-        .max(requested)
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX)
-}
-
-fn bounded_chunk_size(
-    previous: Option<usize>,
-    requested: usize,
-    remaining: usize,
-    existing_chunks: usize,
-) -> usize {
-    if existing_chunks + 1 == MAX_UPLOAD_ARENA_CHUNKS {
-        return remaining;
-    }
-    next_chunk_size(previous, requested).min(remaining)
-}
-
 fn pick_host_visible_memory_type(
     physical_device: &PhysicalDevice,
     memory_type_bits: u32,
@@ -517,10 +751,278 @@ fn pick_host_visible_memory_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        align_up, bounded_chunk_size, next_chunk_size, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES,
-        MAX_UPLOAD_ARENA_BYTES,
-    };
+    use super::{align_up, RangeAllocator, ReservationRanges, UploadArena, UploadArenaStats};
+    use std::sync::Arc;
+
+    #[test]
+    fn detached_writer_parks_only_its_cancelled_span() {
+        let mut spans = ReservationRanges::new(4096);
+        let first = spans.reserve(1024).unwrap();
+        let writer = Arc::new(());
+        spans.attach_writer(first, writer.clone());
+        assert!(!spans.release(first, 1024));
+        assert_eq!(spans.reap_parked(), 0, "rows still own cancelled bytes");
+        let unrelated = spans.reserve(3072).expect("unrelated capacity stays usable");
+        assert_eq!(unrelated, 1024);
+        assert_eq!(spans.reserve(1), None, "cancelled span remains unavailable");
+        std::thread::spawn(move || drop(writer)).join().unwrap();
+        assert_eq!(spans.reap_parked(), 1024);
+        assert_eq!(spans.reap_parked(), 0, "each span returns exactly once");
+        assert_eq!(spans.reserve(1024), Some(first));
+        assert!(spans.release(first, 1024));
+        assert!(spans.release(unrelated, 3072));
+        assert_eq!(spans.free.free, vec![0..4096]);
+    }
+
+    #[test]
+    fn unrelated_writer_tokens_do_not_prevent_completed_reservations_releasing() {
+        let mut spans = ReservationRanges::new(4096);
+        let first = spans.reserve(1024).unwrap();
+        let second = spans.reserve(1024).unwrap();
+        let writer = Arc::new(());
+        spans.attach_writer(first, writer.clone());
+        let returned = Arc::new(());
+        spans.attach_writer(second, returned.clone());
+        drop(returned);
+        assert!(spans.release(second, 1024));
+        assert_eq!(spans.reserve(1024), Some(second));
+        assert_eq!(Arc::strong_count(&writer), 2);
+    }
+
+    #[test]
+    fn owner_sized_ring_never_grows_when_a_whole_generation_waits() {
+        let mut ring = RangeAllocator::new(4096);
+        let first = ring.reserve(3072).unwrap();
+        assert_eq!(
+            ring.reserve(2048),
+            None,
+            "a generation is never partially admitted"
+        );
+        ring.release(first, 3072);
+        assert_eq!(
+            ring.reserve(2048),
+            Some(0),
+            "completion admits the whole generation"
+        );
+    }
+
+    #[test]
+    fn generation_does_not_land_in_bands_across_fragmented_free_spans() {
+        let mut ring = RangeAllocator::new(4096);
+        let first = ring.reserve(1024).unwrap();
+        let second = ring.reserve(1024).unwrap();
+        let third = ring.reserve(2048).unwrap();
+        ring.release(first, 1024);
+        ring.release(third, 2048);
+        assert_eq!(
+            ring.reserve(3072),
+            None,
+            "enough total free bytes cannot authorize a banded upload"
+        );
+        ring.release(second, 1024);
+        assert_eq!(ring.reserve(3072), Some(0));
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn whole_twenty_mib_slice_uses_the_declared_twenty_two_mib_ring() {
+        use crate::backend::{allocator::Fourcc, renderer::ImportMem};
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let data = vec![0; 20 * 1024 * 1024];
+        let before = renderer.diagnostics();
+        assert!(matches!(
+            renderer.import_memory(&data, Fourcc::Argb8888, (2560, 2048).into(), false),
+            Err(super::VulkanRendererError::UploadExceedsArenaLimit {
+                max_contiguous_bytes: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            renderer
+                .diagnostics()
+                .allocations
+                .reason(super::VulkanAllocationReason::Texture),
+            before.allocations.reason(super::VulkanAllocationReason::Texture),
+            "unprovisioned admission cannot allocate an image"
+        );
+        assert!(renderer
+            .configure_memory_upload_capacity(22 * 1024 * 1024)
+            .unwrap());
+        let texture = renderer
+            .import_memory(&data, Fourcc::Argb8888, (2560, 2048).into(), false)
+            .unwrap();
+        let stats = renderer.diagnostics().uploads;
+        assert_eq!(stats.arena_chunk_count, 1);
+        assert_eq!(stats.arena_capacity_bytes, 22 * 1024 * 1024);
+        assert_eq!(stats.owner_capacity_bytes, stats.arena_capacity_bytes);
+        assert_eq!(stats.arena_growth_count, 0);
+        drop(texture);
+        assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn detached_rows_and_slice_upload_share_the_existing_chunk() {
+        use crate::backend::{allocator::Fourcc, renderer::ImportMem};
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        assert!(renderer
+            .configure_memory_upload_capacity(16 * 1024 * 1024)
+            .unwrap());
+        let texture = renderer
+            .import_memory(
+                &vec![0; 4 * 1024 * 1024],
+                Fourcc::Argb8888,
+                (1024, 1024).into(),
+                false,
+            )
+            .unwrap();
+        let before = renderer.diagnostics().uploads;
+        let (update, rows) = renderer
+            .stage_memory_update(&texture, crate::utils::Rectangle::from_size((1024, 1024).into()))
+            .unwrap()
+            .unwrap();
+        let small = renderer
+            .import_memory(&[0; 16 * 1024], Fourcc::Argb8888, (64, 64).into(), false)
+            .unwrap();
+        let after = renderer.diagnostics().uploads;
+        assert_eq!(after.arena_chunk_count, 1);
+        assert_eq!(after.arena_capacity_bytes, before.arena_capacity_bytes);
+        assert_eq!(after.arena_growth_count, before.arena_growth_count);
+        renderer.cancel_staged_memory_update(update);
+        assert_eq!(
+            renderer.diagnostics().uploads.arena_in_use_bytes,
+            8 * 1024 * 1024 + 16 * 1024
+        );
+        drop(rows);
+        drop(small);
+        drop(texture);
+        assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn owner_ring_shrinks_and_retires_only_after_detached_writer_returns() {
+        use crate::backend::allocator::Fourcc;
+        use crate::backend::renderer::ImportMem;
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        assert!(renderer.configure_memory_upload_capacity(4096).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 4096);
+        let (_, update, rows) = renderer
+            .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !renderer.configure_memory_upload_capacity(2048).unwrap(),
+            "a live generation owns its reservation"
+        );
+        renderer.cancel_staged_memory_update(update);
+        assert!(
+            !renderer.configure_memory_upload_capacity(2048).unwrap(),
+            "a detached writer still owns the mapping"
+        );
+        let crate::backend::renderer::MemoryUploadCapacityEdge::CpuWriterPending(completion) =
+            renderer.memory_upload_capacity_edge().unwrap()
+        else {
+            panic!("parked writer must expose its CPU completion");
+        };
+        assert!(!completion.is_ready());
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = returned.clone();
+        completion.on_ready(Arc::new(move || {
+            observed.store(true, std::sync::atomic::Ordering::Release);
+        }));
+        let (_, unrelated, unrelated_rows) = renderer
+            .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap()
+            .unwrap();
+        drop(unrelated_rows);
+        renderer.cancel_staged_memory_update(unrelated);
+        let slice = renderer
+            .import_memory(&[0; 1024], Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap();
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 1);
+        assert_eq!(renderer.diagnostics().uploads.arena_growth_count, 0);
+        drop(slice);
+        drop(rows);
+        assert!(returned.load(std::sync::atomic::Ordering::Acquire));
+        assert!(completion.is_ready());
+        assert!(renderer.configure_memory_upload_capacity(2048).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);
+        assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 0);
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 0);
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn helper_storage_admits_only_its_device_after_exact_writer_returns() {
+        use crate::backend::{allocator::Fourcc, renderer::ImportMem};
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let Some(mut other) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let allocator = renderer.offscreen_allocator();
+        let cold = allocator.clone();
+        let mut prepared = std::thread::spawn(move || cold.prepare_upload_storage(4096))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(other.adopt_memory_upload_storage(&mut prepared, 0, 4096).is_err());
+        assert_eq!(other.diagnostics().uploads.arena_capacity_bytes, 0);
+        assert!(renderer
+            .adopt_memory_upload_storage(&mut prepared, 0, 4096)
+            .unwrap());
+        let (texture, update, rows) = renderer
+            .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap()
+            .unwrap();
+        renderer.cancel_staged_memory_update(update);
+        let cold = allocator.clone();
+        let mut successor = std::thread::spawn(move || cold.prepare_upload_storage(2048))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(!renderer
+            .adopt_memory_upload_storage(&mut successor, 0, 2048)
+            .unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 4096);
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 1);
+        drop(rows);
+        drop(texture);
+        assert!(renderer
+            .adopt_memory_upload_storage(&mut successor, 0, 2048)
+            .unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);
+        assert_eq!(renderer.diagnostics().uploads.arena_growth_count, 0);
+        let mut retired = std::thread::spawn(move || allocator.prepare_upload_storage(0))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(renderer.adopt_memory_upload_storage(&mut retired, 0, 0).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 0);
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 0);
+    }
 
     #[test]
     fn allocator_never_reuses_a_live_span_and_coalesces_retired_neighbors() {
@@ -553,31 +1055,21 @@ mod tests {
     }
 
     #[test]
-    fn first_upload_allocates_only_the_initial_chunk() {
-        assert_eq!(next_chunk_size(None, 4_096), INITIAL_UPLOAD_ARENA_BYTES);
-        assert_eq!(
-            next_chunk_size(Some(INITIAL_UPLOAD_ARENA_BYTES), 4_096),
-            INITIAL_UPLOAD_ARENA_BYTES * 2
-        );
-    }
-
-    #[test]
-    fn final_chunk_uses_the_remaining_bounded_budget() {
-        let first = bounded_chunk_size(None, 4_096, MAX_UPLOAD_ARENA_BYTES, 0);
-        let second = bounded_chunk_size(Some(first), 4_096, MAX_UPLOAD_ARENA_BYTES - first, 1);
-        let third = bounded_chunk_size(Some(second), 4_096, MAX_UPLOAD_ARENA_BYTES - first - second, 2);
-        let fourth = bounded_chunk_size(
-            Some(third),
-            4_096,
-            MAX_UPLOAD_ARENA_BYTES - first - second - third,
-            3,
-        );
-
-        assert_eq!(
-            [first, second, third, fourth],
-            [16, 32, 64, 144].map(|mib| mib * 1024 * 1024)
-        );
-        assert_eq!(first + second + third + fourth, MAX_UPLOAD_ARENA_BYTES);
+    fn unprovisioned_upload_cannot_allocate_storage() {
+        let mut arena = UploadArena {
+            chunks: Vec::new(),
+            atom_size: 256,
+            stats: UploadArenaStats::default(),
+        };
+        assert!(matches!(
+            arena.reserve(20 * 1024 * 1024),
+            Err(super::VulkanRendererError::UploadExceedsArenaLimit {
+                max_contiguous_bytes: 0,
+                ..
+            })
+        ));
+        assert_eq!(arena.stats(), UploadArenaStats::default());
+        assert!(arena.chunks.is_empty());
     }
 
     #[test]

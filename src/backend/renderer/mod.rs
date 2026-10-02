@@ -41,6 +41,9 @@ pub mod vulkan;
 mod color;
 pub use color::Color32F;
 
+mod staged_cpu;
+pub use staged_cpu::MemoryUploadCpuCompletion;
+
 mod staged;
 pub use staged::{StagedMemoryRows, StagedMemoryUpdate};
 
@@ -65,6 +68,13 @@ pub mod utils;
 pub mod element;
 
 pub mod damage;
+
+// Exactly one test allocator authority across minimal DRM and Vulkan builds.
+#[cfg(all(test, not(feature = "renderer_vulkan")))]
+#[path = "vulkan/storage_heap_probe.rs"]
+pub(crate) mod storage_heap_probe;
+#[cfg(all(test, feature = "renderer_vulkan"))]
+pub(crate) use vulkan::storage_heap_probe;
 
 pub mod sync;
 use sync::SyncPoint;
@@ -486,6 +496,26 @@ pub trait Frame {
         alpha: f32,
     ) -> Result<(), Self::Error>;
 
+    /// Physical canonical sample identity while replaying an unresolved owner group.
+    fn canonical_coverage_lane(&self) -> Option<usize> {
+        None
+    }
+
+    /// Draw an already evaluated canonical sample raster without shifting its texel grid.
+    /// The default is sufficient for renderers without owner-group replay.
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_resolved_sample_lane(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to(texture, src, dst, damage, &[], src_transform, alpha)
+    }
+
     /// Render a texture with an analytic rounded clip mask applied in the
     /// destination coordinate space.
     #[allow(clippy::too_many_arguments)]
@@ -568,6 +598,14 @@ pub trait Frame {
 
     /// Wait for a [`SyncPoint`] to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;
+
+    /// A previous segment of this outer frame has already submitted native
+    /// reads, but an error would prevent returning its complete retirement edge.
+    /// Callers must retain sampled sources on such an error. Legacy single-pass
+    /// renderers keep the default behavior.
+    fn completion_unobservable_on_error(&self) -> bool {
+        false
+    }
 
     /// Finish this [`Frame`] returning any error that may happen during any cleanup.
     ///
@@ -721,14 +759,21 @@ pub enum MemoryUploadErrorKind {
 /// Normal rendering does not use this path: implementations batch memory
 /// copies into the next real render submission. A renderer that reports
 /// [`MemoryUploadErrorKind::DeferredCapacity`] must return one exact completion
-/// edge here: either the pending upload prefix is sealed, or the newest
-/// submission retaining staging capacity is identified. Queue ordering then
-/// guarantees that reaching the edge returns all capacity retained before it.
+/// edge here: a pending upload prefix, the newest staging-owning submission,
+/// or the exact detached CPU writers. GPU queue ordering and CPU row-return
+/// custody determine when an owner retry can reuse or reconfigure the ring.
+/// `Available` also permits a retry when reclamation won the edge-query race.
 #[derive(Debug, Clone)]
 pub enum MemoryUploadCapacityEdge {
     /// This renderer does not implement deferred upload custody. It must never
     /// classify an upload error as [`MemoryUploadErrorKind::DeferredCapacity`].
     NotApplicable,
+    /// Reclamation already returned all upload reservations. Retry owner
+    /// preparation on a control turn; no completion wait is necessary.
+    Available,
+    /// Exact detached CPU writers still own unsubmitted or cancelled spans.
+    /// Register the returned readiness snapshot after retaining accepted work.
+    CpuWriterPending(MemoryUploadCpuCompletion),
     /// One renderer submission owns every pending upload and the returned
     /// completion point is the sole safe staging-reuse edge.
     Submitted(sync::SyncPoint),
@@ -738,8 +783,76 @@ pub enum MemoryUploadCapacityEdge {
     InFlight(sync::SyncPoint),
 }
 
+/// Disposition of a synchronous guarded copy into renderer-mapped rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRowUpload<T> {
+    /// The renderer requires the ordinary slice-import path.
+    Unsupported,
+    /// The source callback refused the copy. No GPU upload was queued.
+    SourceFailed,
+    /// The whole generation joins the next dependent render submission.
+    Queued(T),
+}
+
+/// A measured reason an asynchronous foreign-host-pointer upload is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryHostUnavailable {
+    /// The renderer has no foreign host-memory import implementation.
+    Renderer,
+    /// The optional external host-memory extension is absent.
+    Extension,
+    /// Transfer-source foreign host buffers are not importable on this device.
+    BufferUsage,
+    /// The backing file has no monotonic shrink seal.
+    Unsealed,
+    /// Source metadata cannot be represented by a Vulkan buffer-image copy.
+    Layout,
+    /// The alignment-rounded mapping would exceed the sealed file extent.
+    Extent,
+    /// The measured host-pointer or buffer allocation alignment is incompatible.
+    Alignment,
+    /// No compatible host-visible coherent memory type exists.
+    MemoryType,
+    /// The driver rejected this external host pointer.
+    Pointer,
+}
+
+/// Whole-generation admission from an independently owned, sealed mapping.
+#[derive(Debug)]
+pub enum MemoryHostUpload<T> {
+    /// Use the existing bounded copy path for this source/device combination.
+    Unavailable(MemoryHostUnavailable),
+    /// No CPU row copy or staging reservation was made. GPU work retains the
+    /// exact source attachment and independent mapping until real completion.
+    Queued(T),
+}
+
 /// Trait for renderers supporting importing bitmaps from memory.
 pub trait ImportMem: Renderer {
+    /// Prepare a sealed Wayland SHM generation on a non-frame turn. The exact
+    /// attachment owner prevents early protocol release; implementations must
+    /// independently pin the mapping, and must never retain a pool callback address.
+    #[cfg(feature = "wayland_frontend")]
+    fn import_host_shm(
+        &mut self,
+        _source: &utils::Buffer,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+    ) -> Result<MemoryHostUpload<Self::TextureId>, Self::Error> {
+        Ok(MemoryHostUpload::Unavailable(MemoryHostUnavailable::Renderer))
+    }
+
+    /// Prepare damage from the same independently owned SHM mapping. This
+    /// shares the whole-generation submission and lifetime contract above.
+    #[cfg(feature = "wayland_frontend")]
+    fn update_host_shm(
+        &mut self,
+        _texture: &Self::TextureId,
+        _source: &utils::Buffer,
+        _region: Rectangle<i32, BufferCoord>,
+    ) -> Result<MemoryHostUpload<()>, Self::Error> {
+        Ok(MemoryHostUpload::Unavailable(MemoryHostUnavailable::Renderer))
+    }
     /// Import a given chunk of memory into the renderer.
     ///
     /// Returns a texture_id, which can be used with [`Frame::render_texture_from_to`] (or [`Frame::render_texture_at`])
@@ -814,6 +927,48 @@ pub trait ImportMem: Renderer {
         _region: Rectangle<i32, BufferCoord>,
     ) -> Result<Option<(StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
         Ok(None)
+    }
+
+    /// Create a memory texture and reserve its whole initial generation as
+    /// tightly packed writable rows. The texture must not be sampled until
+    /// [`Self::submit_staged_memory_update`] accepts the returned update.
+    ///
+    /// The caller may fill the rows under guarded SHM access without making a
+    /// second full-image CPU copy. Reservations belong to the same bounded
+    /// storage and completion lifetime as staged updates. `Ok(None)` means
+    /// this implementation requires the ordinary slice import path instead.
+    fn stage_memory_import(
+        &mut self,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+        _flipped: bool,
+    ) -> Result<Option<(Self::TextureId, StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Fill mapped rows of a complete new texture without allocating a
+    /// detached update ticket. Return false from `fill` to cancel the copy.
+    /// The callback must finish before the renderer queues the upload.
+    fn import_memory_rows(
+        &mut self,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+        _flipped: bool,
+        _fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<Self::TextureId>, Self::Error> {
+        Ok(MemoryRowUpload::Unsupported)
+    }
+
+    /// Fill mapped rows of one complete update region. This synchronous
+    /// path has no detached heap ticket; a guarded source may fill directly
+    /// into its reservation. False from `fill` preserves existing pixels.
+    fn update_memory_rows(
+        &mut self,
+        _texture: &Self::TextureId,
+        _region: Rectangle<i32, BufferCoord>,
+        _fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<()>, Self::Error> {
+        Ok(MemoryRowUpload::Unsupported)
     }
 
     /// Apply a staged update whose rows are all written. The whole region

@@ -19,10 +19,7 @@
 //! See the [`damage`](crate::backend::renderer::damage) module for more information on
 //! damage tracking.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::sync::{Arc, Weak};
 
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::{backend::ObjectId, Resource};
@@ -42,10 +39,19 @@ use super::{
 
 pub mod memory;
 pub mod solid;
+mod source;
+mod state_map;
+mod vec_workspace;
+pub(crate) use source::ElementSource;
+pub(crate) use vec_workspace::VecStorageBank;
+pub use vec_workspace::WorkspaceVec;
 #[cfg(feature = "wayland_frontend")]
 pub mod surface;
 pub mod texture;
 pub mod utils;
+pub(crate) use state_map::StateMapBank;
+pub(crate) use state_map::StateReceiptReturnWakeup;
+pub use state_map::{FrameWorkspaceError, RenderElementStateMap};
 
 crate::utils::ids::id_gen!(external_id);
 
@@ -412,13 +418,20 @@ pub fn default_primary_scanout_output_compare<'a>(
 }
 
 /// Holds the states for a set of [`RenderElement`]s
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug)]
 pub struct RenderElementStates {
     /// Holds the render states of the elements
-    pub states: HashMap<Id, RenderElementState>,
+    pub states: RenderElementStateMap,
 }
 
 impl RenderElementStates {
+    /// Copy into an independent admitted receipt, refusing retained-slot pressure.
+    pub fn try_clone_reserved(&self) -> Result<Self, FrameWorkspaceError> {
+        Ok(Self {
+            states: self.states.try_clone_reserved()?,
+        })
+    }
+
     /// Return the [`RenderElementState`] for the specified [`Id`]
     ///
     /// Return `None` if the element is not included in the states
@@ -531,6 +544,30 @@ pub trait Element {
     fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         OpaqueRegions::default()
     }
+
+    /// Visit element-local damage without requiring an owning intermediate set.
+    /// The default preserves legacy elements; an allocation-free source must
+    /// override this method and every wrapping adapter must forward it.
+    fn visit_damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<i32, Physical>),
+    ) {
+        for rect in self.damage_since(scale, commit) {
+            visit(rect);
+        }
+    }
+
+    /// Visit element-local opaque proof without an intermediate region set.
+    /// Consumers must preserve every region or return a typed workspace error;
+    /// this method does not impose a silent rectangle limit.
+    fn visit_opaque_regions(&self, scale: Scale<f64>, visit: &mut dyn FnMut(Rectangle<i32, Physical>)) {
+        for rect in self.opaque_regions(scale) {
+            visit(rect);
+        }
+    }
+
     /// Returns an alpha value the element should be drawn with regardless of any
     /// already encoded alpha in it's underlying representation.
     fn alpha(&self) -> f32 {
@@ -675,6 +712,19 @@ where
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         (*self).opaque_regions(scale)
+    }
+
+    fn visit_damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<i32, Physical>),
+    ) {
+        (*self).visit_damage_since(scale, commit, visit)
+    }
+
+    fn visit_opaque_regions(&self, scale: Scale<f64>, visit: &mut dyn FnMut(Rectangle<i32, Physical>)) {
+        (*self).visit_opaque_regions(scale, visit)
     }
 
     fn alpha(&self) -> f32 {
@@ -984,6 +1034,28 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => $crate::render_elements_internal!(@call opaque_regions; x, scale)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn visit_damage_since(&self, scale: $crate::utils::Scale<f64>, commit: Option<$crate::backend::renderer::utils::CommitCounter>, visit: &mut dyn FnMut($crate::utils::Rectangle<i32, $crate::utils::Physical>)) {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(#[$meta])*
+                    Self::$body(x) => $crate::render_elements_internal!(@call visit_damage_since; x, scale, commit, visit)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn visit_opaque_regions(&self, scale: $crate::utils::Scale<f64>, visit: &mut dyn FnMut($crate::utils::Rectangle<i32, $crate::utils::Physical>)) {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(#[$meta])*
+                    Self::$body(x) => $crate::render_elements_internal!(@call visit_opaque_regions; x, scale, visit)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1754,6 +1826,19 @@ where
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         self.0.opaque_regions(scale)
+    }
+
+    fn visit_damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<i32, Physical>),
+    ) {
+        self.0.visit_damage_since(scale, commit, visit)
+    }
+
+    fn visit_opaque_regions(&self, scale: Scale<f64>, visit: &mut dyn FnMut(Rectangle<i32, Physical>)) {
+        self.0.visit_opaque_regions(scale, visit)
     }
 
     fn alpha(&self) -> f32 {

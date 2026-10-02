@@ -86,6 +86,22 @@ impl<E: Element> Element for RescaleRenderElement<E> {
             .collect::<OpaqueRegions<_, _>>()
     }
 
+    fn visit_damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<crate::backend::renderer::utils::CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<i32, Physical>),
+    ) {
+        self.element.visit_damage_since(scale, commit, &mut |rect| {
+            visit(rect.to_f64().upscale(self.scale).to_i32_up())
+        });
+    }
+    fn visit_opaque_regions(&self, scale: Scale<f64>, visit: &mut dyn FnMut(Rectangle<i32, Physical>)) {
+        self.element.visit_opaque_regions(scale, &mut |rect| {
+            visit(rect.to_f64().upscale(self.scale).to_i32_round())
+        });
+    }
+
     fn alpha(&self) -> f32 {
         self.element.alpha()
     }
@@ -311,6 +327,32 @@ impl<E: Element> Element for CropRenderElement<E> {
         }
     }
 
+    fn visit_damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<crate::backend::renderer::utils::CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<i32, Physical>),
+    ) {
+        if let Some(crop) = self.element_crop_rect(scale) {
+            self.element.visit_damage_since(scale, commit, &mut |rect| {
+                if let Some(mut rect) = rect.intersection(crop) {
+                    rect.loc -= crop.loc;
+                    visit(rect);
+                }
+            });
+        }
+    }
+    fn visit_opaque_regions(&self, scale: Scale<f64>, visit: &mut dyn FnMut(Rectangle<i32, Physical>)) {
+        if let Some(crop) = self.element_crop_rect(scale) {
+            self.element.visit_opaque_regions(scale, &mut |rect| {
+                if let Some(mut rect) = rect.intersection(crop) {
+                    rect.loc -= crop.loc;
+                    visit(rect);
+                }
+            });
+        }
+    }
+
     fn alpha(&self) -> f32 {
         self.element.alpha()
     }
@@ -447,6 +489,18 @@ impl<E: Element> Element for RelocateRenderElement<E> {
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         self.element.opaque_regions(scale)
+    }
+
+    fn visit_damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<crate::backend::renderer::utils::CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<i32, Physical>),
+    ) {
+        self.element.visit_damage_since(scale, commit, visit)
+    }
+    fn visit_opaque_regions(&self, scale: Scale<f64>, visit: &mut dyn FnMut(Rectangle<i32, Physical>)) {
+        self.element.visit_opaque_regions(scale, visit)
     }
 
     fn alpha(&self) -> f32 {
@@ -680,3 +734,7 @@ where
         .map(move |e| RelocateRenderElement::from_element(e, offset, Relocate::Relative))
         .filter_map(move |e| CropRenderElement::from_element(e, scale, constrain))
 }
+
+#[cfg(test)]
+#[path = "streaming_tests.rs"]
+mod streaming_tests;

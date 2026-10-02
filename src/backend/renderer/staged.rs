@@ -12,6 +12,8 @@
 
 use std::{any::Any, fmt, sync::Arc};
 
+use super::staged_cpu::MemoryUploadCpuSignal;
+
 use crate::utils::{Buffer as BufferCoord, Rectangle};
 
 /// The renderer-side half of a staged memory update.
@@ -71,7 +73,8 @@ pub struct StagedMemoryRows {
     row_bytes: usize,
     rows: usize,
     ticket: u64,
-    _keepalive: Arc<dyn Any + Send + Sync>,
+    keepalive: Option<Arc<dyn Any + Send + Sync>>,
+    completion: Option<Arc<MemoryUploadCpuSignal>>,
 }
 
 impl fmt::Debug for StagedMemoryRows {
@@ -86,7 +89,7 @@ impl fmt::Debug for StagedMemoryRows {
 
 // SAFETY: The rows are an exclusive view of a reserved staging range. No other
 // code reads or writes that range until the rows are handed back, and
-// `_keepalive` keeps its mapping alive on whichever thread holds the rows.
+// `keepalive` keeps its mapping alive on whichever thread holds the rows.
 unsafe impl Send for StagedMemoryRows {}
 
 impl StagedMemoryRows {
@@ -109,8 +112,28 @@ impl StagedMemoryRows {
             row_bytes,
             rows,
             ticket,
-            _keepalive: keepalive,
+            keepalive: Some(keepalive),
+            completion: None,
         }
+    }
+
+    /// Attach the exact readiness signal to a Vulkan reservation's rows.
+    ///
+    /// # Safety
+    /// Same mapping and exclusive-range requirements as [`Self::new`]. Each
+    /// completion must belong to exactly these rows and complete only once.
+    pub(crate) unsafe fn new_with_completion(
+        ptr: *mut u8,
+        row_bytes: usize,
+        rows: usize,
+        ticket: u64,
+        keepalive: Arc<dyn Any + Send + Sync>,
+        completion: Arc<MemoryUploadCpuSignal>,
+    ) -> Self {
+        // SAFETY: The caller satisfies new's exact mapping/range contract.
+        let mut view = unsafe { Self::new(ptr, row_bytes, rows, ticket, keepalive) };
+        view.completion = Some(completion);
+        view
     }
 
     /// Bytes in one row.
@@ -139,5 +162,51 @@ impl StagedMemoryRows {
         // exclusive to these rows; `row` is in bounds, and `&mut self` makes
         // the returned slice the only live reference into it.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.add(row * self.row_bytes), self.row_bytes) }
+    }
+}
+
+impl Drop for StagedMemoryRows {
+    fn drop(&mut self) {
+        // Returning custody must precede notification. An observer may enqueue
+        // a retry on another thread immediately, and must see the span free.
+        drop(self.keepalive.take());
+        if let Some(completion) = self.completion.take() {
+            completion.complete();
+        }
+    }
+}
+
+#[cfg(test)]
+mod cpu_return_tests {
+    use super::super::MemoryUploadCpuCompletion;
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn row_return_releases_exact_mapping_custody_before_notifying() {
+        let mut mapping = Arc::new([0u8; 16]);
+        let pointer = Arc::get_mut(&mut mapping).unwrap().as_mut_ptr();
+        let weak = Arc::downgrade(&mapping);
+        let signal = Arc::new(MemoryUploadCpuSignal::default());
+        let completion = MemoryUploadCpuCompletion::new([signal.clone()]);
+        // SAFETY: This mapping and sole row guard own exactly 16 writable bytes.
+        let rows =
+            unsafe { StagedMemoryRows::new_with_completion(pointer, 4, 4, 0, mapping.clone(), signal) };
+        let woke = Arc::new(AtomicBool::new(false));
+        let observed = woke.clone();
+        let observer_mapping = weak.clone();
+        completion.on_ready(Arc::new(move || {
+            assert_eq!(
+                observer_mapping.strong_count(),
+                1,
+                "returned rows released their mapping reference"
+            );
+            observed.store(true, Ordering::Release);
+        }));
+        std::thread::spawn(move || drop(rows)).join().unwrap();
+        assert!(woke.load(Ordering::Acquire));
+        assert!(completion.is_ready());
+        drop(mapping);
+        assert!(weak.upgrade().is_none(), "readiness retains no mapping");
     }
 }

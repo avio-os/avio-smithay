@@ -140,6 +140,27 @@ pub enum VulkanRendererError {
         max_sets: usize,
     },
 
+    /// All cold native command slots are occupied by exact GPU or external readers.
+    #[error("vulkan command storage occupied: {slots} slots")]
+    CommandCapacityExhausted {
+        /// Total cold-reserved slots.
+        slots: usize,
+    },
+    /// A single recording exceeds its explicitly cold-reserved CPU storage.
+    #[error("vulkan command storage limit exceeded for {resource}: {requested}/{limit}")]
+    CommandStorageLimitExceeded {
+        /// Exact container whose capacity would otherwise grow.
+        resource: &'static str,
+        /// Requested entries.
+        requested: usize,
+        /// Cold reserved entries.
+        limit: usize,
+    },
+    /// Native completion or command reset was unobservable. Submitted owners
+    /// remain quarantined; this is not a fabricated DEVICE_LOST proof.
+    #[error("vulkan command completion unavailable; exact custody retained")]
+    CommandCompletionUnavailable,
+
     /// The Vulkan renderer context has been lost and must be recreated.
     #[error("vulkan renderer context lost: {0}")]
     ContextLost(&'static str),
@@ -190,6 +211,27 @@ impl VulkanRendererError {
         matches!(self, VulkanRendererError::DescriptorCapacityExhausted { .. })
     }
 
+    /// True only when exact command/reader retirement can restore capacity.
+    pub const fn is_command_deferred(&self) -> bool {
+        matches!(self, Self::CommandCapacityExhausted { .. })
+    }
+
+    /// True when exact native custody is quarantined and this context must
+    /// stop admission without fabricating device loss or retry readiness.
+    pub const fn is_command_completion_unavailable(&self) -> bool {
+        matches!(self, Self::CommandCompletionUnavailable)
+    }
+
+    /// Preserve positive device-loss proof while refusing to infer completion
+    /// from any other failed native observation.
+    pub(super) fn completion_failure(self) -> Self {
+        if self.is_device_lost() {
+            self
+        } else {
+            Self::CommandCompletionUnavailable
+        }
+    }
+
     /// Allocation refusal alone does not prove whether queue submission began.
     /// Callers may reject an attempt only with independent pre-submission proof.
     pub const fn is_resource_allocation_failure(&self) -> bool {
@@ -211,7 +253,8 @@ impl VulkanRendererError {
             | VulkanRendererError::MissingDeviceFeature(_)
             | VulkanRendererError::MissingQueueFamily { .. }
             | VulkanRendererError::Vk(_)
-            | VulkanRendererError::ContextLost(_) => VulkanRendererErrorKind::ContextLost,
+            | VulkanRendererError::ContextLost(_)
+            | VulkanRendererError::CommandCompletionUnavailable => VulkanRendererErrorKind::ContextLost,
             VulkanRendererError::UnsupportedDmabufFormat(_)
             | VulkanRendererError::InvalidDmabuf(_)
             | VulkanRendererError::UnsupportedDmabufDisjoint
@@ -225,6 +268,8 @@ impl VulkanRendererError {
             | VulkanRendererError::UploadBatchFull { .. }
             | VulkanRendererError::DescriptorCapacityExhausted { .. }
             | VulkanRendererError::DescriptorRequestExceedsLimit { .. }
+            | VulkanRendererError::CommandCapacityExhausted { .. }
+            | VulkanRendererError::CommandStorageLimitExceeded { .. }
             | VulkanRendererError::TemporaryFailure(_)
             | VulkanRendererError::NotImplemented(_) => VulkanRendererErrorKind::TemporaryFailure,
         }
@@ -240,6 +285,10 @@ impl crate::backend::renderer::damage::MaybeDeviceLost for VulkanRendererError {
     #[inline]
     fn is_device_lost(&self) -> bool {
         VulkanRendererError::is_device_lost(self)
+    }
+
+    fn is_completion_unobservable(&self) -> bool {
+        self.is_command_completion_unavailable()
     }
 }
 

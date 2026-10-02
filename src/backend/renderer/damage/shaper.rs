@@ -1,9 +1,16 @@
 use std::mem;
 
-use crate::utils::{Physical, Rectangle, Size};
+use crate::{
+    backend::renderer::element::FrameWorkspaceError,
+    utils::{Physical, Rectangle, Size},
+};
 
 /// The recommended minimum tile side.
 const DEFAULT_MIN_TILE_SIDE: i32 = 16;
+
+pub(super) fn tile_storage_layout() -> (usize, i32) {
+    (std::mem::size_of::<Tile>(), DEFAULT_MIN_TILE_SIDE)
+}
 
 /// The maximum ratio of the largest damage rectangle to the current damage bbox.
 const MAX_DAMAGE_TO_DAMAGE_BBOX_RATIO: f32 = 0.9;
@@ -18,12 +25,32 @@ pub struct DamageShaper<const MIN_TILE_SIDE: i32 = DEFAULT_MIN_TILE_SIDE> {
     tiles_cache: Vec<Tile>,
     /// The damage accumulated during shaping.
     out_damage: Vec<Rectangle<i32, Physical>>,
+    storage_limit: Option<usize>,
+    overflow: Option<FrameWorkspaceError>,
 }
 
 impl<const MIN_TILE_SIDE: i32> DamageShaper<MIN_TILE_SIDE> {
     /// Shape damage rectangles.
     #[profiling::function]
     pub fn shape_damage(&mut self, in_damage: &mut Vec<Rectangle<i32, Physical>>) {
+        self.shape_damage_bounded(in_damage, None)
+            .expect("unbounded damage shape");
+    }
+
+    pub(super) fn prepare_storage(&mut self, capacity: usize) {
+        self.tiles_cache
+            .reserve(capacity.saturating_sub(self.tiles_cache.len()));
+        self.out_damage
+            .reserve(capacity.saturating_sub(self.out_damage.len()));
+    }
+
+    pub(super) fn shape_damage_bounded(
+        &mut self,
+        in_damage: &mut Vec<Rectangle<i32, Physical>>,
+        limit: Option<usize>,
+    ) -> Result<(), FrameWorkspaceError> {
+        self.storage_limit = limit;
+        self.overflow = None;
         self.out_damage.clear();
         self.tiles_cache.clear();
 
@@ -33,6 +60,24 @@ impl<const MIN_TILE_SIDE: i32> DamageShaper<MIN_TILE_SIDE> {
         // The shaped damage is inside of `out_damage`, so swap it with `in_damage` since
         // it's irrelevant.
         mem::swap(&mut self.out_damage, in_damage);
+        match self.overflow.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn push_output(&mut self, rect: Rectangle<i32, Physical>) {
+        if let Some(capacity) = self.storage_limit {
+            if self.out_damage.len() >= capacity {
+                self.overflow = Some(FrameWorkspaceError {
+                    resource: "shaped damage rectangles",
+                    required: self.out_damage.len().saturating_add(1),
+                    capacity,
+                });
+                return;
+            }
+        }
+        self.out_damage.push(rect);
     }
 
     // A divide and conquer hybrid damage shaping algorithm.
@@ -55,7 +100,7 @@ impl<const MIN_TILE_SIDE: i32> DamageShaper<MIN_TILE_SIDE> {
         if in_damage.is_empty() {
             return;
         } else if in_damage.len() == 1 {
-            self.out_damage.push(in_damage[0]);
+            self.push_output(in_damage[0]);
             return;
         }
 
@@ -84,7 +129,7 @@ impl<const MIN_TILE_SIDE: i32> DamageShaper<MIN_TILE_SIDE> {
         if max_damage_area as f32 / (damage_bbox.size.w.saturating_mul(damage_bbox.size.h)) as f32
             > MAX_DAMAGE_TO_DAMAGE_BBOX_RATIO
         {
-            self.out_damage.push(damage_bbox);
+            self.push_output(damage_bbox);
             return;
         }
 
@@ -220,6 +265,16 @@ impl<const MIN_TILE_SIDE: i32> DamageShaper<MIN_TILE_SIDE> {
                 }
 
                 tiles_in_column += 1;
+                if let Some(capacity) = self.storage_limit {
+                    if self.tiles_cache.len() >= capacity {
+                        self.overflow = Some(FrameWorkspaceError {
+                            resource: "damage shaping tiles",
+                            required: self.tiles_cache.len().saturating_add(1),
+                            capacity,
+                        });
+                        return;
+                    }
+                }
                 self.tiles_cache.push(tile);
             }
 
@@ -245,8 +300,11 @@ impl<const MIN_TILE_SIDE: i32> DamageShaper<MIN_TILE_SIDE> {
             }
         }
 
-        self.out_damage
-            .extend(self.tiles_cache.iter().filter_map(|tile| tile.damage));
+        for index in 0..self.tiles_cache.len() {
+            if let Some(rect) = self.tiles_cache[index].damage {
+                self.push_output(rect);
+            }
+        }
     }
 }
 

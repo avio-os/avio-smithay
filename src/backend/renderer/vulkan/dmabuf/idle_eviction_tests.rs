@@ -1,6 +1,6 @@
 // Idle eviction of texture imports against a real device. Included into
-// `dmabuf::tests`; every test returns early when no suitable Vulkan device is
-// present, like `shared_multiplane_import_when_available`.
+// `dmabuf::tests`; optional runs skip unavailable hardware. Required runs set
+// AVIO_REQUIRE_VK_DEVICE=1 and fail with the missing prerequisite.
 
 /// An instant strictly after every recency stamp taken before this call.
 fn instant_after_now() -> std::time::Instant {
@@ -22,12 +22,13 @@ fn idle_eviction_setup() -> Option<(VulkanRenderer, VulkanAllocator, crate::back
         format.modifier != Modifier::Invalid
             && renderer.has_dmabuf_render_format(*format)
             && renderer.has_dmabuf_framebuffer_effect_format(*format)
-    })?;
+    });
+    let format = super::super::test_support::present(format, "sampled/render/effect DMA-BUF format")?;
     let allocator = VulkanAllocator::new(
         &physical_device,
         ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC,
-    )
-    .ok()?;
+    );
+    let allocator = super::super::test_support::available(allocator, "DMA-BUF allocator")?;
     Some((renderer, allocator, format))
 }
 
@@ -37,10 +38,11 @@ fn exported_buffer(
     allocator: &mut VulkanAllocator,
     format: crate::backend::allocator::Format,
 ) -> Option<(crate::backend::allocator::vulkan::VulkanImage, Dmabuf)> {
-    let buffer = allocator
-        .create_buffer(64, 64, format.code, &[format.modifier])
-        .ok()?;
-    let dmabuf = buffer.export().ok()?;
+    let buffer = super::super::test_support::available(
+        allocator.create_buffer(64, 64, format.code, &[format.modifier]),
+        "DMA-BUF allocation",
+    )?;
+    let dmabuf = super::super::test_support::available(buffer.export(), "DMA-BUF export")?;
     Some((buffer, dmabuf))
 }
 
@@ -164,4 +166,28 @@ fn idle_eviction_keeps_an_import_hit_since_the_cutoff() {
     assert_eq!(renderer.evict_idle_sampled_dmabuf_imports(cutoff, usize::MAX), 1);
     assert!(renderer.dmabuf.cache.contains_key(&first.weak()));
     assert!(!renderer.dmabuf.cache.contains_key(&second.weak()));
+}
+
+#[test]
+fn last_buffer_drop_retires_cached_vulkan_import_without_cleanup() {
+    let Some((mut renderer, mut allocator, format)) = idle_eviction_setup() else {
+        return;
+    };
+    let Some((buffer, dmabuf)) = exported_buffer(&mut allocator, format) else {
+        return;
+    };
+    let texture = renderer.import_dmabuf_texture(&dmabuf).expect("texture import");
+    let weak = std::sync::Arc::downgrade(texture.image_resource().unwrap());
+    let key = dmabuf.weak();
+    drop(texture);
+    assert!(weak.upgrade().is_some(), "a live buffer permits cache reuse");
+    drop((dmabuf, buffer));
+    assert!(
+        renderer.dmabuf.cache.contains_key(&key),
+        "metadata cleanup has not run"
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "stale metadata must not retain GPU memory"
+    );
 }

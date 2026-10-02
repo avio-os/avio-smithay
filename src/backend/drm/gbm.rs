@@ -309,25 +309,37 @@ where
 
     let ret = if use_opaque {
         let opaque_wrapper = OpaqueBufferWrapper(&bo);
-        drm.add_planar_framebuffer(&opaque_wrapper, flags).map(|fb| {
-            (
-                fb,
-                drm_fourcc::DrmFormat {
-                    code: opaque_wrapper.format(),
-                    modifier: modifier.unwrap_or(DrmModifier::Invalid),
-                },
-            )
-        })
+        drm.add_planar_framebuffer(&opaque_wrapper, flags)
+            .inspect(|_| {
+                crate::backend::allocator::note_gpu_allocation(
+                    crate::backend::allocator::GpuAllocationKind::DrmFramebuffer,
+                )
+            })
+            .map(|fb| {
+                (
+                    fb,
+                    drm_fourcc::DrmFormat {
+                        code: opaque_wrapper.format(),
+                        modifier: modifier.unwrap_or(DrmModifier::Invalid),
+                    },
+                )
+            })
     } else {
-        drm.add_planar_framebuffer(&bo, flags).map(|fb| {
-            (
-                fb,
-                drm_fourcc::DrmFormat {
-                    code: bo.format(),
-                    modifier: modifier.unwrap_or(DrmModifier::Invalid),
-                },
-            )
-        })
+        drm.add_planar_framebuffer(&bo, flags)
+            .inspect(|_| {
+                crate::backend::allocator::note_gpu_allocation(
+                    crate::backend::allocator::GpuAllocationKind::DrmFramebuffer,
+                )
+            })
+            .map(|fb| {
+                (
+                    fb,
+                    drm_fourcc::DrmFormat {
+                        code: bo.format(),
+                        modifier: modifier.unwrap_or(DrmModifier::Invalid),
+                    },
+                )
+            })
     };
 
     let (fb, format) = match ret {
@@ -372,6 +384,11 @@ where
 
             let fb = drm
                 .add_framebuffer(&*bo, depth as u32, bpp as u32)
+                .inspect(|_| {
+                    crate::backend::allocator::note_gpu_allocation(
+                        crate::backend::allocator::GpuAllocationKind::DrmFramebuffer,
+                    )
+                })
                 .map_err(|source| AccessError {
                     errmsg: "Failed to add framebuffer",
                     dev: drm.dev_path(),

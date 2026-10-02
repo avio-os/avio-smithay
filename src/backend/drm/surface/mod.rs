@@ -12,7 +12,7 @@ pub(super) mod atomic;
 #[cfg(feature = "backend_gbm")]
 pub(super) mod gbm;
 pub(super) mod legacy;
-mod mode_blob;
+pub(in crate::backend::drm) mod mode_blob;
 use super::{
     device::PlaneClaimStorage, error::Error, plane_type, DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType,
     Planes,
@@ -36,98 +36,12 @@ pub struct DrmSurface {
     pub(super) primary_plane: (PlaneInfo, PlaneClaim),
 }
 
-#[derive(Debug)]
-struct PlaneDamageInner {
-    drm: DrmDeviceFd,
-    blob: Option<drm::control::property::Value<'static>>,
-}
-
-impl Drop for PlaneDamageInner {
-    fn drop(&mut self) {
-        // There is nothing we can do if that fails
-        if let Some(drm::control::property::Value::Blob(id)) = self.blob.take() {
-            let _ = self.drm.destroy_property_blob(id);
-        }
-    }
-}
-
-#[derive(Debug)]
-/// Helper for `FB_DAMAGE_CLIPS`
-pub struct PlaneDamageClips {
-    inner: Arc<PlaneDamageInner>,
-}
-
-impl PlaneDamageClips {
-    /// Returns the underlying blob
-    pub fn blob(&self) -> drm::control::property::Value<'_> {
-        self.inner.blob.unwrap()
-    }
-}
-
-impl PlaneDamageClips {
-    /// Initialize damage clips for a a plane
-    #[profiling::function]
-    pub fn from_damage(
-        device: &DrmDeviceFd,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: impl IntoIterator<Item = Rectangle<i32, Physical>>,
-    ) -> io::Result<Option<Self>> {
-        let scale = src.size / dst.size.to_logical(1).to_buffer(1, Transform::Normal).to_f64();
-
-        let mut rects = damage
-            .into_iter()
-            .map(|rect| {
-                let mut rect = rect
-                    .to_f64()
-                    .to_logical(1f64)
-                    .to_buffer(
-                        1f64,
-                        Transform::Normal,
-                        &src.size.to_logical(1f64, Transform::Normal),
-                    )
-                    .upscale(scale);
-                rect.loc += src.loc;
-                let rect = rect.to_i32_up();
-
-                drm_ffi::drm_mode_rect {
-                    x1: rect.loc.x,
-                    y1: rect.loc.y,
-                    x2: rect.loc.x.saturating_add(rect.size.w),
-                    y2: rect.loc.y.saturating_add(rect.size.h),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if rects.is_empty() {
-            return Ok(None);
-        }
-
-        let data = unsafe {
-            std::slice::from_raw_parts_mut(
-                rects.as_mut_ptr() as *mut u8,
-                std::mem::size_of::<drm_ffi::drm_mode_rect>() * rects.len(),
-            )
-        };
-
-        let blob = drm_ffi::mode::create_property_blob(device.as_fd(), data)?;
-
-        Ok(Some(PlaneDamageClips {
-            inner: Arc::new(PlaneDamageInner {
-                drm: device.clone(),
-                blob: Some(drm::control::property::Value::Blob(blob.blob_id as u64)),
-            }),
-        }))
-    }
-}
-
-impl Clone for PlaneDamageClips {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
+mod blob_actor;
+mod plane_damage;
+mod prepared_mode;
+pub(crate) use plane_damage::PlaneDamageClipBank;
+pub use plane_damage::{conservative_damage_clip_unions, PlaneDamageClips};
+pub use prepared_mode::PreparedSurfaceMode;
 
 /// State of a single plane
 #[derive(Debug, Clone)]
@@ -231,6 +145,18 @@ impl DrmSurface {
         match &*self.internal {
             DrmSurfaceInternal::Atomic(surf) => surf.pending_connectors(),
             DrmSurfaceInternal::Legacy(surf) => surf.pending_connectors(),
+        }
+    }
+
+    /// Compare borrowed exact configuration without cloning connector state.
+    pub fn pending_configuration_matches(
+        &self,
+        mode: Mode,
+        connectors: &std::collections::HashSet<connector::Handle>,
+    ) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surface) => surface.pending_configuration_matches(mode, connectors),
+            DrmSurfaceInternal::Legacy(surface) => surface.pending_configuration_matches(mode, connectors),
         }
     }
 

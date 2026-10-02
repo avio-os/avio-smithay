@@ -86,6 +86,7 @@ enum FormatUsage {
     RenderTarget,
     FramebufferEffectTarget,
     CaptureTarget,
+    SampledFramebufferTarget,
 }
 
 impl FormatUsage {
@@ -95,6 +96,12 @@ impl FormatUsage {
             FormatUsage::RenderTarget => vk::ImageUsageFlags::COLOR_ATTACHMENT,
             FormatUsage::FramebufferEffectTarget => {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+            }
+            FormatUsage::SampledFramebufferTarget => {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
             }
             FormatUsage::CaptureTarget => {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -158,6 +165,7 @@ pub(crate) struct FormatCapabilities {
     render_formats: FormatSet,
     framebuffer_effect_formats: FormatSet,
     capture_formats: FormatSet,
+    sampled_framebuffer_formats: FormatSet,
     modifier_query_cache: IndexMap<Fourcc, Vec<ModifierCapability>>,
     import_modifiers_by_code: IndexMap<Fourcc, Vec<Modifier>>,
     render_modifiers_by_code: IndexMap<Fourcc, Vec<Modifier>>,
@@ -177,6 +185,7 @@ impl FormatCapabilities {
         let mut render_formats = IndexSet::new();
         let mut framebuffer_effect_formats = IndexSet::new();
         let mut capture_formats = IndexSet::new();
+        let mut sampled_framebuffer_formats = IndexSet::new();
         let mut modifier_query_cache = IndexMap::new();
         let mut import_modifiers_by_code: IndexMap<Fourcc, IndexSet<Modifier>> = IndexMap::new();
         let mut render_modifiers_by_code: IndexMap<Fourcc, IndexSet<Modifier>> = IndexMap::new();
@@ -235,6 +244,29 @@ impl FormatCapabilities {
                         FormatUsage::CaptureTarget,
                         vk::ImageCreateFlags::DISJOINT,
                     )?;
+                // Probe the combined target+sampled usage, rather than assuming
+                // independent render/import support implies a legal combined image.
+                let sampled = Self::is_explicit_modifier_supported(
+                    physical_device,
+                    vk_format,
+                    modifier,
+                    FormatUsage::SampledFramebufferTarget,
+                    vk::ImageCreateFlags::empty(),
+                )? && (properties.drm_format_modifier_plane_count == 1
+                    || (supports_disjoint
+                        && Self::is_explicit_modifier_supported(
+                            physical_device,
+                            vk_format,
+                            modifier,
+                            FormatUsage::SampledFramebufferTarget,
+                            vk::ImageCreateFlags::DISJOINT,
+                        )?));
+                if sampled {
+                    sampled_framebuffer_formats.insert(Format {
+                        code: fourcc,
+                        modifier,
+                    });
+                }
                 cached_modifiers.push(ModifierCapability {
                     modifier,
                     drm_format_modifier_plane_count: properties.drm_format_modifier_plane_count,
@@ -316,6 +348,16 @@ impl FormatCapabilities {
 
             // Explicitly and conservatively probe "implicit modifier" support. We only advertise
             // Modifier::Invalid when Vulkan reports support without explicit DRM modifier metadata.
+            if Self::is_implicit_modifier_supported(
+                physical_device,
+                vk_format,
+                FormatUsage::SampledFramebufferTarget,
+            )? {
+                sampled_framebuffer_formats.insert(Format {
+                    code: fourcc,
+                    modifier: Modifier::Invalid,
+                });
+            }
             if Self::is_implicit_modifier_supported(physical_device, vk_format, FormatUsage::Import)? {
                 Self::insert_supported_format(
                     &mut import_formats,
@@ -368,6 +410,7 @@ impl FormatCapabilities {
             render_formats: render_formats.into_iter().collect(),
             framebuffer_effect_formats: framebuffer_effect_formats.into_iter().collect(),
             capture_formats: capture_formats.into_iter().collect(),
+            sampled_framebuffer_formats: sampled_framebuffer_formats.into_iter().collect(),
             modifier_query_cache,
             import_modifiers_by_code: Self::finalize_modifier_map(import_modifiers_by_code),
             render_modifiers_by_code: Self::finalize_modifier_map(render_modifiers_by_code),
@@ -404,6 +447,28 @@ impl FormatCapabilities {
 
     pub(crate) fn has_framebuffer_effect_format(&self, format: Format) -> bool {
         self.framebuffer_effect_formats.contains(&format)
+    }
+
+    pub(crate) fn has_sampled_framebuffer_format(&self, format: Format) -> bool {
+        self.sampled_framebuffer_formats.contains(&format)
+    }
+
+    // A graph planned before binding must be safe for every selectable modifier.
+    // Empty or mixed-support sets retain the full-copy hardware fallback.
+    pub(crate) fn framebuffer_sampling_supported(&self, code: Fourcc) -> bool {
+        let mut found = false;
+        for format in self
+            .framebuffer_effect_formats
+            .iter()
+            .chain(self.capture_formats.iter())
+            .filter(|format| format.code == code)
+        {
+            found = true;
+            if !self.has_sampled_framebuffer_format(*format) {
+                return false;
+            }
+        }
+        found
     }
 
     pub(crate) fn has_capture_format(&self, format: Format) -> bool {
@@ -624,7 +689,7 @@ impl FormatCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{texture_view_components, FormatCapabilities};
+    use super::{texture_view_components, FormatCapabilities, FormatUsage};
     use crate::backend::allocator::{Format, Fourcc, Modifier};
     use ash::vk;
     use indexmap::IndexMap;
@@ -697,6 +762,7 @@ mod tests {
             import_formats,
             render_formats,
             framebuffer_effect_formats,
+            sampled_framebuffer_formats: capture_formats.clone(),
             capture_formats,
             modifier_query_cache: IndexMap::new(),
             import_modifiers_by_code,
@@ -801,5 +867,37 @@ mod tests {
                 Modifier::from(0xdead_beef_u64),
             ]
         );
+    }
+    #[test]
+    fn sampled_framebuffer_admission_requires_every_selectable_modifier() {
+        let mut caps = sample_capabilities();
+        assert!(caps.framebuffer_sampling_supported(Fourcc::Argb8888));
+        assert!(!caps.framebuffer_sampling_supported(Fourcc::Abgr8888));
+        let unsupported = Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::from(0xbeef_u64),
+        };
+        caps.framebuffer_effect_formats = caps
+            .framebuffer_effect_formats
+            .iter()
+            .copied()
+            .chain([unsupported])
+            .collect();
+        assert!(!caps.framebuffer_sampling_supported(Fourcc::Argb8888));
+        caps.sampled_framebuffer_formats = caps
+            .sampled_framebuffer_formats
+            .iter()
+            .copied()
+            .chain([unsupported])
+            .collect();
+        assert!(caps.framebuffer_sampling_supported(Fourcc::Argb8888));
+    }
+
+    #[test]
+    fn sampled_target_query_requires_combined_image_usage() {
+        let usage = FormatUsage::SampledFramebufferTarget.image_usage();
+        assert!(usage.contains(FormatUsage::Import.image_usage()));
+        assert!(usage.contains(FormatUsage::CaptureTarget.image_usage()));
+        assert!(usage.contains(FormatUsage::FramebufferEffectTarget.image_usage()));
     }
 }
