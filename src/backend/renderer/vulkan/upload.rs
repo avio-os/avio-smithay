@@ -26,7 +26,7 @@ use super::{
     device::{DeviceHandle, DeviceState},
     format::{optimal_tiling_features, texture_view_components, ColorEncoding},
     image::VulkanImage,
-    staging::StagingReservation,
+    staging::{ChunkMemory, StagingReservation},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
@@ -145,8 +145,8 @@ impl UploadState {
         let rows = size.h as usize;
         let (reservation, ptr, memory) = device.reserve_staged_upload(len)?;
         // SAFETY: The complete reservation bounds these exclusive rows.
-        let rows = unsafe { StagedMemoryRows::new(ptr, len / rows, rows, 0, memory) };
-        if !fill_reserved_rows(device, reservation, rows, fill) {
+        let rows = unsafe { StagedMemoryRows::new(ptr, len / rows, rows, 0, memory.clone()) };
+        if !fill_reserved_rows(device, reservation, rows, &memory, fill) {
             return Ok(MemoryRowUpload::SourceFailed);
         }
         let image = match create_upload_image(device, self.next_upload_id(), format, size, flipped) {
@@ -179,8 +179,8 @@ impl UploadState {
         let row_bytes = len / rows;
         let (reservation, ptr, memory) = device.stage_image_upload(image, len)?;
         // SAFETY: The region reservation bounds these exclusive rows.
-        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, 0, memory) };
-        if !fill_reserved_rows(device, reservation, rows, fill) {
+        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, 0, memory.clone()) };
+        if !fill_reserved_rows(device, reservation, rows, &memory, fill) {
             return Ok(MemoryRowUpload::SourceFailed);
         }
         device.queue_staged_image_upload(Arc::clone(image), reservation, buffer_image_copy(region))?;
@@ -320,16 +320,216 @@ impl UploadState {
 fn fill_reserved_rows(
     device: &mut DeviceState,
     reservation: StagingReservation,
+    rows: StagedMemoryRows,
+    memory: &Arc<ChunkMemory>,
+    fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+) -> bool {
+    // Also release on callback unwind. A swapped-out writer still keeps the
+    // mapping alive and blocks reserve_existing until it returns.
+    let reservation = scopeguard::guard(reservation, |reservation| {
+        device.release_staged_image_upload(reservation);
+    });
+    let copied = fill_callback_rows(rows, memory, fill);
+    if copied {
+        let _ = scopeguard::ScopeGuard::into_inner(reservation);
+    }
+    copied
+}
+
+fn fill_callback_rows<T>(
     mut rows: StagedMemoryRows,
+    memory: &Arc<T>,
     fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
 ) -> bool {
     let copied = fill(&mut rows);
     drop(rows);
-    if !copied {
-        device.release_staged_image_upload(reservation);
-        return false;
+    // A callback can safely swap this owned row guard with another renderer's
+    // rows. Dropping the replacement does not return our original writer.
+    // Only the arena and the temporary exact-mapping Arc may remain before
+    // queueing a GPU read. Image/texture readers are separate allocation owners.
+    copied && Arc::strong_count(memory) == 2
+}
+
+#[cfg(test)]
+mod callback_custody_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn mapped_rows() -> (Arc<Mutex<[u8; 16]>>, StagedMemoryRows) {
+        let mut arena = Arc::new(Mutex::new([0u8; 16]));
+        let ptr = Arc::get_mut(&mut arena).unwrap().get_mut().unwrap().as_mut_ptr();
+        // SAFETY: This fixture's arena owns the mapping, and these rows are
+        // its sole writable view until they return or are dropped.
+        let rows = unsafe { StagedMemoryRows::new(ptr, 4, 4, 0, arena.clone()) };
+        (arena, rows)
     }
-    true
+
+    #[test]
+    fn callback_queues_only_a_successful_copy_with_returned_mapping_custody() {
+        let (arena, rows) = mapped_rows();
+        let memory = arena.clone();
+        assert!(fill_callback_rows(rows, &memory, &mut |rows| {
+            for row in 0..rows.rows() {
+                rows.row_mut(row).fill(0xff);
+            }
+            true
+        }));
+        assert_eq!(*arena.lock().unwrap(), [0xff; 16]);
+        assert_eq!(Arc::strong_count(&arena), 2);
+
+        let (arena, rows) = mapped_rows();
+        let memory = arena.clone();
+        assert!(!fill_callback_rows(rows, &memory, &mut |rows| {
+            rows.row_mut(0).fill(0x40);
+            false
+        }));
+        assert_eq!(Arc::strong_count(&arena), 2);
+    }
+
+    #[test]
+    fn swapped_writer_cannot_queue_and_can_retire_on_another_thread() {
+        let (arena, rows) = mapped_rows();
+        let memory = arena.clone();
+        let (other_arena, mut retained) = mapped_rows();
+        assert!(!fill_callback_rows(rows, &memory, &mut |rows| {
+            std::mem::swap(rows, &mut retained);
+            true
+        }));
+        // The replacement returned, but our exact writer escaped. It is
+        // still writable; queueing the original reservation would race it.
+        assert_eq!(Arc::strong_count(&other_arena), 1);
+        assert_eq!(Arc::strong_count(&arena), 3);
+        drop(memory);
+        std::thread::spawn(move || retained.row_mut(0).fill(0x80))
+            .join()
+            .unwrap();
+        assert_eq!(Arc::strong_count(&arena), 1);
+        assert_eq!(&arena.lock().unwrap()[..4], &[0x80; 4]);
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn retained_callback_writer_cancels_without_allocating_or_queueing_an_image() {
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let Some(mut donor) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        assert!(renderer.configure_memory_upload_capacity(4096).unwrap());
+        assert!(donor.configure_memory_upload_capacity(4096).unwrap());
+        let format = Fourcc::Argb8888;
+        let size = Size::from((16, 16));
+        let (_, donor_update, mut retained) =
+            donor.stage_memory_import(format, size, false).unwrap().unwrap();
+        let before = renderer.diagnostics();
+        let result = renderer
+            .import_memory_rows(format, size, false, &mut |rows| {
+                std::mem::swap(rows, &mut retained);
+                true
+            })
+            .unwrap();
+        assert!(matches!(result, MemoryRowUpload::SourceFailed));
+        let after = renderer.diagnostics();
+        assert_eq!(
+            after.uploads.pending_operations,
+            before.uploads.pending_operations
+        );
+        assert_eq!(
+            after.uploads.arena_in_use_bytes,
+            before.uploads.arena_in_use_bytes
+        );
+        assert_eq!(
+            after.allocations.reason(VulkanAllocationReason::Texture),
+            before.allocations.reason(VulkanAllocationReason::Texture)
+        );
+        assert!(!renderer.configure_memory_upload_capacity(0).unwrap());
+        assert!(renderer
+            .stage_memory_import(format, size, false)
+            .unwrap_err()
+            .is_upload_deferred());
+        std::thread::spawn(move || retained.row_mut(0).fill(0xff))
+            .join()
+            .unwrap();
+        donor.cancel_staged_memory_update(donor_update);
+        assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+
+        assert!(renderer.configure_memory_upload_capacity(4096).unwrap());
+        let MemoryRowUpload::Queued(texture) = renderer
+            .import_memory_rows(format, size, false, &mut |rows| {
+                for row in 0..rows.rows() {
+                    rows.row_mut(row).fill(0x40);
+                }
+                true
+            })
+            .unwrap()
+        else {
+            panic!("returned callback rows must queue");
+        };
+        let reader = texture.clone();
+        let (_, donor_update, mut retained) =
+            donor.stage_memory_import(format, size, false).unwrap().unwrap();
+        let before = renderer.diagnostics().uploads;
+        let result = renderer
+            .update_memory_rows(&texture, Rectangle::from_size(size), &mut |rows| {
+                std::mem::swap(rows, &mut retained);
+                true
+            })
+            .unwrap();
+        assert!(matches!(result, MemoryRowUpload::SourceFailed));
+        let after = renderer.diagnostics().uploads;
+        assert_eq!(after.pending_operations, before.pending_operations);
+        assert_eq!(after.arena_in_use_bytes, before.arena_in_use_bytes);
+        drop(retained);
+        donor.cancel_staged_memory_update(donor_update);
+        assert!(matches!(
+            renderer
+                .update_memory_rows(&reader, Rectangle::from_size(size), &mut |rows| {
+                    for row in 0..rows.rows() {
+                        rows.row_mut(row).fill(0x80);
+                    }
+                    true
+                })
+                .unwrap(),
+            MemoryRowUpload::Queued(())
+        ));
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn callback_unwind_releases_its_unsubmitted_reservation() {
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        assert!(renderer.configure_memory_upload_capacity(4096).unwrap());
+        let before = renderer.diagnostics();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = renderer.import_memory_rows(Fourcc::Argb8888, (16, 16).into(), false, &mut |_| {
+                panic!("source callback unwound")
+            });
+        }));
+        assert!(unwound.is_err());
+        let after = renderer.diagnostics();
+        assert_eq!(
+            after.uploads.pending_operations,
+            before.uploads.pending_operations
+        );
+        assert_eq!(
+            after.uploads.arena_in_use_bytes,
+            before.uploads.arena_in_use_bytes
+        );
+        assert_eq!(
+            after.allocations.reason(VulkanAllocationReason::Texture),
+            before.allocations.reason(VulkanAllocationReason::Texture)
+        );
+        assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+    }
 }
 
 impl ImportMem for VulkanRenderer {
