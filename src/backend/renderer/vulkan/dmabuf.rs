@@ -353,10 +353,10 @@ impl DmabufState {
             .map_or(0, |cached| cached.pins)
             .checked_add(usize::from(pin))
             .expect("dma-buf import pin overflow");
-        let first_import = !self
+        let first_import = self
             .cache
             .get(&key)
-            .is_some_and(|entry| entry.imported.upgrade().is_some());
+            .is_none_or(|entry| entry.imported.upgrade().is_none());
         let imported = self.create_image_resource(device, dmabuf, &descriptor, usage)?;
         if first_import && self.frame_client_scope && self.frame_client_sources.contains(&key) {
             self.client_first_imports_on_frame = self.client_first_imports_on_frame.saturating_add(1);
