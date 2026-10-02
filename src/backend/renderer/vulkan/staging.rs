@@ -10,6 +10,8 @@ use crate::backend::{
 use super::{
     allocation::{AllocationGuard, VulkanAllocationReason},
     device::DeviceHandle,
+    device_handle::DeviceRetirement,
+    retirement::RetirementNode,
     VulkanRendererError,
 };
 
@@ -43,9 +45,9 @@ pub(crate) struct UploadArenaStats {
 
 /// Renderer-local, persistently mapped staging memory.
 ///
-/// All allocation and release happens on the renderer's one queue-owner
-/// thread. Reservations remain unavailable until the tracked Vulkan
-/// submission that consumed them retires.
+/// Storage is provisioned cold; final native destruction belongs to the
+/// device's existing retirement actor. Reservations remain unavailable until
+/// the tracked Vulkan submission that consumed them retires.
 pub(crate) struct UploadArena {
     chunks: Vec<StagingChunk>,
     atom_size: usize,
@@ -440,7 +442,28 @@ pub(crate) struct ChunkMemory {
     memory: vk::DeviceMemory,
     mapped: MappedAddress,
     coherent: bool,
+    retirement: Option<Box<RetirementNode<DeviceRetirement>>>,
+}
+
+/// Last row/writer release publishes this preallocated native mapping owner.
+/// It contains no device endpoint, so draining it cannot create an Arc cycle.
+pub(super) struct RetiredStagingBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    _mapped: MappedAddress,
     _allocation: AllocationGuard,
+}
+
+impl RetiredStagingBuffer {
+    pub(super) fn destroy(self, device: &ash::Device) {
+        // Every mapping reader has returned before ChunkMemory's final drop
+        // publishes this node. Native calls happen only on the device actor.
+        unsafe {
+            device.unmap_memory(self.memory);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
 
 impl StagingChunk {
@@ -511,14 +534,9 @@ impl StagingChunk {
         let capacity = usize::try_from(allocation_size).unwrap_or(usize::MAX).min(size);
         let capacity = capacity - (capacity % atom_size);
         Ok(Self {
-            memory: Arc::new(ChunkMemory {
-                device,
-                buffer,
-                memory,
-                mapped,
-                coherent,
-                _allocation: allocation,
-            }),
+            memory: Arc::new(ChunkMemory::new(
+                device, buffer, memory, mapped, coherent, allocation,
+            )),
             ranges: ReservationRanges::new(capacity),
         })
     }
@@ -529,6 +547,30 @@ impl StagingChunk {
 }
 
 impl ChunkMemory {
+    fn new(
+        device: Arc<DeviceHandle>,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+        mapped: MappedAddress,
+        coherent: bool,
+        allocation: AllocationGuard,
+    ) -> Self {
+        let retirement = RetirementNode::new(DeviceRetirement::StagingBuffer(RetiredStagingBuffer {
+            buffer,
+            memory,
+            _mapped: MappedAddress(mapped.0),
+            _allocation: allocation,
+        }));
+        Self {
+            device,
+            buffer,
+            memory,
+            mapped,
+            coherent,
+            retirement: Some(retirement),
+        }
+    }
+
     fn write_rows(
         &self,
         dst_offset: usize,
@@ -592,26 +634,28 @@ impl ChunkMemory {
 
 impl Drop for ChunkMemory {
     fn drop(&mut self) {
-        self.device.destroy_with(|device| unsafe {
-            device.unmap_memory(self.memory);
-            device.destroy_buffer(self.buffer, None);
-            device.free_memory(self.memory, None);
-        });
+        if let Some(node) = self.retirement.take() {
+            self.device.retire_resource(node);
+        }
     }
 }
 
 /// The Vulkan renderer is moved between worker setup and its final queue-owner
 /// thread, and a detached reservation is written on another thread. Every
 /// write goes to a reserved range no one else touches until it is handed
-/// back; mapping and unmapping stay with the owning chunk memory.
+/// back; the final chunk owner publishes unmapping to the device actor.
 struct MappedAddress(*mut u8);
 
 // SAFETY: See the type-level ownership argument above. The address itself is
 // immutable; disjoint reservations never alias, and the mapping is unmapped
-// only when the last owner of the chunk memory drops it.
+// only after the last owner of the chunk memory publishes native retirement.
 unsafe impl Send for MappedAddress {}
 // SAFETY: As above: shared references only read the base address.
 unsafe impl Sync for MappedAddress {}
+
+#[cfg(test)]
+#[path = "staging/retirement_tests.rs"]
+mod retirement_tests;
 
 struct RangeAllocator {
     capacity: usize,

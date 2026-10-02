@@ -25,6 +25,7 @@ pub(super) enum DeviceRetirement {
     Drain(std::sync::mpsc::SyncSender<()>),
     OpaqueCustody(Box<dyn std::any::Any + Send + Sync>),
     ReadbackBuffer(super::readback::RetiredReadbackBuffer),
+    StagingBuffer(super::staging::RetiredStagingBuffer),
     #[cfg(feature = "wayland_frontend")]
     HostBuffer(super::host_memory::RetiredHostBuffer),
 }
@@ -158,6 +159,16 @@ impl DeviceHandle {
                         if valid {
                             buffer.destroy(&destroy_device);
                         } else {
+                            std::mem::forget(buffer);
+                        }
+                    }
+                    DeviceRetirement::StagingBuffer(buffer) => {
+                        if valid {
+                            buffer.destroy(&destroy_device);
+                        } else {
+                            // Detached rows may be the last owner of this
+                            // persistent mapping. Loss cannot authorize an
+                            // inline unmap/free on their releasing thread.
                             std::mem::forget(buffer);
                         }
                     }

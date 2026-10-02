@@ -23,6 +23,7 @@ use std::{
 #[derive(Debug, PartialEq, Eq)]
 pub(in super::super) enum Operation {
     Buffer(u64),
+    Unmap(u64),
     Fence(u64),
     CommandPool(u64),
     View(u64),
@@ -38,6 +39,10 @@ unsafe extern "system" fn destroy_buffer(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     record(device, Operation::Buffer(buffer.as_raw()));
+}
+
+unsafe extern "system" fn unmap_memory(device: vk::Device, memory: vk::DeviceMemory) {
+    record(device, Operation::Unmap(memory.as_raw()));
 }
 
 type Event = (Operation, ThreadId);
@@ -169,6 +174,7 @@ pub(in super::super) fn device_with_wait_result(
                 b"vkDestroyImageView" => destroy_view as *const c_void,
                 b"vkDestroyImage" => destroy_image as *const c_void,
                 b"vkDestroyBuffer" => destroy_buffer as *const c_void,
+                b"vkUnmapMemory" => unmap_memory as *const c_void,
                 b"vkCreateFence" => create_fence as *const c_void,
                 b"vkDestroyFence" => destroy_fence as *const c_void,
                 b"vkWaitForFences" => wait_for_fences as *const c_void,
