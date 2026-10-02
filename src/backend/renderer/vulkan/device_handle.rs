@@ -14,7 +14,7 @@ use super::{
     image::RetiredImage,
     retirement::{RetirementNode, RetirementQueue},
 };
-use crate::backend::vulkan::Instance;
+use crate::backend::vulkan::{Instance, QueuePriorityGrant};
 use ash::vk;
 
 pub(super) enum DeviceRetirement {
@@ -32,6 +32,9 @@ pub(super) enum DeviceRetirement {
 
 pub(crate) struct DeviceHandle {
     device: ash::Device,
+    /// Immutable grant from the call which created this exact native queue.
+    /// Every renderer originating here shares this authority.
+    queue_priority: QueuePriorityGrant,
     queue_order: super::ordered_queue::OrderedQueue,
     offscreen_ids: Arc<std::sync::atomic::AtomicU64>,
     allocation_ledger: Arc<AllocationLedger>,
@@ -74,21 +77,31 @@ impl fmt::Debug for DeviceHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceHandle")
             .field("device", &self.device.handle())
+            .field("queue_priority", &self.queue_priority)
             .field("lost", &self.is_lost())
             .finish()
     }
 }
 
 impl DeviceHandle {
-    pub(super) fn new(device: ash::Device, instance: Instance) -> std::io::Result<Self> {
+    pub(super) fn new(
+        device: ash::Device,
+        instance: Instance,
+        queue_priority: QueuePriorityGrant,
+    ) -> std::io::Result<Self> {
         let instance_lost = instance.lost_flag();
-        Self::with_retirement(device, instance_lost, instance)
+        Self::with_retirement(device, instance_lost, instance, queue_priority)
+    }
+
+    pub(super) fn queue_priority(&self) -> QueuePriorityGrant {
+        self.queue_priority
     }
 
     fn with_retirement(
         device: ash::Device,
         instance_lost: Arc<AtomicBool>,
         parent: impl Send + Sync + 'static,
+        queue_priority: QueuePriorityGrant,
     ) -> std::io::Result<Self> {
         let lost = Arc::new(AtomicBool::new(false));
         let retired_texture_views = Arc::new(super::retired_views::RetirementSubscribers::default());
@@ -213,6 +226,7 @@ impl DeviceHandle {
         };
         Ok(Self {
             device,
+            queue_priority,
             queue_order: Default::default(),
             offscreen_ids: Arc::new(std::sync::atomic::AtomicU64::new(1u64 << 61)),
             allocation_ledger: Arc::new(AllocationLedger::default()),
@@ -258,7 +272,13 @@ impl DeviceHandle {
 
     #[cfg(test)]
     pub(super) fn for_retirement_test(device: ash::Device, parent: impl Send + Sync + 'static) -> Self {
-        Self::with_retirement(device, Arc::new(AtomicBool::new(false)), parent).unwrap()
+        Self::with_retirement(
+            device,
+            Arc::new(AtomicBool::new(false)),
+            parent,
+            QueuePriorityGrant::NOT_REQUESTED,
+        )
+        .unwrap()
     }
 
     pub(crate) fn allocation_ledger(&self) -> &Arc<AllocationLedger> {

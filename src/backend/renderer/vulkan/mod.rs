@@ -7,7 +7,9 @@
 //! # Renderer Lifecycle
 //!
 //! 1. Probe device extension requirements with [`VulkanRenderer::required_extensions`].
-//! 2. Create the renderer using [`VulkanRenderer::new`].
+//! 2. Create the renderer using [`VulkanRenderer::new`], or [`VulkanRenderer::with_queue_priority`]
+//!    to ask the GPU scheduler for a queue global priority above the default (granted, or reported
+//!    as refused and replaced by the default, through [`VulkanRenderer::queue_priority`]).
 //! 3. Inspect supported format/modifier combinations via [`VulkanRenderer::dmabuf_import_formats`]
 //!    and [`VulkanRenderer::dmabuf_render_formats`] before allocator/compositor setup.
 //! 4. Bind targets with [`crate::backend::renderer::Bind::bind`] and record drawing through
@@ -202,7 +204,7 @@ use std::{ffi::CStr, time::Instant};
 use crate::backend::{
     allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc, Modifier},
     renderer::{ContextId, DebugFlags, TextureFilter},
-    vulkan::PhysicalDevice,
+    vulkan::{PhysicalDevice, QueueGlobalPriority, QueuePriorityGrant},
 };
 
 use self::blit::BlitState;
@@ -380,12 +382,27 @@ impl VulkanRenderer {
         DeviceState::required_extensions(physical_device)
     }
 
-    /// Creates a new Vulkan renderer and initializes device/queue infrastructure.
+    /// Creates a new Vulkan renderer and initializes device/queue infrastructure. Its queue runs
+    /// at the default global priority.
     pub fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
-        Self::from_device_state(DeviceState::new(physical_device)?)
+        Self::from_device_state(DeviceState::with_queue_priority(physical_device, None)?)
+    }
+
+    /// Creates a new Vulkan renderer whose queue asks the GPU scheduler for `priority`.
+    ///
+    /// The request is optional to the driver: a device without a global-priority extension, or a
+    /// driver that refuses the request with `VK_ERROR_NOT_PERMITTED_KHR` (a priority above
+    /// [`QueueGlobalPriority::Medium`] typically needs `CAP_SYS_NICE`), still yields a renderer,
+    /// at the default priority. [`VulkanRenderer::queue_priority`] reports what was granted.
+    pub fn with_queue_priority(
+        physical_device: &PhysicalDevice,
+        priority: QueueGlobalPriority,
+    ) -> Result<Self, VulkanRendererError> {
+        Self::from_device_state(DeviceState::with_queue_priority(physical_device, Some(priority))?)
     }
 
     /// Creates an output context without creating another logical device.
+    /// It inherits the grant of the origin's exact native queue.
     pub fn from_device_origin(origin: &VulkanDeviceOrigin) -> Result<Self, VulkanRendererError> {
         Self::from_device_state(DeviceState::from_origin(origin)?)
     }
@@ -444,6 +461,12 @@ impl VulkanRenderer {
     /// marked lost.
     pub fn is_device_lost(&self) -> bool {
         self.device.is_lost()
+    }
+
+    /// Returns the global priority the renderer's queue was created with, and what became of a
+    /// request made through [`VulkanRenderer::with_queue_priority`].
+    pub fn queue_priority(&self) -> QueuePriorityGrant {
+        self.device.queue_priority()
     }
 
     /// The queue family selected for renderer command submissions.
@@ -897,7 +920,139 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use ash::vk;
+
+    use crate::{
+        backend::{
+            allocator::{
+                dmabuf::AsDmabuf,
+                vulkan::{ImageUsageFlags, VulkanAllocator},
+                Allocator,
+            },
+            renderer::{Color32F, Frame, ImportMem, Renderer},
+            vulkan::{version::Version, Instance, PhysicalDevice, QueueGlobalPriority, QueuePriorityOutcome},
+        },
+        utils::{Physical, Rectangle, Size, Transform},
+    };
+
     use super::VulkanRenderer;
+
+    /// Whether this thread's effective capability set holds `CAP_SYS_NICE` (bit 23).
+    fn has_cap_sys_nice() -> bool {
+        std::fs::read_to_string("/proc/thread-self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CapEff:"))
+                    .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+            })
+            .is_some_and(|effective| effective & (1 << 23) != 0)
+    }
+
+    /// Clears a target and draws an uploaded texture into it, then waits for the GPU: the
+    /// renderer's queue accepts and completes real work.
+    fn render_once(renderer: &mut VulkanRenderer, physical_device: &PhysicalDevice) {
+        let mut allocator = VulkanAllocator::new(
+            physical_device,
+            ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .expect("allocator");
+        let format = renderer.mem_formats().next().expect("memory formats");
+        assert!(renderer
+            .configure_memory_upload_capacity_for_extent(0, 16 * 16 * 4)
+            .expect("cold texture upload capacity"));
+        let texture = renderer
+            .import_memory(&[255u8; 16 * 16 * 4], format, Size::from((16, 16)), false)
+            .expect("upload");
+        let target_format = renderer
+            .dmabuf_render_formats()
+            .iter()
+            .copied()
+            .find(|candidate| renderer.has_dmabuf_import_format(*candidate))
+            .expect("a renderable format");
+        let buffer = allocator
+            .create_buffer(32, 32, target_format.code, &[target_format.modifier])
+            .expect("target buffer");
+        let dmabuf = buffer.export().expect("target export");
+        let mut target = renderer.bind_dmabuf_target(&dmabuf).expect("bind");
+        let mut frame = renderer
+            .render(&mut target, Size::from((32, 32)), Transform::Normal)
+            .expect("frame");
+        let full = Rectangle::<i32, Physical>::from_size(Size::from((32, 32)));
+        frame
+            .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+            .expect("clear");
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::new((0.0, 0.0).into(), (16.0, 16.0).into()),
+                Rectangle::new((0, 0).into(), Size::from((16, 16))),
+                &[Rectangle::new((0, 0).into(), Size::from((16, 16)))],
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("draw");
+        frame
+            .finish()
+            .expect("submit")
+            .wait()
+            .expect("the submission completes");
+    }
+
+    /// A high queue priority is a request, never a requirement. On this laptop's driver (Mesa
+    /// ANV on xe), high priority needs `CAP_SYS_NICE`: a test process without it must still get a
+    /// working renderer, created once more at the default priority, and must say so.
+    #[test]
+    #[ignore = "requires a hardware Vulkan render node; run explicitly with --ignored"]
+    fn high_queue_priority_without_cap_sys_nice_falls_back_to_a_working_default() {
+        let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+        let physical_device = PhysicalDevice::enumerate(&instance)
+            .unwrap()
+            .find(|device| device.render_node().ok().flatten().is_some())
+            .expect("hardware render node required");
+
+        let mut renderer = VulkanRenderer::with_queue_priority(&physical_device, QueueGlobalPriority::High)
+            .expect("a refused priority must not fail renderer creation");
+        let grant = renderer.queue_priority();
+        assert_eq!(grant.requested, Some(QueueGlobalPriority::High));
+        match grant.outcome {
+            QueuePriorityOutcome::Granted => assert_eq!(grant.granted(), QueueGlobalPriority::High),
+            QueuePriorityOutcome::NotPermitted | QueuePriorityOutcome::Unsupported => {
+                assert_eq!(grant.granted(), QueueGlobalPriority::DEFAULT)
+            }
+            QueuePriorityOutcome::NotRequested => panic!("the request was made"),
+        }
+        let driver = physical_device.driver().map(|driver| driver.id);
+        if driver == Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA) && !has_cap_sys_nice() {
+            assert_eq!(
+                grant.outcome,
+                QueuePriorityOutcome::NotPermitted,
+                "ANV grants high priority only with CAP_SYS_NICE"
+            );
+            assert!(
+                !renderer
+                    .enabled_extensions()
+                    .contains(&ash::khr::global_priority::NAME),
+                "the fallback device is created without the request"
+            );
+        }
+        let origin = renderer.device_origin();
+        let mut second_context = VulkanRenderer::from_device_origin(&origin)
+            .expect("another output context on the same native queue");
+        assert_eq!(second_context.queue_priority(), grant);
+        assert_eq!(second_context.queue_family_index(), renderer.queue_family_index());
+        render_once(&mut second_context, &physical_device);
+        render_once(&mut renderer, &physical_device);
+
+        let default = VulkanRenderer::new(&physical_device).unwrap();
+        assert_eq!(
+            default.queue_priority().outcome,
+            QueuePriorityOutcome::NotRequested
+        );
+        assert_eq!(default.queue_priority().granted(), QueueGlobalPriority::DEFAULT);
+    }
 
     #[test]
     fn renderer_create_drop_loop() {
