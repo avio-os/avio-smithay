@@ -551,46 +551,13 @@ where
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
-        // check if implicit modifiers are in use
-        if self
-            .compositor
-            .values_mut()
-            .any(|c| c.get_mut().unwrap().modifiers() == [DrmModifier::Invalid])
-        {
-            // if so, first lower the bandwidth by disabling planes on all compositors
-            for compositor in self.compositor.values_mut() {
-                let compositor = compositor.get_mut().unwrap();
-                if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
-                    if !matches!(err, DrmOutputManagerError::Frame(FrameError::EmptyFrame)) {
-                        return Err(err);
-                    }
-                }
-            }
-
-            for compositor in self.compositor.values_mut() {
-                let compositor = compositor.get_mut().unwrap();
-                if compositor.modifiers() != [DrmModifier::Invalid] {
-                    continue;
-                }
-
-                let current_format = compositor.format();
-                if let Err(err) = compositor.set_format(
-                    self.allocator.clone(),
-                    current_format,
-                    self.renderer_formats
-                        .iter()
-                        .filter(|f| f.code == current_format)
-                        .map(|f| f.modifier),
-                ) {
-                    tracing::warn!(?err, "failed to reset format");
-                    continue;
-                }
-
-                render_elements.submit_composited_frame(&mut *compositor, renderer)?;
-            }
-        }
-
-        Ok(())
+        restore_modifiers_internal(
+            &mut self.compositor,
+            self.allocator,
+            self.renderer_formats,
+            renderer,
+            render_elements,
+        )
     }
 
     /// Activates a previously paused device.
@@ -790,6 +757,33 @@ where
         self.with_compositor(|compositor| compositor.commit_frame())
     }
 
+    /// Restore explicit modifiers across this output's device using its
+    /// owner's renderer, after an output has released display bandwidth.
+    ///
+    /// Like [`DrmOutput::use_mode`], this configuration operation holds the
+    /// device-wide compositor lock and may submit frames on other outputs.
+    /// Call it in the renderer owner's command order, outside frame rendering.
+    pub fn try_to_restore_modifiers<R, E>(
+        &mut self,
+        renderer: &mut R,
+        render_elements: &DrmOutputRenderElements<R, E>,
+    ) -> DrmOutputManagerResult<(), A, F, R>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+        let mut write_guard = self.compositor.write().unwrap();
+        restore_modifiers_internal(
+            &mut write_guard,
+            &self.allocator,
+            &self.renderer_formats,
+            renderer,
+            render_elements,
+        )
+    }
+
     /// Tries to apply a new [`Mode`] for this `DrmOutput`.
     ///
     /// Fails if the mode is not compatible with the underlying
@@ -857,6 +851,69 @@ where
         let mut write_guard = self.compositor.write().unwrap();
         write_guard.remove(&self.crtc);
     }
+}
+
+fn restore_modifiers_internal<A, F, U, G, R, E>(
+    compositor_list: &mut HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>>,
+    allocator: &A,
+    renderer_formats: &[DrmFormat],
+    renderer: &mut R,
+    render_elements: &DrmOutputRenderElements<R, E>,
+) -> DrmOutputManagerResult<(), A, F, R>
+where
+    A: Allocator + Clone + fmt::Debug,
+    A::Buffer: AsDmabuf,
+    A::Error: Send + Sync + 'static,
+    <A::Buffer as AsDmabuf>::Error: Send + Sync + 'static,
+    F: ExportFramebuffer<A::Buffer> + Clone,
+    F::Framebuffer: fmt::Debug + Send + Sync + 'static,
+    F::Error: Send + Sync + 'static,
+    G: AsFd + Clone + 'static,
+    U: 'static,
+    E: RenderElement<R>,
+    R: Renderer + Bind<Dmabuf>,
+    R::TextureId: Texture + 'static,
+    R::Error: Send + Sync + 'static,
+{
+    // check if implicit modifiers are in use
+    if compositor_list
+        .values_mut()
+        .any(|c| c.get_mut().unwrap().modifiers() == [DrmModifier::Invalid])
+    {
+        // if so, first lower the bandwidth by disabling planes on all compositors
+        for compositor in compositor_list.values_mut() {
+            let compositor = compositor.get_mut().unwrap();
+            if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
+                if !matches!(err, DrmOutputManagerError::Frame(FrameError::EmptyFrame)) {
+                    return Err(err);
+                }
+            }
+        }
+
+        for compositor in compositor_list.values_mut() {
+            let compositor = compositor.get_mut().unwrap();
+            if compositor.modifiers() != [DrmModifier::Invalid] {
+                continue;
+            }
+
+            let current_format = compositor.format();
+            if let Err(err) = compositor.set_format(
+                allocator.clone(),
+                current_format,
+                renderer_formats
+                    .iter()
+                    .filter(|f| f.code == current_format)
+                    .map(|f| f.modifier),
+            ) {
+                tracing::warn!(?err, "failed to reset format");
+                continue;
+            }
+
+            render_elements.submit_composited_frame(&mut *compositor, renderer)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn use_mode_internal<'a, A, F, U, G, R, E>(
