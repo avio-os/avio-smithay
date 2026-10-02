@@ -1743,27 +1743,21 @@ impl Drop for DeviceState {
 #[cfg(test)]
 mod tests {
     use super::DeviceState;
-    use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
 
     /// The Tier-3 device-validity invariant: once a device is observed lost, the single
     /// teardown accessor stops handing out the device so every destroy/wait becomes a no-op.
-    /// Healthy state keeps the device available. Skips silently when no GPU is present.
+    /// Healthy state keeps the device available. Fails on missing prerequisites when AVIO_REQUIRE_VK_DEVICE=1.
     #[test]
     fn handle_for_destroy_is_none_after_mark_lost() {
-        let instance = match Instance::new(Version::VERSION_1_3, None) {
-            Ok(instance) => instance,
-            Err(_) => return,
-        };
-        let physical_device = match PhysicalDevice::enumerate(&instance) {
-            Ok(mut iter) => match iter.next() {
-                Some(phd) => phd,
-                None => return,
-            },
-            Err(_) => return,
+        let Some(physical_device) = super::super::test_support::physical_device() else {
+            return;
         };
         let device = match DeviceState::new(&physical_device) {
             Ok(device) => device,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let handle = device.shared_device();
@@ -1798,27 +1792,23 @@ mod tests {
     /// exported fd comes from the submission's dedicated export semaphore,
     /// signals when the submission completes, export is an idempotent dup,
     /// and the never-exported VkFence tracks true completion state for
-    /// reclamation. Skips silently when no GPU is present.
+    /// reclamation. Fails on missing prerequisites when AVIO_REQUIRE_VK_DEVICE=1.
     #[test]
     fn submission_sync_file_export_signals_on_completion() {
         use ash::vk;
 
-        let instance = match Instance::new(Version::VERSION_1_3, None) {
-            Ok(instance) => instance,
-            Err(_) => return,
-        };
-        let physical_device = match PhysicalDevice::enumerate(&instance) {
-            Ok(mut iter) => match iter.next() {
-                Some(phd) => phd,
-                None => return,
-            },
-            Err(_) => return,
+        let Some(physical_device) = super::super::test_support::physical_device() else {
+            return;
         };
         let mut device = match DeviceState::new(&physical_device) {
             Ok(device) => device,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         if !device.supports_sync_file_export() {
+            super::super::test_support::unavailable("sync_file export");
             return;
         }
 

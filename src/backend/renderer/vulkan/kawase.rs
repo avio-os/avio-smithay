@@ -451,7 +451,6 @@ mod tests {
         backend::{
             allocator::Fourcc,
             renderer::{vulkan::VulkanKawasePass, Bind, Color32F, ExportMem, Frame, Offscreen, Renderer},
-            vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
@@ -459,20 +458,22 @@ mod tests {
     use super::VulkanRenderer;
 
     fn init_renderer() -> Option<VulkanRenderer> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        VulkanRenderer::new(&physical_device).ok()
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        crate::backend::renderer::vulkan::test_support::renderer(&physical_device)
     }
 
     fn first_working_offscreen_format(renderer: &mut VulkanRenderer) -> Option<Fourcc> {
-        [
-            Fourcc::Argb8888,
-            Fourcc::Abgr8888,
-            Fourcc::Xrgb8888,
-            Fourcc::Xbgr8888,
-        ]
-        .into_iter()
-        .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok())
+        super::super::test_support::present(
+            [
+                Fourcc::Argb8888,
+                Fourcc::Abgr8888,
+                Fourcc::Xrgb8888,
+                Fourcc::Xbgr8888,
+            ]
+            .into_iter()
+            .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok()),
+            "no supported offscreen format",
+        )
     }
 
     /// A kawase down+up round trip of a solid color must reproduce that color

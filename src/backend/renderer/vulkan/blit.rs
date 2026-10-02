@@ -638,7 +638,6 @@ mod tests {
                 vulkan::VulkanBlitChainStep, Bind, Blit, Color32F, ExportMem, Frame, Offscreen, Renderer,
                 TextureFilter,
             },
-            vulkan::{version::Version, Instance, PhysicalDevice},
         },
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
@@ -649,20 +648,22 @@ mod tests {
     use super::{VulkanRenderer, VulkanRendererError};
 
     fn init_renderer() -> Option<VulkanRenderer> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        VulkanRenderer::new(&physical_device).ok()
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        crate::backend::renderer::vulkan::test_support::renderer(&physical_device)
     }
 
     fn first_working_offscreen_format(renderer: &mut VulkanRenderer) -> Option<Fourcc> {
-        [
-            Fourcc::Argb8888,
-            Fourcc::Abgr8888,
-            Fourcc::Xrgb8888,
-            Fourcc::Xbgr8888,
-        ]
-        .into_iter()
-        .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok())
+        super::super::test_support::present(
+            [
+                Fourcc::Argb8888,
+                Fourcc::Abgr8888,
+                Fourcc::Xrgb8888,
+                Fourcc::Xbgr8888,
+            ]
+            .into_iter()
+            .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok()),
+            "no supported offscreen format",
+        )
     }
 
     fn expected_red_pixel(format: Fourcc) -> [u8; 4] {
@@ -908,16 +909,27 @@ mod tests {
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
 
-        let Ok(mut source) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(mut source) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut destination) = renderer.create_buffer(Fourcc::Abgr8888, size) else {
+        let Some(mut destination) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Abgr8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut source_target) = renderer.bind(&mut source) else {
+        let Some(mut source_target) =
+            super::super::test_support::available(renderer.bind(&mut source), "test allocation or binding")
+        else {
             return;
         };
-        let Ok(mut destination_target) = renderer.bind(&mut destination) else {
+        let Some(mut destination_target) = super::super::test_support::available(
+            renderer.bind(&mut destination),
+            "test allocation or binding",
+        ) else {
             return;
         };
 

@@ -560,7 +560,6 @@ mod tests {
     use ash::vk;
 
     use super::super::device::{DeviceState, SubmissionId};
-    use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
 
     use super::{DescriptorState, TextureSampler};
 
@@ -656,11 +655,15 @@ mod tests {
         page_size: usize,
         max_sets: usize,
     ) -> Option<(DeviceState, DescriptorState)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        let device = DeviceState::new(&physical_device).ok()?;
-        let descriptors =
-            DescriptorState::with_limits(device.shared_device(), cache_target, page_size, max_sets).ok()?;
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        let device = super::super::test_support::available(
+            DeviceState::new(&physical_device),
+            "descriptor test device",
+        )?;
+        let descriptors = super::super::test_support::available(
+            DescriptorState::with_limits(device.shared_device(), cache_target, page_size, max_sets),
+            "descriptor pools",
+        )?;
         Some((device, descriptors))
     }
 

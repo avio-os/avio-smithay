@@ -2089,7 +2089,6 @@ mod tests {
     use super::{
         combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
         AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,
-        VulkanRendererError,
     };
     use crate::{
         backend::{
@@ -2108,26 +2107,17 @@ mod tests {
     };
 
     fn init_renderer_and_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
 
-        let renderer = match VulkanRenderer::new(&physical_device) {
-            Ok(renderer) => renderer,
-            Err(
-                VulkanRendererError::MissingDeviceExtensions(_)
-                | VulkanRendererError::MissingDeviceFeature(_)
-                | VulkanRendererError::MissingQueueFamily { .. },
-            ) => {
-                return None;
-            }
-            Err(_) => return None,
-        };
+        let renderer = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)?;
 
-        let allocator = VulkanAllocator::new(
-            &physical_device,
-            ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
-        )
-        .ok()?;
+        let allocator = super::super::test_support::available(
+            VulkanAllocator::new(
+                &physical_device,
+                ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
+            ),
+            "frame test allocator",
+        )?;
 
         Some((renderer, allocator))
     }
@@ -2156,21 +2146,33 @@ mod tests {
     }
 
     fn init_renderer_and_effect_allocator() -> Option<(VulkanRenderer, VulkanAllocator)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
+        let instance = super::super::test_support::available(
+            Instance::new(Version::VERSION_1_3, None),
+            "effect test instance",
+        )?;
         // Avio's Vulkan-allocated external targets are the Venus/virtio path.
         // NVIDIA's proprietary driver loses the consumer device when a DMA-BUF
         // exported by a second VkDevice with TRANSFER_SRC usage is first used;
         // physical NVIDIA outputs use GBM allocation instead. Prefer a device
         // that can exercise the Vulkan-export contract this test owns.
-        let physical_device = PhysicalDevice::enumerate(&instance)
-            .ok()?
-            .find(|device| device.properties().vendor_id != 0x10de)?;
-        let renderer = VulkanRenderer::new(&physical_device).ok()?;
-        let allocator = VulkanAllocator::new(
-            &physical_device,
-            ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST,
-        )
-        .ok()?;
+        let physical_device = super::super::test_support::present(
+            super::super::test_support::available(
+                PhysicalDevice::enumerate(&instance),
+                "effect test devices",
+            )?
+            .find(|device| device.properties().vendor_id != 0x10de),
+            "effect test requires a Vulkan-export-compatible non-NVIDIA device",
+        )?;
+        let renderer = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)?;
+        let allocator = super::super::test_support::available(
+            VulkanAllocator::new(
+                &physical_device,
+                ImageUsageFlags::COLOR_ATTACHMENT
+                    | ImageUsageFlags::TRANSFER_SRC
+                    | ImageUsageFlags::TRANSFER_DST,
+            ),
+            "effect test allocator",
+        )?;
         Some((renderer, allocator))
     }
 
@@ -2404,11 +2406,17 @@ mod tests {
 
         let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let dmabuf = match buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut target = renderer
@@ -2498,15 +2506,24 @@ mod tests {
 
         let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_dmabuf = match texture_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture: VulkanTexture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
             Ok(texture) => texture,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let transforms = [
@@ -2523,15 +2540,24 @@ mod tests {
         for transform in transforms {
             let target_buffer = match allocator.create_buffer(96, 64, format.code, &[format.modifier]) {
                 Ok(buffer) => buffer,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
             let target_dmabuf = match target_buffer.export() {
                 Ok(dmabuf) => dmabuf,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
             let mut target = match renderer.bind_dmabuf_target(&target_dmabuf) {
                 Ok(target) => target,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             let target_size = Size::from((target.width() as i32, target.height() as i32));
@@ -2539,7 +2565,10 @@ mod tests {
 
             let mut frame = match renderer.render(&mut target, output_size, transform) {
                 Ok(frame) => frame,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             frame
@@ -2601,15 +2630,24 @@ mod tests {
 
         let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_dmabuf = match texture_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture: VulkanTexture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
             Ok(texture) => texture,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_image = texture
             .image_resource()
@@ -2618,21 +2656,33 @@ mod tests {
 
         let target_buffer = match allocator.create_buffer(96, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let target_dmabuf = match target_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut target = match renderer.bind_dmabuf_target(&target_dmabuf) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         for _ in 0..2 {
             let mut frame = match renderer.render(&mut target, Size::from((96, 64)), Transform::Normal) {
                 Ok(frame) => frame,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             frame
@@ -2717,6 +2767,7 @@ mod tests {
         ]
         .into_iter()
         .find(|format| renderer.create_buffer(*format, Size::from((4, 4))).is_ok()) else {
+            super::super::test_support::unavailable("frame offscreen format");
             return;
         };
 
@@ -2726,25 +2777,40 @@ mod tests {
 
         let mut frame_tex = match renderer.create_buffer(format, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_tex = match renderer.create_buffer(format, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut frame_target = match renderer.bind(&mut frame_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_target = match renderer.bind(&mut aux_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut frame = match renderer.render(&mut frame_target, physical_size, Transform::Normal) {
             Ok(frame) => frame,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         frame
@@ -2783,13 +2849,22 @@ mod tests {
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
 
-        let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(mut frame_texture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(capture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(capture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut target) = renderer.bind(&mut frame_texture) else {
+        let Some(mut target) = super::super::test_support::available(
+            renderer.bind(&mut frame_texture),
+            "test allocation or binding",
+        ) else {
             return;
         };
 
@@ -2823,13 +2898,22 @@ mod tests {
         let size = Size::from((16, 16));
         let physical_size = Size::<i32, Physical>::from((16, 16));
         let region = Rectangle::from_size(physical_size);
-        let Ok(mut frame_texture) = renderer.create_buffer(Fourcc::Argb8888, size) else {
+        let Some(mut frame_texture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Argb8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(capture) = renderer.create_buffer(Fourcc::Abgr8888, size) else {
+        let Some(capture) = super::super::test_support::available(
+            renderer.create_buffer(Fourcc::Abgr8888, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut target) = renderer.bind(&mut frame_texture) else {
+        let Some(mut target) = super::super::test_support::available(
+            renderer.bind(&mut frame_texture),
+            "test allocation or binding",
+        ) else {
             return;
         };
 
@@ -2875,19 +2959,28 @@ mod tests {
                     .next()
             })
         else {
+            super::super::test_support::unavailable("framebuffer-effect DMA-BUF format");
             return;
         };
         let size = Size::from((16, 16));
         let physical_size = Size::<i32, Physical>::from((16, 16));
         let region = Rectangle::from_size(physical_size);
         let buffer_region = Rectangle::<i32, BufferCoord>::from_size(size);
-        let Ok(buffer) = allocator.create_buffer(16, 16, format.code, &[format.modifier]) else {
+        let Some(buffer) = super::super::test_support::available(
+            allocator.create_buffer(16, 16, format.code, &[format.modifier]),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut dmabuf) = buffer.export() else {
+        let Some(mut dmabuf) =
+            super::super::test_support::available(buffer.export(), "test allocation or binding")
+        else {
             return;
         };
-        let Ok(capture) = renderer.create_buffer(format.code, size) else {
+        let Some(capture) = super::super::test_support::available(
+            renderer.create_buffer(format.code, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
         let mut target = renderer
@@ -2932,17 +3025,26 @@ mod tests {
             .copied()
             .find(|format| format.code == Fourcc::Argb8888)
         else {
+            super::super::test_support::unavailable("framebuffer-effect DMA-BUF format");
             return;
         };
         let size = Size::from((16, 16));
         let rect = Rectangle::<i32, Physical>::from_size((16, 16).into());
-        let Ok(buffer) = allocator.create_buffer(16, 16, format.code, &[format.modifier]) else {
+        let Some(buffer) = super::super::test_support::available(
+            allocator.create_buffer(16, 16, format.code, &[format.modifier]),
+            "test allocation or binding",
+        ) else {
             return;
         };
-        let Ok(mut dmabuf) = buffer.export() else {
+        let Some(mut dmabuf) =
+            super::super::test_support::available(buffer.export(), "test allocation or binding")
+        else {
             return;
         };
-        let Ok(mut source_texture) = renderer.create_buffer(format.code, size) else {
+        let Some(mut source_texture) = super::super::test_support::available(
+            renderer.create_buffer(format.code, size),
+            "test allocation or binding",
+        ) else {
             return;
         };
         let mut source = renderer.bind(&mut source_texture).expect("source target");
@@ -2996,15 +3098,24 @@ mod tests {
 
         let texture_buffer = match allocator.create_buffer(32, 32, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_dmabuf = match texture_buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture = match renderer.import_dmabuf_texture(&texture_dmabuf) {
             Ok(texture) => texture,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let texture_image = texture
             .image_resource()
@@ -3016,24 +3127,39 @@ mod tests {
         let full_damage = Rectangle::from_size(physical_size);
         let mut frame_tex = match renderer.create_buffer(format.code, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_tex = match renderer.create_buffer(format.code, size) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut frame_target = match renderer.bind(&mut frame_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         let mut aux_target = match renderer.bind(&mut aux_tex) {
             Ok(target) => target,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let mut frame = match renderer.render(&mut frame_target, physical_size, Transform::Normal) {
             Ok(frame) => frame,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
         frame
             .render_texture_from_to(

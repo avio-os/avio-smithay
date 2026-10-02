@@ -1,6 +1,6 @@
 // Idle eviction of texture imports against a real device. Included into
-// `dmabuf::tests`; every test returns early when no suitable Vulkan device is
-// present, like `shared_multiplane_import_when_available`.
+// `dmabuf::tests`; optional runs skip unavailable hardware. Required runs set
+// AVIO_REQUIRE_VK_DEVICE=1 and fail with the missing prerequisite.
 
 /// An instant strictly after every recency stamp taken before this call.
 fn instant_after_now() -> std::time::Instant {
@@ -22,12 +22,13 @@ fn idle_eviction_setup() -> Option<(VulkanRenderer, VulkanAllocator, crate::back
         format.modifier != Modifier::Invalid
             && renderer.has_dmabuf_render_format(*format)
             && renderer.has_dmabuf_framebuffer_effect_format(*format)
-    })?;
+    });
+    let format = super::super::test_support::present(format, "sampled/render/effect DMA-BUF format")?;
     let allocator = VulkanAllocator::new(
         &physical_device,
         ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT | ImageUsageFlags::TRANSFER_SRC,
-    )
-    .ok()?;
+    );
+    let allocator = super::super::test_support::available(allocator, "DMA-BUF allocator")?;
     Some((renderer, allocator, format))
 }
 
@@ -37,10 +38,11 @@ fn exported_buffer(
     allocator: &mut VulkanAllocator,
     format: crate::backend::allocator::Format,
 ) -> Option<(crate::backend::allocator::vulkan::VulkanImage, Dmabuf)> {
-    let buffer = allocator
-        .create_buffer(64, 64, format.code, &[format.modifier])
-        .ok()?;
-    let dmabuf = buffer.export().ok()?;
+    let buffer = super::super::test_support::available(
+        allocator.create_buffer(64, 64, format.code, &[format.modifier]),
+        "DMA-BUF allocation",
+    )?;
+    let dmabuf = super::super::test_support::available(buffer.export(), "DMA-BUF export")?;
     Some((buffer, dmabuf))
 }
 

@@ -646,37 +646,22 @@ fn avg_nanos(total_ns: u64, count: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::backend::vulkan::{version::Version, Instance, PhysicalDevice};
+mod test_support;
 
-    use super::{VulkanRenderer, VulkanRendererError};
+#[cfg(test)]
+mod tests {
+    use super::VulkanRenderer;
 
     #[test]
     fn renderer_create_drop_loop() {
-        let instance = match Instance::new(Version::VERSION_1_3, None) {
-            Ok(instance) => instance,
-            Err(_) => return,
+        let Some(physical_device) = crate::backend::renderer::vulkan::test_support::physical_device() else {
+            return;
         };
-
-        let physical_device = match PhysicalDevice::enumerate(&instance) {
-            Ok(mut iter) => match iter.next() {
-                Some(phd) => phd,
-                None => return,
-            },
-            Err(_) => return,
+        let Some(renderer) = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)
+        else {
+            return;
         };
-
-        match VulkanRenderer::new(&physical_device) {
-            Ok(renderer) => drop(renderer),
-            Err(
-                VulkanRendererError::MissingDeviceExtensions(_)
-                | VulkanRendererError::MissingDeviceFeature(_)
-                | VulkanRendererError::MissingQueueFamily { .. },
-            ) => {
-                return;
-            }
-            Err(err) => panic!("unexpected initialization failure for Vulkan renderer: {err}"),
-        }
+        drop(renderer);
 
         for _ in 0..32 {
             let renderer = VulkanRenderer::new(&physical_device)

@@ -930,17 +930,8 @@ mod tests {
     }
 
     fn renderer_and_device() -> Option<(PhysicalDevice, VulkanRenderer)> {
-        let instance = Instance::new(Version::VERSION_1_3, None).ok()?;
-        let physical_device = PhysicalDevice::enumerate(&instance).ok()?.next()?;
-        let renderer = match VulkanRenderer::new(&physical_device) {
-            Ok(renderer) => renderer,
-            Err(
-                VulkanRendererError::MissingDeviceExtensions(_)
-                | VulkanRendererError::MissingDeviceFeature(_)
-                | VulkanRendererError::MissingQueueFamily { .. },
-            ) => return None,
-            Err(err) => panic!("unexpected Vulkan renderer init failure: {err}"),
-        };
+        let physical_device = crate::backend::renderer::vulkan::test_support::physical_device()?;
+        let renderer = crate::backend::renderer::vulkan::test_support::renderer(&physical_device)?;
         Some((physical_device, renderer))
     }
 
@@ -999,7 +990,10 @@ mod tests {
             ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
         ) {
             Ok(allocator) => allocator,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         for format in candidates {
@@ -1024,6 +1018,7 @@ mod tests {
                 .expect("shared multi-plane target bind should succeed");
             return;
         }
+        super::super::test_support::unavailable("no exportable shared multi-plane DMA-BUF format");
     }
 
     /// Exercises the allocator and a separate import device, including drivers
@@ -1099,7 +1094,8 @@ mod tests {
                     .find(|format| renderer.has_dmabuf_render_format(*format))
             });
 
-        let Some(format) = candidate else {
+        let Some(format) = super::super::test_support::present(candidate, "sampled/render DMA-BUF format")
+        else {
             return;
         };
 
@@ -1108,17 +1104,26 @@ mod tests {
             ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
         ) {
             Ok(allocator) => allocator,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
             Ok(buffer) => buffer,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let dmabuf = match buffer.export() {
             Ok(dmabuf) => dmabuf,
-            Err(_) => return,
+            Err(error) => {
+                super::super::test_support::unavailable(error);
+                return;
+            }
         };
 
         let texture_first = renderer
@@ -1145,11 +1150,17 @@ mod tests {
         for _ in 0..32 {
             let buffer = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
                 Ok(buffer) => buffer,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
             let dmabuf = match buffer.export() {
                 Ok(dmabuf) => dmabuf,
-                Err(_) => return,
+                Err(error) => {
+                    super::super::test_support::unavailable(error);
+                    return;
+                }
             };
 
             let _texture = renderer
