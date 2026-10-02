@@ -18,7 +18,17 @@ pub(super) fn unavailable(reason: impl Display) {
 /// required device/extension/feature/queue policy: its absence is a valid
 /// capability result even on a required-device laptop run.
 pub(super) fn capability_unavailable(reason: impl Display) {
-    eprintln!("Vulkan device available; optional capability unavailable: {reason}");
+    // A scoped test writer makes the capability result visible even when the
+    // harness did not install a global tracing subscriber.
+    let subscriber = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(%reason, "Vulkan device available; optional capability unavailable");
+    });
 }
 
 #[track_caller]
