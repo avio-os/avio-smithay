@@ -3,6 +3,16 @@
 use super::*;
 use crate::backend::allocator::{Fourcc, Modifier};
 
+// Direct ARGB scanout can be fully opaque. Its alpha-channel capability is
+// not evidence of a compositor-rendered transparent hole over an underlay.
+pub(super) fn underlay_preserves_visibility(
+    element_is_opaque: bool,
+    primary_has_alpha: bool,
+    primary_can_holepunch: bool,
+) -> bool {
+    element_is_opaque && primary_has_alpha && primary_can_holepunch
+}
+
 pub(super) fn composition_primary<A, F>(
     cached: &mut Option<PlaneState<A::Buffer, F::Framebuffer>>,
     swapchain: &mut Swapchain<A>,
@@ -112,8 +122,18 @@ pub(super) fn select_primary<D, C, E>(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_primary, PrimaryPreparation};
+    use super::{select_primary, underlay_preserves_visibility, PrimaryPreparation};
     use std::cell::Cell;
+
+    #[test]
+    fn direct_opaque_argb_primary_cannot_hide_an_auxiliary_underlay() {
+        // The direct-first primary TEST_ONLY succeeded; it is an opaque
+        // producer ARGB buffer rather than a target that Stage may hole punch.
+        assert!(!underlay_preserves_visibility(true, true, false));
+        assert!(underlay_preserves_visibility(true, true, true));
+        assert!(!underlay_preserves_visibility(false, true, true));
+        assert!(!underlay_preserves_visibility(true, false, true));
+    }
 
     #[test]
     fn accepted_plane_test_never_acquires_a_composition_target() {

@@ -5038,6 +5038,12 @@ where
             .map(|state| has_alpha(state.format().code))
             .unwrap_or(false);
 
+        // Alpha in a directly scanned producer buffer does not provide a
+        // compositor-owned hole punch. Underlays need a rendered primary.
+        let primary_can_holepunch = frame_state
+            .plane_buffer(self.surface.plane())
+            .is_some_and(|primary| matches!(primary.buffer, ScanoutBuffer::Swapchain(_)));
+
         let previous_frame_state = self
             .pending_frame
             .as_ref()
@@ -5089,9 +5095,15 @@ where
             let is_underlay =
                 self.surface.plane_info().zpos.unwrap_or_default() > plane.zpos.unwrap_or_default();
 
-            if is_underlay && !(element_is_opaque && primary_plane_has_alpha) {
+            if is_underlay
+                && !composition::underlay_preserves_visibility(
+                    element_is_opaque,
+                    primary_plane_has_alpha,
+                    primary_can_holepunch,
+                )
+            {
                 trace!(
-                    "skipping direct scan-out on underlay {:?} with zpos {:?}, element {:?} is not opaque or primary plane has no alpha channel",
+                    "skipping direct scan-out on underlay {:?} with zpos {:?}, element {:?} needs an opaque underlay and a hole-punched composition primary",
                     plane.handle,
                     plane.zpos,
                     element_id
