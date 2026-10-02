@@ -1922,7 +1922,9 @@ impl<'a> AtomicRequest<'a> {
 
 /// Exercise the real atomic request builder, without a DRM device: a
 /// planeless security frame keeps the exact mode active and resets every
-/// primary/cursor/overlay property. TEST_ONLY and submission use this builder.
+/// primary/cursor/overlay property. The configuration TEST_ONLY request and
+/// the actual full modeset use this builder; an ordinary page flip intentionally
+/// omits connector and MODE_ID properties and disallows modesetting.
 #[cfg(all(test, debug_assertions))]
 mod planeless_black_request {
     use super::*;

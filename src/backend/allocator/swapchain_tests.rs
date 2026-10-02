@@ -144,3 +144,31 @@ fn adoption_rejects_slots_still_owned_by_another_swapchain() {
     assert!(destination.slots.iter().all(|slot| slot.buffer.is_none()));
     assert_eq!(source.allocator.live.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn immutable_shield_does_not_consume_a_composition_slot_or_release_readers() {
+    let mut chain = chain();
+    let shield = Arc::new(chain.acquire().unwrap().unwrap());
+    let displayed = shield.clone();
+    chain.submitted(&shield);
+    assert!(chain.detach(&shield));
+    assert!(!chain.detach(&shield));
+    let composition = (0..SLOT_CAP)
+        .map(|_| {
+            chain
+                .acquire()
+                .unwrap()
+                .expect("all ordinary slots remain available")
+        })
+        .collect::<Vec<_>>();
+    assert!(chain.acquire().unwrap().is_none());
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), SLOT_CAP + 1);
+    drop(shield);
+    assert_eq!(displayed.size().w, 640);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), SLOT_CAP + 1);
+    drop(displayed);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), SLOT_CAP);
+    drop(composition);
+    assert_eq!(chain.retire_unreferenced(), SLOT_CAP);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 0);
+}

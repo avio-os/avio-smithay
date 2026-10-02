@@ -235,6 +235,20 @@ where
         Ok(None)
     }
 
+    /// Remove a held buffer from the reusable pool without releasing it.
+    ///
+    /// Owners may use this to reserve an immutable configuration target. Its
+    /// existing readers remain alive, while all four ordinary slots remain
+    /// available for composition. Returns whether this pool owned the buffer.
+    pub fn detach(&mut self, slot: &Slot<A::Buffer>) -> bool {
+        if let Some(entry) = self.slots.iter_mut().find(|entry| Arc::ptr_eq(entry, &slot.0)) {
+            *entry = Default::default();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mark a given buffer as submitted.
     ///
     /// This might effect internal data (e.g. buffer age) and may only be called,

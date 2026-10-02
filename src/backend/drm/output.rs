@@ -509,9 +509,9 @@ where
         }
 
         if self.native_black_enabled {
-            if let Err(error) = compositor.initialize_native_black() {
+            if let Err(error) = compositor.configure_native_black(renderer) {
                 self.compositor.remove(&crtc);
-                return Err(DrmOutputManagerError::NativeBlack(error));
+                return Err(DrmOutputManagerError::RenderFrame(error));
             }
         }
 
@@ -1045,8 +1045,16 @@ where
             }
             Err(err) => return Err(DrmOutputManagerError::Frame(err)),
         };
+    } else if let Err(err) = res {
+        return Err(DrmOutputManagerError::Frame(err));
     }
 
+    let compositor = compositor_list.get_mut(crtc).unwrap().get_mut().unwrap();
+    if compositor.native_black_enabled() {
+        compositor
+            .configure_native_black(renderer)
+            .map_err(DrmOutputManagerError::RenderFrame)?;
+    }
     Ok(())
 }
 

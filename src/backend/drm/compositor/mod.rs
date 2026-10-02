@@ -632,6 +632,10 @@ struct FrameState<B: Buffer, F: Framebuffer> {
     // A security frame keeps every reset-plane claim through pending/queued
     // custody and physical completion; Full submission must omit none.
     reset_plane_claims: Vec<PlaneClaim>,
+    // Provenance, not a second resource pin: set only for a freshly rendered
+    // opaque-black configuration frame, independently of syncobj support.
+    opaque_black: bool,
+    native_black: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +721,8 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         FrameState {
             planes: tmp,
             reset_plane_claims: Vec::new(),
+            opaque_black: false,
+            native_black: false,
         }
     }
 }
@@ -1350,7 +1356,9 @@ where
     /// Some(false) = element scanout); drives the rare seam-change witness.
     primary_was_composited: Option<bool>,
     native_black_enabled: bool,
-    native_black_candidate: Option<PlaneConfig<A::Buffer, F::Framebuffer>>,
+    native_black_repaint: native_black::NativeBlackRepaint,
+    // An unobservable cold render stays outside reusable slots until retry.
+    native_black_uncompleted: Option<PlaneConfig<A::Buffer, F::Framebuffer>>,
     native_black: Option<native_black::NativeBlackTarget<A::Buffer, F::Framebuffer>>,
 
     framebuffer_exporter: F,
@@ -1610,7 +1618,8 @@ where
                         supports_fencing,
                         primary_was_composited: None,
                         native_black_enabled: false,
-                        native_black_candidate: None,
+                        native_black_repaint: Default::default(),
+                        native_black_uncompleted: None,
                         native_black: None,
                         debug_flags: DebugFlags::empty(),
                         span,
@@ -1782,7 +1791,8 @@ where
             supports_fencing,
             primary_was_composited: None,
             native_black_enabled: false,
-            native_black_candidate: None,
+            native_black_repaint: Default::default(),
+            native_black_uncompleted: None,
             native_black: None,
             debug_flags: DebugFlags::empty(),
             span,
@@ -2034,7 +2044,8 @@ where
         // If a commit is pending we may still be able to just use a previous
         // state, but we want to queue a frame so we just fake the damage to
         // make sure queue_frame won't be skipped because of no damage
-        let allow_partial_update = !self.reset_pending && !self.surface.commit_pending();
+        let allow_partial_update =
+            !self.reset_pending && !self.surface.commit_pending() && !self.native_black_repaint.pending();
 
         let (current_size, output_scale, output_transform) = (&self.output_mode_source)
             .try_into()
@@ -2853,6 +2864,7 @@ where
         }
 
         let mut primary_rendered_this_frame = false;
+        let mut primary_render_damage = false;
         if render {
             trace!(
                 "rendering {} elements on the primary {:?}",
@@ -2872,7 +2884,7 @@ where
                 let age = if primary_full_repaint_diag() {
                     0
                 } else {
-                    slot.age().into()
+                    self.native_black_repaint.age(slot.age().into())
                 };
                 (dmabuf, age)
             };
@@ -2968,9 +2980,10 @@ where
                         self.reset_pending = true;
                         return Err(FrameError::PrimaryPlaneRenderDenied.into());
                     }
+                    primary_rendered_this_frame = render_output_result.damage.is_some();
+                    primary_render_damage = render_output_result.damage.is_some();
                     let shared_render_sync_file =
                         if render_output_result.damage.is_some() && self.supports_fencing {
-                            primary_rendered_this_frame = true;
                             // Export once for KMS. Source-buffer release is
                             // ownership-driven by compositor use tokens rather
                             // than attached to one arbitrarily selected fence.
@@ -3023,7 +3036,7 @@ where
                     let primary_plane_state = next_frame_state.plane_state_mut(self.surface.plane()).unwrap();
                     let config = primary_plane_state.config.as_mut().unwrap();
 
-                    if !had_direct_scan_out {
+                    if !had_direct_scan_out && !self.native_black_repaint.pending() {
                         if let Some(render_damage) = render_output_result.damage {
                             trace!("rendering damage: {:?}", render_damage);
 
@@ -3058,6 +3071,7 @@ where
                             "clearing previous direct scan-out on primary plane, damaging complete output"
                         );
                         primary_rendered_this_frame = true;
+                        config.damage_clips = None;
                         self.primary_plane_damage_bag
                             .add([output_geometry.to_logical(1).to_buffer(
                                 1,
@@ -3128,23 +3142,15 @@ where
             }
         }
 
-        // Retain the exact initial black target across the synchronous modeset.
-        // A planeless-capable output drops it; a refused output reserves it.
-        if self.native_black_enabled
-            && self.native_black.is_none()
-            && primary_rendered_this_frame
-            && elements.is_empty()
-            && clear_color.r() == 0.0
-            && clear_color.g() == 0.0
-            && clear_color.b() == 0.0
-            && clear_color.a() == 1.0
-            && !primary_clear_red_diag()
-        {
-            self.native_black_candidate = next_frame_state
-                .plane_state(self.surface.plane())
-                .and_then(|state| state.config.as_ref())
-                .cloned();
-        }
+        // Keep provenance in the frame that owns the actual render result.
+        // Uncommitted frames must never pin a speculative shield target.
+        next_frame_state.opaque_black = self.native_black_enabled
+            && native_black::opaque_black_rendered(
+                primary_render_damage,
+                elements.is_empty(),
+                clear_color,
+                primary_clear_red_diag(),
+            );
 
         let next_frame = PreparedFrame {
             kind: if allow_partial_update {
@@ -3345,12 +3351,22 @@ where
                 if prepared_frame.kind == PreparedFrameKind::Full {
                     self.reset_pending = false;
                 }
+                self.native_black_repaint.accepted(
+                    prepared_frame.kind == PreparedFrameKind::Full,
+                    prepared_frame.frame.native_black,
+                );
 
-                self.pending_frame = user_data.map(|user_data| PendingFrame {
-                    frame: prepared_frame.frame,
-                    user_data,
-                    flip_out_fence,
-                });
+                if let Some(user_data) = user_data {
+                    self.pending_frame = Some(PendingFrame {
+                        frame: prepared_frame.frame,
+                        user_data,
+                        flip_out_fence,
+                    });
+                } else {
+                    // A blocking configuration commit has completed. Preserve
+                    // its framebuffer custody just like a completed page flip.
+                    self.current_frame = prepared_frame.frame;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -3459,6 +3475,8 @@ where
                 .map(|(handle, state)| (*handle, state.clone()))
                 .collect(),
             reset_plane_claims: self.current_frame.reset_plane_claims.clone(),
+            opaque_black: false,
+            native_black: self.current_frame.native_black,
         };
         for (_, state) in frame.planes.iter_mut() {
             state.skip = true;
@@ -3522,6 +3540,8 @@ where
                 .map(|(handle, state)| (*handle, state.clone()))
                 .collect(),
             reset_plane_claims: self.current_frame.reset_plane_claims.clone(),
+            opaque_black: false,
+            native_black: self.current_frame.native_black,
         };
         for (_, state) in frame.planes.iter_mut() {
             state.skip = true;
@@ -3655,18 +3675,6 @@ where
         }) = self.pending_frame.take()
         {
             std::mem::swap(&mut frame, &mut self.current_frame);
-            if self.native_black_enabled
-                && self.native_black.is_none()
-                && self.native_black_candidate.as_ref().is_some_and(|candidate| {
-                    self.current_frame
-                        .plane_buffer(self.surface.plane())
-                        .is_some_and(|current| current.fb == candidate.buffer.fb)
-                })
-            {
-                if let Err(error) = self.initialize_native_black() {
-                    tracing::trace!(%error, "native black configuration awaits a usable target");
-                }
-            }
             Some(user_data)
         } else {
             None
@@ -3800,12 +3808,16 @@ where
     /// Fails if the mode is not compatible with the underlying
     /// [`crtc`] or any of the
     /// pending [`connector`]s.
+    /// Native-black owners must call [`Self::configure_native_black`] on a
+    /// cold turn before reporting the new configuration ready. This method
+    /// only updates pending KMS state and never allocates a shield.
     pub fn use_mode(&mut self, mode: Mode) -> FrameResult<(), A, F> {
         self.surface.use_mode(mode).map_err(FrameError::DrmError)?;
         let (w, h) = mode.size();
         self.swapchain.resize(w as _, h as _);
-        self.native_black = None;
-        self.native_black_candidate = None;
+        // A same-size mode can reuse the completed immutable image, but its
+        // exact mode/connector capability must be refreshed by the cold owner.
+        self.native_black_repaint.request();
         Ok(())
     }
 
@@ -5685,6 +5697,9 @@ pub enum FrameError<
     /// denied via [`FrameFlags::DENY_PRIMARY_PLANE_RENDER`]
     #[error("The frame required a primary plane re-render, which the frame flags deny")]
     PrimaryPlaneRenderDenied,
+    /// Native-black configuration needs a completed target or capability.
+    #[error(transparent)]
+    NativeBlack(#[from] NativeBlackError),
 }
 
 /// Error returned from [`DrmCompositor::render_frame`]
@@ -5763,7 +5778,8 @@ impl<
             | x @ FrameError::NoFramebuffer => SwapBuffersError::ContextLost(Box::new(x)),
             x @ FrameError::NoFreeSlotsError
             | x @ FrameError::EmptyFrame
-            | x @ FrameError::PrimaryPlaneRenderDenied => SwapBuffersError::TemporaryFailure(Box::new(x)),
+            | x @ FrameError::PrimaryPlaneRenderDenied
+            | x @ FrameError::NativeBlack(_) => SwapBuffersError::TemporaryFailure(Box::new(x)),
             FrameError::DrmError(err) => err.into(),
             FrameError::Allocator(err) => SwapBuffersError::ContextLost(Box::new(err)),
             FrameError::AsDmabufError(err) => SwapBuffersError::ContextLost(Box::new(err)),
