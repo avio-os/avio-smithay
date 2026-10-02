@@ -191,6 +191,24 @@ fn dmabuf_is_disjoint(dmabuf: &Dmabuf) -> Result<bool, VulkanRendererError> {
 }
 
 impl DmabufState {
+    /// Observe this context's real sampled import without creating, promoting,
+    /// pinning, or claiming readiness from source metadata alone.
+    pub(crate) fn sampled_prepared(&self, dmabuf: &Dmabuf) -> bool {
+        let Some(cached) = self.cache.get(&dmabuf.weak()) else {
+            return false;
+        };
+        cached.context == self.context
+            && cached.signature.size == dmabuf.size()
+            && cached.signature.format == dmabuf.format()
+            && cached.imported.upgrade().is_some_and(|image| {
+                image.image() != vk::Image::null()
+                    && image.view() != vk::ImageView::null()
+                    && image.size() == dmabuf.size()
+                    && image.format() == dmabuf.format()
+                    && image.usage().contains(DmabufRole::Texture.required_usage())
+            })
+    }
+
     pub(crate) fn new(context: ErasedContextId) -> Self {
         Self {
             context,
@@ -983,6 +1001,7 @@ mod tests {
     include!("dmabuf/idle_eviction_tests.rs");
     include!("dmabuf/pin_tests.rs");
     include!("dmabuf/context_custody_tests.rs");
+    include!("dmabuf/prepared_tests.rs");
 
     #[test]
     fn capture_target_usage_covers_direct_materials_and_terminal_blits() {

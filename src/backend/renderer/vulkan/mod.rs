@@ -592,6 +592,16 @@ impl VulkanRenderer {
         self.dmabuf.import_texture(&self.device, &self.formats, dmabuf)
     }
 
+    /// Whether this renderer context already owns a live sampled image/view
+    /// for the exact dma-buf backing and its immutable format/extent.
+    ///
+    /// This observation creates no native object, changes no cache recency or
+    /// pin, and performs no driver operation. A source descriptor, another
+    /// context's import, or stale weak metadata alone never establishes warmth.
+    pub fn sampled_dmabuf_is_prepared(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.sampled_prepared(dmabuf)
+    }
+
     /// Bind a dma-buf for render-target usage.
     pub fn bind_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Result<VulkanTarget, VulkanRendererError> {
         self.dmabuf
