@@ -165,3 +165,27 @@ fn idle_eviction_keeps_an_import_hit_since_the_cutoff() {
     assert!(renderer.dmabuf.cache.contains_key(&first.weak()));
     assert!(!renderer.dmabuf.cache.contains_key(&second.weak()));
 }
+
+#[test]
+fn last_buffer_drop_retires_cached_vulkan_import_without_cleanup() {
+    let Some((mut renderer, mut allocator, format)) = idle_eviction_setup() else {
+        return;
+    };
+    let Some((buffer, dmabuf)) = exported_buffer(&mut allocator, format) else {
+        return;
+    };
+    let texture = renderer.import_dmabuf_texture(&dmabuf).expect("texture import");
+    let weak = std::sync::Arc::downgrade(texture.image_resource().unwrap());
+    let key = dmabuf.weak();
+    drop(texture);
+    assert!(weak.upgrade().is_some(), "a live buffer permits cache reuse");
+    drop((dmabuf, buffer));
+    assert!(
+        renderer.dmabuf.cache.contains_key(&key),
+        "metadata cleanup has not run"
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "stale metadata must not retain GPU memory"
+    );
+}

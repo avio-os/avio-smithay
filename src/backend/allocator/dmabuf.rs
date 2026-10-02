@@ -23,7 +23,7 @@ use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
 use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "backend_drm")]
+#[cfg(any(feature = "backend_drm", feature = "renderer_vulkan"))]
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
 use std::{error, fmt};
@@ -45,6 +45,10 @@ pub(crate) struct DmabufInternal {
     ///
     /// This is a bitflag, to be compared with the `Flags` enum re-exported by this module.
     pub flags: DmabufFlags,
+    /// Renderer resources whose cache residency must end with this buffer.
+    /// The mutex serializes typed initialization across renderer threads.
+    #[cfg(feature = "renderer_vulkan")]
+    resources: Mutex<crate::utils::user_data::UserDataMap>,
     /// Presumably compatible device for buffer import
     ///
     /// This is inferred from client apis, however there is no kernel api or guarantee this is correct
@@ -220,6 +224,8 @@ impl Dmabuf {
                 format,
                 modifier,
                 flags,
+                #[cfg(feature = "renderer_vulkan")]
+                resources: Mutex::new(crate::utils::user_data::UserDataMap::new()),
                 #[cfg(feature = "backend_drm")]
                 node: Mutex::new(None),
             },
@@ -229,6 +235,17 @@ impl Dmabuf {
     /// The amount of planes this Dmabuf has
     pub fn num_planes(&self) -> usize {
         self.0.planes.len()
+    }
+
+    /// Attach renderer-owned resource custody to this buffer's lifetime.
+    /// Callers retain only weak references to this container in their caches;
+    /// submitted work owns its own resources until GPU completion.
+    #[cfg(feature = "renderer_vulkan")]
+    pub(crate) fn resource_custody<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        let resources = self.0.resources.lock().unwrap();
+        resources
+            .get_or_insert_threadsafe(|| Arc::new(T::default()))
+            .clone()
     }
 
     /// Returns raw handles of the planes of this buffer

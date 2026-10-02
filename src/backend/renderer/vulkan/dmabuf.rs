@@ -1,6 +1,6 @@
 use std::{
     os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Instant,
 };
 
@@ -26,6 +26,9 @@ use super::{
     image::VulkanImage,
     VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
+
+mod custody;
+use custody::ImportCustody;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmabufRole {
@@ -110,15 +113,25 @@ struct DmabufSignature {
     y_inverted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CachedDmabuf {
     pub(crate) handle: WeakDmabuf,
     signature: DmabufSignature,
-    imported: Arc<VulkanImage>,
+    imported: Weak<VulkanImage>,
+    custody: Weak<ImportCustody<VulkanImage>>,
+    device: usize,
     /// When a caller last imported or bound this entry. Stamped only where the
     /// entry moves to the back of the cache, so it never decreases from front
     /// to back.
     last_used: Instant,
+}
+
+impl Drop for CachedDmabuf {
+    fn drop(&mut self) {
+        if let Some(custody) = self.custody.upgrade() {
+            custody.remove(self.device, &self.imported);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +261,9 @@ impl DmabufState {
             if cached.last_used >= used_before {
                 break;
             }
-            if idle_evictable_usage(cached.imported.usage()) && Arc::strong_count(&cached.imported) <= 1 {
+            if cached.imported.upgrade().is_some_and(|imported| {
+                idle_evictable_usage(imported.usage()) && Arc::strong_count(&imported) <= 2
+            }) {
                 let _ = self.cache.shift_remove_index(index);
                 evicted = evicted.saturating_add(1);
             } else {
@@ -283,8 +298,11 @@ impl DmabufState {
             // Dmabuf plane metadata is immutable after construction and the weak key
             // identifies that exact allocation. Avoid repeating fstat topology checks
             // for every frame once this buffer and usage have been validated.
-            if cached.imported.usage().contains(requested_usage) {
-                let imported = cached.imported.clone();
+            if let Some(imported) = cached
+                .imported
+                .upgrade()
+                .filter(|imported| imported.usage().contains(requested_usage))
+            {
                 self.promote_entry(&key);
                 self.cache_stats.hits = self.cache_stats.hits.saturating_add(1);
                 trace!(
@@ -304,17 +322,23 @@ impl DmabufState {
             .cache
             .get(&key)
             .filter(|cached| cached.signature == descriptor.signature)
-            .map(|cached| cached.imported.usage() | requested_usage)
+            .and_then(|cached| cached.imported.upgrade())
+            .map(|imported| imported.usage() | requested_usage)
             .unwrap_or(requested_usage);
 
         let imported = self.create_image_resource(device, dmabuf, &descriptor, usage)?;
+        let custody = dmabuf.resource_custody::<ImportCustody<VulkanImage>>();
+        let device_key = Arc::as_ptr(&device.shared_device()) as usize;
+        custody.insert(device_key, imported.clone());
         let _ = self.cache.shift_remove(&key);
         self.cache.insert(
             key.clone(),
             CachedDmabuf {
                 handle: key,
                 signature: descriptor.signature,
-                imported: imported.clone(),
+                imported: Arc::downgrade(&imported),
+                custody: Arc::downgrade(&custody),
+                device: device_key,
                 last_used: Instant::now(),
             },
         );
@@ -353,7 +377,7 @@ impl DmabufState {
             let remove = self
                 .cache
                 .get_index(index)
-                .map(|(_, cached)| cached.handle.is_gone() && Arc::strong_count(&cached.imported) <= 1)
+                .map(|(_, cached)| cached.handle.is_gone())
                 .unwrap_or(false);
             scanned = scanned.saturating_add(1);
 
