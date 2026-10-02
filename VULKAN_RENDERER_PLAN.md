@@ -425,3 +425,10 @@ Pure span tests exercise cancellation, a writer returning from another thread,
 nonoverlapping admission, whole-generation admission and exact coalescing. The
 explicit laptop fixture reproduces a 4 MiB import, a held 4 MiB writer, and a
 16 KiB slice upload and requires one chunk with no additional growth.
+
+Required-device test policy covers instance/device creation, the renderer's
+required extensions, feature and queue family. Optional modifier capabilities
+are reported explicitly after those prerequisites succeed. In particular, a
+device advertising no exportable shared multi-plane modifier for both sampling
+and rendering has a valid negative capability result; an advertised, exportable
+candidate must still pass the real shared-allocation texture and target imports.

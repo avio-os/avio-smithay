@@ -1027,7 +1027,16 @@ mod tests {
             .iter()
             .copied()
             .filter(|format| {
-                renderer.has_dmabuf_render_format(*format) && format.modifier != Modifier::Invalid
+                renderer.has_dmabuf_render_format(*format)
+                    && format.modifier != Modifier::Invalid
+                    && renderer
+                        .formats
+                        .modifier_capabilities(format.code)
+                        .iter()
+                        .any(|capability| {
+                            capability.modifier == format.modifier
+                                && capability.drm_format_modifier_plane_count > 1
+                        })
             })
             .collect::<Vec<_>>();
         let mut allocator = match VulkanAllocator::new(
@@ -1035,10 +1044,7 @@ mod tests {
             ImageUsageFlags::SAMPLED | ImageUsageFlags::COLOR_ATTACHMENT,
         ) {
             Ok(allocator) => allocator,
-            Err(error) => {
-                super::super::test_support::unavailable(error);
-                return;
-            }
+            Err(error) => panic!("required Vulkan allocator initialization failed: {error}"),
         };
 
         for format in candidates {
@@ -1063,7 +1069,9 @@ mod tests {
                 .expect("shared multi-plane target bind should succeed");
             return;
         }
-        super::super::test_support::unavailable("no exportable shared multi-plane DMA-BUF format");
+        super::super::test_support::capability_unavailable(
+            "no exportable shared multi-plane DMA-BUF modifier supporting both sampling and rendering",
+        );
     }
 
     /// Exercises the allocator and a separate import device, including drivers

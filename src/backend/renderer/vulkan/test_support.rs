@@ -14,6 +14,13 @@ pub(super) fn unavailable(reason: impl Display) {
     check_available(false, device_required(), reason);
 }
 
+/// Report a measured optional driver capability. This is separate from the
+/// required device/extension/feature/queue policy: its absence is a valid
+/// capability result even on a required-device laptop run.
+pub(super) fn capability_unavailable(reason: impl Display) {
+    eprintln!("Vulkan device available; optional capability unavailable: {reason}");
+}
+
 #[track_caller]
 pub(super) fn available<T, E: Display>(result: Result<T, E>, requirement: &str) -> Option<T> {
     match result {
@@ -72,4 +79,10 @@ fn required_device_failure_names_the_missing_extension() {
 fn optional_device_failure_and_available_device_are_allowed() {
     check_available(false, false, "no Vulkan device");
     check_available(true, true, "device available");
+}
+
+#[test]
+fn optional_driver_capability_is_reported_without_weakening_required_device_policy() {
+    check_available(true, true, "required Vulkan prerequisites present");
+    capability_unavailable("no exportable sampled/renderable multi-plane modifier");
 }
