@@ -53,7 +53,9 @@
 //! warmup, frame preparation/recording, or maintenance work on its owner
 //! thread. The phase and allocating thread are included in per-event TRACE
 //! records; retirement also records the retiring thread. Phase scopes are
-//! device-specific, nested, and bound to their entering thread. Snapshots are
+//! device-specific, nested, and bound to their entering thread. Their fixed
+//! 64-entry thread-local storage never grows; while an overflow scope is live,
+//! all allocations on that thread are tagged `Unspecified`. Snapshots are
 //! read-only atomic samples: a concurrent allocation/free can straddle their
 //! reads, while a quiescent sample is exact. Device-loss teardown intentionally
 //! skips unsafe Vulkan frees, so owner retirement after loss does not establish
@@ -721,7 +723,9 @@ impl VulkanRenderer {
 
     /// Tags allocations on this thread for this renderer's device until the
     /// returned guard is dropped. The guard holds no renderer borrow and must
-    /// stay on this thread; other devices and threads keep their own phases.
+    /// stay on this thread. This thread has 64 fixed scope slots. While any
+    /// overflow guard is live, all allocations on this thread conservatively
+    /// use `Unspecified`; existing device phases return after overflow retires.
     pub fn allocation_phase_scope(&self, phase: VulkanAllocationPhase) -> VulkanAllocationPhaseGuard {
         self.device.shared_device().allocation_ledger().enter_phase(phase)
     }

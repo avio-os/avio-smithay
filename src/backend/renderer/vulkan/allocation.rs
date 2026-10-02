@@ -47,7 +47,7 @@ impl VulkanAllocationReason {
 /// The caller-owned phase in which device memory was allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulkanAllocationPhase {
-    /// No explicit phase scope covers this allocation.
+    /// No explicit scope covers this allocation, or thread scope storage overflowed.
     Unspecified,
     /// Renderer/device initialization.
     Initialization,
@@ -153,8 +153,75 @@ impl Counters {
 static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 
+const PHASE_SCOPE_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct PhaseScope {
+    ledger: u64,
+    scope: u64,
+    phase: VulkanAllocationPhase,
+}
+
+struct PhaseScopes {
+    entries: [Option<PhaseScope>; PHASE_SCOPE_CAPACITY],
+    overflow_scopes: usize,
+}
+
+impl PhaseScopes {
+    const fn new() -> Self {
+        Self {
+            entries: [None; PHASE_SCOPE_CAPACITY],
+            overflow_scopes: 0,
+        }
+    }
+
+    /// Return true if there was no slot. Overflow cannot retain device/scope
+    /// identities without allocating, so it suppresses all inferred phases
+    /// on this thread until the last overflow guard retires.
+    fn enter(&mut self, entry: PhaseScope) -> bool {
+        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+            false
+        } else {
+            self.overflow_scopes = self.overflow_scopes.saturating_add(1);
+            true
+        }
+    }
+
+    fn phase(&self, ledger: u64) -> VulkanAllocationPhase {
+        if self.overflow_scopes != 0 {
+            return VulkanAllocationPhase::Unspecified;
+        }
+        // Slots are reused after out-of-order drops. Scope identity, rather
+        // than array position, selects the newest surviving device scope.
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.ledger == ledger)
+            .max_by_key(|entry| entry.scope)
+            .map(|entry| entry.phase)
+            .unwrap_or(VulkanAllocationPhase::Unspecified)
+    }
+
+    fn leave(&mut self, ledger: u64, scope: u64, overflow: bool) {
+        if overflow {
+            // Saturation can only be reached after an impossible number of
+            // simultaneously live guards, but keep that case conservative:
+            // do not restore an inferred phase after losing the count.
+            if self.overflow_scopes != usize::MAX {
+                self.overflow_scopes = self.overflow_scopes.saturating_sub(1);
+            }
+        } else if let Some(slot) = self.entries.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| (entry.ledger, entry.scope) == (ledger, scope))
+        }) {
+            *slot = None;
+        }
+    }
+}
+
 thread_local! {
-    static PHASES: RefCell<Vec<(u64, u64, VulkanAllocationPhase)>> = const { RefCell::new(Vec::new()) };
+    static PHASES: RefCell<PhaseScopes> = const { RefCell::new(PhaseScopes::new()) };
 }
 
 /// One independent logical device's allocation counters.
@@ -180,15 +247,7 @@ impl AllocationLedger {
     /// guard into the actual memory owner. Drops happen after Vulkan teardown,
     /// outside any cache or allocation-custody mutex.
     pub(super) fn record(self: &Arc<Self>, reason: VulkanAllocationReason, bytes: u64) -> AllocationGuard {
-        let phase = PHASES.with(|phases| {
-            phases
-                .borrow()
-                .iter()
-                .rev()
-                .find(|(ledger, _, _)| *ledger == self.id)
-                .map(|(_, _, phase)| *phase)
-                .unwrap_or(VulkanAllocationPhase::Unspecified)
-        });
+        let phase = PHASES.with(|phases| phases.borrow().phase(self.id));
         self.by_reason[reason.index()].acquire(bytes);
         self.by_phase[phase.index()].acquire(bytes);
         let current_thread = thread::current();
@@ -224,10 +283,28 @@ impl AllocationLedger {
 
     pub(super) fn enter_phase(&self, phase: VulkanAllocationPhase) -> VulkanAllocationPhaseGuard {
         let scope = NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
-        PHASES.with(|phases| phases.borrow_mut().push((self.id, scope, phase)));
+        let overflow = PHASES.with(|phases| {
+            phases.borrow_mut().enter(PhaseScope {
+                ledger: self.id,
+                scope,
+                phase,
+            })
+        });
+        if overflow {
+            trace!(
+                device_ledger = self.id,
+                ?scope,
+                requested_phase = ?phase,
+                effective_phase = ?VulkanAllocationPhase::Unspecified,
+                ?PHASE_SCOPE_CAPACITY,
+                thread = ?thread::current().id(),
+                "Vulkan allocation phase scope capacity exceeded"
+            );
+        }
         VulkanAllocationPhaseGuard {
             ledger: self.id,
             scope,
+            overflow,
             _thread: PhantomData,
         }
     }
@@ -237,10 +314,14 @@ impl AllocationLedger {
 /// no renderer borrow, so callers can keep it around the operation they tag.
 /// Nested devices remain independent, and dropping an outer scope early does
 /// not erase a live inner scope. It must be dropped on the thread that enters it.
+/// Scope storage is fixed at 64 entries per thread and never grows. While any
+/// overflow guard is live, all devices on that thread use `Unspecified`;
+/// existing scopes are restored when the final overflow guard is dropped.
 #[derive(Debug)]
 pub struct VulkanAllocationPhaseGuard {
     ledger: u64,
     scope: u64,
+    overflow: bool,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -249,9 +330,7 @@ impl Drop for VulkanAllocationPhaseGuard {
         // A guard stored in another thread-local can be dropped after PHASES
         // was destroyed during thread teardown; its phase has already ended.
         let _ = PHASES.try_with(|phases| {
-            phases
-                .borrow_mut()
-                .retain(|(ledger, scope, _)| (*ledger, *scope) != (self.ledger, self.scope));
+            phases.borrow_mut().leave(self.ledger, self.scope, self.overflow);
         });
     }
 }
@@ -347,6 +426,94 @@ mod tests {
         assert_eq!(unscoped.phase, VulkanAllocationPhase::Unspecified);
         assert_eq!(a.snapshot().phase(VulkanAllocationPhase::Frame).live_bytes, 1024);
         assert_eq!(b.snapshot().phase(VulkanAllocationPhase::Frame).live_bytes, 0);
+    }
+
+    #[test]
+    fn phase_storage_is_fixed_and_reused_on_first_frame_worker() {
+        let ledger = Arc::new(AllocationLedger::default());
+        let initialized = ledger.enter_phase(VulkanAllocationPhase::Initialization);
+        drop(initialized);
+        std::thread::spawn(move || {
+            // The device moved from its initialization thread. This worker's
+            // first scope must not lazily create/grow a vector for frame work.
+            let frame = ledger.enter_phase(VulkanAllocationPhase::Frame);
+            assert_eq!(
+                ledger.record(VulkanAllocationReason::Texture, 16).phase,
+                VulkanAllocationPhase::Frame
+            );
+            let storage = PHASES.with(|phases| phases.borrow().entries.as_ptr());
+            drop(frame);
+            for _ in 0..128 {
+                let scopes: [_; PHASE_SCOPE_CAPACITY] =
+                    std::array::from_fn(|_| ledger.enter_phase(VulkanAllocationPhase::Frame));
+                PHASES.with(|phases| {
+                    let phases = phases.borrow();
+                    assert_eq!(phases.entries.as_ptr(), storage);
+                    assert_eq!(phases.entries.len(), PHASE_SCOPE_CAPACITY);
+                    assert_eq!(phases.entries.iter().flatten().count(), PHASE_SCOPE_CAPACITY);
+                    assert_eq!(phases.overflow_scopes, 0);
+                });
+                assert_eq!(
+                    ledger.record(VulkanAllocationReason::Upload, 32).phase,
+                    VulkanAllocationPhase::Frame
+                );
+                drop(scopes);
+                PHASES.with(|phases| {
+                    let phases = phases.borrow();
+                    assert_eq!(phases.entries.as_ptr(), storage);
+                    assert!(phases.entries.iter().all(Option::is_none));
+                });
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn overflow_suppresses_phases_until_final_guard_then_restores_newest_scope() {
+        let a = Arc::new(AllocationLedger::default());
+        let b = Arc::new(AllocationLedger::default());
+        let mut scopes: [_; PHASE_SCOPE_CAPACITY] = std::array::from_fn(|i| {
+            Some(if i % 2 == 0 {
+                a.enter_phase(VulkanAllocationPhase::Frame)
+            } else {
+                b.enter_phase(VulkanAllocationPhase::Warmup)
+            })
+        });
+        let overflow_a = a.enter_phase(VulkanAllocationPhase::Maintenance);
+        let overflow_b = b.enter_phase(VulkanAllocationPhase::Frame);
+        assert!(overflow_a.overflow);
+        assert!(overflow_b.overflow);
+        let check_phase = |ledger: &Arc<AllocationLedger>, expected| {
+            assert_eq!(ledger.record(VulkanAllocationReason::Scratch, 16).phase, expected);
+        };
+        check_phase(&a, VulkanAllocationPhase::Unspecified);
+        check_phase(&b, VulkanAllocationPhase::Unspecified);
+
+        // Reuse the earliest slot while a newer scope remains active. Array
+        // order must not resurrect that older scope, including after overflow.
+        drop(scopes[0].take());
+        let newest_a = a.enter_phase(VulkanAllocationPhase::Maintenance);
+        assert!(!newest_a.overflow);
+        drop(overflow_a);
+        check_phase(&a, VulkanAllocationPhase::Unspecified);
+        check_phase(&b, VulkanAllocationPhase::Unspecified);
+        drop(scopes[1].take());
+        let newest_b = b.enter_phase(VulkanAllocationPhase::Initialization);
+        assert!(!newest_b.overflow);
+        check_phase(&b, VulkanAllocationPhase::Unspecified);
+
+        drop(overflow_b);
+        check_phase(&a, VulkanAllocationPhase::Maintenance);
+        check_phase(&b, VulkanAllocationPhase::Initialization);
+        drop(newest_a);
+        check_phase(&a, VulkanAllocationPhase::Frame);
+        check_phase(&b, VulkanAllocationPhase::Initialization);
+        drop(newest_b);
+        check_phase(&b, VulkanAllocationPhase::Warmup);
+        drop(scopes);
+        check_phase(&a, VulkanAllocationPhase::Unspecified);
+        check_phase(&b, VulkanAllocationPhase::Unspecified);
     }
 
     #[test]
