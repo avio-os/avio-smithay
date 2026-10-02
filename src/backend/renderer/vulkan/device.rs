@@ -3,10 +3,7 @@ use std::{
     ffi::CStr,
     fmt,
     os::fd::{FromRawFd, OwnedFd},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Instant,
 };
 
@@ -15,11 +12,10 @@ use tracing::{instrument, trace, warn};
 
 use crate::backend::{
     renderer::{sync::SyncPoint, MemoryUploadCapacityEdge},
-    vulkan::{version::Version, Instance, PhysicalDevice},
+    vulkan::{version::Version, PhysicalDevice},
 };
 
 use super::{
-    allocation::AllocationLedger,
     image::{transition_image_layout, VulkanImage},
     staging::{ReservationWriter, StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
@@ -29,7 +25,7 @@ use super::{
 const MAX_UPLOAD_BATCH_OPERATIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SubmissionId(u64);
+pub(crate) struct SubmissionId(pub(super) u64);
 
 impl SubmissionId {
     #[cfg(test)]
@@ -266,165 +262,7 @@ impl fmt::Debug for DeviceState {
     }
 }
 
-pub(super) struct DeviceHandle {
-    device: ash::Device,
-    allocation_ledger: Arc<AllocationLedger>,
-    /// Keeps the Vulkan parent instance alive until the logical device and
-    /// every child object sharing this handle have been destroyed.
-    ///
-    /// `DeviceState` is only one owner of this handle: descriptor, pipeline,
-    /// image, fence, and transient-allocation state can outlive it during
-    /// renderer field teardown. Retaining only the instance-loss flag allowed
-    /// the last `PhysicalDevice`/`Instance` owner to drop before these device
-    /// children, violating Vulkan's parent-before-child lifetime contract.
-    _instance: Instance,
-    /// Set once the device has been observed to be lost (any Vulkan call returning
-    /// `VK_ERROR_DEVICE_LOST`). Owned by the device abstraction so that teardown paths
-    /// can consult a single source of truth instead of scattering guards at call sites.
-    ///
-    /// Vulkan keeps lost-device child handles valid and requires normal parent-before-child
-    /// cleanup, but NVIDIA can fault in these destroy paths after some device-loss cascades
-    /// (`destroy_fence`/`vkDestroyInstance` → `libnvidia-eglcore` SIGSEGV). Once loss is
-    /// observed, this flag intentionally chooses a crash-prevention leak over strict teardown
-    /// cleanup.
-    lost: AtomicBool,
-    instance_lost: Arc<AtomicBool>,
-    pending_submissions: std::sync::atomic::AtomicUsize,
-    /// Ids strictly below this watermark have completed on the queue.
-    /// Submissions retire in FIFO order, so a single monotonic frontier is
-    /// total. Written only by submission reclaim; read by the descriptor
-    /// cache to prove a cached set is no longer referenced by pending work.
-    completed_submission_watermark: std::sync::atomic::AtomicU64,
-    /// Image views destroyed since the descriptor cache last drained. A
-    /// dead view's descriptor set must leave the cache promptly — leaving
-    /// it to capacity-triggered eviction let ordinary client-buffer churn
-    /// fill the cache in under a minute and then refuse under load, and a
-    /// driver reusing the raw handle value could even alias a stale set
-    /// onto a new texture.
-    retired_texture_views: std::sync::Mutex<Vec<vk::ImageView>>,
-}
-
-impl fmt::Debug for DeviceHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceHandle")
-            .field("device", &self.device.handle())
-            .field("lost", &self.is_lost())
-            .finish()
-    }
-}
-
-impl DeviceHandle {
-    pub(super) fn allocation_ledger(&self) -> &Arc<AllocationLedger> {
-        &self.allocation_ledger
-    }
-
-    /// Live-operation accessor. Always returns the device regardless of validity — callers on
-    /// the live render path must keep using this so a single observed loss does not silently
-    /// disable in-flight work that the caller is already prepared to error out of.
-    pub(super) fn handle(&self) -> &ash::Device {
-        &self.device
-    }
-
-    /// Marks the device as lost. Idempotent; must only be called after a Vulkan call returns
-    /// `VK_ERROR_DEVICE_LOST` (never for `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which is an
-    /// allocator/eviction event handled elsewhere).
-    pub(super) fn mark_lost(&self) {
-        self.lost.store(true, Ordering::Release);
-        self.instance_lost.store(true, Ordering::Release);
-    }
-
-    /// Records `VK_ERROR_DEVICE_LOST` at the device-ownership layer and returns the
-    /// original result. Callers keep their normal error flow, while every path that
-    /// can newly observe loss flips the shared validity bit before teardown begins.
-    pub(super) fn observe_result<T>(&self, result: Result<T, vk::Result>) -> Result<T, vk::Result> {
-        if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
-            self.mark_lost();
-        }
-        result
-    }
-
-    /// Returns whether the device has been observed lost.
-    pub(super) fn is_lost(&self) -> bool {
-        self.lost.load(Ordering::Acquire) || self.instance_lost.load(Ordering::Acquire)
-    }
-
-    pub(super) fn has_pending_submissions(&self) -> bool {
-        self.pending_submissions.load(Ordering::Acquire) != 0
-    }
-
-    /// Record one destroyed (or about-to-be-destroyed) sampled image view so
-    /// the descriptor cache can retire its set on the next drain. Views that
-    /// never had a cached set drain as no-ops.
-    pub(super) fn note_view_retired(&self, view: vk::ImageView) {
-        self.retired_texture_views
-            .lock()
-            .expect("retired-view queue poisoned")
-            .push(view);
-    }
-
-    pub(super) fn take_retired_views(&self) -> Vec<vk::ImageView> {
-        std::mem::take(
-            &mut *self
-                .retired_texture_views
-                .lock()
-                .expect("retired-view queue poisoned"),
-        )
-    }
-
-    pub(super) fn note_submission_completed(&self, id: SubmissionId) {
-        // FIFO retirement makes this monotonic; max() guards the
-        // wait-for-all path racing an ordinary reclaim.
-        self.completed_submission_watermark
-            .fetch_max(id.0.wrapping_add(1), Ordering::AcqRel);
-    }
-
-    pub(super) fn submission_completed(&self, id: SubmissionId) -> bool {
-        id.0 < self.completed_submission_watermark.load(Ordering::Acquire)
-    }
-
-    fn mark_submission_pending(&self) {
-        self.pending_submissions.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn mark_submission_completed(&self) {
-        self.pending_submissions.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    /// Teardown/Drop accessor. Returns the device only while it has not been marked lost,
-    /// so NVIDIA-sensitive destroy/wait calls are skipped after a device-loss observation.
-    pub(super) fn handle_for_destroy(&self) -> Option<&ash::Device> {
-        (!self.is_lost()).then_some(&self.device)
-    }
-
-    /// Runs `f` with the device only while it is still valid. The single teardown pattern:
-    /// a no-op on a lost device, otherwise a normal destroy. Healthy-path cost is one
-    /// relaxed atomic load.
-    pub(super) fn destroy_with(&self, f: impl FnOnce(&ash::Device)) {
-        if let Some(device) = self.handle_for_destroy() {
-            f(device);
-        }
-    }
-
-    /// Test-only: clears the lost flag so a device sabotaged into the lost state for assertions
-    /// can still be torn down through the normal (healthy) destroy path, avoiding a leaked live
-    /// `VkDevice` whose surviving instance destruction faults on some drivers.
-    #[cfg(test)]
-    pub(super) fn clear_lost_for_test(&self) {
-        self.lost.store(false, Ordering::Release);
-        self.instance_lost.store(false, Ordering::Release);
-        self.pending_submissions.store(0, Ordering::Release);
-    }
-}
-
-impl Drop for DeviceHandle {
-    fn drop(&mut self) {
-        // Device destruction happens once, after dependent resources are dropped. Vulkan
-        // permits this even after loss; skipping it here is the NVIDIA crash workaround.
-        if let Some(device) = self.handle_for_destroy() {
-            unsafe { device.destroy_device(None) };
-        }
-    }
-}
+pub(super) use super::device_handle::DeviceHandle;
 
 impl DeviceState {
     pub(crate) fn required_extensions(physical_device: &PhysicalDevice) -> Vec<&'static CStr> {
@@ -479,16 +317,7 @@ impl DeviceState {
             unsafe { raw_device.get_device_queue(queue_family_index, 0) }
         };
 
-        let device = Arc::new(DeviceHandle {
-            device: raw_device,
-            allocation_ledger: Arc::new(AllocationLedger::default()),
-            _instance: physical_device.instance().clone(),
-            lost: AtomicBool::new(false),
-            instance_lost: physical_device.instance().lost_flag(),
-            pending_submissions: std::sync::atomic::AtomicUsize::new(0),
-            completed_submission_watermark: std::sync::atomic::AtomicU64::new(0),
-            retired_texture_views: std::sync::Mutex::new(Vec::new()),
-        });
+        let device = Arc::new(DeviceHandle::new(raw_device, physical_device.instance().clone())?);
         let external_fence_fd = enabled_extensions
             .contains(&khr::external_fence_fd::NAME)
             .then(|| Arc::new(khr::external_fence_fd::Device::new(instance, device.handle())));

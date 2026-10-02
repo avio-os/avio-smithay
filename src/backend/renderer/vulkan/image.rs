@@ -15,6 +15,7 @@ use super::{
     allocation::AllocationGuard,
     device::DeviceHandle,
     format::{render_view_format, ColorEncoding},
+    retirement::RetirementNode,
 };
 
 /// Immutable origin of a Vulkan image resource.
@@ -43,8 +44,7 @@ impl VulkanImageOrigin {
 pub(crate) struct VulkanImage {
     resource_id: u64,
     image: vk::Image,
-    memories: Vec<vk::DeviceMemory>,
-    _allocations: Vec<AllocationGuard>,
+    retirement: Option<Box<RetirementNode<RetiredImage>>>,
     sampled_view: vk::ImageView,
     render_view: vk::ImageView,
     size: Size<i32, BufferCoord>,
@@ -65,7 +65,7 @@ impl std::fmt::Debug for VulkanImage {
         f.debug_struct("VulkanImage")
             .field("resource_id", &self.resource_id)
             .field("image", &self.image)
-            .field("memories", &self.memories)
+            .field("retirement_pending", &self.retirement.is_some())
             .field("sampled_view", &self.sampled_view)
             .field("render_view", &self.render_view)
             .field("size", &self.size)
@@ -178,8 +178,13 @@ impl VulkanImage {
         Self {
             resource_id,
             image,
-            memories,
-            _allocations: allocations,
+            retirement: Some(RetirementNode::new(RetiredImage {
+                image,
+                sampled_view,
+                render_view,
+                memories,
+                _allocations: allocations,
+            })),
             sampled_view,
             render_view,
             size,
@@ -290,15 +295,39 @@ impl VulkanImage {
 
 impl Drop for VulkanImage {
     fn drop(&mut self) {
-        self.device.note_view_retired(self.sampled_view);
-        self.device.destroy_with(|device| unsafe {
+        // Submitted work retains this image until completion. The final Arc
+        // may then drop on Wayland, input, or frame work, so transfer its
+        // preallocated node without any driver call, allocation or wait.
+        if let Some(retirement) = self.retirement.take() {
+            self.device.retire_image(retirement);
+        }
+    }
+}
+
+/// Contains no device Arc: queued children must not keep their own queue open.
+pub(super) struct RetiredImage {
+    image: vk::Image,
+    pub(super) sampled_view: vk::ImageView,
+    render_view: vk::ImageView,
+    memories: Vec<vk::DeviceMemory>,
+    // Queued memory remains live in the allocation census until its actual
+    // destruction turn (or the existing lost-device quarantine gate).
+    _allocations: Vec<AllocationGuard>,
+}
+
+impl RetiredImage {
+    pub(super) fn destroy(self, device: &ash::Device) {
+        // SAFETY: Only final image drop can enqueue this exact bundle. Every
+        // submitted reader has already relinquished its image Arc, and all
+        // views and memory belong to this logical device.
+        unsafe {
             device.destroy_image_view(self.sampled_view, None);
             device.destroy_image_view(self.render_view, None);
             device.destroy_image(self.image, None);
             for memory in &self.memories {
                 device.free_memory(*memory, None);
             }
-        });
+        }
     }
 }
 

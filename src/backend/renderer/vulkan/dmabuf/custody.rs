@@ -112,4 +112,35 @@ mod tests {
             assert!(Arc::ptr_eq(&first.join().unwrap(), &second.join().unwrap()));
         });
     }
+
+    #[test]
+    fn last_dmabuf_drop_queues_actual_image_destruction_on_idle_device() {
+        use crate::backend::renderer::vulkan::{
+            device_handle::retirement_tests::{device, image, next, Operation},
+            image::VulkanImage,
+        };
+
+        let buffer = buffer();
+        let (device, events) = device();
+        buffer
+            .resource_custody::<ImportCustody<VulkanImage>>()
+            .insert(1, image(device.clone(), 50));
+        let dropping_thread = std::thread::spawn(move || {
+            let thread = std::thread::current().id();
+            drop(buffer);
+            thread
+        })
+        .join()
+        .unwrap();
+        let (operation, executor) = next(&events);
+        assert_eq!(operation, Operation::View(52));
+        assert_ne!(executor, dropping_thread);
+        for operation in [Operation::View(53), Operation::Image(50), Operation::Memory(51)] {
+            assert_eq!(next(&events), (operation, executor));
+        }
+        // No later import, frame or metadata cleanup was needed.
+        drop(device);
+        assert_eq!(next(&events), (Operation::Device, executor));
+        assert_eq!(next(&events), (Operation::Parent, executor));
+    }
 }
