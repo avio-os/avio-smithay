@@ -4,7 +4,11 @@ use ash::vk;
 
 use crate::backend::vulkan::PhysicalDevice;
 
-use super::{device::DeviceHandle, VulkanRendererError};
+use super::{
+    allocation::{AllocationGuard, VulkanAllocationReason},
+    device::DeviceHandle,
+    VulkanRendererError,
+};
 
 const INITIAL_UPLOAD_ARENA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UPLOAD_ARENA_BYTES: usize = 256 * 1024 * 1024;
@@ -351,6 +355,7 @@ pub(crate) struct ChunkMemory {
     memory: vk::DeviceMemory,
     mapped: MappedAddress,
     coherent: bool,
+    _allocation: AllocationGuard,
 }
 
 impl StagingChunk {
@@ -386,6 +391,9 @@ impl StagingChunk {
                     return Err(error.into());
                 }
             };
+        let allocation = device
+            .allocation_ledger()
+            .record(VulkanAllocationReason::Upload, allocation_size);
         if let Err(error) =
             device.observe_result(unsafe { device.handle().bind_buffer_memory(buffer, memory, 0) })
         {
@@ -419,6 +427,7 @@ impl StagingChunk {
                 memory,
                 mapped,
                 coherent,
+                _allocation: allocation,
             }),
             ranges: RangeAllocator::new(capacity),
         })
