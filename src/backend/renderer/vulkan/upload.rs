@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::{
+    allocation::VulkanAllocationReason,
     device::{DeviceHandle, DeviceState},
     format::{optimal_tiling_features, texture_view_components, ColorEncoding},
     image::VulkanImage,
@@ -733,6 +734,10 @@ fn create_upload_image(
             }
         };
 
+    let allocation = device_handle
+        .allocation_ledger()
+        .record(VulkanAllocationReason::Texture, memory_requirements.size);
+
     // SAFETY: Image and memory belong to this device and memory offset 0 is valid for the allocation.
     if let Err(err) = device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memory, 0) }) {
         // SAFETY: Both handles belong to this device and were created above.
@@ -804,6 +809,7 @@ fn create_upload_image(
         import_id,
         image,
         memory,
+        allocation,
         sampled_view,
         render_view,
         size,

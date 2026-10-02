@@ -19,6 +19,7 @@ use crate::{
 };
 
 use super::{
+    allocation::{AllocationGuard, VulkanAllocationReason},
     device::{DeviceHandle, DeviceState},
     format::{
         optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
@@ -662,6 +663,7 @@ impl DmabufState {
             1
         };
         let mut memories = Vec::with_capacity(memory_count);
+        let mut allocations = Vec::with_capacity(memory_count);
 
         for plane_index in 0..memory_count {
             let requirements =
@@ -681,7 +683,10 @@ impl DmabufState {
 
             match Self::allocate_imported_memory(&device_handle, &external_memory_fd, image, fd, requirements)
             {
-                Ok(memory) => memories.push(memory),
+                Ok((memory, allocation)) => {
+                    memories.push(memory);
+                    allocations.push(allocation);
+                }
                 Err(err) => {
                     Self::destroy_image_and_memories(&device_handle, image, &memories);
                     return Err(err);
@@ -792,6 +797,7 @@ impl DmabufState {
             import_id,
             image,
             memories,
+            allocations,
             sampled_view,
             render_view,
             size,
@@ -833,7 +839,7 @@ impl DmabufState {
         image: vk::Image,
         fd: BorrowedFd<'_>,
         requirements: vk::MemoryRequirements,
-    ) -> Result<vk::DeviceMemory, VulkanRendererError> {
+    ) -> Result<(vk::DeviceMemory, AllocationGuard), VulkanRendererError> {
         let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
         device.observe_result(unsafe {
             external_memory_fd.get_memory_fd_properties(
@@ -864,7 +870,10 @@ impl DmabufState {
         let memory = device.observe_result(unsafe { device.handle().allocate_memory(&alloc_info, None) })?;
         // A successful import transfers ownership of the duplicated FD to Vulkan.
         let _ = ScopeGuard::into_inner(import_fd_guard);
-        Ok(memory)
+        let allocation = device
+            .allocation_ledger()
+            .record(VulkanAllocationReason::Import, requirements.size);
+        Ok((memory, allocation))
     }
 
     fn memory_plane_aspect(plane_index: usize) -> Result<vk::ImageAspectFlags, VulkanRendererError> {

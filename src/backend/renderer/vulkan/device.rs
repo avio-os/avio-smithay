@@ -19,6 +19,7 @@ use crate::backend::{
 };
 
 use super::{
+    allocation::AllocationLedger,
     image::{transition_image_layout, VulkanImage},
     staging::{ChunkMemory, StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
@@ -272,6 +273,7 @@ impl fmt::Debug for DeviceState {
 
 pub(super) struct DeviceHandle {
     device: ash::Device,
+    allocation_ledger: Arc<AllocationLedger>,
     /// Keeps the Vulkan parent instance alive until the logical device and
     /// every child object sharing this handle have been destroyed.
     ///
@@ -317,6 +319,10 @@ impl fmt::Debug for DeviceHandle {
 }
 
 impl DeviceHandle {
+    pub(super) fn allocation_ledger(&self) -> &Arc<AllocationLedger> {
+        &self.allocation_ledger
+    }
+
     /// Live-operation accessor. Always returns the device regardless of validity — callers on
     /// the live render path must keep using this so a single observed loss does not silently
     /// disable in-flight work that the caller is already prepared to error out of.
@@ -480,6 +486,7 @@ impl DeviceState {
 
         let device = Arc::new(DeviceHandle {
             device: raw_device,
+            allocation_ledger: Arc::new(AllocationLedger::default()),
             _instance: physical_device.instance().clone(),
             lost: AtomicBool::new(false),
             instance_lost: physical_device.instance().lost_flag(),

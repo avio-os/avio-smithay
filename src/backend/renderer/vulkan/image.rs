@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{
+    allocation::AllocationGuard,
     device::DeviceHandle,
     format::{render_view_format, ColorEncoding},
 };
@@ -43,6 +44,7 @@ pub(crate) struct VulkanImage {
     resource_id: u64,
     image: vk::Image,
     memories: Vec<vk::DeviceMemory>,
+    _allocations: Vec<AllocationGuard>,
     sampled_view: vk::ImageView,
     render_view: vk::ImageView,
     size: Size<i32, BufferCoord>,
@@ -83,6 +85,7 @@ impl VulkanImage {
         resource_id: u64,
         image: vk::Image,
         memory: vk::DeviceMemory,
+        allocation: AllocationGuard,
         sampled_view: vk::ImageView,
         render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
@@ -99,6 +102,7 @@ impl VulkanImage {
             resource_id,
             image,
             vec![memory],
+            vec![allocation],
             sampled_view,
             render_view,
             size,
@@ -119,6 +123,7 @@ impl VulkanImage {
         resource_id: u64,
         image: vk::Image,
         memories: Vec<vk::DeviceMemory>,
+        allocations: Vec<AllocationGuard>,
         sampled_view: vk::ImageView,
         render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
@@ -135,6 +140,7 @@ impl VulkanImage {
             resource_id,
             image,
             memories,
+            allocations,
             sampled_view,
             render_view,
             size,
@@ -155,6 +161,7 @@ impl VulkanImage {
         resource_id: u64,
         image: vk::Image,
         memories: Vec<vk::DeviceMemory>,
+        allocations: Vec<AllocationGuard>,
         sampled_view: vk::ImageView,
         render_view: vk::ImageView,
         size: Size<i32, BufferCoord>,
@@ -172,6 +179,7 @@ impl VulkanImage {
             resource_id,
             image,
             memories,
+            _allocations: allocations,
             sampled_view,
             render_view,
             size,

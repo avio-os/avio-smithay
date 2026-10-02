@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{
+    allocation::{AllocationGuard, VulkanAllocationReason},
     device::DeviceState,
     format::{
         optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
@@ -123,6 +124,10 @@ impl ReadbackState {
                 }
             };
 
+        let allocation = device_handle
+            .allocation_ledger()
+            .record(VulkanAllocationReason::RenderTarget, memory_requirements.size);
+
         // SAFETY: Image and memory belong to this device and offset 0 is valid.
         if let Err(err) =
             device_handle.observe_result(unsafe { vk_device.bind_image_memory(image, memory, 0) })
@@ -198,6 +203,7 @@ impl ReadbackState {
             self.next_offscreen_id(),
             image,
             memory,
+            allocation,
             sampled_view,
             render_view,
             size,
@@ -253,7 +259,10 @@ impl ReadbackState {
                 "readback buffer size overflowed",
             ))?;
 
-        let (staging_buffer, staging_memory, coherent) = create_readback_buffer(device, src_len)?;
+        // Declared before the cleanup guards so accounting retires after the
+        // memory free on every success/error exit.
+        let (staging_buffer, staging_memory, coherent, _allocation) =
+            create_readback_buffer(device, src_len)?;
         let cleanup_device = device.shared_device();
         let cleanup_buffer_device = cleanup_device.clone();
         let cleanup_buffer = scopeguard::guard(staging_buffer, |buffer| {
@@ -554,7 +563,7 @@ fn validate_region(
 fn create_readback_buffer(
     device: &DeviceState,
     size: usize,
-) -> Result<(vk::Buffer, vk::DeviceMemory, bool), VulkanRendererError> {
+) -> Result<(vk::Buffer, vk::DeviceMemory, bool, AllocationGuard), VulkanRendererError> {
     let device_handle = device.shared_device();
     let vk_device = device_handle.handle();
     let create_info = vk::BufferCreateInfo::default()
@@ -584,6 +593,10 @@ fn create_readback_buffer(
         }
     };
 
+    let allocation = device_handle
+        .allocation_ledger()
+        .record(VulkanAllocationReason::Scratch, memory_requirements.size);
+
     // SAFETY: Buffer and memory belong to this device and offset 0 is valid for this allocation.
     if let Err(err) = device_handle.observe_result(unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) })
     {
@@ -595,7 +608,7 @@ fn create_readback_buffer(
         return Err(err.into());
     }
 
-    Ok((buffer, memory, coherent))
+    Ok((buffer, memory, coherent, allocation))
 }
 
 fn pick_image_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<u32> {
@@ -728,6 +741,54 @@ mod tests {
     };
 
     use super::VulkanRenderer;
+
+    #[test]
+    fn offscreen_memory_census_counts_shared_image_once() {
+        use super::super::{test_support, VulkanAllocationPhase, VulkanAllocationReason};
+        let Some(physical_device) = test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = test_support::renderer(&physical_device) else {
+            return;
+        };
+        let Some(format) = test_support::present(
+            first_working_offscreen_format(&mut renderer),
+            "no supported Vulkan offscreen format for allocation census",
+        ) else {
+            return;
+        };
+        let reason = VulkanAllocationReason::RenderTarget;
+        let before = renderer.diagnostics().allocations.reason(reason);
+        let _phase = renderer.allocation_phase_scope(VulkanAllocationPhase::Warmup);
+        let texture = renderer.create_buffer(format, Size::from((8, 8))).unwrap();
+        let image = texture.image_resource().unwrap();
+        // SAFETY: The texture keeps the renderer-local image and device alive.
+        let required = unsafe {
+            renderer
+                .device
+                .device_handle()
+                .get_image_memory_requirements(image.image())
+        }
+        .size;
+        let shared_reader = image.clone();
+        drop(texture);
+        let live = renderer.diagnostics().allocations.reason(reason);
+        assert_eq!(live.live_allocations, before.live_allocations + 1);
+        assert_eq!(live.live_bytes, before.live_bytes + required);
+        assert_eq!(live.total_allocations, before.total_allocations + 1);
+        assert_eq!(
+            renderer
+                .diagnostics()
+                .allocations
+                .phase(VulkanAllocationPhase::Warmup)
+                .live_bytes,
+            required
+        );
+        drop(shared_reader);
+        let retired = renderer.diagnostics().allocations.reason(reason);
+        assert_eq!(retired.live_allocations, before.live_allocations);
+        assert_eq!(retired.live_bytes, before.live_bytes);
+    }
 
     fn init_renderer() -> Option<VulkanRenderer> {
         let instance = Instance::new(Version::VERSION_1_3, None).ok()?;

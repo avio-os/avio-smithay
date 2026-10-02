@@ -37,6 +37,28 @@
 //! - [`crate::backend::renderer::ExportMem`] performs readback through transfer buffers and returns
 //!   deterministic linear pixel data for supported formats.
 //!
+//! # Explicit Device-Memory Census
+//!
+//! [`VulkanRenderer::diagnostics`] reports successful explicit device-memory
+//! allocation owners by texture, render target, import, scratch, and upload
+//! reason. Bytes are the exact Vulkan allocation size rather than pixel-size
+//! estimates. Each image/chunk owns one guard per actual memory binding;
+//! cache aliases, texture clones, and submitted readers share that guard.
+//! Error cleanup and final memory-owner destruction retire it after memory
+//! teardown. Imported bytes describe Vulkan bindings to externally owned
+//! storage and must not be added again to a producer's physical-buffer count.
+//! Driver-internal memory is outside this explicit-allocation census.
+//!
+//! Use [`VulkanRenderer::allocation_phase_scope`] around initialization,
+//! warmup, frame preparation/recording, or maintenance work on its owner
+//! thread. The phase and allocating thread are included in per-event TRACE
+//! records; retirement also records the retiring thread. Phase scopes are
+//! device-specific, nested, and bound to their entering thread. Snapshots are
+//! read-only atomic samples: a concurrent allocation/free can straddle their
+//! reads, while a quiescent sample is exact. Device-loss teardown intentionally
+//! skips unsafe Vulkan frees, so owner retirement after loss does not establish
+//! that the driver reclaimed the corresponding physical memory.
+//!
 //! # Format And Modifier Expectations
 //!
 //! - Explicit modifier support is queried from Vulkan (`VK_EXT_image_drm_format_modifier`) and cached.
@@ -125,6 +147,7 @@
 
 #![allow(dead_code)]
 
+mod allocation;
 mod blit;
 mod descriptor;
 mod device;
@@ -144,6 +167,10 @@ mod target;
 mod texture;
 mod upload;
 
+pub use allocation::{
+    VulkanAllocationPhase, VulkanAllocationPhaseGuard, VulkanAllocationReason, VulkanAllocationSnapshot,
+    VulkanAllocationStats,
+};
 pub use blit::VulkanBlitChainStep;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
 pub use frame::VulkanFrame;
@@ -266,6 +293,8 @@ pub struct VulkanSubmissionSnapshot {
 /// Aggregated runtime diagnostics for the Vulkan renderer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VulkanRendererDiagnostics {
+    /// Exact successful explicit device-memory allocation owners by reason and creation phase.
+    pub allocations: VulkanAllocationSnapshot,
     /// dma-buf import/bind cache diagnostics.
     pub dmabuf_cache: VulkanCacheStats,
     /// Texture descriptor cache diagnostics.
@@ -306,6 +335,10 @@ impl VulkanRenderer {
     /// Creates a new Vulkan renderer and initializes device/queue infrastructure.
     pub fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
         let device = DeviceState::new(physical_device)?;
+        let _initialization = device
+            .shared_device()
+            .allocation_ledger()
+            .enter_phase(VulkanAllocationPhase::Initialization);
         let descriptors = DescriptorState::new(device.shared_device())?;
         let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout())?;
 
@@ -666,12 +699,20 @@ impl VulkanRenderer {
         self.device.configure_memory_upload_capacity(capacity)
     }
 
+    /// Tags allocations on this thread for this renderer's device until the
+    /// returned guard is dropped. The guard holds no renderer borrow and must
+    /// stay on this thread; other devices and threads keep their own phases.
+    pub fn allocation_phase_scope(&self, phase: VulkanAllocationPhase) -> VulkanAllocationPhaseGuard {
+        self.device.shared_device().allocation_ledger().enter_phase(phase)
+    }
+
     /// Returns live diagnostics for cache behavior and command submission timing.
     pub fn diagnostics(&self) -> VulkanRendererDiagnostics {
         let submissions: DeviceDiagnostics = self.device.diagnostics();
         let arena = self.device.upload_arena_stats();
         let (pending_operations, pending_bytes) = self.device.pending_upload_stats();
         VulkanRendererDiagnostics {
+            allocations: self.device.shared_device().allocation_ledger().snapshot(),
             dmabuf_cache: self.dmabuf.cache_stats(),
             descriptor_cache: self.descriptors.cache_stats(),
             descriptors: self.descriptors.arena_stats(),
