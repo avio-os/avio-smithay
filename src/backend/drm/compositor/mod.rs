@@ -183,6 +183,8 @@ use crate::{
     wayland::{shm, single_pixel_buffer},
 };
 
+mod composition;
+pub use composition::{CompositionAllocator, PreparedCompositionBuffers};
 mod elements;
 mod frame_result;
 
@@ -2029,46 +2031,6 @@ where
         let output_geometry: Rectangle<_, Physical> =
             Rectangle::from_size(output_transform.transform_size(current_size));
 
-        // We always acquire a buffer from the swapchain even
-        // if we could end up doing direct scan-out on the primary plane.
-        // The reason is that we can't know upfront and we need a framebuffer
-        // on the primary plane to test overlay/cursor planes
-        let primary_plane_buffer = self
-            .swapchain
-            .acquire()
-            .map_err(FrameError::Allocator)?
-            .ok_or(FrameError::NoFreeSlotsError)?;
-
-        // It is safe to call export multiple times as the Slot will cache the dmabuf for us
-        let dmabuf = primary_plane_buffer.export().map_err(FrameError::AsDmabufError)?;
-
-        // Let's check if we already have a cached framebuffer for this Slot, if not try to export
-        // it and use the Slot userdata to cache it
-        let maybe_buffer = primary_plane_buffer
-            .userdata()
-            .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>();
-        if maybe_buffer.is_none() {
-            let fb_buffer = self
-                .framebuffer_exporter
-                .add_framebuffer(
-                    self.surface.device_fd(),
-                    ExportBuffer::Allocator(&primary_plane_buffer),
-                    self.primary_is_opaque,
-                )
-                .map_err(FrameError::FramebufferExport)?
-                .ok_or(FrameError::NoFramebuffer)?;
-            primary_plane_buffer.userdata().insert_if_missing_threadsafe(|| {
-                CachedDrmFramebuffer::new(DrmFramebuffer::Exporter(fb_buffer))
-            });
-        }
-
-        // This unwrap is safe as we error out above if we were unable to export a framebuffer
-        let fb = primary_plane_buffer
-            .userdata()
-            .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>()
-            .unwrap()
-            .clone();
-
         let mut opaque_regions: Vec<Rectangle<i32, Physical>> = std::mem::take(&mut self.opaque_regions);
         std::mem::swap(&mut self.previous_element_states, &mut self.element_states);
         let mut element_states = std::mem::take(&mut self.element_states);
@@ -2107,42 +2069,6 @@ where
 
             next_frame_state
         };
-
-        // We want to make sure we can actually scan-out the primary plane, so
-        // explicitly set skip to false
-        let plane_claim = self.surface.claim_plane(self.surface.plane()).ok_or_else(|| {
-            error!("failed to claim primary plane");
-            FrameError::PrimaryPlaneClaimFailed
-        })?;
-        let primary_plane_state: PlaneState<
-            <A as Allocator>::Buffer,
-            <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer,
-        > = PlaneState {
-            skip: false,
-            needs_test: false,
-            element_state: None,
-            config: Some(PlaneConfig {
-                properties: PlaneProperties {
-                    src: Rectangle::from_size(dmabuf.size()).to_f64(),
-                    dst: Rectangle::from_size(current_size),
-                    // NOTE: We do not apply the transform to the primary plane as this is handled by the dtr/renderer
-                    transform: Transform::Normal,
-                    alpha: 1.0,
-                    format: primary_plane_buffer.format(),
-                },
-                buffer: DrmScanoutBuffer {
-                    buffer: ScanoutBuffer::Swapchain(Arc::new(primary_plane_buffer)),
-                    fb,
-                },
-                damage_clips: None,
-                plane_claim,
-                sync: None,
-            }),
-        };
-
-        // unconditionally set the primary plane state
-        // if this would fail the test we are screwed anyway
-        next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
 
         // This holds all elements that are visible on the output
         // A element is considered visible if it intersects with the output geometry
@@ -2266,15 +2192,56 @@ where
         }
         self.element_opaque_regions_workhouse = element_opaque_regions_workhouse;
 
+        // A full-output opaque primary candidate lets us test every auxiliary
+        // plane against real producer storage. No scratch target is needed.
+        let mut primary_plane_state = None;
+        let direct_primary = output_elements.last().and_then(|(element, geometry, _, opaque)| {
+            if *opaque && geometry.contains_rect(output_geometry) {
+                self.try_assign_primary_plane(
+                    renderer,
+                    *element,
+                    output_elements.len() - 1,
+                    *geometry,
+                    &mut element_states,
+                    output_scale,
+                    &mut next_frame_state,
+                    output_transform,
+                    output_geometry,
+                    frame_flags,
+                )
+                .ok()
+                .map(|assignment| (*element, assignment))
+            } else {
+                None
+            }
+        });
+        let direct_primary = match composition::select_primary(direct_primary, || {
+            composition::composition_primary(
+                &mut primary_plane_state,
+                &mut self.swapchain,
+                &self.surface,
+                &self.framebuffer_exporter,
+                self.primary_is_opaque,
+                current_size,
+            )
+        })? {
+            composition::PrimaryPreparation::Direct(direct) => Some(direct),
+            composition::PrimaryPreparation::Composition(state) => {
+                next_frame_state.set_state(self.surface.plane(), state);
+                None
+            }
+        };
+
         // This will hold the element that has been selected for direct scan-out on
         // the primary plane if any
-        let mut primary_plane_scanout_element: Option<&'a E> = None;
+        let mut primary_plane_scanout_element: Option<&'a E> = direct_primary.map(|(element, _)| element);
         // This will hold all elements that have been assigned to the primary plane
         // for rendering
         let mut primary_plane_elements: Vec<&'a E> = Vec::with_capacity(elements.len());
         // This will hold the element per plane that has been assigned to a overlay/underlay
         // plane for direct scan-out
-        let mut primary_plane_assignment: Option<PlaneAssignmentInfo> = None;
+        let mut primary_plane_assignment: Option<PlaneAssignmentInfo> =
+            direct_primary.map(|(_, assignment)| assignment);
         let mut overlay_plane_elements: IndexMap<plane::Handle, (&'a E, PlaneAssignmentInfo)> =
             IndexMap::with_capacity(self.planes.overlay.len());
         // This will hold the element assigned on the cursor plane if any
@@ -2292,6 +2259,14 @@ where
             let element_geometry = *element_geometry;
             let remaining_elements = output_elements_len - index;
             let element_is_opaque = *element_is_opaque;
+
+            if direct_primary.is_some() && remaining_elements == 1 {
+                render_element_states.states.insert(
+                    element_id.clone(),
+                    RenderElementState::zero_copy(*element_visible_area),
+                );
+                continue;
+            }
 
             // Check if we found our last item, we can try to do
             // direct scan-out on the primary plane
@@ -2375,6 +2350,26 @@ where
             }
         }
 
+        // An auxiliary element that cannot use a plane requires composition.
+        // Keep the candidate in the same draw order when replacing its plane.
+        if !primary_plane_elements.is_empty() {
+            if let Some((element, _)) = direct_primary {
+                primary_plane_elements.push(element);
+                primary_plane_scanout_element = None;
+                primary_plane_assignment = None;
+                render_element_states.states.remove(element.id());
+                let state = composition::composition_primary(
+                    &mut primary_plane_state,
+                    &mut self.swapchain,
+                    &self.surface,
+                    &self.framebuffer_exporter,
+                    self.primary_is_opaque,
+                    current_size,
+                )?;
+                next_frame_state.set_state(self.surface.plane(), state);
+            }
+        }
+
         if frame_flags.contains(FrameFlags::ALLOW_OUTPUT_LAYER_SCANOUT)
             && self.output_layer_swapchain.is_some()
             && primary_plane_scanout_element.is_none()
@@ -2427,7 +2422,17 @@ where
                                 );
                             }
                             Err(reason) => {
-                                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
+                                next_frame_state.set_state(
+                                    self.surface.plane(),
+                                    composition::composition_primary(
+                                        &mut primary_plane_state,
+                                        &mut self.swapchain,
+                                        &self.surface,
+                                        &self.framebuffer_exporter,
+                                        self.primary_is_opaque,
+                                        current_size,
+                                    )?,
+                                );
                                 primary_plane_scanout_element = None;
                                 primary_plane_assignment = None;
                                 if let Some(reason) = reason {
@@ -2531,7 +2536,22 @@ where
             // to make sure we actually have a slot on the primary
             // plane we can render into
             if !removed_overlay_elements.is_empty() {
-                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
+                if let Some(element) = primary_plane_scanout_element.take() {
+                    primary_plane_assignment = None;
+                    removed_overlay_elements.push((output_elements_len - 1, element));
+                    render_element_states.states.remove(element.id());
+                }
+                next_frame_state.set_state(
+                    self.surface.plane(),
+                    composition::composition_primary(
+                        &mut primary_plane_state,
+                        &mut self.swapchain,
+                        &self.surface,
+                        &self.framebuffer_exporter,
+                        self.primary_is_opaque,
+                        current_size,
+                    )?,
+                );
             }
 
             removed_overlay_elements.sort_by_key(|(z_index, _)| *z_index);
@@ -2563,7 +2583,17 @@ where
                 output_layer_elements.clear();
                 primary_plane_scanout_element = None;
                 primary_plane_assignment = None;
-                next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
+                next_frame_state.set_state(
+                    self.surface.plane(),
+                    composition::composition_primary(
+                        &mut primary_plane_state,
+                        &mut self.swapchain,
+                        &self.surface,
+                        &self.framebuffer_exporter,
+                        self.primary_is_opaque,
+                        current_size,
+                    )?,
+                );
 
                 let cursor_id = cursor_plane_element.map(|element| element.id().clone());
                 primary_plane_elements = output_elements
@@ -3953,21 +3983,18 @@ where
             true,
         )?;
 
-        if let ScanoutBuffer::Swapchain(slot) = &frame_state
+        let format_matches = frame_state
             .plane_buffer(self.surface.plane())
-            .expect("We have a buffer for the primary plane")
-            .buffer
-        {
-            if !frame_flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
-                && slot.format() != element_config.properties.format
-            {
-                trace!(
-                    "failed to assign element {:?} to primary {:?}, format doesn't match",
-                    element.id(),
-                    self.surface.plane()
-                );
-                return Err(None);
-            }
+            .map(|buffer| buffer.format() == element_config.properties.format)
+            .unwrap_or_else(|| {
+                element_config.properties.format.code == self.swapchain.format()
+                    && self
+                        .swapchain
+                        .modifiers()
+                        .contains(&element_config.properties.format.modifier)
+            });
+        if !frame_flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY) && !format_matches {
+            return Err(None);
         }
 
         let has_underlay = self

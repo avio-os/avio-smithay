@@ -32,7 +32,7 @@ use std::{
 };
 
 use crate::utils::{Buffer as BufferCoords, Size};
-pub use swapchain::{Slot, Swapchain};
+pub use swapchain::{AdoptionFailure, RejectedSlots, Slot, Swapchain, SLOT_CAP};
 
 pub use drm_fourcc::{
     DrmFormat as Format, DrmFourcc as Fourcc, DrmModifier as Modifier, DrmVendor as Vendor,
