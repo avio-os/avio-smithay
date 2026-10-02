@@ -251,7 +251,7 @@ impl X11Surface {
 
     /// Returns the id of the X11Wm responsible for this surface, if any
     pub fn xwm_id(&self) -> Option<XwmId> {
-        self.xwm
+        self.state.lock().unwrap().alive.then_some(self.xwm).flatten()
     }
 
     /// X11 protocol id of the underlying window

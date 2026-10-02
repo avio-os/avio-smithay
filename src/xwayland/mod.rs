@@ -18,6 +18,6 @@ mod x11_sockets;
 mod xserver;
 pub mod xwm;
 
-pub use self::lazy::{LazyXWayland, LazyXWaylandEvent, XWaylandDisplay};
+pub use self::lazy::{LazyXWayland, LazyXWaylandClientScale, LazyXWaylandEvent, XWaylandDisplay};
 pub use self::xserver::{XWayland, XWaylandClientData, XWaylandEvent};
 pub use self::xwm::{X11Surface, X11Wm, XwmHandler};

@@ -1,6 +1,13 @@
 //! Socket-triggered Xwayland lifetime. Listening sockets outlive server episodes.
 
-use std::{ffi::OsString, io, os::unix::net::UnixStream, process::Stdio, sync::Arc};
+use atomic_float::AtomicF64;
+use std::{
+    ffi::OsString,
+    io,
+    os::unix::net::UnixStream,
+    process::Stdio,
+    sync::{atomic::Ordering, Arc},
+};
 
 use calloop::{
     channel::{self, Channel, Sender},
@@ -47,6 +54,27 @@ impl XWaylandDisconnectNotify {
     }
 }
 
+/// Shared topology-derived scale for current and future server episodes.
+///
+/// Each episode has its own transaction queue, but shares this one scale with
+/// its compositor client state before that client is inserted in the display.
+#[derive(Clone, Debug)]
+pub struct LazyXWaylandClientScale(Arc<AtomicF64>);
+
+impl LazyXWaylandClientScale {
+    /// Sets a finite positive client scale, including before the first startup.
+    pub fn set(&self, scale: f64) -> io::Result<()> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Xwayland client scale",
+            ));
+        }
+        self.0.store(scale, Ordering::Release);
+        Ok(())
+    }
+}
+
 /// Events from a socket-triggered Xwayland source.
 #[derive(Debug)]
 pub enum LazyXWaylandEvent {
@@ -70,6 +98,17 @@ enum Completion {
     Exited(u64),
 }
 
+fn install_source<S: EventSource>(slot: &mut TransientSource<S>, source: S) {
+    // Calloop's replace() only replaces an existing source. On None it drops
+    // the incoming value. Assignment is safe only for an already empty slot;
+    // otherwise replacement must retain the old FD until deregistration.
+    if slot.is_none() {
+        *slot = source.into();
+    } else {
+        slot.replace(source);
+    }
+}
+
 /// Owns a stable display reservation and launches Xwayland on its first client.
 ///
 /// Process creation runs on a helper thread. `-terminate` retires the server
@@ -78,6 +117,7 @@ enum Completion {
 /// Return `true` from a `Ready` callback only after the XWM was installed.
 pub struct LazyXWayland {
     display: Arc<XWaylandDisplay>,
+    client_scale: LazyXWaylandClientScale,
     dh: DisplayHandle,
     envs: Vec<(OsString, OsString)>,
     listeners: Vec<TransientSource<Generic<UnixStream>>>,
@@ -116,6 +156,7 @@ impl LazyXWayland {
         let (sender, channel) = channel::channel();
         let mut instance = Self {
             display,
+            client_scale: LazyXWaylandClientScale(Arc::new(AtomicF64::new(1.0))),
             dh: dh.clone(),
             envs: envs.into_iter().collect(),
             listeners: Vec::new(),
@@ -138,11 +179,16 @@ impl LazyXWayland {
         self.display.display_number()
     }
 
+    /// Handle for updating the exact scale seen by this and future episodes.
+    pub fn client_scale(&self) -> LazyXWaylandClientScale {
+        self.client_scale.clone()
+    }
+
     fn arm(&mut self) -> io::Result<()> {
         for (index, socket) in self.display.listen_sockets.iter().enumerate() {
             let source = Generic::new(socket.try_clone()?, Interest::READ, Mode::Level);
             if let Some(listener) = self.listeners.get_mut(index) {
-                listener.replace(source);
+                install_source(listener, source);
             } else {
                 self.listeners.push(source.into());
             }
@@ -167,11 +213,12 @@ impl LazyXWayland {
             self.sender.clone(),
             self.generation,
         );
+        let client_scale = self.client_scale.0.clone();
         std::thread::Builder::new()
             .name("xwayland-start".into())
             .spawn(move || {
                 let disconnect_sender = sender.clone();
-                let result = XWayland::spawn_prepared(
+                let result = XWayland::spawn_prepared_with_scale(
                     &dh,
                     &display,
                     envs,
@@ -184,6 +231,7 @@ impl LazyXWayland {
                             }))
                         });
                     },
+                    client_scale,
                 );
                 let _ = sender.send(Completion::Spawned(generation, result));
             })?;
@@ -249,7 +297,14 @@ impl EventSource for LazyXWayland {
                     match result {
                         Ok((server, client)) if !self.exited_during_start && !self.failed => {
                             self.client = Some(client);
-                            self.server.replace(OptionalXWayland(Some(server)));
+                            install_source(
+                                &mut self.server,
+                                OptionalXWayland {
+                                    source: Some(server),
+                                    registered: false,
+                                    startup_finished: false,
+                                },
+                            );
                         }
                         Ok(_) => self.fail(io::Error::other("Xwayland exited during startup"), &mut callback),
                         Err(error) => self.fail(error, &mut callback),
@@ -358,7 +413,11 @@ impl EventSource for LazyXWayland {
 // wrapped source to implement Default. This adapter provides an inert source
 // until the first helper result, while TransientSource still owns deregistration.
 #[derive(Default)]
-struct OptionalXWayland(Option<XWayland>);
+struct OptionalXWayland {
+    source: Option<XWayland>,
+    registered: bool,
+    startup_finished: bool,
+}
 
 impl EventSource for OptionalXWayland {
     type Event = XWaylandEvent;
@@ -369,13 +428,20 @@ impl EventSource for OptionalXWayland {
         &mut self,
         readiness: calloop::Readiness,
         token: calloop::Token,
-        callback: F,
+        mut callback: F,
     ) -> io::Result<PostAction>
     where
         F: FnMut(Self::Event, &mut ()),
     {
-        match self.0.as_mut() {
-            Some(source) => source.process_events(readiness, token, callback),
+        if self.startup_finished {
+            return Ok(PostAction::Continue);
+        }
+        let finished = &mut self.startup_finished;
+        match self.source.as_mut() {
+            Some(source) => source.process_events(readiness, token, |event, metadata| {
+                *finished = true;
+                callback(event, metadata);
+            }),
             None => Ok(PostAction::Continue),
         }
     }
@@ -384,8 +450,11 @@ impl EventSource for OptionalXWayland {
         poll: &mut calloop::Poll,
         factory: &mut calloop::TokenFactory,
     ) -> calloop::Result<()> {
-        if let Some(source) = self.0.as_mut() {
-            source.register(poll, factory)?;
+        if let Some(source) = self.source.as_mut() {
+            if !self.registered && !self.startup_finished {
+                source.register(poll, factory)?;
+                self.registered = true;
+            }
         }
         Ok(())
     }
@@ -394,14 +463,22 @@ impl EventSource for OptionalXWayland {
         poll: &mut calloop::Poll,
         factory: &mut calloop::TokenFactory,
     ) -> calloop::Result<()> {
-        if let Some(source) = self.0.as_mut() {
-            source.reregister(poll, factory)?;
+        if self.registered {
+            if let Some(source) = self.source.as_mut() {
+                source.reregister(poll, factory)?;
+            }
         }
         Ok(())
     }
     fn unregister(&mut self, poll: &mut calloop::Poll) -> calloop::Result<()> {
-        if let Some(source) = self.0.as_mut() {
-            source.unregister(poll)?;
+        // TransientSource retains a disabled server, then unregisters it
+        // again when removed. The displayfd has already been deregistered at
+        // readiness; retain process custody without deleting the poll entry twice.
+        if self.registered {
+            if let Some(source) = self.source.as_mut() {
+                source.unregister(poll)?;
+            }
+            self.registered = false;
         }
         Ok(())
     }
@@ -504,5 +581,177 @@ mod tests {
         let source = dispatcher.as_source_ref();
         assert!(source.failed && !source.starting && !source.ready);
         assert!(source.listeners.iter().all(TransientSource::is_none));
+    }
+
+    #[test]
+    fn actual_ready_source_keeps_client_custody_until_exact_exit_and_rearms() {
+        let mut display = wayland_server::Display::<()>::new().unwrap();
+        std::fs::create_dir_all("/tmp/.X11-unix").unwrap();
+        let mut lazy = LazyXWayland::new(&display.handle(), None, false, []).unwrap();
+        lazy.generation = 1;
+        lazy.starting = true;
+        for listener in &mut lazy.listeners {
+            listener.remove();
+        }
+        let number = lazy.display_number();
+        let inode = rustix::fs::fstat(&lazy.display.listen_sockets[0]).unwrap().st_ino;
+        let (server, client, _peer) =
+            XWayland::readiness_fixture(&display.handle(), &lazy.display, lazy.client_scale.0.clone());
+        lazy.sender
+            .send(Completion::Spawned(1, Ok((server, client.clone()))))
+            .unwrap();
+        let mut event_loop = EventLoop::<Vec<&'static str>>::try_new().unwrap();
+        let dispatcher = Dispatcher::new(lazy, |event, _, events: &mut Vec<&'static str>| {
+            events.push(match event {
+                LazyXWaylandEvent::Ready { .. } => "ready",
+                LazyXWaylandEvent::Exited => "exited",
+                LazyXWaylandEvent::Error(error) => panic!("unexpected readiness error: {error}"),
+            });
+            true
+        });
+        event_loop
+            .handle()
+            .register_dispatcher(dispatcher.clone())
+            .unwrap();
+        let mut events = Vec::new();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        // The Rust Wayland backend retires killed client entries during
+        // dispatch/cleanup; a fixture has no child peer EOF to wake that pass.
+        let _ = display.backend().dispatch_single_client(&mut (), client.id());
+        assert_eq!(events, ["ready"]);
+        {
+            let mut lazy = dispatcher.as_source_mut();
+            assert!(lazy.ready);
+            assert!(lazy.server.map(|optional| optional.source.is_some()).unwrap());
+            assert!(
+                display
+                    .handle()
+                    .backend_handle()
+                    .get_client_data(client.id())
+                    .is_ok(),
+                "Ready must not run XWayland::drop"
+            );
+            assert!(lazy.listeners.iter().all(TransientSource::is_none));
+            lazy.sender.send(Completion::Exited(0)).unwrap();
+        }
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        assert!(dispatcher.as_source_ref().ready);
+        dispatcher
+            .as_source_ref()
+            .sender
+            .send(Completion::Exited(1))
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        let _ = display.backend().dispatch_single_client(&mut (), client.id());
+        assert_eq!(events, ["ready", "exited"]);
+        assert!(
+            display
+                .handle()
+                .backend_handle()
+                .get_client_data(client.id())
+                .is_err(),
+            "Exact exit retires actual Wayland client custody"
+        );
+        let lazy = dispatcher.as_source_ref();
+        assert_eq!(lazy.display_number(), number);
+        assert_eq!(
+            rustix::fs::fstat(&lazy.display.listen_sockets[0]).unwrap().st_ino,
+            inode
+        );
+        assert!(lazy.server.is_none());
+        assert!(lazy.listeners.iter().all(|source| !source.is_none()));
+        drop(lazy);
+
+        // A second episode installs into the now empty server/listener slots,
+        // not merely into the original initial registration.
+        let mut lazy = dispatcher.as_source_mut();
+        lazy.generation = 2;
+        lazy.starting = true;
+        for listener in &mut lazy.listeners {
+            listener.remove();
+        }
+        let (server, successor, _successor_peer) =
+            XWayland::readiness_fixture(&display.handle(), &lazy.display, lazy.client_scale.0.clone());
+        lazy.sender
+            .send(Completion::Spawned(2, Ok((server, successor.clone()))))
+            .unwrap();
+        drop(lazy);
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        let _ = display.backend().dispatch_single_client(&mut (), successor.id());
+        assert_eq!(events, ["ready", "exited", "ready"]);
+        dispatcher
+            .as_source_ref()
+            .sender
+            .send(Completion::Exited(1))
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        assert!(display
+            .handle()
+            .backend_handle()
+            .get_client_data(successor.id())
+            .is_ok());
+        dispatcher
+            .as_source_ref()
+            .sender
+            .send(Completion::Exited(2))
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut events)
+            .unwrap();
+        assert_eq!(events, ["ready", "exited", "ready", "exited"]);
+        assert!(dispatcher
+            .as_source_ref()
+            .listeners
+            .iter()
+            .all(|source| !source.is_none()));
+    }
+
+    #[test]
+    fn initial_scale_and_topology_changes_reach_each_exact_client_episode() {
+        let display = wayland_server::Display::<()>::new().unwrap();
+        std::fs::create_dir_all("/tmp/.X11-unix").unwrap();
+        let lazy = LazyXWayland::new(&display.handle(), None, false, []).unwrap();
+        let scale = lazy.client_scale();
+        scale.set(1.75).unwrap();
+        let (first, client, _peer) =
+            XWayland::readiness_fixture(&display.handle(), &lazy.display, scale.0.clone());
+        let state = &client
+            .get_data::<super::super::XWaylandClientData>()
+            .unwrap()
+            .compositor_state;
+        assert_eq!(state.client_scale(), 1.75);
+        scale.set(2.5).unwrap();
+        assert_eq!(state.client_scale(), 2.5);
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            assert!(scale.set(invalid).is_err());
+        }
+        assert_eq!(state.client_scale(), 2.5);
+        drop(first);
+        let (_second, client, _peer) =
+            XWayland::readiness_fixture(&display.handle(), &lazy.display, scale.0.clone());
+        assert_eq!(
+            client
+                .get_data::<super::super::XWaylandClientData>()
+                .unwrap()
+                .compositor_state
+                .client_scale(),
+            2.5
+        );
     }
 }

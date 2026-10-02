@@ -87,6 +87,50 @@ pub enum XWaylandEvent {
 }
 
 impl XWayland {
+    #[cfg(test)]
+    pub(super) fn readiness_fixture(
+        dh: &DisplayHandle,
+        prepared: &XWaylandDisplay,
+        scale: Arc<atomic_float::AtomicF64>,
+    ) -> (Self, Client, UnixStream) {
+        // Exercise the actual displayfd source, Wayland client custody and Drop
+        // implementation. This fixture starts no X server or child process.
+        let (display_fd, writer) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC)
+                .unwrap();
+        rustix::io::write(&writer, format!("{}\n", prepared.display_number()).as_bytes()).unwrap();
+        let (x11_socket, _peer) = UnixStream::pair().unwrap();
+        let (wayland, peer) = UnixStream::pair().unwrap();
+        let wrapper = unsafe { calloop::generic::FdWrapper::new(display_fd.as_raw_fd()) };
+        let source = calloop::generic::Generic::new(wrapper, calloop::Interest::READ, calloop::Mode::Level);
+        let inner = Arc::new(Mutex::new(Instance {
+            display_lock: prepared.lock.clone(),
+            display_fd,
+            x11_socket: Some(x11_socket),
+        }));
+        let mut dh = dh.clone();
+        let client = dh
+            .insert_client(
+                wayland,
+                Arc::new(XWaylandClientData {
+                    compositor_state: CompositorClientState::with_client_scale(scale),
+                    data_map: UserDataMap::new(),
+                    child: Mutex::new(None),
+                }),
+            )
+            .unwrap();
+        (
+            Self {
+                inner,
+                source,
+                dh,
+                client: client.clone(),
+            },
+            client,
+            peer,
+        )
+    }
+
     /// Spawns an XWayland server instance. `Xwayland` must be on the `PATH` and
     /// executable.
     ///
@@ -138,6 +182,32 @@ impl XWayland {
         stdout: impl Into<std::process::Stdio>,
         stderr: impl Into<std::process::Stdio>,
         user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
+        Self::spawn_prepared_with_scale(
+            dh,
+            prepared,
+            envs,
+            stdout,
+            stderr,
+            user_data,
+            CompositorClientState::default().clone_client_scale(),
+        )
+    }
+
+    pub(super) fn spawn_prepared_with_scale<K, V, I, F>(
+        dh: &DisplayHandle,
+        prepared: &XWaylandDisplay,
+        envs: I,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+        client_scale: Arc<atomic_float::AtomicF64>,
     ) -> std::io::Result<(Self, Client)>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -229,7 +299,7 @@ impl XWayland {
             wl_me,
             Arc::new(XWaylandClientData {
                 #[cfg(feature = "wayland_frontend")]
-                compositor_state: CompositorClientState::default(),
+                compositor_state: CompositorClientState::with_client_scale(client_scale),
                 data_map,
                 child: Mutex::new(Some(child)),
             }),

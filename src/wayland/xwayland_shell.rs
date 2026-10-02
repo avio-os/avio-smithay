@@ -332,6 +332,11 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
             // We only care about surfaces created by XWayland.
             if let Some(xwm_id) = client
                 .get_data::<XWaylandClientData>()
+                .filter(|data| {
+                    data.user_data()
+                        .get::<crate::xwayland::xwm::WmLifetime>()
+                        .is_none_or(|lifetime| lifetime.is_alive())
+                })
                 .and_then(|data| data.user_data().get::<XwmId>())
             {
                 let xwm = XwmHandler::xwm_state(state, *xwm_id);

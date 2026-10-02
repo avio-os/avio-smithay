@@ -177,7 +177,11 @@ use x11rb::{
 mod dnd;
 pub mod settings;
 use settings::{NameError, Value, XSettings};
+mod registration;
 mod selection;
+mod startup;
+use registration::RegistrationScope;
+pub(crate) use registration::WmLifetime;
 mod surface;
 use self::dnd::XWmDnd;
 pub use self::dnd::XwmOfferData;
@@ -479,6 +483,7 @@ pub trait XwmHandler {
 #[derive(Debug)]
 pub struct X11Wm {
     id: XwmId,
+    registrations: RegistrationScope,
     conn: Arc<RustConnection>,
     client_scale: Arc<AtomicF64>,
     screen: Screen,
@@ -507,6 +512,26 @@ pub struct X11Wm {
 
 impl Drop for X11Wm {
     fn drop(&mut self) {
+        self.registrations.invalidate();
+        // Invalidate retained DnD surfaces before the WM identity can be reused.
+        for window in &self.windows {
+            window
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .alive = false;
+        }
+        // Owned event-reader shutdown happens only after callbacks and retained
+        // surfaces can no longer resolve this WM episode.
+        self.registrations.cancel();
+        for selection in [&mut self.clipboard, &mut self.primary, &mut self.dnd.selection] {
+            for transfer in selection.incoming.values_mut() {
+                transfer.token = None;
+            }
+            for transfer in selection.outgoing.values_mut() {
+                transfer.token = None;
+            }
+        }
         xwm_id::remove(self.id.0);
     }
 }
@@ -670,201 +695,20 @@ impl X11Wm {
         <D as SeatHandler>::TouchFocus: DndFocus<D>,
         D: 'static,
     {
-        let id = XwmId(xwm_id::next());
-        let span = debug_span!("xwayland_wm", id = id.0);
-        let _guard = span.enter();
-
-        // Create an X11 connection. XWayland only uses screen 0.
-        let screen = 0;
-        let stream = DefaultStream::from_unix_stream(connection)?.0;
-        let conn = RustConnection::connect_to_stream(stream, screen)?;
-        let atoms = Atoms::new(&conn)?.reply()?;
-        let screen = conn.setup().roots[0].clone();
-        let randr_primary = conn.randr_get_output_primary(screen.root)?.reply()?.output;
-
-        {
-            let font = FontWrapper::open_font(&conn, "cursor".as_bytes())?;
-            let cursor = CursorWrapper::create_glyph_cursor(
-                &conn,
-                font.font(),
-                font.font(),
-                68,
-                69,
-                0,
-                0,
-                0,
-                u16::MAX,
-                u16::MAX,
-                u16::MAX,
-            )?;
-
-            // Actually become the WM by redirecting some operations
-            conn.change_window_attributes(
-                screen.root,
-                &ChangeWindowAttributesAux::default()
-                    .event_mask(
-                        EventMask::SUBSTRUCTURE_REDIRECT
-                            | EventMask::SUBSTRUCTURE_NOTIFY
-                            | EventMask::PROPERTY_CHANGE
-                            | EventMask::FOCUS_CHANGE,
-                    )
-                    // and also set a default root cursor in case downstream doesn't
-                    .cursor(cursor.cursor()),
-            )?;
-            // Watch for primary output changes
-            conn.randr_select_input(screen.root, NotifyMask::OUTPUT_CHANGE | NotifyMask::SCREEN_CHANGE)?;
-        }
-
-        // Tell XWayland that we are the WM by acquiring the WM_S0 selection. No X11 clients are accepted before this.
-        let win = conn.generate_id()?;
-        conn.create_window(
-            screen.root_depth,
-            win,
-            screen.root,
-            // x, y, width, height, border width
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            x11rb::COPY_FROM_PARENT,
-            &Default::default(),
-        )?;
-        conn.set_selection_owner(win, atoms.WM_S0, x11rb::CURRENT_TIME)?;
-        conn.set_selection_owner(win, atoms._NET_WM_CM_S0, x11rb::CURRENT_TIME)?;
-        conn.composite_redirect_subwindows(screen.root, Redirect::MANUAL)?;
-
-        // Set some EWMH properties
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_SUPPORTED,
-            AtomEnum::ATOM,
-            &[
-                atoms._NET_WM_STATE,
-                atoms._NET_WM_STATE_MAXIMIZED_HORZ,
-                atoms._NET_WM_STATE_MAXIMIZED_VERT,
-                atoms._NET_WM_STATE_HIDDEN,
-                atoms._NET_WM_STATE_FULLSCREEN,
-                atoms._NET_WM_STATE_MODAL,
-                atoms._NET_WM_STATE_FOCUSED,
-                atoms._NET_ACTIVE_WINDOW,
-                atoms._NET_WM_MOVERESIZE,
-                atoms._NET_CLIENT_LIST,
-                atoms._NET_CLIENT_LIST_STACKING,
-            ],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_CLIENT_LIST,
-            AtomEnum::WINDOW,
-            &[],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_CLIENT_LIST_STACKING,
-            AtomEnum::WINDOW,
-            &[],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_ACTIVE_WINDOW,
-            AtomEnum::WINDOW,
-            &[0],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_SUPPORTING_WM_CHECK,
-            AtomEnum::WINDOW,
-            &[win],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            win,
-            atoms._NET_SUPPORTING_WM_CHECK,
-            AtomEnum::WINDOW,
-            &[win],
-        )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            win,
-            atoms._NET_WM_NAME,
-            atoms.UTF8_STRING,
-            "Smithay X WM".as_bytes(),
-        )?;
-        debug!(window = win, "Created WM Window");
-
-        let conn = Arc::new(conn);
-        let xsettings = XSettings::new(&conn, screen.root_depth, screen.root, &atoms)?;
-        conn.flush()?;
-
-        let source = X11Source::new(Arc::clone(&conn), win, atoms._SMITHAY_CLOSE_CONNECTION);
-
-        let client_data = client.get_data::<XWaylandClientData>().unwrap();
-        let client_scale = client_data.compositor_state.clone_client_scale();
-
-        // We need this for the commit hook.
-        client_data.user_data().insert_if_missing(|| id);
-
-        let _xfixes_data = conn
-            .query_extension(x11rb::protocol::xfixes::X11_EXTENSION_NAME.as_bytes())?
-            .reply_unchecked()?
-            .ok_or(ConnectionError::UnsupportedExtension)?;
-        if !_xfixes_data.present {
-            return Err(ConnectionError::UnsupportedExtension.into());
-        }
-        conn.xfixes_query_version(1, 0)?.reply_unchecked()?; // we just need version 1 for clipboard monitoring
-
-        let clipboard = XWmSelection::new(&conn, &screen, &atoms, atoms.CLIPBOARD)?;
-        let primary = XWmSelection::new(&conn, &screen, &atoms, atoms.PRIMARY)?;
-        let dnd = XWmDnd::new(&conn, &screen, &atoms)?;
-        let wm_window = OwnedX11Window::new(win, &conn);
-
-        drop(_guard);
-        let wm = Self {
-            id,
-            conn,
-            client_scale,
-            screen,
-            atoms,
-            xsettings,
-            randr_primary,
-            wm_window,
-            _xfixes_data,
-            clipboard,
-            primary,
-            dnd,
-            unpaired_surfaces: Default::default(),
-            sequences_to_ignore: Default::default(),
-            windows: Vec::new(),
-            client_list: Vec::new(),
-            client_list_stacking: Vec::new(),
-            span,
-        };
-
-        let event_handle = handle.clone();
-        let dh = dh.clone();
-        handle.insert_source(source, move |event, _, data| match event {
-            calloop::channel::Event::Msg(event) => {
-                if let Err(err) = handle_event(&event_handle, &dh, data, id, event) {
-                    warn!(id = id.0, err = ?err, "Failed to handle X11 event");
-                }
-            }
-            calloop::channel::Event::Closed => {
-                data.disconnected(id);
-            }
-        })?;
-        Ok(wm)
+        Self::start_wm_with_initialization(handle, dh, connection, client, |_| Ok(()))
     }
 
     /// Id of this X11 WM
     pub fn id(&self) -> XwmId {
         self.id
+    }
+
+    /// Share this episode's private WM connection without opening an X client.
+    ///
+    /// The WM remains the lifetime owner. Dropping it shuts down the socket and
+    /// invalidates all aliases, even if their `Arc`s remain alive.
+    pub fn connection(&self) -> Arc<RustConnection> {
+        Arc::clone(&self.conn)
     }
 
     /// Raises a window in the internal X11 state
@@ -1716,40 +1560,39 @@ where
                         let loop_handle_clone = loop_handle.clone();
                         let incoming_window = *window;
                         let atom = n.selection;
-                        let token = loop_handle
-                            .insert_source(
-                                Generic::new(fd, Interest::WRITE, Mode::Level),
-                                move |_, fd, data| {
-                                    let xwm = data.xwm_state(xwm_id);
-                                    let conn = &xwm.conn;
-                                    let atoms = &xwm.atoms;
-                                    let selection = match atom {
-                                        x if x == xwm.atoms.CLIPBOARD => &mut xwm.clipboard,
-                                        x if x == xwm.atoms.PRIMARY => &mut xwm.primary,
-                                        x if x == xwm.atoms.XdndSelection => &mut xwm.dnd.selection,
-                                        _ => unreachable!(),
+                        let token = xwm.registrations.insert(
+                            loop_handle,
+                            Generic::new(fd, Interest::WRITE, Mode::Level),
+                            move |_, fd, data| {
+                                let xwm = data.xwm_state(xwm_id);
+                                let conn = &xwm.conn;
+                                let atoms = &xwm.atoms;
+                                let selection = match atom {
+                                    x if x == xwm.atoms.CLIPBOARD => &mut xwm.clipboard,
+                                    x if x == xwm.atoms.PRIMARY => &mut xwm.primary,
+                                    x if x == xwm.atoms.XdndSelection => &mut xwm.dnd.selection,
+                                    _ => unreachable!(),
+                                };
+                                if let Some(transfer) = selection.incoming.get_mut(&incoming_window) {
+                                    match write_selection_callback(fd.as_fd(), conn, atoms, transfer) {
+                                        Ok(IncomingAction::WaitForWritable) => {
+                                            return Ok(PostAction::Continue)
+                                        }
+                                        Ok(IncomingAction::WaitForProperty) if !transfer.incr_done => {
+                                            return Ok(PostAction::Disable)
+                                        }
+                                        Ok(_) | Err(_) => {
+                                            selection
+                                                .incoming
+                                                .remove(&incoming_window)
+                                                .unwrap()
+                                                .destroy(&loop_handle_clone);
+                                        }
                                     };
-                                    if let Some(transfer) = selection.incoming.get_mut(&incoming_window) {
-                                        match write_selection_callback(fd.as_fd(), conn, atoms, transfer) {
-                                            Ok(IncomingAction::WaitForWritable) => {
-                                                return Ok(PostAction::Continue)
-                                            }
-                                            Ok(IncomingAction::WaitForProperty) if !transfer.incr_done => {
-                                                return Ok(PostAction::Disable)
-                                            }
-                                            Ok(_) | Err(_) => {
-                                                selection
-                                                    .incoming
-                                                    .remove(&incoming_window)
-                                                    .unwrap()
-                                                    .destroy(&loop_handle_clone);
-                                            }
-                                        };
-                                    }
-                                    Ok(PostAction::Remove)
-                                },
-                            )
-                            .map_err(|err| err.error)?;
+                                }
+                                Ok(PostAction::Remove)
+                            },
+                        )?;
                         loop_handle.disable(&token)?;
 
                         let transfer = IncomingTransfer {
@@ -1921,7 +1764,8 @@ where
                         let requestor = n.requestor;
                         let atom = selection.atom;
 
-                        let token = loop_handle.insert_source(
+                        let token = xwm.registrations.insert(
+                            loop_handle,
                             Generic::new(recv_fd, Interest::READ, Mode::Level),
                             move |_, fd, data| {
                                 let xwm = data.xwm_state(xwm_id);
@@ -1962,7 +1806,7 @@ where
                             Ok(token) => token,
                             Err(err) => {
                                 warn!(
-                                    err = ?err.error,
+                                    err = ?err,
                                     "Failed to initialize event loop source for clipboard transfer",
 
                                 );
