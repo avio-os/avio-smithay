@@ -1919,3 +1919,55 @@ impl<'a> AtomicRequest<'a> {
         Ok(req)
     }
 }
+
+/// Exercise the real atomic request builder, without a DRM device: a
+/// planeless security frame keeps the exact mode active and resets every
+/// primary/cursor/overlay property. TEST_ONLY and submission use this builder.
+#[cfg(all(test, debug_assertions))]
+mod planeless_black_request {
+    use super::*;
+    use std::num::NonZeroU32;
+
+    fn handle<T: From<NonZeroU32>>(id: u32) -> T {
+        NonZeroU32::new(id).unwrap().into()
+    }
+
+    #[test]
+    fn exact_active_mode_and_every_owned_plane_are_in_the_request() {
+        let mapping = PropMapping::default();
+        let crtc = handle(2);
+        let connector = handle(3);
+        let planes: Vec<_> = [10, 11, 12]
+            .into_iter()
+            .map(|id| PlaneState {
+                handle: handle(id),
+                config: None,
+            })
+            .collect();
+        let req = AtomicRequest::build_request(
+            &mapping,
+            crtc,
+            Some(property::Value::Blob(77)),
+            false,
+            [&connector],
+            [],
+            &planes,
+        )
+        .unwrap();
+        assert_eq!(req.crtc_props[&crtc]["ACTIVE"], property::Value::Boolean(true));
+        assert_eq!(req.crtc_props[&crtc]["MODE_ID"], property::Value::Blob(77));
+        assert_eq!(
+            req.connector_props[&connector]["CRTC_ID"],
+            property::Value::CRTC(Some(crtc))
+        );
+        assert_eq!(req.plane_props.len(), 3);
+        for plane in &planes {
+            let props = &req.plane_props[&plane.handle];
+            assert_eq!(props["CRTC_ID"], property::Value::CRTC(None));
+            assert_eq!(props["FB_ID"], property::Value::Framebuffer(None));
+            for name in ["SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_W", "CRTC_H"] {
+                assert_eq!(props[name], property::Value::UnsignedRange(0));
+            }
+        }
+    }
+}

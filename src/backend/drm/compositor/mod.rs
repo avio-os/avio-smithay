@@ -187,6 +187,8 @@ mod composition;
 pub use composition::{CompositionAllocator, PreparedCompositionBuffers};
 mod elements;
 mod frame_result;
+mod native_black;
+pub use native_black::{NativeBlackError, NativeBlackKind};
 
 use elements::*;
 pub use frame_result::*;
@@ -627,6 +629,9 @@ impl<B: Buffer, F: Framebuffer> Clone for PlaneState<B, F> {
 #[derive(Debug)]
 struct FrameState<B: Buffer, F: Framebuffer> {
     planes: SmallVec<[(plane::Handle, PlaneState<B, F>); 10]>,
+    // A security frame keeps every reset-plane claim through pending/queued
+    // custody and physical completion; Full submission must omit none.
+    reset_plane_claims: Vec<PlaneClaim>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,7 +714,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                 .map(|info| (info.handle, PlaneState::default())),
         );
 
-        FrameState { planes: tmp }
+        FrameState {
+            planes: tmp,
+            reset_plane_claims: Vec::new(),
+        }
     }
 }
 
@@ -884,6 +892,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
             }
         }
 
+        let reset_plane_claims = &self.reset_plane_claims;
         self.planes
             .iter_mut()
             .filter(move |(handle, state)| {
@@ -909,7 +918,9 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                     // use represented by having an config defined.
                     !state.skip || state.config.is_some()
                 } else {
-                    state.config.is_some() || surface.claim_plane(*handle).is_some()
+                    state.config.is_some()
+                        || reset_plane_claims.iter().any(|claim| claim.plane() == *handle)
+                        || surface.claim_plane(*handle).is_some()
                 }
             })
             .map(move |(handle, state)| super::surface::PlaneState {
@@ -1338,6 +1349,9 @@ where
     /// Last frame's primary disposition (Some(true) = swapchain composite,
     /// Some(false) = element scanout); drives the rare seam-change witness.
     primary_was_composited: Option<bool>,
+    native_black_enabled: bool,
+    native_black_candidate: Option<PlaneConfig<A::Buffer, F::Framebuffer>>,
+    native_black: Option<native_black::NativeBlackTarget<A::Buffer, F::Framebuffer>>,
 
     framebuffer_exporter: F,
 
@@ -1595,6 +1609,9 @@ where
                         element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
                         primary_was_composited: None,
+                        native_black_enabled: false,
+                        native_black_candidate: None,
+                        native_black: None,
                         debug_flags: DebugFlags::empty(),
                         span,
                     };
@@ -1764,6 +1781,9 @@ where
             element_opaque_regions_workhouse: Vec::new(),
             supports_fencing,
             primary_was_composited: None,
+            native_black_enabled: false,
+            native_black_candidate: None,
+            native_black: None,
             debug_flags: DebugFlags::empty(),
             span,
         };
@@ -3108,6 +3128,24 @@ where
             }
         }
 
+        // Retain the exact initial black target across the synchronous modeset.
+        // A planeless-capable output drops it; a refused output reserves it.
+        if self.native_black_enabled
+            && self.native_black.is_none()
+            && primary_rendered_this_frame
+            && elements.is_empty()
+            && clear_color.r() == 0.0
+            && clear_color.g() == 0.0
+            && clear_color.b() == 0.0
+            && clear_color.a() == 1.0
+            && !primary_clear_red_diag()
+        {
+            self.native_black_candidate = next_frame_state
+                .plane_state(self.surface.plane())
+                .and_then(|state| state.config.as_ref())
+                .cloned();
+        }
+
         let next_frame = PreparedFrame {
             kind: if allow_partial_update {
                 PreparedFrameKind::Partial
@@ -3420,6 +3458,7 @@ where
                 .iter()
                 .map(|(handle, state)| (*handle, state.clone()))
                 .collect(),
+            reset_plane_claims: self.current_frame.reset_plane_claims.clone(),
         };
         for (_, state) in frame.planes.iter_mut() {
             state.skip = true;
@@ -3482,6 +3521,7 @@ where
                 .iter()
                 .map(|(handle, state)| (*handle, state.clone()))
                 .collect(),
+            reset_plane_claims: self.current_frame.reset_plane_claims.clone(),
         };
         for (_, state) in frame.planes.iter_mut() {
             state.skip = true;
@@ -3615,6 +3655,18 @@ where
         }) = self.pending_frame.take()
         {
             std::mem::swap(&mut frame, &mut self.current_frame);
+            if self.native_black_enabled
+                && self.native_black.is_none()
+                && self.native_black_candidate.as_ref().is_some_and(|candidate| {
+                    self.current_frame
+                        .plane_buffer(self.surface.plane())
+                        .is_some_and(|current| current.fb == candidate.buffer.fb)
+                })
+            {
+                if let Err(error) = self.initialize_native_black() {
+                    tracing::trace!(%error, "native black configuration awaits a usable target");
+                }
+            }
             Some(user_data)
         } else {
             None
@@ -3752,6 +3804,8 @@ where
         self.surface.use_mode(mode).map_err(FrameError::DrmError)?;
         let (w, h) = mode.size();
         self.swapchain.resize(w as _, h as _);
+        self.native_black = None;
+        self.native_black_candidate = None;
         Ok(())
     }
 

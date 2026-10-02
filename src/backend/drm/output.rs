@@ -57,6 +57,7 @@ where
     compositor: CompositorList<A, F, U, G>,
     color_formats: Vec<DrmFourcc>,
     renderer_formats: Vec<DrmFormat>,
+    native_black_enabled: bool,
 }
 
 /// Locked variant of the [`DrmOutputManager`].
@@ -75,6 +76,7 @@ where
     compositor_arc: CompositorList<A, F, U, G>,
     color_formats: &'a [DrmFourcc],
     renderer_formats: &'a [DrmFormat],
+    native_black_enabled: bool,
 }
 
 impl<A, F, U, G> fmt::Debug for DrmOutputManager<A, F, U, G>
@@ -199,6 +201,9 @@ where
     /// The underlying [`DrmCompositor`] returned an error upon rendering a frame
     #[error(transparent)]
     RenderFrame(RenderFrameError<A, B, F, R>),
+    /// Native security-frame configuration could not be established.
+    #[error(transparent)]
+    NativeBlack(super::compositor::NativeBlackError),
 }
 
 /// Result returned by `DrmOutputManager`'s methods
@@ -255,7 +260,15 @@ where
             compositor: Default::default(),
             color_formats: color_formats.into_iter().collect(),
             renderer_formats: renderer_formats.into_iter().collect(),
+            native_black_enabled: false,
         }
+    }
+
+    /// Reserve native-black capability or one immutable initial black target
+    /// for subsequently initialized outputs. Does not change existing outputs.
+    pub fn enable_native_black(mut self) -> Self {
+        self.native_black_enabled = true;
+        self
     }
 
     /// Locks the [`DrmOutputManager`] causing derived [`DrmOutput`]s to stall
@@ -273,6 +286,7 @@ where
             compositor_arc: self.compositor.clone(),
             color_formats: &self.color_formats,
             renderer_formats: &self.renderer_formats,
+            native_black_enabled: self.native_black_enabled,
         }
     }
 }
@@ -366,6 +380,12 @@ where
                         self.gbm.clone(),
                     )
                 }
+                .map(|mut compositor| {
+                    if self.native_black_enabled {
+                        compositor.enable_native_black();
+                    }
+                    compositor
+                })
             };
 
         let compositor = create_compositor(false);
@@ -486,6 +506,13 @@ where
         if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
             self.compositor.remove(&crtc);
             return Err(err);
+        }
+
+        if self.native_black_enabled {
+            if let Err(error) = compositor.initialize_native_black() {
+                self.compositor.remove(&crtc);
+                return Err(DrmOutputManagerError::NativeBlack(error));
+            }
         }
 
         Ok(DrmOutput {
