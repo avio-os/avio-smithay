@@ -1,4 +1,4 @@
-use std::{fmt, ops::Range, sync::Arc};
+use std::{collections::HashMap, fmt, ops::Range, sync::Arc};
 
 use ash::vk;
 
@@ -140,6 +140,7 @@ impl UploadArena {
         device: Arc<DeviceHandle>,
         capacity: usize,
     ) -> Result<bool, VulkanRendererError> {
+        self.reap_parked();
         let capacity = align_up(capacity, self.atom_size).ok_or(VulkanRendererError::InvalidMemoryUpload(
             "fixed upload capacity overflowed",
         ))?;
@@ -180,6 +181,7 @@ impl UploadArena {
         device: Arc<DeviceHandle>,
         len: usize,
     ) -> Result<StagingReservation, VulkanRendererError> {
+        self.reap_parked();
         let reserved_len = align_up(len, self.atom_size).ok_or(VulkanRendererError::InvalidMemoryUpload(
             "staging reservation size overflowed",
         ))?;
@@ -241,13 +243,6 @@ impl UploadArena {
 
     fn reserve_existing(&mut self, len: usize, reserved_len: usize) -> Option<StagingReservation> {
         for (chunk_index, chunk) in self.chunks.iter_mut().enumerate() {
-            // Detached rows are an exclusive writer. Even a prematurely
-            // cancelled ticket cannot make its mapping writable by another
-            // reservation before that writer returns. A fixed owner waits
-            // whole; it never creates a second chunk around this custody.
-            if Arc::strong_count(&chunk.memory) != 1 {
-                continue;
-            }
             let Some(offset) = chunk.ranges.reserve(reserved_len) else {
                 continue;
             };
@@ -303,18 +298,22 @@ impl UploadArena {
     /// another thread. The returned mapping owner keeps the bytes valid even if
     /// the arena is dropped first.
     pub(crate) fn detach(
-        &self,
+        &mut self,
         reservation: StagingReservation,
-    ) -> Result<(*mut u8, Arc<ChunkMemory>), VulkanRendererError> {
+    ) -> Result<(*mut u8, Arc<ReservationWriter>), VulkanRendererError> {
         let chunk = self
             .chunks
-            .get(reservation.chunk)
+            .get_mut(reservation.chunk)
             .ok_or(VulkanRendererError::TemporaryFailure(
                 "staging reservation names an unknown chunk",
             ))?;
         // SAFETY: The reservation lies inside the chunk's persistent mapping.
         let ptr = unsafe { chunk.memory.mapped.0.add(reservation.offset) };
-        Ok((ptr, Arc::clone(&chunk.memory)))
+        let writer = Arc::new(ReservationWriter {
+            _memory: Arc::clone(&chunk.memory),
+        });
+        chunk.ranges.attach_writer(reservation.offset, writer.clone());
+        Ok((ptr, writer))
     }
 
     /// Make host writes to the reservation visible to the device.
@@ -333,8 +332,16 @@ impl UploadArena {
             .chunks
             .get_mut(reservation.chunk)
             .expect("tracked staging reservation names a live arena chunk");
-        chunk.ranges.release(reservation.offset, reservation.reserved_len);
-        self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_sub(reservation.reserved_len);
+        if chunk.ranges.release(reservation.offset, reservation.reserved_len) {
+            self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_sub(reservation.reserved_len);
+        }
+    }
+
+    pub(crate) fn reap_parked(&mut self) {
+        for chunk in &mut self.chunks {
+            let released = chunk.ranges.reap_parked();
+            self.stats.in_use_bytes = self.stats.in_use_bytes.saturating_sub(released);
+        }
     }
 
     pub(crate) fn stats(&self) -> UploadArenaStats {
@@ -344,7 +351,68 @@ impl UploadArena {
 
 struct StagingChunk {
     memory: Arc<ChunkMemory>,
-    ranges: RangeAllocator,
+    ranges: ReservationRanges<ReservationWriter>,
+}
+
+/// Exact writer custody for one span. Its mapping owner is deliberately
+/// separate from the free-range authority: another span may be used while
+/// these rows are being written or while cancellation awaits their return.
+pub(crate) struct ReservationWriter {
+    _memory: Arc<ChunkMemory>,
+}
+
+/// Span ownership, including cancelled reservations still writable elsewhere.
+/// The arena owns one token; the exclusive row guard owns the other.
+struct ReservationRanges<T> {
+    free: RangeAllocator,
+    writers: HashMap<usize, Arc<T>>,
+    parked: Vec<(usize, usize, Arc<T>)>,
+}
+
+impl<T> ReservationRanges<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            free: RangeAllocator::new(capacity),
+            writers: HashMap::new(),
+            parked: Vec::new(),
+        }
+    }
+
+    fn reserve(&mut self, len: usize) -> Option<usize> {
+        self.free.reserve(len)
+    }
+
+    fn attach_writer(&mut self, offset: usize, token: Arc<T>) {
+        assert!(
+            self.writers.insert(offset, token).is_none(),
+            "one writer per staging reservation"
+        );
+    }
+
+    /// Returns true only when these bytes have become reusable.
+    fn release(&mut self, offset: usize, len: usize) -> bool {
+        if let Some(token) = self.writers.remove(&offset) {
+            if Arc::strong_count(&token) != 1 {
+                self.parked.push((offset, len, token));
+                return false;
+            }
+        }
+        self.free.release(offset, len);
+        true
+    }
+
+    fn reap_parked(&mut self) -> usize {
+        let mut bytes = 0;
+        self.parked.retain(|(offset, len, token)| {
+            if Arc::strong_count(token) != 1 {
+                return true;
+            }
+            self.free.release(*offset, *len);
+            bytes += len;
+            false
+        });
+        bytes
+    }
 }
 
 /// One chunk's buffer, memory and persistent mapping. Shared with detached
@@ -429,12 +497,12 @@ impl StagingChunk {
                 coherent,
                 _allocation: allocation,
             }),
-            ranges: RangeAllocator::new(capacity),
+            ranges: ReservationRanges::new(capacity),
         })
     }
 
     fn capacity(&self) -> usize {
-        self.ranges.capacity
+        self.ranges.free.capacity
     }
 }
 
@@ -638,9 +706,45 @@ fn pick_host_visible_memory_type(
 #[cfg(test)]
 mod tests {
     use super::{
-        align_up, bounded_chunk_size, next_chunk_size, ArenaMode, RangeAllocator, INITIAL_UPLOAD_ARENA_BYTES,
-        MAX_UPLOAD_ARENA_BYTES,
+        align_up, bounded_chunk_size, next_chunk_size, ArenaMode, RangeAllocator, ReservationRanges,
+        INITIAL_UPLOAD_ARENA_BYTES, MAX_UPLOAD_ARENA_BYTES,
     };
+    use std::sync::Arc;
+
+    #[test]
+    fn detached_writer_parks_only_its_cancelled_span() {
+        let mut spans = ReservationRanges::new(4096);
+        let first = spans.reserve(1024).unwrap();
+        let writer = Arc::new(());
+        spans.attach_writer(first, writer.clone());
+        assert!(!spans.release(first, 1024));
+        assert_eq!(spans.reap_parked(), 0, "rows still own cancelled bytes");
+        let unrelated = spans.reserve(3072).expect("unrelated capacity stays usable");
+        assert_eq!(unrelated, 1024);
+        assert_eq!(spans.reserve(1), None, "cancelled span remains unavailable");
+        std::thread::spawn(move || drop(writer)).join().unwrap();
+        assert_eq!(spans.reap_parked(), 1024);
+        assert_eq!(spans.reap_parked(), 0, "each span returns exactly once");
+        assert_eq!(spans.reserve(1024), Some(first));
+        assert!(spans.release(first, 1024));
+        assert!(spans.release(unrelated, 3072));
+        assert_eq!(spans.free.free, vec![0..4096]);
+    }
+
+    #[test]
+    fn unrelated_writer_tokens_do_not_prevent_completed_reservations_releasing() {
+        let mut spans = ReservationRanges::new(4096);
+        let first = spans.reserve(1024).unwrap();
+        let second = spans.reserve(1024).unwrap();
+        let writer = Arc::new(());
+        spans.attach_writer(first, writer.clone());
+        let returned = Arc::new(());
+        spans.attach_writer(second, returned.clone());
+        drop(returned);
+        assert!(spans.release(second, 1024));
+        assert_eq!(spans.reserve(1024), Some(second));
+        assert_eq!(Arc::strong_count(&writer), 2);
+    }
 
     #[test]
     fn owner_sized_ring_never_grows_when_a_whole_generation_waits() {
@@ -681,6 +785,47 @@ mod tests {
 
     #[test]
     #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn detached_rows_and_slice_upload_share_the_existing_chunk() {
+        use crate::backend::{allocator::Fourcc, renderer::ImportMem};
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let texture = renderer
+            .import_memory(
+                &vec![0; 4 * 1024 * 1024],
+                Fourcc::Argb8888,
+                (1024, 1024).into(),
+                false,
+            )
+            .unwrap();
+        let before = renderer.diagnostics().uploads;
+        let (update, rows) = renderer
+            .stage_memory_update(&texture, crate::utils::Rectangle::from_size((1024, 1024).into()))
+            .unwrap()
+            .unwrap();
+        let small = renderer
+            .import_memory(&[0; 16 * 1024], Fourcc::Argb8888, (64, 64).into(), false)
+            .unwrap();
+        let after = renderer.diagnostics().uploads;
+        assert_eq!(after.arena_chunk_count, 1);
+        assert_eq!(after.arena_capacity_bytes, before.arena_capacity_bytes);
+        assert_eq!(after.arena_growth_count, before.arena_growth_count);
+        renderer.cancel_staged_memory_update(update);
+        assert_eq!(
+            renderer.diagnostics().uploads.arena_in_use_bytes,
+            8 * 1024 * 1024 + 16 * 1024
+        );
+        drop(rows);
+        drop(small);
+        drop(texture);
+        renderer.memory_upload_capacity_edge().unwrap();
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
     fn owner_ring_shrinks_and_retires_only_after_detached_writer_returns() {
         use crate::backend::allocator::Fourcc;
         use crate::backend::renderer::ImportMem;
@@ -705,13 +850,26 @@ mod tests {
             !renderer.configure_memory_upload_capacity(2048).unwrap(),
             "a detached writer still owns the mapping"
         );
-        assert!(
-            renderer
-                .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
-                .unwrap_err()
-                .is_upload_deferred(),
-            "cancelled bytes cannot be reused while the detached writer exists"
-        );
+        let (_, unrelated, unrelated_rows) = renderer
+            .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap()
+            .unwrap();
+        drop(unrelated_rows);
+        renderer.cancel_staged_memory_update(unrelated);
+        let crate::backend::renderer::MemoryRowUpload::Queued(slice) = renderer
+            .import_memory_rows(Fourcc::Argb8888, (16, 16).into(), false, &mut |rows| {
+                for index in 0..rows.rows() {
+                    rows.row_mut(index).fill(0);
+                }
+                true
+            })
+            .unwrap()
+        else {
+            panic!("unrelated row fill must be admitted");
+        };
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 1);
+        assert_eq!(renderer.diagnostics().uploads.arena_growth_count, 0);
+        drop(slice);
         drop(rows);
         assert!(renderer.configure_memory_upload_capacity(2048).unwrap());
         assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);

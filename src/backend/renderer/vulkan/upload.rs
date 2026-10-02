@@ -26,7 +26,7 @@ use super::{
     device::{DeviceHandle, DeviceState},
     format::{optimal_tiling_features, texture_view_components, ColorEncoding},
     image::VulkanImage,
-    staging::{ChunkMemory, StagingReservation},
+    staging::{ReservationWriter, StagingReservation},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 
@@ -321,11 +321,11 @@ fn fill_reserved_rows(
     device: &mut DeviceState,
     reservation: StagingReservation,
     rows: StagedMemoryRows,
-    memory: &Arc<ChunkMemory>,
+    memory: &Arc<ReservationWriter>,
     fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
 ) -> bool {
     // Also release on callback unwind. A swapped-out writer still keeps the
-    // mapping alive and blocks reserve_existing until it returns.
+    // mapping alive and parks only its own reservation until it returns.
     let reservation = scopeguard::guard(reservation, |reservation| {
         device.release_staged_image_upload(reservation);
     });
@@ -345,8 +345,8 @@ fn fill_callback_rows<T>(
     drop(rows);
     // A callback can safely swap this owned row guard with another renderer's
     // rows. Dropping the replacement does not return our original writer.
-    // Only the arena and the temporary exact-mapping Arc may remain before
-    // queueing a GPU read. Image/texture readers are separate allocation owners.
+    // Only the reservation authority and its temporary exact-writer Arc may
+    // remain before queueing a GPU read. Unrelated spans have separate tokens.
     copied && Arc::strong_count(memory) == 2
 }
 
@@ -440,17 +440,19 @@ mod callback_custody_tests {
         );
         assert_eq!(
             after.uploads.arena_in_use_bytes,
-            before.uploads.arena_in_use_bytes
+            before.uploads.arena_in_use_bytes + 1024
         );
         assert_eq!(
             after.allocations.reason(VulkanAllocationReason::Texture),
             before.allocations.reason(VulkanAllocationReason::Texture)
         );
         assert!(!renderer.configure_memory_upload_capacity(0).unwrap());
-        assert!(renderer
+        let (_, unrelated, unrelated_rows) = renderer
             .stage_memory_import(format, size, false)
-            .unwrap_err()
-            .is_upload_deferred());
+            .unwrap()
+            .unwrap();
+        drop(unrelated_rows);
+        renderer.cancel_staged_memory_update(unrelated);
         std::thread::spawn(move || retained.row_mut(0).fill(0xff))
             .join()
             .unwrap();
@@ -482,7 +484,7 @@ mod callback_custody_tests {
         assert!(matches!(result, MemoryRowUpload::SourceFailed));
         let after = renderer.diagnostics().uploads;
         assert_eq!(after.pending_operations, before.pending_operations);
-        assert_eq!(after.arena_in_use_bytes, before.arena_in_use_bytes);
+        assert_eq!(after.arena_in_use_bytes, before.arena_in_use_bytes + 1024);
         drop(retained);
         donor.cancel_staged_memory_update(donor_update);
         assert!(matches!(
@@ -522,7 +524,7 @@ mod callback_custody_tests {
         );
         assert_eq!(
             after.uploads.arena_in_use_bytes,
-            before.uploads.arena_in_use_bytes
+            before.uploads.arena_in_use_bytes + 1024
         );
         assert_eq!(
             after.allocations.reason(VulkanAllocationReason::Texture),

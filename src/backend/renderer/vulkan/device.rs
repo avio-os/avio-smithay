@@ -21,7 +21,7 @@ use crate::backend::{
 use super::{
     allocation::AllocationLedger,
     image::{transition_image_layout, VulkanImage},
-    staging::{ChunkMemory, StagingReservation, UploadArena, UploadArenaStats},
+    staging::{ReservationWriter, StagingReservation, UploadArena, UploadArenaStats},
     sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
     VulkanRendererError, VulkanSubmissionSnapshot,
 };
@@ -766,7 +766,7 @@ impl DeviceState {
         &mut self,
         image: &Arc<VulkanImage>,
         len: usize,
-    ) -> Result<(StagingReservation, *mut u8, Arc<ChunkMemory>), VulkanRendererError> {
+    ) -> Result<(StagingReservation, *mut u8, Arc<ReservationWriter>), VulkanRendererError> {
         if !image.is_renderer_local() {
             return Err(VulkanRendererError::TemporaryFailure(
                 "memory uploads require a renderer-local Vulkan image",
@@ -778,7 +778,7 @@ impl DeviceState {
     pub(crate) fn reserve_staged_upload(
         &mut self,
         len: usize,
-    ) -> Result<(StagingReservation, *mut u8, Arc<ChunkMemory>), VulkanRendererError> {
+    ) -> Result<(StagingReservation, *mut u8, Arc<ReservationWriter>), VulkanRendererError> {
         self.reclaim_completed_submissions()?;
         self.drop_unsampleable_uploads();
         let arena = self.owner_upload_arena.as_mut().unwrap_or(&mut self.upload_arena);
@@ -837,6 +837,10 @@ impl DeviceState {
     /// upload claims batch or staging capacity and before a batch is
     /// recorded, so dead uploads neither fill the batch nor reach the GPU.
     fn drop_unsampleable_uploads(&mut self) {
+        self.upload_arena.reap_parked();
+        if let Some(arena) = &mut self.owner_upload_arena {
+            arena.reap_parked();
+        }
         self.pending_uploads
             .drop_unsampleable(&mut self.upload_arena, &mut self.owner_upload_arena);
     }
