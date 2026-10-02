@@ -283,7 +283,7 @@ impl VulkanOffscreenAllocator {
             false,
             vk::ImageLayout::UNDEFINED,
             self.device.clone(),
-        ));
+        )?);
 
         Ok(VulkanTexture::from_renderer_image(
             imported,

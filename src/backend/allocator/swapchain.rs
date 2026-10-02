@@ -102,6 +102,22 @@ pub struct RetiredSlot<B: Buffer> {
     userdata: UserDataMap,
 }
 
+/// Displaced vacant controls retained by a cold composition preparation.
+/// Adoption fills this inline owner without releasing any control on the
+/// rendering thread. Drop it on the preparation/disposal owner.
+#[derive(Debug)]
+pub struct RetiredSwapchainControls<B: Buffer> {
+    slots: [Option<Arc<InternalSlot<B>>>; SLOT_CAP],
+}
+
+impl<B: Buffer> Default for RetiredSwapchainControls<B> {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+}
+
 impl<B: Buffer> RetiredSlot<B> {
     /// Exported buffer metadata retained through off-thread disposal.
     pub fn userdata(&self) -> &UserDataMap {
@@ -425,8 +441,22 @@ where
     /// on rejection the existing swapchain and all supplied slots are returned
     /// unchanged. Imported buffers start at age zero for a full repaint.
     pub fn adopt(&mut self, slots: Vec<Slot<A::Buffer>>) -> Result<(), RejectedSlots<A::Buffer>> {
+        let mut slots = slots;
+        let mut displaced = RetiredSwapchainControls::default();
+        self.adopt_retained(&mut slots, &mut displaced)
+            .map_err(|reason| RejectedSlots { reason, slots })
+    }
+
+    /// Adopt prepared buffers while retaining all displaced controls and the
+    /// supplied vector backing for cold disposal. Rejection changes neither
+    /// the swapchain nor the preparation. A packet may be adopted only once.
+    pub fn adopt_retained(
+        &mut self,
+        slots: &mut Vec<Slot<A::Buffer>>,
+        displaced: &mut RetiredSwapchainControls<A::Buffer>,
+    ) -> Result<(), AdoptionFailure> {
         let vacancies = self.slots.iter().filter(|slot| slot.buffer.is_none()).count();
-        let reason = if slots.len() > vacancies {
+        let reason = if displaced.slots.iter().any(Option::is_some) || slots.len() > vacancies {
             Some(AdoptionFailure::NoVacancies)
         } else if slots.iter().any(|slot| Arc::strong_count(&slot.0) != 1) {
             Some(AdoptionFailure::AlreadyOwned)
@@ -444,15 +474,16 @@ where
             None
         };
         if let Some(reason) = reason {
-            return Err(RejectedSlots { reason, slots });
+            return Err(reason);
         }
-        for (destination, slot) in self
+        for ((destination, retired), slot) in self
             .slots
             .iter_mut()
             .filter(|slot| slot.buffer.is_none())
-            .zip(slots)
+            .zip(displaced.slots.iter_mut())
+            .zip(slots.drain(..))
         {
-            *destination = slot.0.clone();
+            *retired = Some(std::mem::replace(destination, slot.0.clone()));
             destination.age.store(0, Ordering::SeqCst);
             // Dropping the unique Slot makes the adopted buffer acquirable.
             drop(slot);

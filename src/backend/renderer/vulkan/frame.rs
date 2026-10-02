@@ -1381,10 +1381,11 @@ impl VulkanFrame<'_> {
                 self.renderer.upscale_filter,
             )
         };
-        let descriptor_set = self
-            .renderer
-            .descriptors
-            .texture_descriptor_set(texture_image.view(), sampler)?;
+        let descriptor_set = self.renderer.descriptors.texture_descriptor_set(
+            texture_image.view(),
+            texture_image.incarnation(),
+            sampler,
+        )?;
 
         let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
         let has_shader_effect = !effect.is_none() || material_operation.is_some();

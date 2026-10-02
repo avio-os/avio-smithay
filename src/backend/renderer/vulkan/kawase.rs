@@ -325,9 +325,11 @@ impl VulkanRenderer {
                 destination.render_view()
             };
             let pipelines = self.pipelines.prepared_pipelines_for_format(destination_format)?;
-            let descriptor_set = self
-                .descriptors
-                .texture_descriptor_set(source.view(), TextureSampler::LINEAR)?;
+            let descriptor_set = self.descriptors.texture_descriptor_set(
+                source.view(),
+                source.incarnation(),
+                TextureSampler::LINEAR,
+            )?;
             let constants = KawasePushConstants::new(
                 kawase_halfpixel(pass.source_extent, pass.destination_extent),
                 pass.offset,

@@ -99,6 +99,27 @@ impl DmabufState {
         expected_source: &Dmabuf,
         expected_generation: u64,
     ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.adopt_prepared_with_custody(device, prepared, expected_source, expected_generation, false)
+    }
+
+    pub(in crate::backend::renderer::vulkan) fn adopt_prepared_cold(
+        &mut self,
+        device: &DeviceState,
+        prepared: &mut PreparedSourceImport,
+        expected_source: &Dmabuf,
+        expected_generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.adopt_prepared_with_custody(device, prepared, expected_source, expected_generation, true)
+    }
+
+    fn adopt_prepared_with_custody(
+        &mut self,
+        device: &DeviceState,
+        prepared: &mut PreparedSourceImport,
+        expected_source: &Dmabuf,
+        expected_generation: u64,
+        cold_owner: bool,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
         if prepared.consumed
             || prepared.generation != expected_generation
             || prepared.source.weak() != expected_source.weak()
@@ -165,13 +186,21 @@ impl DmabufState {
                     "import membership exhausted",
                 ))
         })?;
-        let previous = match prepared
-            .custody
-            .try_replace_reserved(&self.context, prepared.image.clone())
-        {
-            Ok(previous) => previous,
-            Err(()) => return Ok(PreparedResourceAdoption::Busy),
+        let replacement = if cold_owner {
+            prepared
+                .custody
+                .replace_reserved_cold(&self.context, prepared.image.clone())
+                .map_err(|_| VulkanRendererError::InvalidDmabuf("reserved cold import custody unavailable"))
+        } else {
+            match prepared
+                .custody
+                .try_replace_reserved(&self.context, prepared.image.clone())
+            {
+                Ok(previous) => Ok(previous),
+                Err(()) => return Ok(PreparedResourceAdoption::Busy),
+            }
         };
+        let previous = replacement?;
         let mut cached = prepared.cached.take().expect("unconsumed prepared metadata");
         cached.pins = pins;
         prepared.retired_cache = self.cache.shift_remove(&key);

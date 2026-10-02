@@ -43,6 +43,7 @@ impl VulkanImageOrigin {
 /// the image was allocated or whether a FOREIGN transfer is legal.
 pub(crate) struct VulkanImage {
     resource_id: u64,
+    incarnation: std::num::NonZeroU64,
     image: vk::Image,
     retirement: Option<Box<RetirementNode<super::device_handle::DeviceRetirement>>>,
     sampled_view: vk::ImageView,
@@ -97,7 +98,7 @@ impl VulkanImage {
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
-    ) -> Self {
+    ) -> Result<Self, super::VulkanRendererError> {
         Self::new(
             resource_id,
             image,
@@ -135,7 +136,7 @@ impl VulkanImage {
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
-    ) -> Self {
+    ) -> Result<Self, super::VulkanRendererError> {
         Self::new(
             resource_id,
             image,
@@ -174,19 +175,28 @@ impl VulkanImage {
         origin: VulkanImageOrigin,
         initial_layout: vk::ImageLayout,
         device: Arc<DeviceHandle>,
-    ) -> Self {
-        Self {
-            resource_id,
+    ) -> Result<Self, super::VulkanRendererError> {
+        let retirement = RetirementNode::new(super::device_handle::DeviceRetirement::Image(RetiredImage {
             image,
-            retirement: Some(RetirementNode::new(
-                super::device_handle::DeviceRetirement::Image(RetiredImage {
-                    image,
-                    sampled_view,
-                    render_view,
-                    memories,
-                    _allocations: allocations,
-                }),
-            )),
+            sampled_view,
+            render_view,
+            memories,
+            _allocations: allocations,
+        }));
+        let incarnation = match device.reserve_image_incarnation() {
+            Ok(incarnation) => incarnation,
+            Err(error) => {
+                // The native image already exists. Exhaustion returns its exact
+                // owner to the same cold actor before rejecting construction.
+                device.retire_resource(retirement);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            resource_id,
+            incarnation,
+            image,
+            retirement: Some(retirement),
             sampled_view,
             render_view,
             size,
@@ -200,7 +210,11 @@ impl VulkanImage {
             layout: AtomicI32::new(initial_layout.as_raw()),
             owned_by_foreign: AtomicBool::new(origin.uses_foreign_queue()),
             device,
-        }
+        })
+    }
+
+    pub(crate) fn incarnation(&self) -> std::num::NonZeroU64 {
+        self.incarnation
     }
 
     pub(crate) fn id(&self) -> u64 {

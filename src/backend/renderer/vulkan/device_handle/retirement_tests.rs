@@ -22,6 +22,7 @@ use std::{
 
 #[derive(Debug, PartialEq, Eq)]
 pub(in super::super) enum Operation {
+    DescriptorWrite(u64),
     Buffer(u64),
     Unmap(u64),
     Fence(u64),
@@ -37,6 +38,31 @@ pub(in super::super) enum Operation {
     Memory(u64),
     Device,
     Parent,
+}
+
+// CPU native-dispatch fixtures: descriptors have no driver allocation here.
+unsafe extern "system" fn update_descriptor_sets(
+    device: vk::Device,
+    count: u32,
+    writes: *const vk::WriteDescriptorSet<'_>,
+    _: u32,
+    _: *const vk::CopyDescriptorSet<'_>,
+) {
+    for write in unsafe { std::slice::from_raw_parts(writes, count as usize) } {
+        record(device, Operation::DescriptorWrite(write.dst_set.as_raw()));
+    }
+}
+unsafe extern "system" fn destroy_descriptor_set_layout(
+    _: vk::Device,
+    _: vk::DescriptorSetLayout,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
+}
+unsafe extern "system" fn destroy_sampler(
+    _: vk::Device,
+    _: vk::Sampler,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
 }
 
 unsafe extern "system" fn destroy_buffer(
@@ -319,6 +345,9 @@ pub(in super::super) fn device_with_wait_result(
     let raw = unsafe {
         ash::Device::load_with(
             |name| match name.to_bytes() {
+                b"vkUpdateDescriptorSets" => update_descriptor_sets as *const c_void,
+                b"vkDestroyDescriptorSetLayout" => destroy_descriptor_set_layout as *const c_void,
+                b"vkDestroySampler" => destroy_sampler as *const c_void,
                 b"vkDestroyImageView" => destroy_view as *const c_void,
                 b"vkDestroyImage" => destroy_image as *const c_void,
                 b"vkDestroyBuffer" => destroy_buffer as *const c_void,
@@ -353,26 +382,29 @@ pub(in super::super) fn image(device: Arc<DeviceHandle>, id: u64) -> Arc<VulkanI
     let allocation = device
         .allocation_ledger()
         .record(VulkanAllocationReason::RenderTarget, 4096);
-    Arc::new(VulkanImage::new_renderer_local(
-        id,
-        vk::Image::from_raw(id),
-        vk::DeviceMemory::from_raw(id + 1),
-        allocation,
-        vk::ImageView::from_raw(id + 2),
-        vk::ImageView::from_raw(id + 3),
-        (1, 1).into(),
-        Format {
-            code: Fourcc::Argb8888,
-            modifier: Modifier::Linear,
-        },
-        vk::Format::B8G8R8A8_UNORM,
-        vk::FormatFeatureFlags::SAMPLED_IMAGE,
-        ColorEncoding::LinearPremultiplied,
-        vk::ImageUsageFlags::SAMPLED,
-        false,
-        vk::ImageLayout::UNDEFINED,
-        device,
-    ))
+    Arc::new(
+        VulkanImage::new_renderer_local(
+            id,
+            vk::Image::from_raw(id),
+            vk::DeviceMemory::from_raw(id + 1),
+            allocation,
+            vk::ImageView::from_raw(id + 2),
+            vk::ImageView::from_raw(id + 3),
+            (1, 1).into(),
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: Modifier::Linear,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+            vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            ColorEncoding::LinearPremultiplied,
+            vk::ImageUsageFlags::SAMPLED,
+            false,
+            vk::ImageLayout::UNDEFINED,
+            device,
+        )
+        .expect("cold image incarnation"),
+    )
 }
 
 pub(in super::super) fn drain_until_parent(events: &Receiver<Event>) {
@@ -391,7 +423,6 @@ pub(in super::super) fn next(events: &Receiver<Event>) -> Event {
 fn final_image_drop_wakes_idle_device_and_frees_on_executor() {
     let (device, events) = device();
     let ledger = device.allocation_ledger().clone();
-    let retired_views = device.retired_view_subscription();
     let image = image(device.clone(), 10);
     let weak = Arc::downgrade(&image);
     let dropping_thread = thread::spawn(move || {
@@ -410,14 +441,6 @@ fn final_image_drop_wakes_idle_device_and_frees_on_executor() {
     }
     // The executor woke and freed memory while the owner remained idle/live.
     assert!(events.try_recv().is_err());
-    let mut views = Vec::new();
-    retired_views.drain(|node| {
-        if let super::DeviceRetirement::ViewNotification(view) = node.value() {
-            views.push(*view);
-        }
-        device.retire_resource(node);
-    });
-    assert_eq!(views, [vk::ImageView::from_raw(12)]);
     drop(device);
     assert_eq!(next(&events), (Operation::Device, executor));
     assert_eq!(next(&events), (Operation::Parent, executor));
@@ -462,28 +485,6 @@ fn submitted_image_custody_precedes_retirement_and_parent_teardown() {
         assert_eq!(actual, operation);
         assert_ne!(thread, completed_thread);
         assert_eq!(*executor.get_or_insert(thread), thread);
-    }
-}
-
-#[test]
-fn poisoned_view_notifications_cannot_make_final_drop_panic() {
-    let (device, events) = device();
-    let image = image(device.clone(), 30);
-    let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        device.retired_texture_views.poison_registry();
-    }));
-    assert!(poison.is_err());
-    drop(image);
-    drop(device);
-    for expected in [
-        Operation::View(32),
-        Operation::View(33),
-        Operation::Image(30),
-        Operation::Memory(31),
-        Operation::Device,
-        Operation::Parent,
-    ] {
-        assert_eq!(next(&events).0, expected);
     }
 }
 

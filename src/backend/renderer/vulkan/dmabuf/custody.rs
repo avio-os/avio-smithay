@@ -47,6 +47,19 @@ impl<T> ImportCustody<T> {
         Ok(slot.replace(resource))
     }
 
+    /// The unique cold renderer owner may wait for the creating buffer's
+    /// registry. Failure still preserves the prepared and previous images;
+    /// it never invents a readiness edge for a poisoned or unreserved slot.
+    pub(super) fn replace_reserved_cold(
+        &self,
+        context: &ErasedContextId,
+        resource: Arc<T>,
+    ) -> Result<Option<Arc<T>>, ()> {
+        let mut resources = self.resources.lock().map_err(|_| ())?;
+        let slot = resources.get_mut(context).ok_or(())?;
+        Ok(slot.replace(resource))
+    }
+
     pub(super) fn remove(&self, context: &ErasedContextId, expected: &Weak<T>) {
         let removed = {
             let mut resources = self.resources.lock().unwrap();
@@ -149,6 +162,52 @@ mod tests {
             current.get(&context).unwrap().as_ref().unwrap(),
             &original
         ));
+    }
+
+    #[test]
+    fn cold_adoption_waits_for_the_exact_reserved_registry_without_losing_readers() {
+        let registry = Arc::new(ImportCustody::default());
+        let context = context();
+        let original = Arc::new(7u8);
+        registry.insert(context.clone(), original.clone());
+        let held = registry.resources.lock().unwrap();
+        let (started, received_start) = std::sync::mpsc::sync_channel(1);
+        let (finished, received_finish) = std::sync::mpsc::sync_channel(1);
+        let cold_registry = registry.clone();
+        let cold_context = context.clone();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let previous = cold_registry
+                .replace_reserved_cold(&cold_context, Arc::new(9u8))
+                .unwrap();
+            finished.send(()).unwrap();
+            previous
+        });
+        received_start.recv().unwrap();
+        assert!(matches!(
+            received_finish.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(Arc::strong_count(&original), 2);
+        drop(held);
+        let previous = worker.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&previous, &original));
+        received_finish.recv().unwrap();
+        assert_eq!(Arc::strong_count(&original), 2);
+        let current = registry.resources.lock().unwrap();
+        assert_eq!(**current.get(&context).unwrap().as_ref().unwrap(), 9);
+    }
+
+    #[test]
+    fn cold_adoption_rejects_an_unreserved_slot_without_inserting_it() {
+        let registry = ImportCustody::<u8>::default();
+        let context = context();
+        let prepared = Arc::new(7u8);
+        assert!(registry
+            .replace_reserved_cold(&context, prepared.clone())
+            .is_err());
+        assert!(registry.resources.lock().unwrap().is_empty());
+        assert_eq!(Arc::strong_count(&prepared), 1);
     }
 
     #[test]

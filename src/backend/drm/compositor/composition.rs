@@ -213,6 +213,7 @@ pub struct PreparedCompositionBuffers<B: Buffer> {
     pub(super) crtc: crtc::Handle,
     pub(super) slots: Vec<Slot<B>>,
     output_layer: bool,
+    displaced: crate::backend::allocator::RetiredSwapchainControls<B>,
 }
 
 impl<B: Buffer> PreparedCompositionBuffers<B> {
@@ -319,6 +320,7 @@ where
             crtc: self.crtc,
             slots,
             output_layer: self.output_layer,
+            displaced: Default::default(),
         })
     }
 }
@@ -374,38 +376,37 @@ where
     /// A mode/format change rejects stale preparation atomically.
     pub fn adopt_composition_buffers(
         &mut self,
-        buffers: PreparedCompositionBuffers<A::Buffer>,
+        mut buffers: PreparedCompositionBuffers<A::Buffer>,
     ) -> Result<(), PreparedCompositionBuffers<A::Buffer>> {
-        if buffers.device_fd != *self.surface.device_fd() || buffers.crtc != self.surface.crtc() {
-            return Err(buffers);
+        if self.adopt_composition_buffers_retained(&mut buffers) {
+            Ok(())
+        } else {
+            Err(buffers)
         }
-        let PreparedCompositionBuffers {
-            device_fd,
-            crtc,
-            slots,
-            output_layer,
-        } = buffers;
-        let swapchain = if output_layer {
+    }
+
+    /// Swap exact prepared slots without freeing their vectors, displaced
+    /// empty controls or DRM-file roots. The caller returns this entire packet
+    /// to its cold owner after acceptance or rejection. Imports/exports must
+    /// already have completed on that owner before calling this method.
+    pub fn adopt_composition_buffers_retained(
+        &mut self,
+        buffers: &mut PreparedCompositionBuffers<A::Buffer>,
+    ) -> bool {
+        if buffers.device_fd != *self.surface.device_fd() || buffers.crtc != self.surface.crtc() {
+            return false;
+        }
+        let swapchain = if buffers.output_layer {
             let Some(layer) = self.output_layer_swapchain.as_mut() else {
-                return Err(PreparedCompositionBuffers {
-                    device_fd,
-                    crtc,
-                    slots,
-                    output_layer,
-                });
+                return false;
             };
             layer
         } else {
             &mut self.swapchain
         };
         swapchain
-            .adopt(slots)
-            .map_err(|rejected| PreparedCompositionBuffers {
-                device_fd,
-                crtc,
-                slots: rejected.slots,
-                output_layer,
-            })
+            .adopt_retained(&mut buffers.slots, &mut buffers.displaced)
+            .is_ok()
     }
 
     /// Retire unused composition targets at an owner-observed completion edge.

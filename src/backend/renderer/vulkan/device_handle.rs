@@ -20,8 +20,6 @@ use ash::vk;
 pub(super) enum DeviceRetirement {
     Fence(vk::Fence),
     Image(RetiredImage),
-    /// A context returns the exact actor-allocated notification node here.
-    ViewNotification(vk::ImageView),
     #[cfg(test)]
     Drain(std::sync::mpsc::SyncSender<()>),
     OpaqueCustody(Box<dyn std::any::Any + Send + Sync>),
@@ -63,13 +61,6 @@ pub(crate) struct DeviceHandle {
     /// total. Written only by submission reclaim; read by the descriptor
     /// cache to prove a cached set is no longer referenced by pending work.
     completed_submission_watermark: std::sync::atomic::AtomicU64,
-    /// Image views destroyed since the descriptor cache last drained. A
-    /// dead view's descriptor set must leave the cache promptly — leaving
-    /// it to capacity-triggered eviction let ordinary client-buffer churn
-    /// fill the cache in under a minute and then refuse under load, and a
-    /// driver reusing the raw handle value could even alias a stale set
-    /// onto a new texture.
-    retired_texture_views: Arc<super::retired_views::RetirementSubscribers<DeviceRetirement>>,
 }
 
 #[cfg(test)]
@@ -107,11 +98,9 @@ impl DeviceHandle {
         queue_priority: QueuePriorityGrant,
     ) -> std::io::Result<Self> {
         let lost = Arc::new(AtomicBool::new(false));
-        let retired_texture_views = Arc::new(super::retired_views::RetirementSubscribers::default());
         let destroy_device = device.clone();
         let destroy_lost = lost.clone();
         let destroy_instance_lost = instance_lost.clone();
-        let retired_views = retired_texture_views.clone();
         let finish_device = device.clone();
         let finish_lost = lost.clone();
         let finish_instance_lost = instance_lost.clone();
@@ -162,7 +151,6 @@ impl DeviceHandle {
                 let valid =
                     !destroy_lost.load(Ordering::Acquire) && !destroy_instance_lost.load(Ordering::Acquire);
                 match resource {
-                    DeviceRetirement::ViewNotification(_) => {}
                     DeviceRetirement::ExternalWaitOwner(_) => unreachable!("wait owner node recycled above"),
                     DeviceRetirement::Fence(fence) => {
                         if valid {
@@ -210,7 +198,6 @@ impl DeviceHandle {
                         }
                     }
                     DeviceRetirement::Image(image) => {
-                        retired_views.retired(|| DeviceRetirement::ViewNotification(image.sampled_view));
                         if valid {
                             image.destroy(&destroy_device);
                         }
@@ -260,8 +247,23 @@ impl DeviceHandle {
             instance_lost,
             pending_submissions: std::sync::atomic::AtomicUsize::new(0),
             completed_submission_watermark: std::sync::atomic::AtomicU64::new(0),
-            retired_texture_views,
         })
+    }
+
+    /// Cold, exact image incarnation from the existing shared image namespace.
+    /// No raw native handle, context-local resource id or zero can alias it.
+    pub(super) fn reserve_image_incarnation(
+        &self,
+    ) -> Result<std::num::NonZeroU64, super::VulkanRendererError> {
+        self.offscreen_ids
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1).filter(|next| *next < (1u64 << 62))
+            })
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or(super::VulkanRendererError::TemporaryFailure(
+                "image incarnation namespace exhausted",
+            ))
     }
 
     pub(super) fn offscreen_ids(&self) -> Arc<std::sync::atomic::AtomicU64> {
@@ -343,15 +345,6 @@ impl DeviceHandle {
         self.pending_submissions.load(Ordering::Acquire) != 0
     }
 
-    /// Record one destroyed (or about-to-be-destroyed) sampled image view so
-    /// the descriptor cache can retire its set on the next drain. Views that
-    /// never had a cached set drain as no-ops.
-    #[cfg(test)]
-    pub(super) fn note_view_retired(&self, view: vk::ImageView) {
-        self.retired_texture_views
-            .retired(|| DeviceRetirement::ViewNotification(view));
-    }
-
     /// Cold test-only completion edge for all previously published native
     /// resource nodes. Never polls a driver or relies on a timing delay.
     #[cfg(test)]
@@ -359,12 +352,6 @@ impl DeviceHandle {
         let (completed, received) = std::sync::mpsc::sync_channel(1);
         self.retire_resource(RetirementNode::new(DeviceRetirement::Drain(completed)));
         received.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    }
-
-    pub(super) fn retired_view_subscription(
-        &self,
-    ) -> super::retired_views::RetirementSubscription<DeviceRetirement> {
-        self.retired_texture_views.subscribe()
     }
 
     pub(super) fn note_submission_completed(&self, id: SubmissionId) {

@@ -182,7 +182,6 @@ mod kawase_calibration;
 mod offscreen;
 mod pipeline;
 mod readback;
-mod retired_views;
 mod retirement_slot;
 pub use retirement_slot::VulkanRetirementSlot;
 mod retirement;
@@ -243,9 +242,9 @@ pub struct VulkanCacheStats {
     pub misses: u64,
     /// Number of entries evicted from the cache.
     pub evictions: u64,
-    /// Number of entries retired because their texture's image view was
-    /// destroyed (the death-edge reclaim; these free capacity without any
-    /// quiescence requirement beyond their own last use).
+    /// Descriptor keys retired when a recycled native view handle is observed
+    /// with a different exact image incarnation. Reuse still waits for each
+    /// set's last native submission and current recording reader.
     pub dead_view_reclaims: u64,
 }
 
@@ -547,6 +546,20 @@ impl VulkanRenderer {
     ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
         self.dmabuf
             .adopt_prepared(&self.device, prepared, source, generation)
+    }
+
+    /// Install an exact prepared import on the unique cold renderer owner.
+    /// This may wait for the buffer's custody registry and must not run on a
+    /// realtime worker. Cache admission and all identity checks match the warm
+    /// adoption path; displaced readers remain in the prepared return packet.
+    pub fn adopt_prepared_source_cold(
+        &mut self,
+        prepared: &mut PreparedSourceImport,
+        source: &Dmabuf,
+        generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.dmabuf
+            .adopt_prepared_cold(&self.device, prepared, source, generation)
     }
 
     fn from_device_state(device: DeviceState) -> Result<Self, VulkanRendererError> {

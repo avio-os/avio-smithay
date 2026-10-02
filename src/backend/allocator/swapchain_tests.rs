@@ -118,6 +118,77 @@ fn adoption_preserves_off_thread_userdata_without_an_allocator_call() {
 }
 
 #[test]
+fn retained_adoption_keeps_vector_and_vacant_controls_until_cold_disposal() {
+    let mut chain = chain();
+    let old_controls = chain.slots.each_ref().map(Arc::downgrade);
+    let mut slots = (0..3)
+        .map(|_| {
+            Slot::new(
+                chain
+                    .allocator
+                    .create_buffer(640, 480, Fourcc::Argb8888, &[Modifier::Linear])
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    slots[0].userdata().insert_if_missing_threadsafe(|| 37u64);
+    let pointer = slots.as_ptr();
+    let capacity = slots.capacity();
+    let mut displaced = RetiredSwapchainControls::default();
+    let (result, heap) = crate::backend::renderer::storage_heap_probe::measure(|| {
+        chain.adopt_retained(&mut slots, &mut displaced)
+    });
+    assert_eq!(heap, [0; 4]);
+    result.unwrap();
+    assert!(slots.is_empty());
+    assert_eq!(slots.as_ptr(), pointer);
+    assert_eq!(slots.capacity(), capacity);
+    assert!(old_controls.iter().all(|old| old.upgrade().is_some()));
+    assert_eq!(
+        chain.acquire_existing().unwrap().userdata().get::<u64>(),
+        Some(&37)
+    );
+    drop(displaced);
+    assert!(old_controls[..3].iter().all(|old| old.upgrade().is_none()));
+    assert!(old_controls[3].upgrade().is_some());
+}
+
+#[test]
+fn retained_adoption_rejection_keeps_the_exact_packet_and_earlier_batch() {
+    let mut primary = chain();
+    let mut layer = chain();
+    let mut prepared = vec![Slot::new(
+        primary
+            .allocator
+            .create_buffer(640, 480, Fourcc::Argb8888, &[Modifier::Linear])
+            .unwrap(),
+    )];
+    let mut wrong = vec![Slot::new(
+        layer
+            .allocator
+            .create_buffer(639, 480, Fourcc::Argb8888, &[Modifier::Linear])
+            .unwrap(),
+    )];
+    let mut displaced = RetiredSwapchainControls::default();
+    let mut rejected_controls = RetiredSwapchainControls::default();
+    let wrong_owner = Arc::as_ptr(&wrong[0].0);
+    let (results, heap) = crate::backend::renderer::storage_heap_probe::measure(|| {
+        (
+            primary.adopt_retained(&mut prepared, &mut displaced),
+            layer.adopt_retained(&mut wrong, &mut rejected_controls),
+        )
+    });
+    assert_eq!(heap, [0; 4]);
+    assert_eq!(results, (Ok(()), Err(AdoptionFailure::WrongSize)));
+    assert_eq!(primary.allocated_slots(), 1);
+    assert_eq!(layer.allocated_slots(), 0);
+    assert_eq!(wrong.len(), 1);
+    assert_eq!(Arc::as_ptr(&wrong[0].0), wrong_owner);
+    assert!(rejected_controls.slots.iter().all(Option::is_none));
+    assert!(displaced.slots[0].is_some());
+}
+
+#[test]
 fn retirement_keeps_submitted_owners_and_frees_only_unused_slots() {
     let mut chain = chain();
     let submitted = chain.acquire().unwrap().unwrap();

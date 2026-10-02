@@ -847,7 +847,12 @@ mod tests {
             );
         let view = unsafe { vk_device.create_image_view(&view_info, None) }?;
 
+        let incarnation = device
+            .shared_device()
+            .reserve_image_incarnation()
+            .map_err(|_| vk::Result::ERROR_TOO_MANY_OBJECTS)?;
         Ok(TestImage {
+            incarnation,
             device: device.shared_device(),
             image,
             memory,
@@ -984,7 +989,7 @@ mod tests {
         )
         .expect("framebuffer");
         let descriptor_set = descriptors
-            .texture_descriptor_set(texture.view, TextureSampler::LINEAR)
+            .texture_descriptor_set(texture.view, texture.incarnation, TextureSampler::LINEAR)
             .expect("descriptor set");
         let command_buffer = device.acquire_command_buffer().expect("command buffer");
         let vk_device = device.device_handle();
@@ -1507,6 +1512,7 @@ mod tests {
         image: vk::Image,
         memory: vk::DeviceMemory,
         view: vk::ImageView,
+        incarnation: std::num::NonZeroU64,
     }
 
     impl Drop for TestImage {
@@ -1657,7 +1663,11 @@ mod tests {
             Err(_) => return,
         };
 
-        let descriptor_set = match descriptors.texture_descriptor_set(texture.view, TextureSampler::LINEAR) {
+        let descriptor_set = match descriptors.texture_descriptor_set(
+            texture.view,
+            texture.incarnation,
+            TextureSampler::LINEAR,
+        ) {
             Ok(set) => set,
             Err(_) => return,
         };
@@ -2055,7 +2065,12 @@ mod tests {
             }
         };
 
+        let incarnation = device
+            .shared_device()
+            .reserve_image_incarnation()
+            .map_err(|_| vk::Result::ERROR_TOO_MANY_OBJECTS)?;
         Ok(TestImage {
+            incarnation,
             device: device.shared_device(),
             image,
             memory,

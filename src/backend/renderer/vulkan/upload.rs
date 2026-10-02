@@ -1245,7 +1245,7 @@ fn create_upload_image(
         y_inverted,
         vk::ImageLayout::UNDEFINED,
         device.shared_device(),
-    )))
+    )?))
 }
 
 fn pick_image_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<u32> {

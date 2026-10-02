@@ -353,6 +353,6 @@ impl DmabufState {
             descriptor.signature.y_inverted,
             vk::ImageLayout::UNDEFINED,
             device_handle,
-        )))
+        )?))
     }
 }
