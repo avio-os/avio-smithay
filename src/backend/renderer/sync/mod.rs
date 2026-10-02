@@ -3,6 +3,9 @@ use std::{error::Error, fmt, os::unix::io::OwnedFd, sync::Arc};
 
 use downcast_rs::{impl_downcast, Downcast};
 
+mod merge;
+pub use merge::merge_sync_files;
+
 #[cfg(feature = "backend_egl")]
 mod egl;
 
