@@ -86,6 +86,7 @@ impl VulkanFrame<'_> {
         damage: &[Rectangle<i32, Physical>],
         mut replay: impl FnMut(&mut Self) -> Result<(), VulkanRendererError>,
     ) -> Result<(), VulkanRendererError> {
+        self.recording()?.admit_framebuffer()?;
         if self.owner_sample_replay.is_some() || self.outer_rounded_clip.is_some() || self.draw_alpha != 1.0 {
             return Err(VulkanRendererError::TemporaryFailure(
                 "owner groups require an independent neutral-alpha replay epoch",

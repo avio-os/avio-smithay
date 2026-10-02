@@ -12,7 +12,7 @@ pub(super) struct ImportCustody<T> {
     // Contexts can share a device while importing distinct images. The
     // existing cold context token also prevents identity reuse while this
     // source still owns an import, without retaining a renderer or client.
-    resources: Mutex<HashMap<ErasedContextId, Arc<T>>>,
+    resources: Mutex<HashMap<ErasedContextId, Option<Arc<T>>>>,
 }
 
 impl<T> Default for ImportCustody<T> {
@@ -25,9 +25,26 @@ impl<T> Default for ImportCustody<T> {
 
 impl<T> ImportCustody<T> {
     pub(super) fn insert(&self, context: ErasedContextId, resource: Arc<T>) {
-        let previous = self.resources.lock().unwrap().insert(context, resource);
+        let previous = self.resources.lock().unwrap().insert(context, Some(resource));
         // Driver destruction must happen after releasing the custody lock.
         drop(previous);
+    }
+
+    /// Cold preparation reserves the context slot without replacing its image.
+    pub(super) fn reserve(&self, context: ErasedContextId) {
+        self.resources.lock().unwrap().entry(context).or_insert(None);
+    }
+
+    /// The warm owner changes only a previously reserved slot. A busy registry
+    /// defers adoption; old readers remain valid and no allocation is permitted.
+    pub(super) fn try_replace_reserved(
+        &self,
+        context: &ErasedContextId,
+        resource: Arc<T>,
+    ) -> Result<Option<Arc<T>>, ()> {
+        let mut resources = self.resources.try_lock().map_err(|_| ())?;
+        let slot = resources.get_mut(context).ok_or(())?;
+        Ok(slot.replace(resource))
     }
 
     pub(super) fn remove(&self, context: &ErasedContextId, expected: &Weak<T>) {
@@ -35,6 +52,7 @@ impl<T> ImportCustody<T> {
             let mut resources = self.resources.lock().unwrap();
             if resources
                 .get(context)
+                .and_then(Option::as_ref)
                 .is_some_and(|resource| Weak::ptr_eq(&Arc::downgrade(resource), expected))
             {
                 resources.remove(context)
@@ -90,6 +108,47 @@ mod tests {
         assert_eq!(weak.strong_count(), 1);
         drop(reader);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn preparation_reserves_without_replacing_the_current_image() {
+        let registry = ImportCustody::default();
+        let context = context();
+        let original = Arc::new(7u8);
+        registry.insert(context.clone(), original.clone());
+        registry.reserve(context.clone());
+        assert_eq!(Arc::strong_count(&original), 2);
+        let previous = registry
+            .try_replace_reserved(&context, Arc::new(9u8))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &previous));
+        assert_eq!(
+            Arc::strong_count(&original),
+            2,
+            "old reader and returned cold owner remain"
+        );
+    }
+
+    #[test]
+    fn warm_adoption_refuses_unreserved_context_and_busy_registry() {
+        let registry = ImportCustody::<u8>::default();
+        let context = context();
+        let original = Arc::new(7u8);
+        assert!(registry.try_replace_reserved(&context, original.clone()).is_err());
+        registry.reserve(context.clone());
+        let held = registry.resources.lock().unwrap();
+        assert!(registry.try_replace_reserved(&context, original.clone()).is_err());
+        drop(held);
+        assert!(registry
+            .try_replace_reserved(&context, original.clone())
+            .unwrap()
+            .is_none());
+        let current = registry.resources.lock().unwrap();
+        assert!(Arc::ptr_eq(
+            current.get(&context).unwrap().as_ref().unwrap(),
+            &original
+        ));
     }
 
     #[test]

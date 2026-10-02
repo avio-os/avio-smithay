@@ -101,7 +101,6 @@ use std::{
 use std::{os::fd::OwnedFd, sync::Arc};
 
 use indexmap::IndexMap;
-use smallvec::{smallvec, SmallVec};
 use tracing::{info_span, instrument, trace};
 
 use crate::{
@@ -114,7 +113,8 @@ use crate::{
 use super::{element::UnderlyingStorage, utils::Buffer as WaylandBuffer};
 use super::{
     element::{
-        Element, FramebufferCapturePolicy, Id, Kind, RenderElement, RenderElementState, RenderElementStates,
+        Element, ElementSource, FrameWorkspaceError, FramebufferCapturePolicy, Id, Kind, RenderElement,
+        RenderElementState, RenderElementStates, StateMapBank,
     },
     sync::SyncPoint,
     utils::CommitCounter,
@@ -124,10 +124,40 @@ use super::{
 use super::{Renderer, Texture};
 
 mod shaper;
+pub(crate) mod workspace;
+
+#[cfg(test)]
+mod storage_tests;
 
 use shaper::DamageShaper;
 
 const MAX_AGE: usize = 4;
+
+/// Cold-declared damage workspace policy. Exact mode retains ordinary partial
+/// repaint; conservative mode bounds repair storage without losing contributors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DamageStoragePolicy {
+    /// Preserve the existing occlusion and partial-damage optimizations.
+    #[default]
+    Exact,
+    /// Detect unchanged scenes normally, but repair changed/old targets fully.
+    /// Every intersecting contributor draws; reported visibility remains the
+    /// exact visible union area rather than claiming occluded pixels visible.
+    ConservativeFullOutput,
+}
+
+/// Current retained damage inventory for checked cold storage admission.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetainedDamageStorage {
+    /// Instances from the last successfully rendered scene, including duplicates.
+    pub elements: usize,
+    /// Last target's declared opaque rectangle inventory.
+    pub opaque_rectangles: usize,
+    /// Rectangle seeds considered by the supported target-age restoration.
+    pub history_rectangles: usize,
+    /// Maximum older history entries considered during restoration.
+    pub history_entries: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ElementInstanceState {
@@ -165,13 +195,28 @@ impl ElementInstanceState {
 #[derive(Debug, Clone)]
 struct ElementState {
     last_commit: CommitCounter,
-    last_instances: SmallVec<[ElementInstanceState; 1]>,
+    first_instance: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ElementInstanceRecord {
+    state: ElementInstanceState,
+    next: Option<usize>,
 }
 
 impl ElementState {
+    fn instances<'a>(
+        &self,
+        records: &'a [ElementInstanceRecord],
+    ) -> impl Iterator<Item = &'a ElementInstanceState> {
+        std::iter::successors(Some(self.first_instance), |index| records[*index].next)
+            .map(|index| &records[index].state)
+    }
+
     #[inline]
     fn instance_matches(
         &self,
+        records: &[ElementInstanceRecord],
         src: Rectangle<f64, BufferCoords>,
         geometry: Rectangle<i32, Physical>,
         transform: Transform,
@@ -180,7 +225,7 @@ impl ElementState {
         is_framebuffer_effect: bool,
         effect_regions: Option<super::element::FramebufferEffectRegions>,
     ) -> bool {
-        self.last_instances.iter().any(|instance| {
+        self.instances(records).any(|instance| {
             instance.matches(
                 src,
                 geometry,
@@ -199,6 +244,7 @@ struct RendererState {
     transform: Option<Transform>,
     size: Option<Size<i32, Physical>>,
     elements: IndexMap<Id, ElementState>,
+    instances: Vec<ElementInstanceRecord>,
     old_damage: VecDeque<Vec<Rectangle<i32, Physical>>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
     clear_color: Option<Color32F>,
@@ -219,6 +265,13 @@ pub struct OutputDamageTracker {
     element_opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_visible_area_workhouse: Vec<Rectangle<i32, Physical>>,
     visibility_opaque_regions: Vec<Rectangle<i32, Physical>>,
+    render_indices: Vec<usize>,
+    capture_support_damage: Vec<Rectangle<i32, Physical>>,
+    history_spares: Vec<Vec<Rectangle<i32, Physical>>>,
+    new_damage: Vec<Rectangle<i32, Physical>>,
+    state_bank: Option<StateMapBank>,
+    storage_capacity: Option<(usize, usize)>,
+    storage_policy: DamageStoragePolicy,
     span: tracing::Span,
 }
 
@@ -238,6 +291,13 @@ pub trait MaybeDeviceLost {
     fn is_device_lost(&self) -> bool {
         false
     }
+
+    /// Native work may have been submitted without an observable retirement
+    /// edge. Its context must stop admission and retain the exact resources;
+    /// this does not itself prove that the logical device was lost.
+    fn is_completion_unobservable(&self) -> bool {
+        false
+    }
 }
 
 /// Errors thrown by [`OutputDamageTracker::render_output`]
@@ -246,6 +306,17 @@ pub enum Error<E: std::error::Error> {
     /// The provided [`Renderer`] returned an error
     #[error(transparent)]
     Rendering(E),
+    /// Earlier segments submitted native reads, but this outer frame failed
+    /// before producing an edge covering all of its sampled sources.
+    #[error("partial-frame completion is unobservable: {0}")]
+    PartialFrameCompletionUnobservable(E),
+    /// CPU workspace refusal after an earlier segment submitted native reads.
+    /// Capacity is retained as the cause, but cannot authorize source release.
+    #[error("partial-frame completion is unobservable: {0}")]
+    PartialFrameWorkspaceCompletionUnobservable(FrameWorkspaceError),
+    /// Cold-prepared CPU workspace or retained receipt slots are exhausted.
+    #[error(transparent)]
+    WorkspaceCapacity(#[from] FrameWorkspaceError),
     /// Rendering sampled a Wayland buffer but produced no observable completion edge.
     ///
     /// The caller must retain every sampled source until the renderer epoch is
@@ -258,14 +329,33 @@ pub enum Error<E: std::error::Error> {
     OutputNoMode(#[from] OutputNoMode),
 }
 
+impl<E: std::error::Error> Error<E> {
+    fn from_frame_rendering(error: E, previous_submission: bool) -> Self {
+        if previous_submission {
+            Self::PartialFrameCompletionUnobservable(error)
+        } else {
+            Self::Rendering(error)
+        }
+    }
+    fn from_frame_workspace(error: FrameWorkspaceError, previous_submission: bool) -> Self {
+        if previous_submission {
+            Self::PartialFrameWorkspaceCompletionUnobservable(error)
+        } else {
+            Self::WorkspaceCapacity(error)
+        }
+    }
+}
+
 impl<E: std::error::Error + MaybeDeviceLost> Error<E> {
     /// Returns `true` when this error was caused by an unrecoverable loss of
     /// the rendering device (see [`MaybeDeviceLost`]).
     pub fn is_device_lost(&self) -> bool {
         match self {
-            Error::Rendering(err) => err.is_device_lost(),
+            Error::Rendering(err) | Error::PartialFrameCompletionUnobservable(err) => err.is_device_lost(),
             Error::WaylandCompletionUnobservable => false,
-            Error::OutputNoMode(_) => false,
+            Error::OutputNoMode(_)
+            | Error::WorkspaceCapacity(_)
+            | Error::PartialFrameWorkspaceCompletionUnobservable(_) => false,
         }
     }
 
@@ -274,7 +364,21 @@ impl<E: std::error::Error + MaybeDeviceLost> Error<E> {
     pub fn is_wayland_completion_unobservable(&self) -> bool {
         matches!(self, Error::WaylandCompletionUnobservable)
     }
+
+    /// Whether any sampled resources lack an exact retirement edge.
+    pub fn is_completion_unobservable(&self) -> bool {
+        match self {
+            Self::Rendering(error) => error.is_completion_unobservable(),
+            Self::WaylandCompletionUnobservable
+            | Self::PartialFrameCompletionUnobservable(_)
+            | Self::PartialFrameWorkspaceCompletionUnobservable(_) => true,
+            Self::OutputNoMode(_) | Self::WorkspaceCapacity(_) => false,
+        }
+    }
 }
+
+#[cfg(all(test, feature = "renderer_vulkan"))]
+mod partial_frame_tests;
 
 #[cfg(test)]
 mod completion_error_tests {
@@ -290,8 +394,33 @@ mod completion_error_tests {
     fn unobservable_wayland_completion_is_typed_and_not_device_loss() {
         let error = Error::<TestRendererError>::WaylandCompletionUnobservable;
         assert!(error.is_wayland_completion_unobservable());
+        assert!(error.is_completion_unobservable());
         assert!(!error.is_device_lost());
     }
+
+    #[cfg(feature = "renderer_vulkan")]
+    #[test]
+    fn native_completion_unknown_survives_damage_wrapping_without_device_loss() {
+        use crate::backend::renderer::vulkan::VulkanRendererError;
+        let failure = Error::Rendering(VulkanRendererError::CommandCompletionUnavailable);
+        assert!(failure.is_completion_unobservable());
+        assert!(!failure.is_wayland_completion_unobservable());
+        assert!(!failure.is_device_lost());
+        let pressure = Error::Rendering(VulkanRendererError::CommandCapacityExhausted { slots: 64 });
+        assert!(!pressure.is_completion_unobservable());
+        assert!(!pressure.is_device_lost());
+    }
+}
+
+/// Damage-only failures, including cold workspace admission.
+#[derive(Debug, thiserror::Error)]
+pub enum DamageOutputError {
+    /// Output mode is unavailable.
+    #[error(transparent)]
+    OutputNoMode(#[from] OutputNoMode),
+    /// A prepared workspace or retained receipt bank is exhausted.
+    #[error(transparent)]
+    WorkspaceCapacity(#[from] FrameWorkspaceError),
 }
 
 /// Represents the result from rendering the output
@@ -407,21 +536,25 @@ fn rects_area(rects: &[Rectangle<i32, Physical>]) -> u64 {
 /// interpretation. `damage_floor` limits the trigger set to damage introduced
 /// by the current phase (new scene damage or buffer-age restoration).
 #[allow(clippy::too_many_arguments)]
-fn propagate_framebuffer_effect_damage<E: Element>(
+fn propagate_framebuffer_effect_damage<'e, S: ElementSource + ?Sized>(
     damage: &mut Vec<Rectangle<i32, Physical>>,
     opaque_regions: &mut [Rectangle<i32, Physical>],
     opaque_regions_index: &[Range<usize>],
     element_damage_index: &[usize],
-    render_elements: &[&E],
+    elements: &'e S,
+    render_indices: &[usize],
+    capture_support_damage: &mut Vec<Rectangle<i32, Physical>>,
+    rectangle_limit: Option<usize>,
     states: &mut RenderElementStates,
     output_scale: Scale<f64>,
     output_geo: Rectangle<i32, Physical>,
     damage_floor: usize,
     force_redraw: bool,
-) {
-    let mut capture_support_damage = Vec::new();
-    for (z_index, element) in render_elements
+) -> Result<(), FrameWorkspaceError> {
+    capture_support_damage.clear();
+    for (z_index, element) in render_indices
         .iter()
+        .map(|index| elements.element(*index))
         .enumerate()
         .filter(|(_, element)| element.is_framebuffer_effect())
         .rev()
@@ -460,7 +593,7 @@ fn propagate_framebuffer_effect_damage<E: Element>(
         };
         state.needs_capture = true;
         if let Some(read) = read_area {
-            capture_support_damage.push(read);
+            workspace::extend(capture_support_damage, [read], rectangle_limit)?;
 
             // An opaque element above the effect normally suppresses lower
             // drawing. The effect captures before either that upper element
@@ -474,23 +607,421 @@ fn propagate_framebuffer_effect_damage<E: Element>(
             }
         }
         if let Some(paint) = paint_area {
-            damage.push(paint);
+            workspace::extend(damage, [paint], rectangle_limit)?;
         }
     }
-    damage.extend(capture_support_damage);
+    workspace::extend(damage, capture_support_damage.iter().copied(), rectangle_limit)
 }
 
 impl<E: std::error::Error> std::fmt::Debug for Error<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Rendering(err) => std::fmt::Debug::fmt(err, f),
+            Error::Rendering(err) | Error::PartialFrameCompletionUnobservable(err) => {
+                std::fmt::Debug::fmt(err, f)
+            }
             Error::WaylandCompletionUnobservable => f.write_str("WaylandCompletionUnobservable"),
             Error::OutputNoMode(err) => std::fmt::Debug::fmt(err, f),
+            Error::WorkspaceCapacity(err) | Error::PartialFrameWorkspaceCompletionUnobservable(err) => {
+                std::fmt::Debug::fmt(err, f)
+            }
         }
     }
 }
 
 impl OutputDamageTracker {
+    /// Cold-admit CPU workspace and independent returned receipt slots.
+    /// Existing receipts keep their previous bank alive across reconfiguration.
+    pub fn prepare_frame_storage(
+        &mut self,
+        elements: usize,
+        rectangles: usize,
+        receipts: usize,
+    ) -> Result<(), FrameWorkspaceError> {
+        self.prepare_frame_storage_with_policy(elements, rectangles, receipts, DamageStoragePolicy::Exact)
+    }
+
+    /// Cold-admit explicit repair policy; policy changes invalidate target
+    /// history before the next native draw, never while a pass is recording.
+    pub fn prepare_frame_storage_with_policy(
+        &mut self,
+        elements: usize,
+        rectangles: usize,
+        receipts: usize,
+        policy: DamageStoragePolicy,
+    ) -> Result<(), FrameWorkspaceError> {
+        self.prepare_frame_storage_with_return_wakeup(elements, rectangles, receipts, policy, None)
+    }
+
+    pub(crate) fn prepare_frame_storage_with_return_wakeup(
+        &mut self,
+        elements: usize,
+        rectangles: usize,
+        receipts: usize,
+        policy: DamageStoragePolicy,
+        returned: Option<crate::backend::renderer::element::StateReceiptReturnWakeup>,
+    ) -> Result<(), FrameWorkspaceError> {
+        if rectangles == 0 || receipts == 0 {
+            return Err(FrameWorkspaceError {
+                resource: "cold frame storage",
+                required: 1,
+                capacity: 0,
+            });
+        }
+        self.state_bank = Some(StateMapBank::new_with_wakeup(elements, receipts, returned));
+        self.storage_capacity = Some((elements, rectangles));
+        if self.storage_policy != policy {
+            self.reset_history();
+        }
+        self.storage_policy = policy;
+        workspace::reserve(&mut self.render_indices, elements);
+        workspace::reserve(&mut self.opaque_regions_index, elements);
+        workspace::reserve(&mut self.element_damage_index, elements);
+        self.last_state
+            .elements
+            .reserve(elements.saturating_sub(self.last_state.elements.len()));
+        workspace::reserve(&mut self.last_state.instances, elements);
+        for vec in [
+            &mut self.damage,
+            &mut self.element_damage,
+            &mut self.opaque_regions,
+            &mut self.element_opaque_regions,
+            &mut self.element_visible_area_workhouse,
+            &mut self.visibility_opaque_regions,
+            &mut self.capture_support_damage,
+            &mut self.new_damage,
+            &mut self.last_state.opaque_regions,
+        ] {
+            workspace::reserve(vec, rectangles);
+        }
+        self.last_state
+            .old_damage
+            .reserve((MAX_AGE + 1).saturating_sub(self.last_state.old_damage.len()));
+        workspace::reserve(&mut self.history_spares, MAX_AGE + 1);
+        for vec in self
+            .last_state
+            .old_damage
+            .iter_mut()
+            .chain(self.history_spares.iter_mut())
+        {
+            workspace::reserve(vec, rectangles);
+        }
+        while self.last_state.old_damage.len() + self.history_spares.len() < MAX_AGE + 1 {
+            self.history_spares.push(Vec::with_capacity(rectangles));
+        }
+        self.damage_shaper.prepare_storage(rectangles);
+        Ok(())
+    }
+
+    pub(crate) fn storage_receipts_reclaimable(&self) -> bool {
+        self.state_bank.as_ref().is_none_or(StateMapBank::is_reclaimable)
+    }
+
+    pub(crate) fn set_mode_source_preserving_storage(&mut self, mode: OutputModeSource) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.reset_history();
+        }
+    }
+
+    /// The exact policy declared by the cold output owner.
+    pub fn storage_policy(&self) -> DamageStoragePolicy {
+        self.storage_policy
+    }
+
+    /// Exact retained inputs; no guessed maximum from SmallVec inline lengths.
+    pub fn retained_frame_storage(&self) -> RetainedDamageStorage {
+        RetainedDamageStorage {
+            elements: self.last_state.instances.len(),
+            opaque_rectangles: self.last_state.opaque_regions.len(),
+            history_rectangles: self
+                .last_state
+                .old_damage
+                .iter()
+                .take(MAX_AGE - 1)
+                .map(Vec::len)
+                .sum(),
+            history_entries: MAX_AGE - 1,
+        }
+    }
+
+    /// Exact per-rectangle CPU backing and minimum shaper tile side for cold
+    /// output admission, including reusable history and scratch vectors.
+    pub fn rectangle_storage_layout() -> (usize, i32) {
+        let (tile_bytes, side) = shaper::tile_storage_layout();
+        // Nine scratch/state vectors, five reusable history vectors and the
+        // shaper output vector. Its tile vector has the same admitted count.
+        (
+            (9 + MAX_AGE + 1 + 1) * std::mem::size_of::<Rectangle<i32, Physical>>() + tile_bytes,
+            side,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn damage_output_conservative<'e, S: ElementSource + ?Sized>(
+        &mut self,
+        age: usize,
+        elements: &'e S,
+        output_scale: Scale<f64>,
+        output_transform: Transform,
+        output_geo: Rectangle<i32, Physical>,
+        clear_color: Option<Color32F>,
+    ) -> Result<RenderElementStates, FrameWorkspaceError> {
+        let mut states = self.claim_states(elements.len())?;
+        let limit = self.storage_capacity.map(|(_, rectangles)| rectangles);
+        self.render_indices.clear();
+        self.opaque_regions.clear();
+        self.opaque_regions_index.clear();
+        self.element_damage_index.clear();
+        self.damage.clear();
+        self.new_damage.clear();
+        self.damage_summary = OutputDamageSummary {
+            buffer_age: age,
+            ..Default::default()
+        };
+        let output_changed = self.last_state.size != Some(output_geo.size)
+            || self.last_state.transform != Some(output_transform)
+            || self.last_state.clear_color != clear_color;
+        let mut scene_changed = output_changed;
+        self.damage_summary.output_state_full_damage = output_changed;
+
+        for (index, element) in elements.iter().enumerate() {
+            let geometry = element.geometry(output_scale);
+            let Some(visible_geometry) = geometry.intersection(output_geo) else {
+                states
+                    .states
+                    .entry(element.id().clone())
+                    .or_insert_with(RenderElementState::skipped);
+                continue;
+            };
+            let z_index = self.render_indices.len();
+            let previous = self.last_state.elements.get(element.id());
+            let same_instance = previous.is_some_and(|previous| {
+                previous.instance_matches(
+                    &self.last_state.instances,
+                    element.src(),
+                    geometry,
+                    element.transform(),
+                    element.alpha(),
+                    z_index,
+                    element.is_framebuffer_effect(),
+                    element.framebuffer_effect_regions(output_scale),
+                )
+            });
+            scene_changed |= !same_instance;
+            let mut element_damage_count = 0;
+            let mut element_damage_area = 0_u64;
+            element.visit_damage_since(
+                output_scale,
+                previous.map(|state| state.last_commit),
+                &mut |rect| {
+                    element_damage_count += 1;
+                    element_damage_area = element_damage_area.saturating_add(rect_area(rect));
+                },
+            );
+            scene_changed |= element_damage_count != 0;
+            self.damage_summary.element_state_change_count += usize::from(!same_instance);
+            self.damage_summary.element_damage_rect_count += element_damage_count;
+            self.damage_summary.element_damage_area = self
+                .damage_summary
+                .element_damage_area
+                .saturating_add(element_damage_area);
+
+            let area = workspace::visible_area(visible_geometry, &self.opaque_regions);
+            states
+                .states
+                .entry(element.id().clone())
+                .and_modify(|state| {
+                    if state.presentation_state == RenderElementPresentationState::Skipped {
+                        *state = RenderElementState::rendered(area);
+                    } else {
+                        state.visible_area = state.visible_area.saturating_add(area);
+                    }
+                })
+                .or_insert_with(|| RenderElementState::rendered(area));
+            // Every intersecting source participates in full repair, including
+            // a currently occluded source required by a later prefix capture.
+            self.render_indices.push(index);
+            self.opaque_regions_index.push(0..0);
+            self.element_damage_index.push(0);
+            workspace::try_visit(
+                |visit| element.visit_opaque_regions(output_scale, visit),
+                |mut rect| {
+                    rect.loc += geometry.loc;
+                    match rect.intersection(output_geo) {
+                        Some(rect) => workspace::extend(&mut self.opaque_regions, [rect], limit),
+                        None => Ok(()),
+                    }
+                },
+            )?;
+        }
+        scene_changed |= self.render_indices.len() != self.last_state.instances.len();
+        // Complete membership/order comparison covers removals even when a
+        // replacement happens to have the same count and geometry.
+        scene_changed |= self.last_state.elements.keys().any(|id| {
+            !self
+                .render_indices
+                .iter()
+                .any(|index| elements.element(*index).id() == id)
+        });
+        let age_valid = age > 0 && age <= MAX_AGE && self.last_state.old_damage.len() >= age;
+        let old_target_changed = !age_valid
+            || self
+                .last_state
+                .old_damage
+                .iter()
+                .take(age.saturating_sub(1))
+                .any(|damage| !damage.is_empty());
+        self.damage_summary.buffer_age_full_damage = !age_valid;
+        if scene_changed {
+            workspace::extend(&mut self.new_damage, [output_geo], limit)?;
+        }
+        if scene_changed || old_target_changed {
+            workspace::extend(&mut self.damage, [output_geo], limit)?;
+        }
+        self.opaque_regions.clear();
+        self.damage_summary.final_damage_rect_count = self.damage.len();
+        self.damage_summary.final_damage_area = rects_area(&self.damage);
+        if self.damage.is_empty() {
+            return Ok(states);
+        }
+        for index in &self.render_indices {
+            let element = elements.element(*index);
+            if element.is_framebuffer_effect() {
+                if let Some(state) = states.states.get_mut(element.id()) {
+                    state.needs_capture = true;
+                }
+            }
+        }
+        self.last_state.elements.clear();
+        self.last_state.instances.clear();
+        for (z_index, index) in self.render_indices.iter().enumerate() {
+            let element = elements.element(*index);
+            let instance_index = self.last_state.instances.len();
+            let next = self
+                .last_state
+                .elements
+                .get(element.id())
+                .map(|state| state.first_instance);
+            self.last_state.instances.push(ElementInstanceRecord {
+                state: ElementInstanceState {
+                    last_src: element.src(),
+                    last_geometry: element.geometry(output_scale),
+                    last_transform: element.transform(),
+                    last_alpha: element.alpha(),
+                    last_z_index: z_index,
+                    last_is_framebuffer_effect: element.is_framebuffer_effect(),
+                    last_effect_regions: element.framebuffer_effect_regions(output_scale),
+                },
+                next,
+            });
+            self.last_state.elements.insert(
+                element.id().clone(),
+                ElementState {
+                    last_commit: element.current_commit(),
+                    first_instance: instance_index,
+                },
+            );
+        }
+        self.last_state.size = Some(output_geo.size);
+        self.last_state.transform = Some(output_transform);
+        self.last_state.clear_color = clear_color;
+        self.last_state.opaque_regions.clear();
+        self.reclaim_history(MAX_AGE);
+        let mut new_damage = self.history_spares.pop().unwrap_or_default();
+        std::mem::swap(&mut self.new_damage, &mut new_damage);
+        self.last_state.old_damage.push_front(new_damage);
+        Ok(states)
+    }
+
+    fn validate_render_rectangles<'e, S: ElementSource + ?Sized>(
+        &mut self,
+        elements: &'e S,
+        scale: Scale<f64>,
+    ) -> Result<(), FrameWorkspaceError> {
+        let limit = self.storage_capacity.map(|(_, rectangles)| rectangles);
+        self.element_damage.clear();
+        workspace::extend(&mut self.element_damage, self.damage.iter().copied(), limit)?;
+        workspace::subtract(
+            &mut self.element_damage,
+            self.opaque_regions.iter().copied(),
+            limit,
+        )?;
+        for (z_index, element) in self
+            .render_indices
+            .iter()
+            .rev()
+            .map(|index| elements.element(*index))
+            .enumerate()
+        {
+            let geometry = element.geometry(scale);
+            self.element_damage.clear();
+            workspace::extend(
+                &mut self.element_damage,
+                self.damage.iter().filter_map(|d| d.intersection(geometry)),
+                limit,
+            )?;
+            let range = self
+                .opaque_regions_index
+                .iter()
+                .rev()
+                .nth(z_index)
+                .expect("visible element range");
+            workspace::subtract(
+                &mut self.element_damage,
+                self.opaque_regions[..range.start].iter().copied(),
+                limit,
+            )?;
+            self.element_opaque_regions.clear();
+            workspace::extend(
+                &mut self.element_opaque_regions,
+                self.opaque_regions[range.clone()].iter().copied(),
+                limit,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn claim_states(&mut self, required: usize) -> Result<RenderElementStates, FrameWorkspaceError> {
+        if let Some((capacity, _)) = self.storage_capacity {
+            if required > capacity {
+                return Err(FrameWorkspaceError {
+                    resource: "damage element indices",
+                    required,
+                    capacity,
+                });
+            }
+        } else {
+            workspace::reserve(&mut self.render_indices, required);
+            self.last_state
+                .elements
+                .reserve(required.saturating_sub(self.last_state.elements.len()));
+            workspace::reserve(&mut self.last_state.instances, required);
+        }
+        Ok(RenderElementStates {
+            states: match &self.state_bank {
+                Some(bank) => bank.acquire(required)?,
+                None => HashMap::with_capacity(required).into(),
+            },
+        })
+    }
+
+    fn reclaim_history(&mut self, keep: usize) {
+        while self.last_state.old_damage.len() > keep {
+            self.history_spares
+                .push(self.last_state.old_damage.pop_back().expect("damage history"));
+        }
+    }
+
+    fn reset_history(&mut self) {
+        self.last_state.transform = None;
+        self.last_state.size = None;
+        self.last_state.clear_color = None;
+        self.last_state.elements.clear();
+        self.last_state.instances.clear();
+        self.last_state.opaque_regions.clear();
+        self.reclaim_history(0);
+    }
+
     /// Initialize a static [`OutputDamageTracker`]
     pub fn new(
         size: impl Into<Size<i32, Physical>>,
@@ -514,6 +1045,13 @@ impl OutputDamageTracker {
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
             visibility_opaque_regions: Default::default(),
+            render_indices: Default::default(),
+            capture_support_damage: Default::default(),
+            history_spares: Default::default(),
+            new_damage: Default::default(),
+            state_bank: None,
+            storage_capacity: None,
+            storage_policy: DamageStoragePolicy::Exact,
 
             span: info_span!("renderer_damage"),
         }
@@ -537,6 +1075,13 @@ impl OutputDamageTracker {
             element_opaque_regions: Default::default(),
             element_visible_area_workhouse: Default::default(),
             visibility_opaque_regions: Default::default(),
+            render_indices: Default::default(),
+            capture_support_damage: Default::default(),
+            history_spares: Default::default(),
+            new_damage: Default::default(),
+            state_bank: None,
+            storage_capacity: None,
+            storage_policy: DamageStoragePolicy::Exact,
 
             last_state: Default::default(),
             span: info_span!("renderer_damage", output = output.name()),
@@ -562,6 +1107,13 @@ impl OutputDamageTracker {
             element_damage_index: Default::default(),
             element_visible_area_workhouse: Default::default(),
             visibility_opaque_regions: Default::default(),
+            render_indices: Default::default(),
+            capture_support_damage: Default::default(),
+            history_spares: Default::default(),
+            new_damage: Default::default(),
+            state_bank: None,
+            storage_capacity: None,
+            storage_policy: DamageStoragePolicy::Exact,
 
             last_state: Default::default(),
         }
@@ -590,6 +1142,24 @@ impl OutputDamageTracker {
         R: Renderer,
         R::TextureId: Texture,
     {
+        self.render_output_from(renderer, framebuffer, age, elements, clear_color)
+    }
+
+    /// Render an indexed borrowed source without allocating an element list.
+    pub(crate) fn render_output_from<'a, 'e, R, S>(
+        &'a mut self,
+        renderer: &mut R,
+        framebuffer: &mut R::Framebuffer<'_>,
+        age: usize,
+        elements: &'e S,
+        clear_color: impl Into<Color32F>,
+    ) -> Result<RenderOutputResult<'a>, Error<R::Error>>
+    where
+        S: ElementSource + ?Sized,
+        S::Element<'e>: RenderElement<R>,
+        R: Renderer,
+        R::TextureId: Texture,
+    {
         let clear_color = clear_color.into();
         let (output_size, output_scale, output_transform) =
             std::convert::TryInto::<(Size<i32, Physical>, Scale<f64>, Transform)>::try_into(&self.mode)?;
@@ -604,16 +1174,16 @@ impl OutputDamageTracker {
         let output_geo = Rectangle::from_size(output_transform.transform_size(output_size));
 
         // This will hold all the damage we need for this rendering step
-        let mut render_elements: Vec<&E> = Vec::with_capacity(elements.len());
-        let states = self.damage_output_internal(
-            age,
-            elements,
-            output_scale,
-            output_transform,
-            output_geo,
-            Some(clear_color),
-            &mut render_elements,
-        );
+        let states = self
+            .damage_output_internal(
+                age,
+                elements,
+                output_scale,
+                output_transform,
+                output_geo,
+                Some(clear_color),
+            )
+            .map_err(Error::WorkspaceCapacity)?;
 
         if self.damage.is_empty() {
             trace!("no damage, skipping rendering");
@@ -629,7 +1199,7 @@ impl OutputDamageTracker {
         #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
         let rendered_wayland_buffers = {
             let mut buffers = Vec::<WaylandBuffer>::new();
-            for element in &render_elements {
+            for element in self.render_indices.iter().map(|index| elements.element(*index)) {
                 let Some(UnderlyingStorage::Wayland(buffer)) = element.sampled_storage(renderer) else {
                     continue;
                 };
@@ -640,44 +1210,78 @@ impl OutputDamageTracker {
             buffers
         };
 
+        if let Err(error) = self.validate_render_rectangles(elements, output_scale) {
+            // Damage calculation advanced its logical history, but no native
+            // frame has begun. Retry must repaint the real unchanged target.
+            self.last_state.size = None;
+            return Err(Error::WorkspaceCapacity(error));
+        }
+
         let render_res = (|| {
             // we have to take the element damage to be able to move it around
-            let mut element_damage = std::mem::take(&mut self.element_damage);
-            let mut element_opaque_regions = std::mem::take(&mut self.element_opaque_regions);
-            let mut frame = renderer.render(framebuffer, output_size, output_transform)?;
+            let rectangle_limit = self.storage_capacity.map(|(_, rectangles)| rectangles);
+            let mut frame = renderer
+                .render(framebuffer, output_size, output_transform)
+                .map_err(Error::Rendering)?;
 
-            element_damage.clear();
-            element_damage.extend_from_slice(&self.damage);
-            element_damage =
-                Rectangle::subtract_rects_many_in_place(element_damage, self.opaque_regions.iter().copied());
+            self.element_damage.clear();
+            workspace::extend(
+                &mut self.element_damage,
+                self.damage.iter().copied(),
+                rectangle_limit,
+            )
+            .map_err(|error| Error::from_frame_workspace(error, frame.completion_unobservable_on_error()))?;
+            workspace::subtract(
+                &mut self.element_damage,
+                self.opaque_regions.iter().copied(),
+                rectangle_limit,
+            )
+            .map_err(|error| Error::from_frame_workspace(error, frame.completion_unobservable_on_error()))?;
 
-            trace!("clearing damage {:?}", element_damage);
-            frame.clear(clear_color, &element_damage)?;
+            trace!("clearing damage {:?}", self.element_damage);
+            frame.clear(clear_color, &self.element_damage).map_err(|error| {
+                Error::from_frame_rendering(error, frame.completion_unobservable_on_error())
+            })?;
 
-            for (z_index, element) in render_elements.iter().rev().enumerate() {
+            for (z_index, element) in self
+                .render_indices
+                .iter()
+                .rev()
+                .map(|index| elements.element(*index))
+                .enumerate()
+            {
                 let element_id = element.id();
                 let element_geometry = element.geometry(output_scale);
 
-                element_damage.clear();
-                element_damage.extend(
+                self.element_damage.clear();
+                workspace::extend(
+                    &mut self.element_damage,
                     self.damage
                         .iter()
                         .filter_map(|d| d.intersection(element_geometry)),
-                );
+                    rectangle_limit,
+                )
+                .map_err(|error| {
+                    Error::from_frame_workspace(error, frame.completion_unobservable_on_error())
+                })?;
 
                 let element_opaque_regions_range =
                     self.opaque_regions_index.iter().rev().nth(z_index).unwrap();
-                element_damage = Rectangle::subtract_rects_many_in_place(
-                    element_damage,
+                workspace::subtract(
+                    &mut self.element_damage,
                     self.opaque_regions[..element_opaque_regions_range.start]
                         .iter()
                         .copied(),
-                );
-                element_damage.iter_mut().for_each(|d| {
+                    rectangle_limit,
+                )
+                .map_err(|error| {
+                    Error::from_frame_workspace(error, frame.completion_unobservable_on_error())
+                })?;
+                self.element_damage.iter_mut().for_each(|d| {
                     d.loc -= element_geometry.loc;
                 });
 
-                if element_damage.is_empty() {
+                if self.element_damage.is_empty() {
                     trace!(
                         "skipping rendering element {:?} with geometry {:?}, no damage",
                         element_id,
@@ -686,8 +1290,9 @@ impl OutputDamageTracker {
                     continue;
                 }
 
-                element_opaque_regions.clear();
-                element_opaque_regions.extend(
+                self.element_opaque_regions.clear();
+                workspace::extend(
+                    &mut self.element_opaque_regions,
                     self.opaque_regions[element_opaque_regions_range.start..element_opaque_regions_range.end]
                         .iter()
                         .copied()
@@ -695,13 +1300,17 @@ impl OutputDamageTracker {
                             rect.loc -= element_geometry.loc;
                             rect
                         }),
-                );
+                    rectangle_limit,
+                )
+                .map_err(|error| {
+                    Error::from_frame_workspace(error, frame.completion_unobservable_on_error())
+                })?;
 
                 trace!(
                     "rendering element {:?} with geometry {:?} and damage {:?}",
                     element_id,
                     element_geometry,
-                    element_damage,
+                    self.element_damage,
                 );
 
                 if states
@@ -711,22 +1320,30 @@ impl OutputDamageTracker {
                     let regions = element
                         .framebuffer_effect_regions(output_scale)
                         .expect("framebuffer effect without read/paint regions");
-                    element.capture_framebuffer(&mut frame, regions)?;
+                    element
+                        .capture_framebuffer(&mut frame, regions)
+                        .map_err(|error| {
+                            Error::from_frame_rendering(error, frame.completion_unobservable_on_error())
+                        })?;
                 }
 
-                element.draw(
-                    &mut frame,
-                    element.src(),
-                    element_geometry,
-                    &element_damage,
-                    &element_opaque_regions,
-                )?;
+                element
+                    .draw(
+                        &mut frame,
+                        element.src(),
+                        element_geometry,
+                        &self.element_damage,
+                        &self.element_opaque_regions,
+                    )
+                    .map_err(|error| {
+                        Error::from_frame_rendering(error, frame.completion_unobservable_on_error())
+                    })?;
             }
 
-            // return the element damage so that we can re-use the allocation
-            std::mem::swap(&mut self.element_damage, &mut element_damage);
-            std::mem::swap(&mut self.element_opaque_regions, &mut element_opaque_regions);
-            frame.finish()
+            let previous_submission = frame.completion_unobservable_on_error();
+            frame
+                .finish()
+                .map_err(|error| Error::from_frame_rendering(error, previous_submission))
         })();
 
         match render_res {
@@ -740,7 +1357,7 @@ impl OutputDamageTracker {
                     // caller already owns the sampled resources; return typed
                     // unobservable custody so it can quarantine them through
                     // renderer-epoch teardown without blocking this path.
-                    self.last_state = Default::default();
+                    self.reset_history();
                     return Err(Error::WaylandCompletionUnobservable);
                 }
                 #[cfg(all(feature = "backend_drm", feature = "wayland_frontend"))]
@@ -766,8 +1383,8 @@ impl OutputDamageTracker {
             Err(err) => {
                 // if the rendering errors on us, we need to be prepared, that this whole buffer was partially updated and thus now unusable.
                 // thus clean our old states before returning
-                self.last_state = Default::default();
-                Err(Error::Rendering(err))
+                self.reset_history();
+                Err(err)
             }
         }
     }
@@ -781,11 +1398,21 @@ impl OutputDamageTracker {
         &'a mut self,
         age: usize,
         elements: &'e [E],
-    ) -> Result<(Option<&'a Vec<Rectangle<i32, Physical>>>, RenderElementStates), OutputNoMode>
+    ) -> Result<(Option<&'a Vec<Rectangle<i32, Physical>>>, RenderElementStates), DamageOutputError>
     where
         E: Element,
     {
-        let (output_size, output_scale, output_transform) = self.mode.clone().try_into()?;
+        self.damage_output_from(age, elements)
+    }
+
+    /// Calculate damage from an indexed borrowed source.
+    pub(crate) fn damage_output_from<'a, 'e, S: ElementSource + ?Sized>(
+        &'a mut self,
+        age: usize,
+        elements: &'e S,
+    ) -> Result<(Option<&'a Vec<Rectangle<i32, Physical>>>, RenderElementStates), DamageOutputError> {
+        let (output_size, output_scale, output_transform) =
+            std::convert::TryInto::<(Size<i32, Physical>, Scale<f64>, Transform)>::try_into(&self.mode)?;
 
         // Output transform is specified in surface-rotation, so inversion gives us the
         // render transform for the output itself.
@@ -796,7 +1423,6 @@ impl OutputDamageTracker {
         // damage with the wrong size
         let output_geo = Rectangle::from_size(output_transform.transform_size(output_size));
 
-        let mut render_elements: Vec<&E> = Vec::with_capacity(elements.len());
         let states = self.damage_output_internal(
             age,
             elements,
@@ -804,8 +1430,7 @@ impl OutputDamageTracker {
             output_transform,
             output_geo,
             self.last_state.clear_color,
-            &mut render_elements,
-        );
+        )?;
 
         if self.damage.is_empty() {
             Ok((None, states))
@@ -816,19 +1441,28 @@ impl OutputDamageTracker {
 
     #[allow(clippy::too_many_arguments)]
     #[profiling::function]
-    fn damage_output_internal<'a, E>(
+    fn damage_output_internal<'e, S: ElementSource + ?Sized>(
         &mut self,
         age: usize,
-        elements: &'a [E],
+        elements: &'e S,
         output_scale: Scale<f64>,
         output_transform: Transform,
         output_geo: Rectangle<i32, Physical>,
         clear_color: Option<Color32F>,
-        render_elements: &mut Vec<&'a E>,
-    ) -> RenderElementStates
-    where
-        E: Element,
-    {
+    ) -> Result<RenderElementStates, FrameWorkspaceError> {
+        if self.storage_policy == DamageStoragePolicy::ConservativeFullOutput {
+            return self.damage_output_conservative(
+                age,
+                elements,
+                output_scale,
+                output_transform,
+                output_geo,
+                clear_color,
+            );
+        }
+        let mut element_render_states = self.claim_states(elements.len())?;
+        let rectangle_limit = self.storage_capacity.map(|(_, rectangles)| rectangles);
+        self.render_indices.clear();
         self.damage.clear();
         self.damage_summary = OutputDamageSummary {
             buffer_age: age,
@@ -838,17 +1472,10 @@ impl OutputDamageTracker {
         self.opaque_regions_index.clear();
         self.element_damage_index.clear();
 
-        let mut element_render_states = RenderElementStates {
-            states: HashMap::with_capacity(elements.len()),
-        };
-
-        // we have to take the element damage to be able to move it around
-        let mut element_damage = std::mem::take(&mut self.element_damage);
-
-        let mut element_visible_area_workhouse = std::mem::take(&mut self.element_visible_area_workhouse);
         // Preserve the original opacity traversal with no extra copying until
         // a framebuffer effect actually needs a distinct capture view.
-        let mut visibility_opaque_regions: Option<Vec<Rectangle<i32, Physical>>> = None;
+        let mut uses_visibility_opaque_regions = false;
+        self.visibility_opaque_regions.clear();
         let mut z_index = 0;
         for (element_index, element) in elements.iter().enumerate() {
             let element_id = element.id();
@@ -862,17 +1489,25 @@ impl OutputDamageTracker {
             };
 
             // Then test if the element is completely hidden behind opaque regions
-            element_visible_area_workhouse.clear();
-            element_visible_area_workhouse.push(element_output_geometry);
-            element_visible_area_workhouse = Rectangle::subtract_rects_many_in_place(
-                element_visible_area_workhouse,
-                visibility_opaque_regions
-                    .as_deref()
-                    .unwrap_or(&self.opaque_regions)
-                    .iter()
-                    .copied(),
-            );
-            let element_visible_area = element_visible_area_workhouse
+            self.element_visible_area_workhouse.clear();
+            workspace::extend(
+                &mut self.element_visible_area_workhouse,
+                [element_output_geometry],
+                rectangle_limit,
+            )?;
+            workspace::subtract(
+                &mut self.element_visible_area_workhouse,
+                if uses_visibility_opaque_regions {
+                    &self.visibility_opaque_regions
+                } else {
+                    &self.opaque_regions
+                }
+                .iter()
+                .copied(),
+                rectangle_limit,
+            )?;
+            let element_visible_area = self
+                .element_visible_area_workhouse
                 .iter()
                 .fold(0usize, |acc, item| acc + (item.size.w * item.size.h) as usize);
 
@@ -900,6 +1535,7 @@ impl OutputDamageTracker {
             if element_last_state
                 .map(|s| {
                     !s.instance_matches(
+                        &self.last_state.instances,
                         element_src,
                         element_geometry,
                         element_transform,
@@ -912,15 +1548,16 @@ impl OutputDamageTracker {
                 .unwrap_or(true)
             {
                 if let Some(intersection) = element_geometry.intersection(output_geo) {
-                    self.damage.push(intersection);
+                    workspace::extend(&mut self.damage, [intersection], rectangle_limit)?;
                 }
                 if let Some(state) = element_last_state {
-                    self.damage.extend(
+                    workspace::extend(
+                        &mut self.damage,
                         state
-                            .last_instances
-                            .iter()
+                            .instances(&self.last_state.instances)
                             .filter_map(|i| i.last_geometry.intersection(output_geo)),
-                    );
+                        rectangle_limit,
+                    )?;
                 }
                 let state_change_damage = &self.damage[self.element_damage_index[z_index]..];
                 if !state_change_damage.is_empty() {
@@ -941,18 +1578,25 @@ impl OutputDamageTracker {
                 }
             } else {
                 let element_output_damage_start = self.damage.len();
-                let element_output_damage = element
-                    .damage_since(
-                        output_scale,
-                        self.last_state.elements.get(element_id).map(|s| s.last_commit),
-                    )
-                    .into_iter()
-                    .map(|mut d| {
-                        d.loc += element_loc;
-                        d
-                    })
-                    .filter_map(|geo| geo.intersection(output_geo));
-                self.damage.extend(element_output_damage);
+                workspace::try_visit(
+                    |visit| {
+                        element.visit_damage_since(
+                            output_scale,
+                            self.last_state
+                                .elements
+                                .get(element_id)
+                                .map(|state| state.last_commit),
+                            visit,
+                        )
+                    },
+                    |mut rect| {
+                        rect.loc += element_loc;
+                        match rect.intersection(output_geo) {
+                            Some(rect) => workspace::extend(&mut self.damage, [rect], rectangle_limit),
+                            None => Ok(()),
+                        }
+                    },
+                )?;
                 let element_output_damage = &self.damage[element_output_damage_start..];
                 if !element_output_damage.is_empty() {
                     let element_damage_area = rects_area(element_output_damage);
@@ -978,15 +1622,16 @@ impl OutputDamageTracker {
             }
 
             let element_opaque_regions_start_index = self.opaque_regions.len();
-            let element_opaque_regions = element
-                .opaque_regions(output_scale)
-                .into_iter()
-                .map(|mut region| {
-                    region.loc += element_loc;
-                    region
-                })
-                .filter_map(|geo| geo.intersection(output_geo));
-            self.opaque_regions.extend(element_opaque_regions);
+            workspace::try_visit(
+                |visit| element.visit_opaque_regions(output_scale, visit),
+                |mut rect| {
+                    rect.loc += element_loc;
+                    match rect.intersection(output_geo) {
+                        Some(rect) => workspace::extend(&mut self.opaque_regions, [rect], rectangle_limit),
+                        None => Ok(()),
+                    }
+                },
+            )?;
             let element_opaque_regions_end_index = self.opaque_regions.len();
             self.opaque_regions_index
                 .push(element_opaque_regions_start_index..element_opaque_regions_end_index);
@@ -997,29 +1642,31 @@ impl OutputDamageTracker {
             // opacity cannot permanently cull contributors in the declared
             // read support. Elements encountered after the effect are part of
             // that prefix and may occlude still-lower contributors normally.
-            if let Some(visibility_opaque_regions) = visibility_opaque_regions.as_mut() {
-                visibility_opaque_regions.extend_from_slice(
-                    &self.opaque_regions
-                        [element_opaque_regions_start_index..element_opaque_regions_end_index],
-                );
+            if uses_visibility_opaque_regions {
+                workspace::extend(
+                    &mut self.visibility_opaque_regions,
+                    self.opaque_regions[element_opaque_regions_start_index..element_opaque_regions_end_index]
+                        .iter()
+                        .copied(),
+                    rectangle_limit,
+                )?;
             }
-            if element_is_framebuffer_effect {
-                if let Some(read_area) = element_effect_regions
-                    .and_then(|regions| regions.backdrop_read_area.intersection(output_geo))
-                {
-                    let visibility_opaque_regions = visibility_opaque_regions.get_or_insert_with(|| {
-                        let mut regions = std::mem::take(&mut self.visibility_opaque_regions);
-                        regions.clear();
-                        regions.extend_from_slice(&self.opaque_regions);
-                        regions
-                    });
-                    *visibility_opaque_regions = Rectangle::subtract_rects_many_in_place(
-                        std::mem::take(visibility_opaque_regions),
-                        [read_area],
-                    );
+            if let Some(read_area) = element_is_framebuffer_effect
+                .then_some(element_effect_regions)
+                .flatten()
+                .and_then(|regions| regions.backdrop_read_area.intersection(output_geo))
+            {
+                if !uses_visibility_opaque_regions {
+                    workspace::extend(
+                        &mut self.visibility_opaque_regions,
+                        self.opaque_regions.iter().copied(),
+                        rectangle_limit,
+                    )?;
+                    uses_visibility_opaque_regions = true;
                 }
+                workspace::subtract(&mut self.visibility_opaque_regions, [read_area], rectangle_limit)?;
             }
-            render_elements.push(element);
+            self.render_indices.push(element_index);
 
             if let Some(state) = element_render_states.states.get_mut(element_id) {
                 if matches!(state.presentation_state, RenderElementPresentationState::Skipped) {
@@ -1044,18 +1691,6 @@ impl OutputDamageTracker {
             }
             z_index += 1;
         }
-        std::mem::swap(
-            &mut self.element_visible_area_workhouse,
-            &mut element_visible_area_workhouse,
-        );
-        if let Some(mut visibility_opaque_regions) = visibility_opaque_regions {
-            std::mem::swap(
-                &mut self.visibility_opaque_regions,
-                &mut visibility_opaque_regions,
-            );
-        }
-
-        // add the damage for elements gone that are not covered an opaque region
         let elements_gone = self.last_state.elements.iter().filter(|(id, _)| {
             element_render_states
                 .states
@@ -1066,12 +1701,13 @@ impl OutputDamageTracker {
 
         for (_, state) in elements_gone {
             let gone_damage_start = self.damage.len();
-            self.damage.extend(
+            workspace::extend(
+                &mut self.damage,
                 state
-                    .last_instances
-                    .iter()
+                    .instances(&self.last_state.instances)
                     .filter_map(|i| i.last_geometry.intersection(output_geo)),
-            );
+                rectangle_limit,
+            )?;
             let gone_damage = &self.damage[gone_damage_start..];
             if !gone_damage.is_empty() {
                 self.damage_summary.element_gone_count =
@@ -1084,25 +1720,35 @@ impl OutputDamageTracker {
         }
 
         // damage regions no longer covered by opaque regions
-        element_damage.clear();
-        element_damage.extend_from_slice(&self.last_state.opaque_regions);
-        element_damage =
-            Rectangle::subtract_rects_many_in_place(element_damage, self.opaque_regions.iter().copied());
-        if !element_damage.is_empty() {
+        self.element_damage.clear();
+        workspace::extend(
+            &mut self.element_damage,
+            self.last_state.opaque_regions.iter().copied(),
+            rectangle_limit,
+        )?;
+        workspace::subtract(
+            &mut self.element_damage,
+            self.opaque_regions.iter().copied(),
+            rectangle_limit,
+        )?;
+        if !self.element_damage.is_empty() {
             self.damage_summary.opaque_uncovered_rect_count = self
                 .damage_summary
                 .opaque_uncovered_rect_count
-                .saturating_add(element_damage.len());
+                .saturating_add(self.element_damage.len());
             self.damage_summary.opaque_uncovered_area = self
                 .damage_summary
                 .opaque_uncovered_area
-                .saturating_add(rects_area(&element_damage));
+                .saturating_add(rects_area(&self.element_damage));
         }
-        self.damage.extend_from_slice(&element_damage);
+        workspace::extend(
+            &mut self.damage,
+            self.element_damage.iter().copied(),
+            rectangle_limit,
+        )?;
 
         // we no longer need the element damage, return it so that we can
         // re-use its allocation next time
-        std::mem::swap(&mut self.element_damage, &mut element_damage);
 
         let force_effect_redraw = self.last_state.size != Some(output_geo.size)
             || self.last_state.transform != Some(output_transform)
@@ -1119,7 +1765,7 @@ impl OutputDamageTracker {
                 current_clear_color = ?clear_color,
                 "Output geometry, transform or clear color changed, damaging whole output geometry");
             self.damage.clear();
-            self.damage.push(output_geo);
+            workspace::extend(&mut self.damage, [output_geo], rectangle_limit)?;
         }
 
         propagate_framebuffer_effect_damage(
@@ -1127,43 +1773,48 @@ impl OutputDamageTracker {
             &mut self.opaque_regions,
             &self.opaque_regions_index,
             &self.element_damage_index,
-            &render_elements,
+            elements,
+            &self.render_indices,
+            &mut self.capture_support_damage,
+            rectangle_limit,
             &mut element_render_states,
             output_scale,
             output_geo,
             0,
             force_effect_redraw,
-        );
+        )?;
 
         // That is all completely new damage, which we need to store for subsequent renders
-        let mut new_damage = self.damage.clone();
-        new_damage.shrink_to_fit();
+        self.new_damage.clear();
+        workspace::extend(&mut self.new_damage, self.damage.iter().copied(), rectangle_limit)?;
 
         // We now add old damage states, if we have an age value
         let age_damage_start = self.damage.len();
-        let buffer_age_forces_full_damage = if age > 0 && self.last_state.old_damage.len() >= age {
-            trace!("age of {} recent enough, using old damage", age);
-            // We do not need even older states anymore
-            self.last_state.old_damage.truncate(age);
-            self.damage
-                .extend(self.last_state.old_damage.iter().take(age - 1).flatten().copied());
-            false
-        } else {
-            self.damage_summary.buffer_age_full_damage = true;
-            trace!(
-                "no old damage available, re-render everything. age: {} old_damage len: {}",
-                age,
-                self.last_state.old_damage.len(),
-            );
-            // we still truncate the old damage to prevent growing
-            // indefinitely in case we are continuously called with
-            // an age of 0
-            self.last_state.old_damage.truncate(MAX_AGE);
-            // just damage everything, if we have no damage
-            self.damage.clear();
-            self.damage.push(output_geo);
-            true
-        };
+        let buffer_age_forces_full_damage =
+            if age > 0 && age <= MAX_AGE && self.last_state.old_damage.len() >= age {
+                trace!("age of {} recent enough, using old damage", age);
+                // We do not need even older states anymore
+                workspace::extend(
+                    &mut self.damage,
+                    self.last_state.old_damage.iter().take(age - 1).flatten().copied(),
+                    rectangle_limit,
+                )?;
+                false
+            } else {
+                self.damage_summary.buffer_age_full_damage = true;
+                trace!(
+                    "no old damage available, re-render everything. age: {} old_damage len: {}",
+                    age,
+                    self.last_state.old_damage.len(),
+                );
+                // we still truncate the old damage to prevent growing
+                // indefinitely in case we are continuously called with
+                // an age of 0
+                // just damage everything, if we have no damage
+                self.damage.clear();
+                workspace::extend(&mut self.damage, [output_geo], rectangle_limit)?;
+                true
+            };
 
         // Buffer-age damage is target-local correctness damage just like new
         // scene damage. If it intersects an effect's read support, the lower
@@ -1175,7 +1826,10 @@ impl OutputDamageTracker {
             &mut self.opaque_regions,
             &self.opaque_regions_index,
             &self.element_damage_index,
-            &render_elements,
+            elements,
+            &self.render_indices,
+            &mut self.capture_support_damage,
+            rectangle_limit,
             &mut element_render_states,
             output_scale,
             output_geo,
@@ -1185,7 +1839,7 @@ impl OutputDamageTracker {
                 age_damage_start
             },
             buffer_age_forces_full_damage,
-        );
+        )?;
 
         // Optimize the damage for rendering
 
@@ -1199,75 +1853,62 @@ impl OutputDamageTracker {
             }
         });
 
-        self.damage_shaper.shape_damage(&mut self.damage);
+        self.damage_shaper
+            .shape_damage_bounded(&mut self.damage, rectangle_limit)?;
         self.damage_summary.final_damage_rect_count = self.damage.len();
         self.damage_summary.final_damage_area = rects_area(&self.damage);
 
         if self.damage.is_empty() {
             trace!("nothing damaged, exiting early");
-            return element_render_states;
+            return Ok(element_render_states);
         }
 
-        let mut new_elements_state = std::mem::take(&mut self.last_state.elements);
-        new_elements_state.clear();
-        new_elements_state.reserve(render_elements.len());
-        let new_elements_state =
-            render_elements
-                .iter()
-                .enumerate()
-                .fold(new_elements_state, |mut map, (z_index, elem)| {
-                    let id = elem.id();
-                    let elem_src = elem.src();
-                    let elem_alpha = elem.alpha();
-                    let elem_geometry = elem.geometry(output_scale);
-                    let elem_transform = elem.transform();
-                    let element_is_framebuffer_effect = elem.is_framebuffer_effect();
-                    let element_effect_regions = elem.framebuffer_effect_regions(output_scale);
-
-                    if let Some(state) = map.get_mut(id) {
-                        state.last_instances.push(ElementInstanceState {
-                            last_src: elem_src,
-                            last_geometry: elem_geometry,
-                            last_transform: elem_transform,
-                            last_alpha: elem_alpha,
-                            last_z_index: z_index,
-                            last_is_framebuffer_effect: element_is_framebuffer_effect,
-                            last_effect_regions: element_effect_regions,
-                        });
-                    } else {
-                        let current_commit = elem.current_commit();
-                        map.insert(
-                            id.clone(),
-                            ElementState {
-                                last_commit: current_commit,
-                                last_instances: smallvec![ElementInstanceState {
-                                    last_src: elem_src,
-                                    last_geometry: elem_geometry,
-                                    last_transform: elem_transform,
-                                    last_alpha: elem_alpha,
-                                    last_z_index: z_index,
-                                    last_is_framebuffer_effect: element_is_framebuffer_effect,
-                                    last_effect_regions: element_effect_regions,
-                                }],
-                            },
-                        );
-                    }
-
-                    map
-                });
+        self.last_state.elements.clear();
+        self.last_state.instances.clear();
+        for (z_index, elem) in self
+            .render_indices
+            .iter()
+            .map(|index| elements.element(*index))
+            .enumerate()
+        {
+            let id = elem.id();
+            let index = self.last_state.instances.len();
+            let previous = self.last_state.elements.get(id).map(|state| state.first_instance);
+            self.last_state.instances.push(ElementInstanceRecord {
+                state: ElementInstanceState {
+                    last_src: elem.src(),
+                    last_geometry: elem.geometry(output_scale),
+                    last_transform: elem.transform(),
+                    last_alpha: elem.alpha(),
+                    last_z_index: z_index,
+                    last_is_framebuffer_effect: elem.is_framebuffer_effect(),
+                    last_effect_regions: elem.framebuffer_effect_regions(output_scale),
+                },
+                next: previous,
+            });
+            self.last_state.elements.insert(
+                id.clone(),
+                ElementState {
+                    last_commit: elem.current_commit(),
+                    first_instance: index,
+                },
+            );
+        }
 
         self.last_state.size = Some(output_geo.size);
         self.last_state.transform = Some(output_transform);
-        self.last_state.elements = new_elements_state;
+        self.reclaim_history(MAX_AGE);
+        let mut new_damage = self.history_spares.pop().unwrap_or_default();
+        std::mem::swap(&mut self.new_damage, &mut new_damage);
         self.last_state.old_damage.push_front(new_damage);
         self.last_state.opaque_regions.clear();
         self.last_state
             .opaque_regions
             .extend(self.opaque_regions.iter().copied());
-        self.last_state.opaque_regions.shrink_to_fit();
+
         self.last_state.clear_color = clear_color;
 
-        element_render_states
+        Ok(element_render_states)
     }
 }
 
@@ -1283,7 +1924,7 @@ mod framebuffer_effect_tests {
     };
 
     #[derive(Debug, Clone)]
-    struct TestElement {
+    pub(super) struct TestElement {
         id: Id,
         commit: CommitCounter,
         geometry: Rectangle<i32, Physical>,
@@ -1293,7 +1934,10 @@ mod framebuffer_effect_tests {
     }
 
     impl TestElement {
-        fn draw(geometry: Rectangle<i32, Physical>, commit: usize) -> Self {
+        pub(super) fn advance_commit(&mut self) {
+            self.commit.increment();
+        }
+        pub(super) fn draw(geometry: Rectangle<i32, Physical>, commit: usize) -> Self {
             Self {
                 id: Id::new(),
                 commit: CommitCounter::from(commit),
@@ -1304,7 +1948,7 @@ mod framebuffer_effect_tests {
             }
         }
 
-        fn effect(
+        pub(super) fn effect(
             paint_area: Rectangle<i32, Physical>,
             backdrop_read_area: Rectangle<i32, Physical>,
         ) -> Self {
@@ -1321,7 +1965,7 @@ mod framebuffer_effect_tests {
             }
         }
 
-        fn opaque(mut self) -> Self {
+        pub(super) fn opaque(mut self) -> Self {
             self.opaque = true;
             self
         }

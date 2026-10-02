@@ -52,6 +52,7 @@ impl OwnerSampleReplay {
         ]
     }
 
+    #[cfg(test)]
     fn damage(self, rects: Vec<Rectangle<i32, Physical>>) -> Vec<Rectangle<i32, Physical>> {
         rects
             .into_iter()

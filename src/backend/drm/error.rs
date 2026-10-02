@@ -83,6 +83,29 @@ pub enum Error {
         /// Property name
         name: &'static str,
     },
+    /// Legacy mode validation requires a real commit and cannot be prepared
+    /// without the owning presentation transaction.
+    #[error("prepared mode validation requires atomic TEST_ONLY support")]
+    PreparedModeUnsupported,
+    /// The owning atomic request/state workspace is temporarily borrowed.
+    #[error("atomic DRM request workspace is busy")]
+    AtomicRequestBusy,
+    /// An input is outside the cold-admitted native request roster or capacity.
+    #[error("atomic DRM workspace `{resource}` needs {required} entries, admitted {capacity}")]
+    AtomicRequestCapacity {
+        /// Exact native metadata resource.
+        resource: &'static str,
+        /// Required entries for this request.
+        required: usize,
+        /// Cold-admitted entries.
+        capacity: usize,
+    },
+    /// Every exact mode owner slot is retained or quarantined; no blob was created.
+    #[error("mode blob owner capacity {capacity} is exhausted")]
+    ModeBlobCapacity {
+        /// Actual cold mode owner slots for this surface.
+        capacity: usize,
+    },
     /// Atomic Test failed for new properties
     #[error("Atomic Test failed for new properties on crtc ({0:?})")]
     TestFailed(crtc::Handle),
@@ -94,7 +117,10 @@ impl From<Error> for SwapBuffersError {
         // FIXME: replace the special handling for EBUSY with ErrorKind::ResourceBusy once
         // we reach MSRV >= 1.83
         match err {
-            x @ Error::DeviceInactive => SwapBuffersError::TemporaryFailure(Box::new(x)),
+            x @ (Error::DeviceInactive
+            | Error::AtomicRequestBusy
+            | Error::AtomicRequestCapacity { .. }
+            | Error::ModeBlobCapacity { .. }) => SwapBuffersError::TemporaryFailure(Box::new(x)),
             Error::Access(AccessError {
                 errmsg, dev, source, ..
             }) if matches!(

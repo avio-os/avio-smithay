@@ -11,6 +11,8 @@ use crate::utils::{DevPath, DeviceFd};
 struct InternalDrmDeviceFd {
     fd: DeviceFd,
     privileged: bool,
+    // One creating-file authority; quarantined native slots survive surface recreation.
+    mode_blobs: std::sync::Mutex<Option<super::super::surface::mode_blob::ModeFileBanks>>,
 }
 
 impl PartialEq for InternalDrmDeviceFd {
@@ -69,6 +71,7 @@ impl DrmDeviceFd {
         let mut dev = InternalDrmDeviceFd {
             fd,
             privileged: false,
+            mode_blobs: std::sync::Mutex::new(None),
         };
 
         // We want to modeset, so we better be the master, if we run via a tty session.
@@ -81,6 +84,37 @@ impl DrmDeviceFd {
         }
 
         DrmDeviceFd(Arc::new(dev))
+    }
+
+    pub(super) fn prepare_mode_blob_banks(
+        &self,
+        crtcs: &[drm::control::crtc::Handle],
+    ) -> Result<(), super::super::error::Error> {
+        let mut banks = self.0.mode_blobs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = banks.as_ref() {
+            for crtc in crtcs {
+                if !existing.contains(*crtc) {
+                    return Err(super::super::error::Error::UnknownCrtc(*crtc));
+                }
+            }
+        } else {
+            *banks = Some(super::super::surface::mode_blob::ModeFileBanks::cold(crtcs)?);
+        }
+        Ok(())
+    }
+    pub(in crate::backend::drm) fn mode_blob_bank(
+        &self,
+        crtc: drm::control::crtc::Handle,
+    ) -> Result<super::super::surface::mode_blob::ModeBlobBank, super::super::error::Error> {
+        let banks = self
+            .0
+            .mode_blobs
+            .try_lock()
+            .map_err(|_| super::super::error::Error::AtomicRequestBusy)?;
+        banks
+            .as_ref()
+            .ok_or(super::super::error::Error::UnknownCrtc(crtc))?
+            .lease(crtc)
     }
 
     pub(in crate::backend::drm) fn is_privileged(&self) -> bool {

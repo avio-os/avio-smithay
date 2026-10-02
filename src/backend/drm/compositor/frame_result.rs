@@ -8,19 +8,55 @@ use crate::{
         },
         drm::Framebuffer,
         renderer::{
-            damage::{OutputDamageSummary, OutputDamageTracker},
-            element::{Element, Id, RenderElement, RenderElementStates},
+            damage::{DamageOutputError, OutputDamageSummary, OutputDamageTracker},
+            element::{Element, ElementSource, Id, RenderElement, RenderElementStates, WorkspaceVec},
             sync::SyncPoint,
             utils::{CommitCounter, DamageSet, DamageSnapshot, OpaqueRegions},
             Bind, Blit, Color32F, Frame, Renderer,
         },
     },
-    output::OutputNoMode,
     utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform},
 };
 use drm::control::{plane, PlaneType};
 
 use super::{DrmScanoutBuffer, ScanoutBuffer};
+
+/// Independent selected-index receipt over the actual borrowed scene source.
+/// The index storage cannot be recycled until this result is dropped.
+#[derive(Debug)]
+pub struct SelectedElements<'a, E> {
+    source: &'a [E],
+    pub(super) indices: WorkspaceVec<usize>,
+}
+impl<'a, E> SelectedElements<'a, E> {
+    pub(super) fn new(source: &'a [E], indices: WorkspaceVec<usize>) -> Self {
+        Self { source, indices }
+    }
+    /// Iterate selected original elements in their accepted order.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &'a E> + ExactSizeIterator + '_ {
+        self.indices.iter().map(|index| &self.source[*index])
+    }
+    /// Number of selected elements.
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+    /// Whether no element was selected.
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+impl<E: Element> ElementSource for SelectedElements<'_, E> {
+    type Element<'a>
+        = &'a E
+    where
+        Self: 'a;
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn element(&self, index: usize) -> Self::Element<'_> {
+        &self.source[self.indices[index]]
+    }
+}
 
 /// DRM plane selected for a rendered element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,14 +97,14 @@ pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     /// Selected primary scanout plane when `primary_element` is a direct element.
     pub primary_plane_assignment: Option<PlaneAssignmentInfo>,
     /// Overlay elements in front to back order
-    pub overlay_elements: Vec<&'a E>,
+    pub overlay_elements: SelectedElements<'a, E>,
     /// Selected overlay/underlay planes in the same order as `overlay_elements`.
-    pub overlay_plane_assignments: Vec<PlaneAssignmentInfo>,
+    pub overlay_plane_assignments: WorkspaceVec<PlaneAssignmentInfo>,
     /// Selected compositor-owned output layer plane when scene content was
     /// rendered above a direct-scanout primary element.
     pub output_layer_plane_assignment: Option<PlaneAssignmentInfo>,
     /// Scene elements rendered into the compositor-owned output layer.
-    pub output_layer_elements: Vec<&'a E>,
+    pub output_layer_elements: SelectedElements<'a, E>,
     /// Number of scene elements rendered into the compositor-owned output layer.
     pub output_layer_element_count: usize,
     /// True when the output layer performed GPU rendering in this frame.
@@ -279,7 +315,7 @@ where
         damage_tracker: &'d mut OutputDamageTracker,
         age: usize,
         filter: impl IntoIterator<Item = Id>,
-    ) -> Result<(Option<&'d Vec<Rectangle<i32, Physical>>>, RenderElementStates), OutputNoMode>
+    ) -> Result<(Option<&'d Vec<Rectangle<i32, Physical>>>, RenderElementStates), DamageOutputError>
     where
         E: Element,
     {
@@ -302,14 +338,14 @@ where
             self.output_layer_elements
                 .iter()
                 .filter(|e| !filter_ids.contains(e.id()))
-                .map(|e| FrameResultDamageElement::Element(*e)),
+                .map(FrameResultDamageElement::Element),
         );
 
         elements.extend(
             self.overlay_elements
                 .iter()
                 .filter(|e| !filter_ids.contains(e.id()))
-                .map(|e| FrameResultDamageElement::Element(*e)),
+                .map(FrameResultDamageElement::Element),
         );
 
         let primary_render_element = match &self.primary_element {
@@ -715,17 +751,17 @@ mod tests {
         RenderFrameResult {
             is_empty: false,
             states: RenderElementStates {
-                states: HashMap::new(),
+                states: HashMap::new().into(),
             },
             primary_element: PrimaryPlaneElement::Swapchain(make_primary_swapchain_element(
                 exported_sync_file,
                 true,
             )),
             primary_plane_assignment: None,
-            overlay_elements: Vec::new(),
-            overlay_plane_assignments: Vec::new(),
+            overlay_elements: SelectedElements::new(&[], WorkspaceVec::legacy(Vec::new())),
+            overlay_plane_assignments: WorkspaceVec::legacy(Vec::new()),
             output_layer_plane_assignment: None,
-            output_layer_elements: Vec::new(),
+            output_layer_elements: SelectedElements::new(&[], WorkspaceVec::legacy(Vec::new())),
             output_layer_element_count: 0,
             output_layer_rendered_this_frame: false,
             output_layer_damage_rect_count: 0,

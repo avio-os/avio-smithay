@@ -18,6 +18,7 @@ use crate::backend::vulkan::{Instance, QueuePriorityGrant};
 use ash::vk;
 
 pub(super) enum DeviceRetirement {
+    Fence(vk::Fence),
     Image(RetiredImage),
     /// A context returns the exact actor-allocated notification node here.
     ViewNotification(vk::ImageView),
@@ -26,6 +27,8 @@ pub(super) enum DeviceRetirement {
     OpaqueCustody(Box<dyn std::any::Any + Send + Sync>),
     ReadbackBuffer(super::readback::RetiredReadbackBuffer),
     StagingBuffer(super::staging::RetiredStagingBuffer),
+    ExternalWaitSemaphores(super::external_wait_storage::RetiredExternalWaitSemaphores),
+    ExternalWaitOwner(super::external_wait_storage::ExternalWaitOwnerReturn),
     #[cfg(feature = "wayland_frontend")]
     HostBuffer(super::host_memory::RetiredHostBuffer),
 }
@@ -148,12 +151,26 @@ impl DeviceHandle {
         };
         let command_wake = command_retirement.worker_thread();
         let executor_parent = parent.clone();
-        let retirement = match RetirementQueue::start(
-            move |resource: DeviceRetirement| {
+        let retirement = match RetirementQueue::start_with_nodes(
+            move |node: Box<RetirementNode<DeviceRetirement>>| {
+                if matches!(node.value(), DeviceRetirement::ExternalWaitOwner(_)) {
+                    super::external_wait_storage::ExternalWaitOwnerReturn::reset(node);
+                    command_wake.unpark();
+                    return;
+                }
+                let resource = node.into_value();
                 let valid =
                     !destroy_lost.load(Ordering::Acquire) && !destroy_instance_lost.load(Ordering::Acquire);
                 match resource {
                     DeviceRetirement::ViewNotification(_) => {}
+                    DeviceRetirement::ExternalWaitOwner(_) => unreachable!("wait owner node recycled above"),
+                    DeviceRetirement::Fence(fence) => {
+                        if valid {
+                            unsafe {
+                                destroy_device.destroy_fence(fence, None);
+                            }
+                        }
+                    }
                     #[cfg(test)]
                     DeviceRetirement::Drain(completed) => {
                         let _ = completed.send(());
@@ -183,6 +200,13 @@ impl DeviceHandle {
                             // persistent mapping. Loss cannot authorize an
                             // inline unmap/free on their releasing thread.
                             std::mem::forget(buffer);
+                        }
+                    }
+                    DeviceRetirement::ExternalWaitSemaphores(semaphores) => {
+                        if valid {
+                            semaphores.destroy(&destroy_device);
+                        } else {
+                            std::mem::forget(semaphores);
                         }
                     }
                     DeviceRetirement::Image(image) => {

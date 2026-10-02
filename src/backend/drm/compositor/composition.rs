@@ -209,9 +209,9 @@ mod tests {
 
 /// Framebuffer-ready composition buffers with exact DRM output custody.
 pub struct PreparedCompositionBuffers<B: Buffer> {
-    device_fd: crate::backend::drm::DrmDeviceFd,
-    crtc: crtc::Handle,
-    slots: Vec<Slot<B>>,
+    pub(super) device_fd: crate::backend::drm::DrmDeviceFd,
+    pub(super) crtc: crtc::Handle,
+    pub(super) slots: Vec<Slot<B>>,
     output_layer: bool,
 }
 
@@ -246,7 +246,7 @@ impl<B: Buffer> std::fmt::Debug for PreparedCompositionBuffers<B> {
 ///
 /// Construct on the configuration path, move to an allocation thread, and adopt
 /// its prepared slots back into the same output. Dropping it retains no targets.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompositionAllocator<A: Allocator, F> {
     allocator: A,
     framebuffer_exporter: F,
@@ -270,6 +270,19 @@ where
     F::Framebuffer: std::fmt::Debug + Send + Sync + 'static,
     F::Error: std::error::Error + Send + Sync + 'static,
 {
+    pub(super) fn set_extent(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+    }
+    pub(super) fn format(&self) -> Fourcc {
+        self.fourcc
+    }
+    pub(super) fn modifiers(&self) -> &[Modifier] {
+        &self.modifiers
+    }
+    pub(super) fn set_modifiers(&mut self, modifiers: Vec<Modifier>) {
+        self.modifiers = modifiers;
+    }
     /// Allocate, export, and create DRM framebuffers outside frame rendering.
     ///
     /// A partial failure drops every target prepared by this call. The resulting

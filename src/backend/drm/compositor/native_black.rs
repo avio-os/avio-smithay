@@ -9,6 +9,14 @@
 use super::*;
 use std::collections::HashSet;
 
+#[path = "native_black/frame_storage.rs"]
+mod frame_storage;
+#[path = "native_black/prepared.rs"]
+mod prepared;
+use frame_storage::assemble_native_frame;
+pub(super) use frame_storage::NativeBlackFrameStorage;
+pub use prepared::{NativeBlackAllocator, PreparedNativeBlack, PreparedNativeBlackAdoption};
+
 /// Capability and resource policy for one output's native black shield.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeBlackKind {
@@ -40,6 +48,9 @@ pub enum NativeBlackError {
     /// A reset-plane belongs to another output; the frame cannot omit it.
     #[error("could not claim every output plane for native black")]
     PlaneClaimDenied,
+    /// No native state receipt/rectangle storage can serve this request.
+    #[error(transparent)]
+    FrameStorageUnavailable(#[from] FrameWorkspaceError),
     /// The exact all-planes-off or buffered-black atomic request was rejected.
     #[error(transparent)]
     Drm(#[from] DrmError),
@@ -52,6 +63,7 @@ pub(super) struct NativeBlackTarget<B: Buffer, F: Framebuffer> {
     modeset_fallback: bool,
     mode: drm::control::Mode,
     connectors: HashSet<connector::Handle>,
+    reset_claims: Vec<PlaneClaim>,
 }
 
 impl<B: Buffer, F: Framebuffer> NativeBlackTarget<B, F> {
@@ -72,20 +84,24 @@ fn disabled_planes<B: Buffer, F: Framebuffer>(
     handles: impl IntoIterator<Item = plane::Handle>,
 ) -> FrameState<B, F> {
     let mut frame = FrameState {
-        planes: SmallVec::new(),
-        reset_plane_claims: Vec::new(),
+        planes: WorkspaceVec::legacy(Vec::new()),
+        reset_plane_claims: WorkspaceVec::legacy(Vec::new()),
         opaque_black: false,
         native_black: true,
+        damage_clip_error: None,
     };
     for handle in handles {
         if frame.plane_state(handle).is_none() {
-            frame.planes.push((
-                handle,
-                PlaneState {
-                    skip: false,
-                    ..Default::default()
-                },
-            ));
+            frame
+                .planes
+                .push((
+                    handle,
+                    PlaneState {
+                        skip: false,
+                        ..Default::default()
+                    },
+                ))
+                .expect("unbounded legacy black plane list");
         }
     }
     frame
@@ -234,11 +250,14 @@ where
         // They also prevent Full's ordinary claim filter silently omitting a
         // cursor/old scanout plane that the capability test disabled.
         for (handle, _) in &frame.planes {
-            frame.reset_plane_claims.push(
-                self.surface
-                    .claim_plane(*handle)
-                    .ok_or(NativeBlackError::PlaneClaimDenied)?,
-            );
+            frame
+                .reset_plane_claims
+                .push(
+                    self.surface
+                        .claim_plane(*handle)
+                        .ok_or(NativeBlackError::PlaneClaimDenied)?,
+                )
+                .expect("unbounded legacy black reset claims");
         }
         Ok(frame)
     }
@@ -250,6 +269,7 @@ where
     /// A refused/legacy output reserves the exact committed black target,
     /// making future shields independent of allocation, import and rendering.
     pub fn initialize_native_black(&mut self) -> Result<NativeBlackKind, NativeBlackError> {
+        self.prepare_native_black_storage()?;
         if let Some(config) = self.native_black_uncompleted.as_ref() {
             if let Some((sync, _)) = &config.sync {
                 sync.wait()
@@ -336,12 +356,22 @@ where
             shield_planeless = u8::from(accepted),
             "DRM native black capability"
         );
+        let reset_claims = self
+            .native_black_plane_handles()?
+            .into_iter()
+            .map(|plane| {
+                self.surface
+                    .claim_plane(plane)
+                    .ok_or(NativeBlackError::PlaneClaimDenied)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.native_black = Some(NativeBlackTarget {
             config,
             planeless: accepted,
             modeset_fallback: self.surface.commit_pending(),
             mode: self.surface.pending_mode(),
             connectors: self.surface.pending_connectors().into_iter().collect(),
+            reset_claims,
         });
         Ok(kind)
     }
@@ -494,6 +524,73 @@ where
         })
     }
 
+    /// Reserve native plane/control metadata once on bring-up. Capacity comes
+    /// from actual hardware planes, with four independently held state receipts.
+    pub fn prepare_native_black_storage(&mut self) -> Result<(), NativeBlackError> {
+        if self.native_black_storage.is_none() {
+            let count = self
+                .surface
+                .device_fd()
+                .plane_handles()
+                .map_err(NativeBlackError::PlaneEnumeration)?
+                .len();
+            self.native_black_storage = Some(NativeBlackFrameStorage::cold(count));
+        }
+        Ok(())
+    }
+    /// Warm native assembly uses the cold roster and exact held plane claims.
+    /// Capability was established on the cold owner; only the ordinary KMS
+    /// submission may produce a physical receipt or report actual rejection.
+    pub fn prepare_native_black_prepared(&mut self) -> Result<NativeBlackKind, NativeBlackError> {
+        let black = self
+            .native_black
+            .as_ref()
+            .ok_or(NativeBlackError::MissingBlackTarget)?;
+        if !self
+            .surface
+            .pending_configuration_matches(black.mode, &black.connectors)
+        {
+            return Err(NativeBlackError::ConfigurationChanged);
+        }
+        let storage = self
+            .native_black_storage
+            .as_ref()
+            .ok_or(NativeBlackError::MissingBlackTarget)?;
+        self.next_frame = None;
+        let mut frame = assemble_native_frame(
+            storage,
+            &black.reset_claims,
+            [
+                Some(&self.current_frame),
+                self.pending_frame.as_ref().map(|pending| &pending.frame),
+                self.queued_frame
+                    .as_ref()
+                    .map(|queued| &queued.prepared_frame.frame),
+            ]
+            .into_iter()
+            .flatten(),
+        )?;
+        let kind = if black.planeless {
+            NativeBlackKind::Planeless
+        } else {
+            let config = black
+                .config
+                .as_ref()
+                .ok_or(NativeBlackError::ColdFallbackRequired)?;
+            let state = frame
+                .plane_state_mut(self.surface.plane())
+                .ok_or(NativeBlackError::ConfigurationChanged)?;
+            state.config = Some(config.clone());
+            NativeBlackKind::Buffered
+        };
+        self.next_frame = Some(PreparedFrame {
+            kind: PreparedFrameKind::Full,
+            frame,
+        });
+        self.native_black_repaint.request();
+        Ok(kind)
+    }
+
     /// Prepare a full native-black frame for ordinary [`Self::queue_frame`].
     /// Every output-owned cursor/overlay is disabled in that exact request.
     /// A successful return is preparation, never a presentation receipt.
@@ -559,13 +656,13 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::backend::drm::device::PlaneClaimStorage;
     use std::num::NonZeroU32;
 
     #[derive(Debug)]
-    struct TestBuffer;
+    pub(in crate::backend::drm::compositor) struct TestBuffer;
     impl Buffer for TestBuffer {
         fn size(&self) -> Size<i32, BufferCoords> {
             (1, 1).into()
@@ -578,7 +675,7 @@ mod tests {
         }
     }
     #[derive(Debug)]
-    struct TestFramebuffer(framebuffer::Handle);
+    pub(in crate::backend::drm::compositor) struct TestFramebuffer(framebuffer::Handle);
     impl AsRef<framebuffer::Handle> for TestFramebuffer {
         fn as_ref(&self) -> &framebuffer::Handle {
             &self.0
@@ -593,7 +690,7 @@ mod tests {
         NonZeroU32::new(id).unwrap().into()
     }
 
-    fn config() -> PlaneConfig<TestBuffer, TestFramebuffer> {
+    pub(in crate::backend::drm::compositor) fn config() -> PlaneConfig<TestBuffer, TestFramebuffer> {
         let claims = PlaneClaimStorage::default();
         PlaneConfig {
             properties: PlaneProperties {
@@ -715,6 +812,7 @@ mod tests {
         let old = NativeBlackTarget {
             mode: mode(60),
             connectors: old_connectors.clone(),
+            reset_claims: Vec::new(),
             config: Some(config()),
             planeless: false,
             modeset_fallback: false,
@@ -743,6 +841,7 @@ mod tests {
         let refreshed = NativeBlackTarget {
             mode: mode(144),
             connectors: old_connectors.clone(),
+            reset_claims: Vec::new(),
             config: Some(reused),
             planeless: false,
             modeset_fallback: false,
@@ -871,13 +970,79 @@ mod tests {
     }
 
     #[test]
+    fn prepared_roster_includes_actual_cursor_and_queued_overlay_claims() {
+        let claims = PlaneClaimStorage::default();
+        let crtc = handle(20);
+        let roster = [claims.claim(handle(10), crtc).unwrap()];
+        let mut current = disabled_planes([handle(11)]);
+        let mut cursor = config();
+        cursor.plane_claim = claims.claim(handle(11), crtc).unwrap();
+        current.plane_state_mut(handle(11)).unwrap().config = Some(cursor);
+        let mut pending = disabled_planes([handle(12)]);
+        let mut overlay = config();
+        overlay.plane_claim = claims.claim(handle(12), crtc).unwrap();
+        pending.plane_state_mut(handle(12)).unwrap().config = Some(overlay);
+        let storage = NativeBlackFrameStorage::<TestBuffer, TestFramebuffer>::cold(3);
+        let frame = assemble_native_frame(&storage, &roster, [&current, &pending]).unwrap();
+        assert_eq!(
+            frame.planes.iter().map(|(plane, _)| *plane).collect::<Vec<_>>(),
+            [handle(10), handle(11), handle(12)]
+        );
+        assert_eq!(frame.reset_plane_claims.len(), 3);
+        assert!(frame.planes.iter().all(|(_, state)| state.config.is_none()));
+        assert!(claims.claim(handle(11), handle(21)).is_none());
+    }
+
+    #[test]
+    fn native_receipts_never_reuse_live_reader_and_return_exact_capacity() {
+        let claims = PlaneClaimStorage::default();
+        let roster = [claims.claim(handle(10), handle(20)).unwrap()];
+        let storage = NativeBlackFrameStorage::<TestBuffer, TestFramebuffer>::cold(1);
+        let acquire = || assemble_native_frame(&storage, &roster, std::iter::empty()).unwrap();
+        let a = acquire();
+        let b = acquire();
+        let c = acquire();
+        let d = acquire();
+        assert!(assemble_native_frame(&storage, &roster, std::iter::empty()).is_err());
+        drop(b);
+        let reused = acquire();
+        assert_eq!(a.reset_plane_claims[0].plane(), handle(10));
+        assert_eq!(c.reset_plane_claims[0].plane(), handle(10));
+        assert_eq!(d.reset_plane_claims[0].plane(), handle(10));
+        assert_eq!(reused.reset_plane_claims[0].plane(), handle(10));
+        drop((a, c, d, reused));
+        assert_eq!(acquire().planes.len(), 1);
+    }
+
+    #[test]
+    fn prepared_native_assembly_is_heap_quiet_for_120_frames() {
+        let claims = PlaneClaimStorage::default();
+        let roster = [
+            claims.claim(handle(10), handle(20)).unwrap(),
+            claims.claim(handle(11), handle(20)).unwrap(),
+        ];
+        let storage = NativeBlackFrameStorage::<TestBuffer, TestFramebuffer>::cold(2);
+        let (_, measured) = crate::backend::renderer::storage_heap_probe::measure(|| {
+            for _ in 0..120 {
+                let frame = assemble_native_frame(&storage, &roster, std::iter::empty()).unwrap();
+                assert_eq!(frame.planes.len(), 2);
+                drop(frame);
+            }
+        });
+        assert_eq!(measured, [0; 4]);
+    }
+
+    #[test]
     fn reset_claims_remain_owned_until_the_frame_retires() {
         let claims = PlaneClaimStorage::default();
         let crtc = handle(2);
         let other_crtc = handle(3);
         let plane = handle(10);
         let mut frame = disabled_planes::<TestBuffer, TestFramebuffer>([plane]);
-        frame.reset_plane_claims.push(claims.claim(plane, crtc).unwrap());
+        frame
+            .reset_plane_claims
+            .push(claims.claim(plane, crtc).unwrap())
+            .unwrap();
         assert!(claims.claim(plane, other_crtc).is_none());
         assert!(claims.claim(plane, crtc).is_some());
         drop(frame);

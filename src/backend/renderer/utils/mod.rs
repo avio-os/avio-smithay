@@ -220,6 +220,28 @@ impl<N: Coordinate, Kind> DamageSnapshot<N, Kind> {
         }
     }
 
+    /// Visit the exact retained damage range without collecting an owning set.
+    /// False means the predecessor is unavailable and visits no rectangles;
+    /// callers then use full damage, as with `damage_since`.
+    pub fn visit_damage_since(
+        &self,
+        commit: Option<CommitCounter>,
+        visit: &mut dyn FnMut(Rectangle<N, Kind>),
+    ) -> bool {
+        let Some(distance) = self.commit_counter.distance(commit) else {
+            return false;
+        };
+        if distance > self.damage.len() {
+            return false;
+        }
+        for damage in self.damage.iter().take(distance) {
+            for rect in damage {
+                visit(*rect);
+            }
+        }
+        true
+    }
+
     fn add(&mut self, damage: impl IntoIterator<Item = Rectangle<N, Kind>>) {
         // FIXME: Get rid of this allocation here
         let mut damage = damage.into_iter().filter(|d| !d.is_empty()).collect::<Vec<_>>();
@@ -640,6 +662,54 @@ impl SurfaceView {
 mod tests {
     use super::*;
     use crate::utils::Transform;
+
+    #[test]
+    fn borrowed_damage_range_matches_large_legacy_set_and_retains_its_generation() {
+        let mut bag = DamageBag::<i32, Physical>::new(4);
+        let previous = bag.current_commit();
+        for row in 0..3 {
+            bag.add((0..40).map(|column| Rectangle::new((column * 2, row * 3).into(), (1, 2).into())));
+        }
+        let retained = bag.snapshot();
+        let expected: Vec<_> = retained
+            .damage_since(Some(previous))
+            .unwrap()
+            .into_iter()
+            .collect();
+        let mut actual = Vec::new();
+        assert!(retained.visit_damage_since(Some(previous), &mut |rect| actual.push(rect)));
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 120);
+        for _ in 0..5 {
+            bag.add([Rectangle::from_size((1, 1).into())]);
+        }
+        let mut called = false;
+        assert!(!bag
+            .snapshot()
+            .visit_damage_since(Some(previous), &mut |_| called = true));
+        assert!(!called);
+        actual.clear();
+        assert!(retained.visit_damage_since(Some(previous), &mut |rect| actual.push(rect)));
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "renderer_vulkan")]
+    #[test]
+    fn repeated_large_damage_visits_allocate_nothing() {
+        let mut bag = DamageBag::<i32, Physical>::new(4);
+        let previous = bag.current_commit();
+        bag.add((0..96).map(|index| Rectangle::new((index, 0).into(), (1, 1).into())));
+        let snapshot = bag.snapshot();
+        let (count, calls) = crate::backend::renderer::vulkan::storage_heap_probe::measure(|| {
+            let mut count = 0;
+            for _ in 0..120 {
+                assert!(snapshot.visit_damage_since(Some(previous), &mut |_| count += 1));
+            }
+            count
+        });
+        assert_eq!(count, 96 * 120);
+        assert_eq!(calls, [0; 4]);
+    }
 
     #[test]
     fn surface_view_projects_buffer_damage_to_element_identity() {

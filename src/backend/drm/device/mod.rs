@@ -218,6 +218,9 @@ impl DrmDevice {
         })?;
 
         let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
+        if matches!(&*internal, DrmDeviceInternal::Atomic(_)) {
+            internal.device_fd().prepare_mode_blob_banks(resources.crtcs())?;
+        }
 
         Ok((
             DrmDevice {
@@ -377,6 +380,7 @@ impl DrmDevice {
                 mapping,
                 mode,
                 connectors,
+                &planes,
             )?)
         } else {
             DrmSurfaceInternal::Legacy(LegacyDrmSurface::new(

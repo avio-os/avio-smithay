@@ -69,6 +69,13 @@ pub mod element;
 
 pub mod damage;
 
+// Exactly one test allocator authority across minimal DRM and Vulkan builds.
+#[cfg(all(test, not(feature = "renderer_vulkan")))]
+#[path = "vulkan/storage_heap_probe.rs"]
+pub(crate) mod storage_heap_probe;
+#[cfg(all(test, feature = "renderer_vulkan"))]
+pub(crate) use vulkan::storage_heap_probe;
+
 pub mod sync;
 use sync::SyncPoint;
 
@@ -591,6 +598,14 @@ pub trait Frame {
 
     /// Wait for a [`SyncPoint`] to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;
+
+    /// A previous segment of this outer frame has already submitted native
+    /// reads, but an error would prevent returning its complete retirement edge.
+    /// Callers must retain sampled sources on such an error. Legacy single-pass
+    /// renderers keep the default behavior.
+    fn completion_unobservable_on_error(&self) -> bool {
+        false
+    }
 
     /// Finish this [`Frame`] returning any error that may happen during any cleanup.
     ///

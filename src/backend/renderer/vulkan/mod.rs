@@ -161,6 +161,12 @@ pub(crate) mod device_handle;
 mod device_origin;
 mod ordered_queue;
 pub use device_origin::VulkanDeviceOrigin;
+mod prepared_resources;
+mod resource_factory;
+pub use prepared_resources::{
+    PreparedAttachmentFormat, PreparedPipelineBank, PreparedResourceAdoption, PreparedSourceImport,
+};
+pub use resource_factory::VulkanResourceFactory;
 mod dmabuf;
 mod error;
 mod format;
@@ -182,7 +188,19 @@ pub use retirement_slot::VulkanRetirementSlot;
 mod retirement;
 mod staging;
 pub use staging::VulkanUploadStorage;
+mod bank_return;
+mod command_storage;
+mod damage_scratch;
+mod external_wait_storage;
+mod fence_return;
+mod recording_foreign;
+mod recording_storage;
+#[cfg(test)]
+pub(crate) mod storage_heap_probe;
+mod submission_storage;
+pub use command_storage::VulkanCommandStorage;
 mod sync;
+pub use submission_storage::VulkanCommandStorageLimits;
 mod target;
 mod texture;
 mod upload;
@@ -199,7 +217,7 @@ pub use offscreen::VulkanOffscreenAllocator;
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
 
-use std::{ffi::CStr, time::Instant};
+use std::{ffi::CStr, sync::Arc, time::Instant};
 
 use crate::backend::{
     allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc, Modifier},
@@ -346,7 +364,7 @@ pub struct VulkanRenderer {
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
     device: DeviceState,
-    formats: FormatCapabilities,
+    formats: Arc<FormatCapabilities>,
     dmabuf: DmabufState,
     upload: UploadState,
     readback: ReadbackState,
@@ -368,6 +386,103 @@ impl Drop for VulkanRenderer {
 }
 
 impl VulkanRenderer {
+    /// Provision this exact context's source-fence semaphore inventory cold.
+    /// The count covers one selected frame, rather than all native slots.
+    pub fn prepare_external_wait_storage(&mut self, count: usize) -> Result<(), VulkanRendererError> {
+        self.device.prepare_external_wait_storage(count)
+    }
+
+    /// Number of actual cold-created native wait semaphores in this context.
+    pub fn external_wait_storage_capacity(&self) -> usize {
+        self.device.external_wait_storage_capacity()
+    }
+
+    /// Whether the context enabled strict prepared external waits, including
+    /// an admitted empty inventory. Legacy renderer users remain compatible.
+    pub fn external_wait_storage_is_prepared(&self) -> bool {
+        self.device.external_wait_storage_is_prepared()
+    }
+
+    /// Admit every external wait in the selected source batch before imports.
+    /// Pressure preserves the original request and exposes its actual native
+    /// loan-owner edge through `command_capacity_edge`.
+    pub fn begin_external_wait_batch(&mut self, required: usize) -> Result<(), VulkanRendererError> {
+        self.device.begin_external_wait_batch(required)
+    }
+
+    /// Adopt a cold bank of this exact origin after every native submission,
+    /// imported wait, pending upload, and external fence reader has returned.
+    /// A deferred token remains owned by the caller; no creation/wait occurs.
+    pub fn adopt_command_storage(
+        &mut self,
+        prepared: &mut VulkanCommandStorage,
+    ) -> Result<bool, VulkanRendererError> {
+        self.device.adopt_command_storage(prepared)
+    }
+
+    /// Exact all-native/all-logical-reader edge for replacing the whole bank.
+    /// Unlike single-slot admission this does not report one free slot as ready.
+    pub fn command_storage_adoption_edge(
+        &mut self,
+    ) -> Result<crate::backend::renderer::sync::SyncPoint, VulkanRendererError> {
+        self.device.command_storage_adoption_edge()
+    }
+
+    /// Rectangle backing cost per admitted capacity across the actual nested
+    /// damage loans. Include this in owning cold workspace-budget admission.
+    pub fn damage_scratch_bytes_per_rectangle(slots: usize) -> Option<usize> {
+        damage_scratch::DamageScratchBank::bytes_per_rectangle(slots)
+    }
+
+    /// Configure the exact nested rectangle loans on the untagged resource
+    /// owner, before admitting a frame. This does not submit or await GPU work.
+    pub fn prepare_damage_scratch_storage(
+        &mut self,
+        slots: usize,
+        rectangles: usize,
+    ) -> Result<(), VulkanRendererError> {
+        self.device.prepare_damage_scratch_storage(slots, rectangles)
+    }
+
+    /// Actual immutable cold command-reader bound for this context, including
+    /// externally held completion epochs. Use it to admit dependent owner banks.
+    pub fn command_storage_limits(&self) -> VulkanCommandStorageLimits {
+        self.device.command_storage_limits()
+    }
+
+    /// Exact native completion or external reader-return edge for occupied
+    /// cold command storage. A ready native FD never substitutes for readers.
+    pub fn command_capacity_edge(
+        &mut self,
+    ) -> Result<Option<crate::backend::renderer::sync::SyncPoint>, VulkanRendererError> {
+        self.device.command_capacity_edge()
+    }
+
+    /// Fixed import-cache policy capacity used by a cold owner membership bank.
+    pub fn sampled_source_capacity(&self) -> usize {
+        dmabuf::MAX_DMABUF_CACHE_ENTRIES
+    }
+
+    /// Whether this exact context already owns the actual native attachment bank.
+    pub fn attachment_format_is_prepared(&self, format: PreparedAttachmentFormat) -> bool {
+        format
+            .native()
+            .is_ok_and(|native| self.pipelines.prepared_pipelines_for_format(native).is_ok())
+    }
+
+    /// Adopt a cold-created bank for this exact context. No Vulkan calls,
+    /// cache mutex acquisition, native eviction or heap growth occur here.
+    pub fn adopt_prepared_pipeline_bank(
+        &mut self,
+        prepared: &mut PreparedPipelineBank,
+        expected_factory: &VulkanResourceFactory,
+        format: PreparedAttachmentFormat,
+        generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.pipelines
+            .adopt_prepared(prepared, expected_factory, generation, format.native()?)
+    }
+
     /// Actual foreign-host transfer-source support queried from this physical
     /// device. The returned alignment is a requirement, not a claimed platform
     /// constant. Each source still needs seal, extent and memory-type validation.
@@ -412,6 +527,28 @@ impl VulkanRenderer {
         VulkanDeviceOrigin::from_state(&self.device)
     }
 
+    /// Mint immutable exact-context cold preparation authority before RT work.
+    pub fn resource_factory(&self) -> VulkanResourceFactory {
+        self.dmabuf.resource_factory(
+            self.device_origin(),
+            self.formats.clone(),
+            self.pipelines.creation_authority(),
+        )
+    }
+
+    /// Install a cold-prepared sampled import without native creation or cache
+    /// growth. The caller returns the exact result object to the cold helper
+    /// after adoption so displaced owners and signatures are dropped there.
+    pub fn adopt_prepared_source(
+        &mut self,
+        prepared: &mut PreparedSourceImport,
+        source: &Dmabuf,
+        generation: u64,
+    ) -> Result<PreparedResourceAdoption, VulkanRendererError> {
+        self.dmabuf
+            .adopt_prepared(&self.device, prepared, source, generation)
+    }
+
     fn from_device_state(device: DeviceState) -> Result<Self, VulkanRendererError> {
         let physical_device = device.physical_device();
         let _initialization = device
@@ -421,7 +558,7 @@ impl VulkanRenderer {
         let descriptors = DescriptorState::new(device.shared_device())?;
         let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout())?;
 
-        let formats = FormatCapabilities::new(physical_device)?;
+        let formats = Arc::new(FormatCapabilities::new(physical_device)?);
         let readback = ReadbackState::new(device.shared_device().offscreen_ids());
         let context_id = ContextId::new();
         let dmabuf = DmabufState::new(context_id.erased());
@@ -439,6 +576,15 @@ impl VulkanRenderer {
             descriptors: std::mem::ManuallyDrop::new(descriptors),
             pipelines: std::mem::ManuallyDrop::new(pipelines),
         })
+    }
+
+    /// Creates context-local cold command storage with explicit CPU bounds on
+    /// the same native queue/device origin. Call during cold preparation only.
+    pub fn from_device_origin_with_command_storage_limits(
+        origin: &VulkanDeviceOrigin,
+        limits: VulkanCommandStorageLimits,
+    ) -> Result<Self, VulkanRendererError> {
+        Self::from_device_state(DeviceState::from_origin_with_limits(origin, limits)?)
     }
 
     /// Sets runtime debug flags.

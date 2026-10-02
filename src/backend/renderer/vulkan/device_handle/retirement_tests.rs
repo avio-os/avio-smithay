@@ -25,7 +25,13 @@ pub(in super::super) enum Operation {
     Buffer(u64),
     Unmap(u64),
     Fence(u64),
+    FenceReset(u64),
     CommandPool(u64),
+    CommandPoolCreated(u64),
+    CommandBuffersAllocated(u32),
+    SemaphoreCreated(u64),
+    Semaphore(u64),
+    SemaphoreImported(u64),
     View(u64),
     Image(u64),
     Memory(u64),
@@ -49,9 +55,11 @@ type Event = (Operation, ThreadId);
 struct TestDispatch {
     events: Sender<Event>,
     wait_result: Arc<AtomicI32>,
+    import_result: AtomicI32,
 }
 static DEVICES: OnceLock<Mutex<HashMap<u64, TestDispatch>>> = OnceLock::new();
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1);
+static NEXT_NATIVE: AtomicU64 = AtomicU64::new(10000);
 
 fn record(device: vk::Device, operation: Operation) {
     DEVICES
@@ -67,13 +75,23 @@ fn record(device: vk::Device, operation: Operation) {
 }
 
 unsafe extern "system" fn create_fence(
-    device: vk::Device,
+    _device: vk::Device,
     _: *const vk::FenceCreateInfo<'_>,
     _: *const vk::AllocationCallbacks<'_>,
     fence: *mut vk::Fence,
 ) -> vk::Result {
     unsafe {
-        fence.write(vk::Fence::from_raw(device.as_raw() + 1000));
+        fence.write(vk::Fence::from_raw(NEXT_NATIVE.fetch_add(1, Ordering::Relaxed)));
+    }
+    vk::Result::SUCCESS
+}
+unsafe extern "system" fn reset_fences(
+    device: vk::Device,
+    count: u32,
+    fences: *const vk::Fence,
+) -> vk::Result {
+    for fence in unsafe { std::slice::from_raw_parts(fences, count as usize) } {
+        record(device, Operation::FenceReset(fence.as_raw()));
     }
     vk::Result::SUCCESS
 }
@@ -83,6 +101,106 @@ unsafe extern "system" fn destroy_fence(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     record(device, Operation::Fence(fence.as_raw()));
+}
+
+unsafe extern "system" fn create_semaphore(
+    device: vk::Device,
+    _: *const vk::SemaphoreCreateInfo<'_>,
+    _: *const vk::AllocationCallbacks<'_>,
+    semaphore: *mut vk::Semaphore,
+) -> vk::Result {
+    let id = NEXT_NATIVE.fetch_add(1, Ordering::Relaxed);
+    unsafe { semaphore.write(vk::Semaphore::from_raw(id)) };
+    record(device, Operation::SemaphoreCreated(id));
+    vk::Result::SUCCESS
+}
+unsafe extern "system" fn destroy_semaphore(
+    device: vk::Device,
+    semaphore: vk::Semaphore,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
+    record(device, Operation::Semaphore(semaphore.as_raw()));
+}
+unsafe extern "system" fn import_semaphore_fd(
+    device: vk::Device,
+    info: *const vk::ImportSemaphoreFdInfoKHR<'_>,
+) -> vk::Result {
+    let result = {
+        let devices = DEVICES.get().unwrap().lock().unwrap();
+        vk::Result::from_raw(
+            devices
+                .get(&device.as_raw())
+                .unwrap()
+                .import_result
+                .load(Ordering::Acquire),
+        )
+    };
+    let info = unsafe { &*info };
+    assert_eq!(info.flags, vk::SemaphoreImportFlags::TEMPORARY);
+    assert_eq!(info.handle_type, vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    assert!(unsafe { libc::fcntl(info.fd, libc::F_GETFD) } >= 0);
+    if result == vk::Result::SUCCESS {
+        // Mirror the native ABI ownership transfer, without claiming that the
+        // eventfd fixture is a real driver-accepted Linux sync_file.
+        unsafe { libc::close(info.fd) };
+        record(device, Operation::SemaphoreImported(info.semaphore.as_raw()));
+    }
+    result
+}
+
+unsafe extern "system" fn get_device_proc_addr(
+    _: vk::Device,
+    name: *const std::ffi::c_char,
+) -> vk::PFN_vkVoidFunction {
+    if unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() == b"vkImportSemaphoreFdKHR" {
+        Some(unsafe {
+            std::mem::transmute::<vk::PFN_vkImportSemaphoreFdKHR, unsafe extern "system" fn()>(
+                import_semaphore_fd,
+            )
+        })
+    } else {
+        None
+    }
+}
+
+pub(in super::super) fn external_semaphore_fd(
+    device: &DeviceHandle,
+) -> ash::khr::external_semaphore_fd::Device {
+    let instance = unsafe {
+        ash::Instance::load_with(
+            |name| {
+                if name.to_bytes() == b"vkGetDeviceProcAddr" {
+                    get_device_proc_addr as *const c_void
+                } else {
+                    std::ptr::null()
+                }
+            },
+            vk::Instance::null(),
+        )
+    };
+    ash::khr::external_semaphore_fd::Device::new(&instance, device.handle())
+}
+
+pub(in super::super) fn set_import_result(device: &DeviceHandle, result: vk::Result) {
+    DEVICES
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .get(&device.handle().handle().as_raw())
+        .unwrap()
+        .import_result
+        .store(result.as_raw(), Ordering::Release);
+}
+unsafe extern "system" fn get_fence_status(device: vk::Device, _: vk::Fence) -> vk::Result {
+    let devices = DEVICES.get().unwrap().lock().unwrap();
+    vk::Result::from_raw(
+        devices
+            .get(&device.as_raw())
+            .unwrap()
+            .wait_result
+            .load(Ordering::Acquire),
+    )
 }
 unsafe extern "system" fn wait_for_fences(
     device: vk::Device,
@@ -99,6 +217,35 @@ unsafe extern "system" fn wait_for_fences(
             .wait_result
             .load(Ordering::Acquire),
     )
+}
+unsafe extern "system" fn create_command_pool(
+    device: vk::Device,
+    _: *const vk::CommandPoolCreateInfo<'_>,
+    _: *const vk::AllocationCallbacks<'_>,
+    pool: *mut vk::CommandPool,
+) -> vk::Result {
+    let id = NEXT_NATIVE.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        pool.write(vk::CommandPool::from_raw(id));
+    }
+    record(device, Operation::CommandPoolCreated(id));
+    vk::Result::SUCCESS
+}
+unsafe extern "system" fn allocate_command_buffers(
+    device: vk::Device,
+    info: *const vk::CommandBufferAllocateInfo<'_>,
+    buffers: *mut vk::CommandBuffer,
+) -> vk::Result {
+    let count = unsafe { (*info).command_buffer_count };
+    for index in 0..count {
+        unsafe {
+            buffers.add(index as usize).write(vk::CommandBuffer::from_raw(
+                NEXT_NATIVE.fetch_add(1, Ordering::Relaxed),
+            ));
+        }
+    }
+    record(device, Operation::CommandBuffersAllocated(count));
+    vk::Result::SUCCESS
 }
 unsafe extern "system" fn destroy_command_pool(
     device: vk::Device,
@@ -164,6 +311,7 @@ pub(in super::super) fn device_with_wait_result(
         TestDispatch {
             events: events.clone(),
             wait_result,
+            import_result: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
         },
     );
     // SAFETY: Only the supplied destructor functions are invoked by this
@@ -176,9 +324,15 @@ pub(in super::super) fn device_with_wait_result(
                 b"vkDestroyBuffer" => destroy_buffer as *const c_void,
                 b"vkUnmapMemory" => unmap_memory as *const c_void,
                 b"vkCreateFence" => create_fence as *const c_void,
+                b"vkCreateSemaphore" => create_semaphore as *const c_void,
+                b"vkDestroySemaphore" => destroy_semaphore as *const c_void,
                 b"vkDestroyFence" => destroy_fence as *const c_void,
+                b"vkResetFences" => reset_fences as *const c_void,
                 b"vkWaitForFences" => wait_for_fences as *const c_void,
+                b"vkGetFenceStatus" => get_fence_status as *const c_void,
                 b"vkDestroyCommandPool" => destroy_command_pool as *const c_void,
+                b"vkCreateCommandPool" => create_command_pool as *const c_void,
+                b"vkAllocateCommandBuffers" => allocate_command_buffers as *const c_void,
                 b"vkFreeMemory" => free_memory as *const c_void,
                 b"vkDestroyDevice" => destroy_device as *const c_void,
                 _ => std::ptr::null(),
@@ -219,6 +373,14 @@ pub(in super::super) fn image(device: Arc<DeviceHandle>, id: u64) -> Arc<VulkanI
         vk::ImageLayout::UNDEFINED,
         device,
     ))
+}
+
+pub(in super::super) fn drain_until_parent(events: &Receiver<Event>) {
+    loop {
+        if next(events).0 == Operation::Parent {
+            break;
+        }
+    }
 }
 
 pub(in super::super) fn next(events: &Receiver<Event>) -> Event {

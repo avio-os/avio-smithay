@@ -24,23 +24,18 @@ fn failed_native_readback_wait_retains_exact_fence_source_and_destination_until_
         census.record(VulkanAllocationReason::Scratch, 4096),
     );
     let destination_weak = Arc::downgrade(&destination);
-    let fence = VulkanFence::create(device.clone()).unwrap();
-    let fence_handle = fence.handle().as_raw();
+    let mut slot =
+        InFlightSubmission::cold(device.clone(), None, VulkanCommandStorageLimits::default()).unwrap();
+    let fence_handle = slot.native_fence().handle().as_raw();
     device.mark_submission_pending();
     let mut commands = RetiredCommands::empty(vk::CommandPool::from_raw(600));
     commands.device = Some(device.clone());
-    commands.submissions.push_back(InFlightSubmission {
-        id: SubmissionId(1),
-        fence,
-        export_semaphore: None,
-        command_buffers: Vec::new(),
-        framebuffers: Vec::new(),
-        retained_images: vec![source],
-        upload_sources: Vec::new(),
-        _readback: Some(destination),
-        wait_semaphores: Vec::new(),
-        submitted_at: Instant::now(),
-    });
+    slot.id = SubmissionId(1);
+    slot.submission_id_known = true;
+    slot.retained_images.push(source);
+    slot._readback = Some(destination);
+    commands.submissions.push_back(slot);
+
     assert_eq!(
         device.observe_result(commands.wait_complete(device.handle())),
         Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)

@@ -56,6 +56,25 @@ pub struct Swapchain<A: Allocator> {
     slots: [Arc<InternalSlot<A::Buffer>>; SLOT_CAP],
 }
 
+/// Cold-created empty slot controls for a dimension change. Adoption swaps
+/// the old controls into this packet; its owning actor disposes them cold.
+#[derive(Debug)]
+pub struct PreparedSwapchainResize<B: Buffer> {
+    width: u32,
+    height: u32,
+    slots: [Arc<InternalSlot<B>>; SLOT_CAP],
+}
+impl<B: Buffer> PreparedSwapchainResize<B> {
+    /// Build all empty controls outside realtime/frame/input threads.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            slots: Default::default(),
+        }
+    }
+}
+
 impl<A: Allocator> fmt::Debug for Swapchain<A> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("Swapchain")
@@ -331,9 +350,11 @@ where
                             Some(0)
                         }
                     });
-                // If the age overflows the slot was not used for a long time. Lets clear it
+                // Age zero forces a full repaint when this admitted buffer is
+                // reused. Keep its exact backing and live readers: idle pool
+                // retirement, rather than submission, owns releasing it.
                 if res.is_err() {
-                    *other_slot = Default::default();
+                    other_slot.age.store(0, Ordering::SeqCst);
                 }
             }
         }
@@ -350,6 +371,34 @@ where
         self.width = width;
         self.height = height;
         self.slots = Default::default();
+    }
+
+    /// Apply a cold-created dimension successor without creating or dropping
+    /// slot controls. Existing acquired/current readers retain their Arcs.
+    pub fn adopt_prepared_resize(&mut self, prepared: &mut PreparedSwapchainResize<A::Buffer>) {
+        if (self.width, self.height) == (prepared.width, prepared.height) {
+            return;
+        }
+        std::mem::swap(&mut self.width, &mut prepared.width);
+        std::mem::swap(&mut self.height, &mut prepared.height);
+        std::mem::swap(&mut self.slots, &mut prepared.slots);
+    }
+
+    /// Swap a cold-created modifier successor and empty controls. Existing
+    /// readers keep their exact slot; displaced metadata returns in the packet.
+    pub fn adopt_prepared_modifiers(
+        &mut self,
+        prepared: &mut PreparedSwapchainResize<A::Buffer>,
+        modifiers: &mut Vec<Modifier>,
+    ) {
+        if self.modifiers == *modifiers {
+            self.adopt_prepared_resize(prepared);
+            return;
+        }
+        std::mem::swap(&mut self.modifiers, modifiers);
+        std::mem::swap(&mut self.width, &mut prepared.width);
+        std::mem::swap(&mut self.height, &mut prepared.height);
+        std::mem::swap(&mut self.slots, &mut prepared.slots);
     }
 
     /// Retire cached slots with no outstanding acquisition or frame owner.

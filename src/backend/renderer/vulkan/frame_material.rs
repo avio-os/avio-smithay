@@ -62,6 +62,27 @@ impl VulkanFrame<'_> {
         passes: &[VulkanKawasePass],
         direct_downsample: Option<(Size<i32, BufferCoord>, f32)>,
     ) -> Result<(), VulkanRendererError> {
+        let mut resolved = std::mem::take(&mut self.recording_mut()?.storage.resolved_kawase);
+        let result = self.capture_material_prefix_in_storage(
+            backdrop_read_area,
+            capture,
+            passes,
+            direct_downsample,
+            &mut resolved,
+        );
+        resolved.clear();
+        self.recording_mut()?.storage.resolved_kawase = resolved;
+        result
+    }
+
+    fn capture_material_prefix_in_storage(
+        &mut self,
+        backdrop_read_area: Rectangle<i32, Physical>,
+        capture: &VulkanTexture,
+        passes: &[VulkanKawasePass],
+        direct_downsample: Option<(Size<i32, BufferCoord>, f32)>,
+        resolved: &mut Vec<ResolvedKawasePass>,
+    ) -> Result<(), VulkanRendererError> {
         let Some(capture_image) = capture.image_resource().cloned() else {
             return Err(VulkanRendererError::NotImplemented(
                 "framebuffer-effect capture requires an image-backed Vulkan texture",
@@ -127,8 +148,18 @@ impl VulkanFrame<'_> {
         }
         // Resolve all resources before ending the main pass; no invalid graph can
         // leave an otherwise usable frame in a paused render-pass state.
-        let first_resolved = self.renderer.resolve_kawase_passes(first_pass.as_slice())?;
-        let resolved = self.renderer.resolve_kawase_passes(passes)?;
+        self.renderer
+            .resolve_kawase_passes_into(first_pass.as_slice(), resolved)?;
+        self.renderer.resolve_kawase_passes_into(passes, resolved)?;
+        let recording = self.recording()?;
+        let requested = recording.effect_framebuffers.len() + resolved.len() + 1;
+        if requested > recording.framebuffer_limit {
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "Kawase framebuffers",
+                requested,
+                limit: recording.framebuffer_limit,
+            });
+        }
 
         // SAFETY: The frame owns an active render pass in this command buffer.
         unsafe {
@@ -143,11 +174,7 @@ impl VulkanFrame<'_> {
                 .cmd_end_render_pass(command_buffer);
         }
 
-        if direct_downsample.is_some() {
-            for pass in &first_resolved {
-                self.record_kawase_pass(command_buffer, pass)?;
-            }
-        } else {
+        if direct_downsample.is_none() {
             self.transition_image_layout(&target, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
             self.transition_image_layout(&capture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
             record_image_blit(
@@ -161,7 +188,7 @@ impl VulkanFrame<'_> {
             );
         }
 
-        for pass in &resolved {
+        for pass in resolved.iter() {
             self.record_kawase_pass(command_buffer, pass)?;
         }
 
@@ -193,6 +220,7 @@ impl VulkanFrame<'_> {
         command_buffer: vk::CommandBuffer,
         pass: &ResolvedKawasePass,
     ) -> Result<(), VulkanRendererError> {
+        self.recording()?.admit_framebuffer()?;
         self.transition_image_layout(&pass.source, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
         self.transition_image_layout(&pass.destination, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
 

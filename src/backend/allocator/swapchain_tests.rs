@@ -214,3 +214,103 @@ fn immutable_shield_does_not_consume_a_composition_slot_or_release_readers() {
     assert_eq!(chain.retire_unreferenced(), SLOT_CAP);
     assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn prepared_mode_and_modifier_adoption_retains_old_reader_and_displaced_controls() {
+    let mut chain = chain();
+    let front = chain.acquire().unwrap().unwrap();
+    let live = chain.allocator.live.clone();
+    let mut successor = PreparedSwapchainResize::new(800, 600);
+    let mut modifiers = vec![Modifier::Invalid];
+    let (_, measured) = crate::backend::renderer::storage_heap_probe::measure(|| {
+        chain.adopt_prepared_modifiers(&mut successor, &mut modifiers);
+    });
+    assert_eq!(measured, [0; 4]);
+    assert_eq!(chain.dimensions(), (800, 600));
+    assert_eq!(chain.modifiers(), [Modifier::Invalid]);
+    assert_eq!(front.size(), (640, 480).into());
+    assert_eq!(modifiers, [Modifier::Linear]);
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    drop(front);
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "packet owns displaced slot until cold disposal"
+    );
+    drop(successor);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn same_extent_modifier_restoration_replaces_controls_without_reinterpreting_front() {
+    let mut chain = chain();
+    let front = chain.acquire().unwrap().unwrap();
+    let mut successor = PreparedSwapchainResize::new(640, 480);
+    let mut modifiers = vec![Modifier::Invalid];
+    chain.adopt_prepared_modifiers(&mut successor, &mut modifiers);
+    assert_eq!(chain.allocated_slots(), 0);
+    assert_eq!(front.format().modifier, Modifier::Linear);
+    assert_eq!(chain.modifiers(), [Modifier::Invalid]);
+    assert_eq!(chain.allocator.allocations, 1);
+}
+
+#[test]
+fn age_overflow_preserves_admitted_backing_and_held_reader_until_cold_retirement() {
+    let mut chain = chain();
+    let held = chain.acquire().unwrap().unwrap();
+    held.userdata().insert_if_missing_threadsafe(|| 37u64);
+    let selected = chain.acquire().unwrap().unwrap();
+    let control = Arc::as_ptr(&held.0);
+    let buffer = &*held as *const TestBuffer;
+    chain.submitted(&held);
+    for _ in 0..254 {
+        chain.submitted(&selected);
+    }
+    assert_eq!(held.age(), u8::MAX);
+    chain.submitted(&selected);
+    assert_eq!(held.age(), 0, "unknown age requires full-buffer repair");
+    assert!(chain.slots.iter().any(|slot| Arc::as_ptr(slot) == control));
+    assert_eq!(&*held as *const TestBuffer, buffer);
+    assert_eq!(held.userdata().get::<u64>(), Some(&37));
+    assert_eq!(chain.allocated_slots(), 2);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 2);
+    assert_eq!(chain.retire_unreferenced(), 0, "both readers are still held");
+    drop(held);
+    let reused = chain.acquire_existing().unwrap();
+    assert_eq!(Arc::as_ptr(&reused.0), control);
+    assert_eq!(&*reused as *const TestBuffer, buffer);
+    assert_eq!(reused.age(), 0);
+    assert_eq!(chain.allocator.allocations, 2);
+    drop((reused, selected));
+    assert_eq!(chain.retire_unreferenced(), 2);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn repeated_age_overflows_are_heap_quiet_for_4096_warm_submissions() {
+    let mut chain = chain();
+    let held = chain.acquire().unwrap().unwrap();
+    let selected = chain.acquire().unwrap().unwrap();
+    let control = Arc::as_ptr(&held.0);
+    let mut overflows = 0;
+    let (_, heap) = crate::backend::renderer::storage_heap_probe::measure(|| {
+        for submission in 0..4096 {
+            if submission % 256 == 0 {
+                chain.submitted(&held);
+            }
+            let previous_age = held.age();
+            chain.submitted(&selected);
+            if previous_age == u8::MAX {
+                assert_eq!(held.age(), 0);
+                overflows += 1;
+            }
+            assert!(chain.slots.iter().any(|slot| Arc::as_ptr(slot) == control));
+            assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 2);
+        }
+    });
+    assert_eq!(overflows, 16);
+    assert_eq!(heap, [0; 4]);
+    assert_eq!(chain.allocator.allocations, 2);
+    assert_eq!(held.age(), 0);
+    assert_eq!(selected.age(), 1);
+}

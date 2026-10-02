@@ -19,13 +19,18 @@ use crate::backend::{
 };
 
 use super::{
+    external_wait_storage::{ExternalWaitBank, ExternalWaitBatch, ImportedWaitSemaphore},
     image::{transition_image_layout, VulkanImage},
     staging::{ReservationWriter, StagingReservation, UploadArena, UploadArenaStats},
-    sync::{import_sync_file_to_fence, import_sync_file_to_semaphore, VulkanFence},
+    sync::{
+        import_sync_file_into_semaphore, import_sync_file_to_fence, import_sync_file_to_semaphore,
+        VulkanFence,
+    },
     VulkanRendererError, VulkanSubmissionSnapshot,
 };
 
 const MAX_UPLOAD_BATCH_OPERATIONS: usize = 256;
+use super::submission_storage::VulkanCommandStorageLimits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SubmissionId(pub(super) u64);
@@ -37,44 +42,63 @@ impl SubmissionId {
     }
 }
 
-struct InFlightSubmission {
-    id: SubmissionId,
-    fence: VulkanFence,
+pub(super) struct InFlightSubmission {
+    pub(super) id: SubmissionId,
+    pub(super) submission_id_known: bool,
+    pub(super) fence: SyncPoint,
+    pub(super) native: Arc<VulkanFence>,
+    pub(super) readers: Arc<super::fence_return::FenceReaders>,
+    pub(super) reader_return: SyncPoint,
     /// Binary semaphore signaled by this submission whose SYNC_FD was
     /// exported right after submit (the caller-visible sync_file). The
     /// VkFence is never exported, so it faithfully tracks completion and is
     /// polled directly for reclamation; the semaphore is kept alive until
     /// the submission retires (a semaphore referenced by pending GPU work
     /// must not be destroyed) and destroyed on recycle.
-    export_semaphore: Option<vk::Semaphore>,
-    command_buffers: Vec<vk::CommandBuffer>,
-    framebuffers: Vec<vk::Framebuffer>,
-    retained_images: Vec<Arc<VulkanImage>>,
-    upload_sources: Vec<UploadSource>,
-    _readback: Option<Arc<super::readback::ReadbackBuffer>>,
-    wait_semaphores: Vec<vk::Semaphore>,
-    submitted_at: Instant,
+    pub(super) export_semaphore: Option<vk::Semaphore>,
+    pub(super) export_unconsumed: bool,
+    pub(super) command_buffers: Vec<vk::CommandBuffer>,
+    pub(super) framebuffers: Vec<vk::Framebuffer>,
+    pub(super) retained_images: Vec<Arc<VulkanImage>>,
+    pub(super) upload_sources: Vec<UploadSource>,
+    pub(super) _readback: Option<Arc<super::readback::ReadbackBuffer>>,
+    pub(super) wait_semaphores: Vec<ImportedWaitSemaphore>,
+    pub(super) submitted_at: Instant,
 }
 
 /// Exact queue readers moved intact to the device's off-thread command
 /// retirement owner. A failed wait retains this whole object, including every
 /// foreign host mapping, instead of asserting that GPU access ended.
 pub(super) struct RetiredCommands {
-    command_pool: vk::CommandPool,
-    submissions: VecDeque<InFlightSubmission>,
-    pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
+    pub(super) command_pool: vk::CommandPool,
+    pub(super) submissions: VecDeque<InFlightSubmission>,
+    pub(super) free_submissions: Vec<InFlightSubmission>,
+    pub(super) reusable_command_buffers: Vec<vk::CommandBuffer>,
+    pub(super) recording_storage: Option<Arc<super::recording_storage::RecordingStorageBank>>,
+    pub(super) bank_return: Option<SyncPoint>,
+    damage_scratch: Option<Arc<super::damage_scratch::DamageScratchBank>>,
+    failed_recording: Option<super::recording_storage::RecordingStorageLease>,
+    pending_waits: Vec<(ImportedWaitSemaphore, vk::PipelineStageFlags)>,
+    pub(super) external_wait_bank: Option<ExternalWaitBank>,
     pending_uploads: PendingUploadBatch,
     upload_arena: Option<UploadArena>,
     context_state: Option<(super::pipeline::PipelineState, super::descriptor::DescriptorState)>,
-    device: Option<Arc<DeviceHandle>>,
+    pub(super) device: Option<Arc<DeviceHandle>>,
 }
 
 impl RetiredCommands {
-    fn empty(command_pool: vk::CommandPool) -> Self {
+    pub(super) fn empty(command_pool: vk::CommandPool) -> Self {
         Self {
             command_pool,
             submissions: VecDeque::new(),
+            free_submissions: Vec::new(),
+            reusable_command_buffers: Vec::new(),
+            recording_storage: None,
+            bank_return: None,
+            damage_scratch: None,
+            failed_recording: None,
             pending_waits: Vec::new(),
+            external_wait_bank: None,
             pending_uploads: Default::default(),
             upload_arena: None,
             context_state: None,
@@ -82,11 +106,24 @@ impl RetiredCommands {
         }
     }
 
+    pub(super) fn cold_cpu_storage(
+        command_pool: vk::CommandPool,
+        limits: VulkanCommandStorageLimits,
+    ) -> Self {
+        let mut commands = Self::empty(command_pool);
+        commands.submissions = VecDeque::with_capacity(limits.submission_slots);
+        commands.free_submissions = Vec::with_capacity(limits.submission_slots);
+        commands.recording_storage = Some(super::recording_storage::RecordingStorageBank::cold(limits));
+        commands.pending_waits = Vec::with_capacity(limits.waits_per_submission);
+        commands.pending_uploads.operations = Vec::with_capacity(MAX_UPLOAD_BATCH_OPERATIONS);
+        commands
+    }
+
     /// The native VkFence is never exported/consumed. Success for every
     /// reader is the only proof that allows destruction of this command pool.
     pub(super) fn wait_complete(&self, raw: &ash::Device) -> Result<(), vk::Result> {
         for submission in &self.submissions {
-            unsafe { raw.wait_for_fences(&[submission.fence.handle()], true, u64::MAX) }?;
+            unsafe { raw.wait_for_fences(&[submission.native_fence().handle()], true, u64::MAX) }?;
         }
         Ok(())
     }
@@ -97,18 +134,31 @@ impl RetiredCommands {
                 unsafe { raw.destroy_semaphore(semaphore, None) };
             }
             for semaphore in &submission.wait_semaphores {
-                unsafe { raw.destroy_semaphore(*semaphore, None) };
+                if !semaphore.pooled {
+                    unsafe { raw.destroy_semaphore(semaphore.handle, None) };
+                }
             }
             for framebuffer in &submission.framebuffers {
                 unsafe { raw.destroy_framebuffer(*framebuffer, None) };
             }
             if let Some(device) = &self.device {
                 device.mark_submission_completed();
-                device.note_submission_completed(submission.id);
+                if submission.submission_id_known {
+                    device.note_submission_completed(submission.id);
+                }
+            }
+        }
+        for slot in &self.free_submissions {
+            if let Some(semaphore) = slot.export_semaphore {
+                unsafe {
+                    raw.destroy_semaphore(semaphore, None);
+                }
             }
         }
         for (semaphore, _) in &self.pending_waits {
-            unsafe { raw.destroy_semaphore(*semaphore, None) };
+            if !semaphore.pooled {
+                unsafe { raw.destroy_semaphore(semaphore.handle, None) };
+            }
         }
         unsafe { raw.destroy_command_pool(self.command_pool, None) };
         // Drop GPU readers and host mappings only after their exact fences and
@@ -116,7 +166,17 @@ impl RetiredCommands {
         self.submissions.clear();
         self.pending_uploads.operations.clear();
         self.upload_arena.take();
+        if let Some(recording) = self.failed_recording.as_mut() {
+            for framebuffer in recording.submitted_framebuffers.drain(..) {
+                unsafe {
+                    raw.destroy_framebuffer(framebuffer, None);
+                }
+            }
+        }
+        self.failed_recording.take();
+        self.recording_storage.take();
         self.context_state.take();
+        self.external_wait_bank.take();
         self.device.take();
     }
 }
@@ -148,7 +208,7 @@ pub(crate) enum BlockingSubmitError {
     Submitted(VulkanRendererError),
 }
 
-enum UploadSource {
+pub(super) enum UploadSource {
     Staging(StagingReservation),
     #[cfg(feature = "wayland_frontend")]
     Host(Arc<super::host_memory::HostBuffer>),
@@ -307,12 +367,22 @@ pub(crate) struct DeviceState {
     command_retirement: Option<Box<super::retirement::RetirementNode<RetiredCommands>>>,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
+    free_submissions: Vec<InFlightSubmission>,
+    command_limits: VulkanCommandStorageLimits,
+    recording_storage: Arc<super::recording_storage::RecordingStorageBank>,
+    bank_return: SyncPoint,
+    damage_scratch: Arc<super::damage_scratch::DamageScratchBank>,
+    completion_unknown: bool,
+    failed_recording: Option<super::recording_storage::RecordingStorageLease>,
     upload_arena: UploadArena,
     owner_upload_structural_bytes: usize,
     owner_upload_exception_bytes: usize,
     owner_upload_extent_exceptions: u64,
     pending_uploads: PendingUploadBatch,
-    pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
+    pending_waits: Vec<(ImportedWaitSemaphore, vk::PipelineStageFlags)>,
+    external_wait_bank: Option<ExternalWaitBank>,
+    external_wait_batch: ExternalWaitBatch,
+    external_wait_pressure: usize,
     next_submission_id: u64,
     device: Arc<DeviceHandle>,
     #[cfg(feature = "wayland_frontend")]
@@ -448,10 +518,17 @@ impl DeviceState {
             queue_family_index,
             queue,
             device,
+            VulkanCommandStorageLimits::default(),
         )
     }
 
     pub(crate) fn from_origin(origin: &super::VulkanDeviceOrigin) -> Result<Self, VulkanRendererError> {
+        Self::from_origin_with_limits(origin, VulkanCommandStorageLimits::default())
+    }
+    pub(crate) fn from_origin_with_limits(
+        origin: &super::VulkanDeviceOrigin,
+        limits: VulkanCommandStorageLimits,
+    ) -> Result<Self, VulkanRendererError> {
         Self::from_parts(
             &origin.physical_device,
             origin.enabled_extensions.clone(),
@@ -459,6 +536,7 @@ impl DeviceState {
             origin.queue_family_index,
             origin.queue,
             origin.device.clone(),
+            limits,
         )
     }
 
@@ -469,6 +547,7 @@ impl DeviceState {
         queue_family_index: u32,
         queue: vk::Queue,
         device: Arc<DeviceHandle>,
+        command_limits: VulkanCommandStorageLimits,
     ) -> Result<Self, VulkanRendererError> {
         let instance = physical_device.instance().handle();
         #[cfg(feature = "wayland_frontend")]
@@ -503,18 +582,24 @@ impl DeviceState {
         // Renderers that only import DMA-BUFs retain no idle upload allocation.
         let upload_arena = UploadArena::new(physical_device);
 
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-
-        // SAFETY: Device is valid and create info references live data.
-        let command_pool = match unsafe { device.handle().create_command_pool(&pool_info, None) } {
-            Ok(pool) => pool,
-            Err(err) => {
-                return Err(err.into());
-            }
-        };
-
+        let mut prepared = super::VulkanCommandStorage::prepare(
+            device.clone(),
+            queue_family_index,
+            capabilities.sync_file_semaphore_export(),
+            command_limits,
+        )?;
+        let command_limits = prepared.limits;
+        let mut command_retirement = prepared.node.take().expect("prepared command bank");
+        let commands = command_retirement.value_mut();
+        let command_pool = commands.command_pool;
+        let reusable_command_buffers = std::mem::take(&mut commands.reusable_command_buffers);
+        let free_submissions = std::mem::take(&mut commands.free_submissions);
+        let in_flight_submissions = std::mem::take(&mut commands.submissions);
+        let recording_storage = commands.recording_storage.take().unwrap();
+        let bank_return = commands.bank_return.take().unwrap();
+        let pending_uploads = std::mem::take(&mut commands.pending_uploads);
+        let pending_waits = std::mem::take(&mut commands.pending_waits);
+        commands.device.take();
         Ok(DeviceState {
             physical_device: physical_device.clone(),
             enabled_extensions,
@@ -522,17 +607,25 @@ impl DeviceState {
             queue_family_index,
             queue,
             command_pool,
-            command_retirement: Some(super::retirement::RetirementNode::new(RetiredCommands::empty(
-                command_pool,
-            ))),
-            reusable_command_buffers: Vec::new(),
-            in_flight_submissions: VecDeque::new(),
+            command_retirement: Some(command_retirement),
+            reusable_command_buffers,
+            in_flight_submissions,
+            free_submissions,
+            recording_storage,
+            bank_return,
+            damage_scratch: super::damage_scratch::DamageScratchBank::cold(0, 0)?,
+            command_limits,
+            completion_unknown: false,
+            failed_recording: None,
             upload_arena,
             owner_upload_structural_bytes: 0,
             owner_upload_exception_bytes: 0,
             owner_upload_extent_exceptions: 0,
-            pending_uploads: PendingUploadBatch::default(),
-            pending_waits: Vec::new(),
+            pending_uploads,
+            pending_waits,
+            external_wait_bank: None,
+            external_wait_batch: Default::default(),
+            external_wait_pressure: 0,
             next_submission_id: 0,
             device,
             #[cfg(feature = "wayland_frontend")]
@@ -1027,9 +1120,7 @@ impl DeviceState {
                 .iter()
                 .rev()
                 .find(|submission| !submission.upload_sources.is_empty())
-                .map(|submission| {
-                    MemoryUploadCapacityEdge::InFlight(SyncPoint::from(submission.fence.clone()))
-                })
+                .map(|submission| MemoryUploadCapacityEdge::InFlight(submission.fence.clone()))
                 .unwrap_or_else(|| {
                     if let Some(completion) = self.upload_arena.cpu_completion() {
                         MemoryUploadCapacityEdge::CpuWriterPending(completion)
@@ -1067,12 +1158,12 @@ impl DeviceState {
 
         match self.submit_tracked(
             command_buffer,
-            Vec::new(),
-            Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
             None,
             SubmissionKind::MemoryUploadBatch,
         ) {
-            Ok((_, fence)) => Ok(MemoryUploadCapacityEdge::Submitted(SyncPoint::from(fence))),
+            Ok((_, fence)) => Ok(MemoryUploadCapacityEdge::Submitted(fence)),
             Err(error) => Err(error),
         }
     }
@@ -1124,13 +1215,20 @@ impl DeviceState {
     }
 
     pub(crate) fn queue_wait_on_sync_file(&mut self, sync_file: OwnedFd) -> Result<(), VulkanRendererError> {
-        self.queue_wait_on_sync_file_with_stage(sync_file, vk::PipelineStageFlags::ALL_COMMANDS)
+        self.queue_wait_on_sync_file_with_stage(sync_file, vk::PipelineStageFlags::ALL_COMMANDS, None)
+    }
+
+    pub(crate) fn external_wait_already_staged(&self, source: &SyncPoint) -> bool {
+        self.external_wait_bank
+            .as_ref()
+            .is_some_and(|bank| bank.contains_owner(source))
     }
 
     pub(crate) fn queue_wait_on_sync_file_with_stage(
         &mut self,
         sync_file: OwnedFd,
         wait_stage_mask: vk::PipelineStageFlags,
+        source: Option<&SyncPoint>,
     ) -> Result<(), VulkanRendererError> {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
@@ -1140,25 +1238,74 @@ impl DeviceState {
                 "sync_file semaphore import is not available on this Vulkan device",
             ));
         }
-
-        let external_semaphore_fd = self
-            .external_semaphore_fd
-            .as_ref()
-            .expect("checked by supports_sync_file_import");
-        let semaphore =
-            import_sync_file_to_semaphore(self.device.as_ref(), external_semaphore_fd, sync_file)?;
-
+        if self.completion_unknown {
+            return Err(VulkanRendererError::CommandCompletionUnavailable);
+        }
         if wait_stage_mask.is_empty() {
-            // SAFETY: Semaphore was just imported on this device and was never submitted.
-            // Routed through the teardown accessor so a lost device is not touched.
-            self.device
-                .destroy_with(|device| unsafe { device.destroy_semaphore(semaphore, None) });
             return Err(VulkanRendererError::TemporaryFailure(
                 "sync_file wait stage mask must not be empty",
             ));
         }
 
-        self.pending_waits.push((semaphore, wait_stage_mask));
+        if self.pending_waits.len() >= self.command_limits.waits_per_submission {
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "imported waits",
+                requested: self.pending_waits.len() + 1,
+                limit: self.command_limits.waits_per_submission,
+            });
+        }
+        let external_semaphore_fd = self
+            .external_semaphore_fd
+            .as_ref()
+            .expect("checked by supports_sync_file_import");
+        let semaphore = if let Some(bank) = self.external_wait_bank.as_mut() {
+            // The selected frame preclaims its complete import inventory. A
+            // caller undercount is refused before the extra native import.
+            self.external_wait_batch.check()?;
+            let source = source.ok_or(VulkanRendererError::TemporaryFailure(
+                "prepared wait requires its original source proof",
+            ))?;
+            let Some(semaphore) = bank.take(source) else {
+                return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                    resource: "admitted external wait loans",
+                    requested: self.pending_waits.len().saturating_add(1),
+                    limit: bank.capacity(),
+                });
+            };
+            if let Err(error) = import_sync_file_into_semaphore(
+                self.device.as_ref(),
+                external_semaphore_fd,
+                semaphore.handle,
+                sync_file,
+            ) {
+                // Import failure did not submit a wait or transfer the FD.
+                bank.release(semaphore);
+                return Err(error);
+            }
+            self.external_wait_batch.imported();
+            semaphore
+        } else {
+            ImportedWaitSemaphore {
+                handle: import_sync_file_to_semaphore(
+                    self.device.as_ref(),
+                    external_semaphore_fd,
+                    sync_file,
+                )?,
+                pooled: false,
+                index: 0,
+            }
+        };
+
+        // A repeated proof can cover any subsequent queue read, irrespective
+        // of the narrower stage mask of its first importer.
+        self.pending_waits.push((
+            semaphore,
+            if semaphore.pooled {
+                vk::PipelineStageFlags::ALL_COMMANDS
+            } else {
+                wait_stage_mask
+            },
+        ));
         Ok(())
     }
 
@@ -1169,19 +1316,44 @@ impl DeviceState {
     }
 
     pub(crate) fn clear_pending_wait_semaphores(&mut self) {
-        let pending = std::mem::take(&mut self.pending_waits);
-        // On a lost device these never-submitted semaphores cannot be destroyed without
-        // touching the dead driver; drop the handles and skip the destroy.
-        self.device.destroy_with(|device| {
-            for (semaphore, _) in pending {
-                // SAFETY: Semaphore belongs to this device and is not in-flight because it was never submitted.
-                unsafe { device.destroy_semaphore(semaphore, None) };
+        // These loans were never part of a successful or uncertain native
+        // submit. TEMPORARY import replacement discards their old payload;
+        // no CPU signal/reset is fabricated, and the original source FD stays
+        // owned by the cached source proof for a retry.
+        for (semaphore, _) in self.pending_waits.drain(..) {
+            if semaphore.pooled {
+                self.external_wait_bank
+                    .as_mut()
+                    .expect("native wait loan bank")
+                    .release(semaphore);
+            } else {
+                self.device
+                    .destroy_with(|device| unsafe { device.destroy_semaphore(semaphore.handle, None) });
             }
-        });
+        }
+        self.external_wait_batch.begin(0);
     }
 
     #[instrument(level = "trace", skip(self))]
     #[profiling::function]
+    pub(super) fn completion_unknown(&self) -> bool {
+        self.completion_unknown
+    }
+    pub(super) fn preserve_failed_recording(
+        &mut self,
+        storage: super::recording_storage::RecordingStorageLease,
+    ) {
+        assert!(self.failed_recording.is_none(), "one exclusive failed recording");
+        self.completion_unknown = true;
+        self.failed_recording = Some(storage);
+    }
+
+    pub(super) fn acquire_recording_storage(
+        &self,
+    ) -> Result<super::recording_storage::RecordingStorageLease, VulkanRendererError> {
+        self.recording_storage.acquire()
+    }
+
     pub(crate) fn acquire_command_buffer(&mut self) -> Result<vk::CommandBuffer, VulkanRendererError> {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
@@ -1192,19 +1364,9 @@ impl DeviceState {
             return Ok(command_buffer);
         }
 
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-
-        // SAFETY: Device and command pool are valid, allocation info references live data.
-        let command_buffers = unsafe { self.device.handle().allocate_command_buffers(&alloc_info) }?;
-        command_buffers
-            .into_iter()
-            .next()
-            .ok_or(VulkanRendererError::TemporaryFailure(
-                "Vulkan did not return a command buffer allocation",
-            ))
+        Err(VulkanRendererError::CommandCapacityExhausted {
+            slots: self.command_limits.submission_slots,
+        })
     }
 
     pub(crate) fn submit(
@@ -1217,17 +1379,18 @@ impl DeviceState {
     pub(crate) fn submit_with_framebuffers(
         &mut self,
         command_buffer: vk::CommandBuffer,
-        framebuffers: Vec<vk::Framebuffer>,
+        mut framebuffers: Vec<vk::Framebuffer>,
     ) -> Result<SubmissionId, VulkanRendererError> {
-        let (id, _) = self.submit_with_resources_and_fence(command_buffer, framebuffers, Vec::new())?;
+        let (id, _) =
+            self.submit_with_resources_and_fence(command_buffer, &mut framebuffers, &mut Vec::new())?;
         Ok(id)
     }
 
     pub(crate) fn submit_with_resources(
         &mut self,
         command_buffer: vk::CommandBuffer,
-        framebuffers: Vec<vk::Framebuffer>,
-        retained_images: Vec<Arc<VulkanImage>>,
+        framebuffers: &mut Vec<vk::Framebuffer>,
+        retained_images: &mut Vec<Arc<VulkanImage>>,
     ) -> Result<SubmissionId, VulkanRendererError> {
         let (id, _) = self.submit_with_resources_and_fence(command_buffer, framebuffers, retained_images)?;
         Ok(id)
@@ -1238,17 +1401,17 @@ impl DeviceState {
     pub(crate) fn submit_with_framebuffers_and_fence(
         &mut self,
         command_buffer: vk::CommandBuffer,
-        framebuffers: Vec<vk::Framebuffer>,
-    ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
-        self.submit_with_resources_and_fence(command_buffer, framebuffers, Vec::new())
+        mut framebuffers: Vec<vk::Framebuffer>,
+    ) -> Result<(SubmissionId, SyncPoint), VulkanRendererError> {
+        self.submit_with_resources_and_fence(command_buffer, &mut framebuffers, &mut Vec::new())
     }
 
     pub(crate) fn submit_with_resources_and_fence(
         &mut self,
         command_buffer: vk::CommandBuffer,
-        framebuffers: Vec<vk::Framebuffer>,
-        retained_images: Vec<Arc<VulkanImage>>,
-    ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
+        framebuffers: &mut Vec<vk::Framebuffer>,
+        retained_images: &mut Vec<Arc<VulkanImage>>,
+    ) -> Result<(SubmissionId, SyncPoint), VulkanRendererError> {
         self.submit_tracked(
             command_buffer,
             framebuffers,
@@ -1266,174 +1429,192 @@ impl DeviceState {
     fn submit_tracked(
         &mut self,
         command_buffer: vk::CommandBuffer,
-        framebuffers: Vec<vk::Framebuffer>,
-        mut retained_images: Vec<Arc<VulkanImage>>,
+        framebuffers: &mut Vec<vk::Framebuffer>,
+        retained_images: &mut Vec<Arc<VulkanImage>>,
         readback: Option<Arc<super::readback::ReadbackBuffer>>,
         kind: SubmissionKind,
-    ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
+    ) -> Result<(SubmissionId, SyncPoint), VulkanRendererError> {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
+        }
+        if self.completion_unknown {
+            return Err(VulkanRendererError::CommandCompletionUnavailable);
+        }
+        self.reclaim_completed_submissions()?;
+        let image_count = retained_images.len() + self.pending_uploads.operations.len();
+        if image_count > self.command_limits.images_per_submission
+            || framebuffers.len() > self.command_limits.framebuffers_per_submission
+        {
+            let _ = self.discard_recording_resources(command_buffer, framebuffers);
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "submitted resources",
+                requested: image_count,
+                limit: self.command_limits.images_per_submission,
+            });
+        }
+        let Some(index) = self
+            .free_submissions
+            .iter()
+            .position(InFlightSubmission::readers_returned)
+        else {
+            let _ = self.discard_recording_resources(command_buffer, framebuffers);
+            return Err(VulkanRendererError::CommandCapacityExhausted {
+                slots: self.command_limits.submission_slots,
+            });
+        };
+        let mut slot = self.free_submissions.swap_remove(index);
+        if let Err(error) = slot.prepare_for_submit() {
+            self.free_submissions.push(slot);
+            let _ = self.discard_recording_resources(command_buffer, framebuffers);
+            return Err(error);
         }
         let recorded_uploads = match self.record_pending_uploads() {
             Ok(recorded) => recorded,
             Err(error) => {
+                self.free_submissions.push(slot);
                 let _ = self.discard_recording_resources(command_buffer, framebuffers);
                 return Err(error);
             }
         };
         let submit_started_at = Instant::now();
-        let fence = match VulkanFence::create(self.shared_device()) {
-            Ok(fence) => fence,
-            Err(error) => {
-                if let Some(recorded_uploads) = recorded_uploads {
-                    if self
-                        .discard_command_buffer(recorded_uploads.command_buffer)
-                        .is_ok()
-                    {
-                        self.restore_pending_uploads(recorded_uploads.batch);
-                    }
-                }
-                let _ = self.discard_recording_resources(command_buffer, framebuffers);
-                return Err(error);
-            }
-        };
-
-        // Render-completion export rides a dedicated binary semaphore signaled
-        // by this submission, exported exactly once immediately after submit
-        // while the signal operation is provably pending. Exporting the
-        // VkFence instead (vkGetFenceFdKHR has move semantics) was observed
-        // racing fence completion on NVIDIA, yielding valid fds bound to a
-        // consumed payload — sync_files that never signal.
-        let export_semaphore = if kind.exports_completion() && self.supports_sync_file_export() {
-            match self.create_export_semaphore() {
-                Ok(semaphore) => Some(semaphore),
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "failed to create export semaphore; submission completes without an exportable sync_file"
-                    );
-                    None
-                }
-            }
+        let export_semaphore = if kind.exports_completion() {
+            slot.export_semaphore
         } else {
             None
         };
-
-        let pending_waits = if kind.consumes_pending_waits() {
-            std::mem::take(&mut self.pending_waits)
+        let mut waits = [vk::Semaphore::null(); 256];
+        let mut stages = [vk::PipelineStageFlags::empty(); 256];
+        let wait_count = if kind.consumes_pending_waits() {
+            self.pending_waits.len()
         } else {
-            Vec::new()
+            0
         };
-        let (wait_semaphores, wait_dst_stage_mask): (Vec<vk::Semaphore>, Vec<vk::PipelineStageFlags>) =
-            pending_waits.into_iter().unzip();
-
-        let mut command_buffers = Vec::with_capacity(2);
+        for (index, (semaphore, stage)) in self.pending_waits.iter().take(wait_count).enumerate() {
+            waits[index] = semaphore.handle;
+            stages[index] = *stage;
+        }
         if let Some(upload) = recorded_uploads.as_ref() {
-            command_buffers.push(upload.command_buffer);
+            slot.command_buffers.push(upload.command_buffer);
         }
-        command_buffers.push(command_buffer);
-        let mut submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        if !wait_semaphores.is_empty() {
-            submit = submit
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_dst_stage_mask);
+        slot.command_buffers.push(command_buffer);
+        let mut submit = vk::SubmitInfo::default()
+            .command_buffers(&slot.command_buffers)
+            .wait_semaphores(&waits[..wait_count])
+            .wait_dst_stage_mask(&stages[..wait_count]);
+        let signals = export_semaphore.map(|semaphore| [semaphore]);
+        if let Some(signals) = signals.as_ref() {
+            submit = submit.signal_semaphores(signals);
         }
-        let signal_semaphores = export_semaphore.map(|semaphore| [semaphore]);
-        if let Some(signal_semaphores) = signal_semaphores.as_ref() {
-            submit = submit.signal_semaphores(signal_semaphores);
-        }
-        let submit_info = [submit];
-
-        // Every output context shares this queue's host synchronization and
-        // identity order; command pools and recording stay context-local.
-        let id = match self.device.submit_queue(self.queue, &submit_info, fence.handle()) {
+        slot.native_fence().mark_native_attempt();
+        let id = match self
+            .device
+            .submit_queue(self.queue, &[submit], slot.native_fence().handle())
+        {
             Ok(id) => id,
-            Err(err) => {
-                if let Some(recorded_uploads) = recorded_uploads {
-                    if self
-                        .discard_command_buffer(recorded_uploads.command_buffer)
-                        .is_ok()
-                    {
-                        self.restore_pending_uploads(recorded_uploads.batch);
+            Err(error) => {
+                if !error.is_resource_allocation_failure() {
+                    // Unknown/device-loss submit outcomes cannot authorize
+                    // resetting encoded commands or releasing their mappings.
+                    self.completion_unknown = true;
+                    slot.submission_id_known = false;
+                    slot.submitted_at = submit_started_at;
+                    slot.export_unconsumed = export_semaphore.is_some();
+                    slot.framebuffers.append(framebuffers);
+                    slot.retained_images.append(retained_images);
+                    slot._readback = readback;
+                    if kind.consumes_pending_waits() {
+                        slot.wait_semaphores
+                            .extend(self.pending_waits.drain(..).map(|(semaphore, _)| semaphore));
+                    }
+                    if let Some(mut upload) = recorded_uploads {
+                        for operation in upload.batch.operations.drain(..) {
+                            slot.retained_images.push(operation.image);
+                            slot.upload_sources.push(operation.source);
+                        }
+                        upload.batch.bytes = 0;
+                        self.pending_uploads = upload.batch;
+                    }
+                    self.next_submission_id = self.next_submission_id.wrapping_add(1);
+                    self.device.mark_submission_pending();
+                    self.in_flight_submissions.push_back(slot);
+                    return Err(error.completion_failure());
+                }
+                if let Some(upload) = recorded_uploads {
+                    if self.discard_command_buffer(upload.command_buffer).is_ok() {
+                        self.restore_pending_uploads(upload.batch);
                     }
                 }
                 let _ = self.discard_recording_resources(command_buffer, framebuffers);
-                self.device.destroy_with(|device| {
-                    for semaphore in wait_semaphores {
-                        // SAFETY: Semaphore belongs to this device and the submission did not succeed.
-                        unsafe { device.destroy_semaphore(semaphore, None) };
-                    }
-                    if let Some(semaphore) = export_semaphore {
-                        // SAFETY: Semaphore belongs to this device and was never submitted.
-                        unsafe { device.destroy_semaphore(semaphore, None) };
-                    }
-                });
-                return Err(err);
+                slot.native_fence().cancel_unsubmitted_attempt();
+                slot.command_buffers.clear();
+                self.free_submissions.push(slot);
+                // Imported acquire waits were never consumed. Keep them in
+                // their exact pending owner for the caller's rollback/retry.
+                return Err(error);
             }
         };
-
-        let (upload_sources, upload_operation_count, upload_bytes) = if let Some(recorded_uploads) =
-            recorded_uploads
-        {
-            let upload_operation_count = recorded_uploads.batch.operations.len();
-            let upload_bytes = recorded_uploads.batch.bytes;
-            let mut reservations = Vec::with_capacity(upload_operation_count);
-            for operation in recorded_uploads.batch.operations {
-                retained_images.push(operation.image);
-                reservations.push(operation.source);
+        // Native submission succeeded. Every vector below was cold-reserved
+        // and the admission above proves draining cannot grow any container.
+        slot.id = id;
+        slot.native_fence().mark_submitted();
+        slot.submission_id_known = true;
+        slot.submitted_at = submit_started_at;
+        slot.framebuffers.append(framebuffers);
+        slot.retained_images.append(retained_images);
+        slot._readback = readback;
+        if kind.consumes_pending_waits() {
+            slot.wait_semaphores
+                .extend(self.pending_waits.drain(..).map(|(semaphore, _)| semaphore));
+        }
+        let mut upload_operation_count = 0;
+        let mut upload_bytes = 0;
+        if let Some(mut upload) = recorded_uploads {
+            upload_operation_count = upload.batch.operations.len();
+            upload_bytes = upload.batch.bytes;
+            for operation in upload.batch.operations.drain(..) {
+                slot.retained_images.push(operation.image);
+                slot.upload_sources.push(operation.source);
             }
+            upload.batch.bytes = 0;
+            self.pending_uploads = upload.batch;
             self.diagnostics.upload_batches = self.diagnostics.upload_batches.saturating_add(1);
             self.diagnostics.upload_operations = self
                 .diagnostics
                 .upload_operations
                 .saturating_add(upload_operation_count as u64);
             self.diagnostics.upload_bytes = self.diagnostics.upload_bytes.saturating_add(upload_bytes as u64);
-            (reservations, upload_operation_count, upload_bytes)
-        } else {
-            (Vec::new(), 0, 0)
-        };
-
+        }
         if let Some(semaphore) = export_semaphore {
+            slot.export_unconsumed = true;
             match self.export_semaphore_sync_file(semaphore) {
-                Ok(fd) => fence.set_exported_sync_file(fd),
-                Err(err) => {
-                    // The semaphore stays in the submission for deferred
-                    // destruction; callers see a non-exportable sync point and
-                    // fall back to genuine host waits (the fence is truthful).
-                    warn!(?err, "failed to export submission sync_file from semaphore");
+                Ok(fd) => {
+                    slot.native_fence().set_exported_sync_file(fd);
+                    slot.export_unconsumed = false;
+                }
+                Err(error) => {
+                    // Without a successful SYNC_FD export its binary payload
+                    // cannot be signaled again. Retire it after native proof;
+                    // this slot then truthfully supplies a nonexportable fence.
+                    warn!(?error, "submission completion export failed");
                 }
             }
         }
-
         let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
         self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
         self.diagnostics.total_submit_cpu_ns =
             self.diagnostics.total_submit_cpu_ns.saturating_add(submit_cpu_ns);
         self.diagnostics.max_submit_cpu_ns = self.diagnostics.max_submit_cpu_ns.max(submit_cpu_ns);
-
         self.next_submission_id = self.next_submission_id.wrapping_add(1);
         self.device.mark_submission_pending();
-        self.in_flight_submissions.push_back(InFlightSubmission {
-            id,
-            fence: fence.clone(),
-            export_semaphore,
-            command_buffers,
-            framebuffers,
-            retained_images,
-            upload_sources,
-            _readback: readback,
-            wait_semaphores,
-            submitted_at: submit_started_at,
-        });
+        let fence = slot.fence.clone();
+        self.in_flight_submissions.push_back(slot);
         trace!(
-            submission = ?id,
+            ?id,
             submit_cpu_ns,
-            in_flight = self.in_flight_submissions.len(),
             upload_operation_count,
             upload_bytes,
-            "submitted vulkan command buffer"
+            "submitted bounded vulkan command scope"
         );
-
         Ok((id, fence))
     }
 
@@ -1448,28 +1629,44 @@ impl DeviceState {
         // Tracking happens before any host wait. Once queue submission
         // succeeds, every native fence, upload source and destination owner
         // stays in the exact submission even if completion is unobservable.
-        let (id, fence) = self
-            .submit_tracked(
-                command_buffer,
-                Vec::new(),
-                vec![image],
-                Some(readback),
-                SubmissionKind::Readback,
-            )
+        let mut storage = self
+            .acquire_recording_storage()
             .map_err(BlockingSubmitError::NotSubmitted)?;
+        storage.retained_images.push(image);
+        let recording = &mut *storage;
+        let submitted = self.submit_tracked(
+            command_buffer,
+            &mut recording.submitted_framebuffers,
+            &mut recording.retained_images,
+            Some(readback),
+            SubmissionKind::Readback,
+        );
+        let (id, fence) = match submitted {
+            Ok(submitted) => submitted,
+            Err(error) if self.completion_unknown => return Err(BlockingSubmitError::Submitted(error)),
+            Err(error) => return Err(BlockingSubmitError::NotSubmitted(error)),
+        };
         self.diagnostics.blocking_submissions = self.diagnostics.blocking_submissions.saturating_add(1);
         if self.device.is_lost() {
             return Err(BlockingSubmitError::Submitted(VulkanRendererError::ContextLost(
                 "readback completion became unobservable on lost device",
             )));
         }
-        self.device
-            .observe_result(unsafe {
-                self.device
-                    .handle()
-                    .wait_for_fences(&[fence.handle()], true, u64::MAX)
-            })
-            .map_err(|error| BlockingSubmitError::Submitted(error.into()))?;
+        if let Err(error) = self.device.observe_result(unsafe {
+            self.device.handle().wait_for_fences(
+                &[fence
+                    .get::<VulkanFence>()
+                    .expect("native submission fence")
+                    .handle()],
+                true,
+                u64::MAX,
+            )
+        }) {
+            self.completion_unknown = true;
+            return Err(BlockingSubmitError::Submitted(
+                VulkanRendererError::from(error).completion_failure(),
+            ));
+        }
         let index = self
             .in_flight_submissions
             .iter()
@@ -1492,11 +1689,14 @@ impl DeviceState {
         }
         // SAFETY: Command buffer belongs to `self.command_pool` and is not in-flight because
         // it was never submitted.
-        self.device.observe_result(unsafe {
+        if let Err(error) = self.device.observe_result(unsafe {
             self.device
                 .handle()
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-        })?;
+        }) {
+            self.completion_unknown = true;
+            return Err(VulkanRendererError::from(error).completion_failure());
+        }
         self.reusable_command_buffers.push(command_buffer);
         Ok(())
     }
@@ -1508,11 +1708,11 @@ impl DeviceState {
     pub(crate) fn discard_recording_resources(
         &mut self,
         command_buffer: vk::CommandBuffer,
-        framebuffers: Vec<vk::Framebuffer>,
+        framebuffers: &mut Vec<vk::Framebuffer>,
     ) -> Result<(), VulkanRendererError> {
         self.discard_command_buffer(command_buffer)?;
         self.device.destroy_with(|device| {
-            for framebuffer in framebuffers {
+            for framebuffer in framebuffers.drain(..) {
                 // SAFETY: Reset removed every command-buffer reference and no
                 // queue submission ever consumed this framebuffer.
                 unsafe { device.destroy_framebuffer(framebuffer, None) };
@@ -1537,30 +1737,10 @@ impl DeviceState {
         }
         self.in_flight_submissions
             .back()
-            .map(|submission| SyncPoint::from(submission.fence.clone()))
+            .map(|submission| submission.fence.clone())
             .or_else(|| Some(SyncPoint::signaled()))
     }
 
-    /// Create the binary semaphore that carries a submission's exportable
-    /// SYNC_FD payload.
-    fn create_export_semaphore(&self) -> Result<vk::Semaphore, VulkanRendererError> {
-        if self.device.is_lost() {
-            return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
-        }
-        let mut export_info = vk::ExportSemaphoreCreateInfo::default()
-            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
-        // SAFETY: Device is valid and create info references live memory.
-        let semaphore = self
-            .device
-            .observe_result(unsafe { self.device.handle().create_semaphore(&create_info, None) })?;
-        Ok(semaphore)
-    }
-
-    /// Export the SYNC_FD from a submission's export semaphore. Must be
-    /// called immediately after the successful `vkQueueSubmit` that signals
-    /// the semaphore, while the signal operation is pending — the export has
-    /// move semantics and binds the fd to that pending operation.
     fn export_semaphore_sync_file(&self, semaphore: vk::Semaphore) -> Result<OwnedFd, VulkanRendererError> {
         let Some(loader) = self.external_semaphore_fd.as_ref() else {
             return Err(VulkanRendererError::ContextLost(
@@ -1590,6 +1770,9 @@ impl DeviceState {
         if self.device.is_lost() {
             return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
         }
+        if self.completion_unknown {
+            return Err(VulkanRendererError::CommandCompletionUnavailable);
+        }
         loop {
             let Some(front) = self.in_flight_submissions.front() else {
                 break;
@@ -1598,14 +1781,17 @@ impl DeviceState {
             // The caller-visible fence is never exported (the sync_file rides
             // a dedicated semaphore), so it faithfully tracks completion and
             // can be polled directly.
-            let poll_fence = front.fence.handle();
+            let poll_fence = front.native_fence().handle();
             // SAFETY: Fence was created by this device and remains valid while tracked.
             let signaled = match self
                 .device
                 .observe_result(unsafe { self.device.handle().get_fence_status(poll_fence) })
             {
                 Ok(signaled) => signaled,
-                Err(err) => return Err(err.into()),
+                Err(error) => {
+                    self.completion_unknown = true;
+                    return Err(VulkanRendererError::from(error).completion_failure());
+                }
             };
             if !signaled {
                 break;
@@ -1631,13 +1817,14 @@ impl DeviceState {
             // The caller-visible fence is never exported, so it faithfully
             // tracks completion and can be waited on directly.
             // SAFETY: Fence was created by this device and remains valid while tracked.
-            if let Err(err) = self.device.observe_result(unsafe {
+            if let Err(error) = self.device.observe_result(unsafe {
                 self.device
                     .handle()
-                    .wait_for_fences(&[submission.fence.handle()], true, u64::MAX)
+                    .wait_for_fences(&[submission.native_fence().handle()], true, u64::MAX)
             }) {
                 self.in_flight_submissions.push_front(submission);
-                return Err(err.into());
+                self.completion_unknown = true;
+                return Err(VulkanRendererError::from(error).completion_failure());
             }
             self.recycle_submission(submission)?;
         }
@@ -1645,62 +1832,272 @@ impl DeviceState {
         Ok(())
     }
 
-    fn recycle_submission(&mut self, submission: InFlightSubmission) -> Result<(), VulkanRendererError> {
-        let InFlightSubmission {
-            id,
-            fence: _fence,
-            export_semaphore,
-            command_buffers,
-            framebuffers,
-            upload_sources,
-            wait_semaphores,
-            submitted_at,
-            ..
-        } = submission;
-
-        let completion_ns = duration_to_ns(submitted_at.elapsed());
-        for command_buffer in command_buffers {
-            // SAFETY: The fence is signaled. Reset removes all recorded child
-            // references before those children are destroyed below.
-            self.device.observe_result(unsafe {
+    fn recycle_submission(&mut self, mut submission: InFlightSubmission) -> Result<(), VulkanRendererError> {
+        let completion_ns = duration_to_ns(submission.submitted_at.elapsed());
+        // Preserve the complete slot on any reset failure. Native completion
+        // is proven, but executable command references still need teardown.
+        for command_buffer in &submission.command_buffers {
+            if let Err(error) = self.device.observe_result(unsafe {
                 self.device
                     .handle()
-                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-            })?;
-            self.reusable_command_buffers.push(command_buffer);
+                    .reset_command_buffer(*command_buffer, vk::CommandBufferResetFlags::empty())
+            }) {
+                self.completion_unknown = true;
+                self.in_flight_submissions.push_front(submission);
+                return Err(VulkanRendererError::from(error).completion_failure());
+            }
         }
-
+        self.reusable_command_buffers
+            .extend(submission.command_buffers.drain(..));
+        // Only the exact submitted fence, plus successful command reset above,
+        // authorizes reuse. Unknown completion retains these loans in the slot.
+        for semaphore in submission.wait_semaphores.drain(..) {
+            if semaphore.pooled {
+                self.external_wait_bank
+                    .as_mut()
+                    .expect("submitted native wait bank")
+                    .release(semaphore);
+            } else {
+                self.device
+                    .destroy_with(|device| unsafe { device.destroy_semaphore(semaphore.handle, None) });
+            }
+        }
         self.device.destroy_with(|device| {
-            if let Some(semaphore) = export_semaphore {
-                // SAFETY: Submission completed and command buffers were reset.
-                unsafe { device.destroy_semaphore(semaphore, None) };
+            for framebuffer in submission.framebuffers.drain(..) {
+                unsafe {
+                    device.destroy_framebuffer(framebuffer, None);
+                }
             }
-            for framebuffer in framebuffers {
-                // SAFETY: Submission completed and recorded references were reset.
-                unsafe { device.destroy_framebuffer(framebuffer, None) };
-            }
-            for semaphore in wait_semaphores {
-                // SAFETY: Submission completion released the queue reference.
-                unsafe { device.destroy_semaphore(semaphore, None) };
+            if submission.export_unconsumed {
+                if let Some(semaphore) = submission.export_semaphore.take() {
+                    unsafe {
+                        device.destroy_semaphore(semaphore, None);
+                    }
+                }
             }
         });
-        for source in upload_sources {
+        for source in submission.upload_sources.drain(..) {
             source.release(&mut self.upload_arena);
         }
-
+        submission.retained_images.clear();
+        submission._readback.take();
         self.device.mark_submission_completed();
-        self.device.note_submission_completed(id);
+        if submission.submission_id_known {
+            self.device.note_submission_completed(submission.id);
+        }
         self.diagnostics.reclaimed_submissions = self.diagnostics.reclaimed_submissions.saturating_add(1);
         self.diagnostics.total_completion_ns =
             self.diagnostics.total_completion_ns.saturating_add(completion_ns);
         self.diagnostics.max_completion_ns = self.diagnostics.max_completion_ns.max(completion_ns);
-        trace!(
-            submission = ?id,
-            completion_ns,
-            reclaimed = self.diagnostics.reclaimed_submissions,
-            "reclaimed completed vulkan submission"
-        );
+        self.free_submissions.push(submission);
         Ok(())
+    }
+
+    pub(crate) fn adopt_command_storage(
+        &mut self,
+        prepared: &mut super::VulkanCommandStorage,
+    ) -> Result<bool, VulkanRendererError> {
+        if !Arc::ptr_eq(&self.device, &prepared.device) || self.queue_family_index != prepared.family {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "prepared command storage belongs to another native origin",
+            ));
+        }
+        if prepared.node.is_none() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "prepared command storage already adopted",
+            ));
+        }
+        self.reclaim_completed_submissions()?;
+        if !self.in_flight_submissions.is_empty()
+            || !self.pending_uploads.operations.is_empty()
+            || !self.pending_waits.is_empty()
+            || self.free_submissions.iter().any(|slot| !slot.readers_returned())
+        {
+            return Ok(false);
+        }
+        let mut new_node = prepared.node.take().unwrap();
+        let new = new_node.value_mut();
+        let mut old_node = self.command_retirement.take().unwrap();
+        let old = old_node.value_mut();
+        old.device = Some(self.device.clone());
+        old.free_submissions = std::mem::replace(
+            &mut self.free_submissions,
+            std::mem::take(&mut new.free_submissions),
+        );
+        old.submissions = std::mem::replace(
+            &mut self.in_flight_submissions,
+            std::mem::take(&mut new.submissions),
+        );
+        old.reusable_command_buffers = std::mem::replace(
+            &mut self.reusable_command_buffers,
+            std::mem::take(&mut new.reusable_command_buffers),
+        );
+        old.bank_return = Some(std::mem::replace(
+            &mut self.bank_return,
+            new.bank_return.take().unwrap(),
+        ));
+        old.recording_storage = Some(std::mem::replace(
+            &mut self.recording_storage,
+            new.recording_storage.take().unwrap(),
+        ));
+        old.pending_uploads = std::mem::replace(
+            &mut self.pending_uploads,
+            std::mem::take(&mut new.pending_uploads),
+        );
+        old.pending_waits =
+            std::mem::replace(&mut self.pending_waits, std::mem::take(&mut new.pending_waits));
+        self.command_pool = new.command_pool;
+        self.command_limits = prepared.limits;
+        new.device.take();
+        self.command_retirement = Some(new_node);
+        self.device.retire_commands(old_node);
+        Ok(true)
+    }
+
+    pub(crate) fn command_storage_adoption_edge(&mut self) -> Result<SyncPoint, VulkanRendererError> {
+        self.reclaim_completed_submissions()?;
+        Ok(self.bank_return.clone())
+    }
+
+    pub(crate) fn prepare_damage_scratch_storage(
+        &mut self,
+        slots: usize,
+        rectangles: usize,
+    ) -> Result<(), VulkanRendererError> {
+        if self.damage_scratch.limits() != (slots, rectangles) {
+            self.damage_scratch = super::damage_scratch::DamageScratchBank::cold(slots, rectangles)?;
+        }
+        Ok(())
+    }
+    pub(super) fn acquire_damage_scratch(
+        &self,
+        required: usize,
+    ) -> Result<super::damage_scratch::DamageScratchLoan, VulkanRendererError> {
+        self.damage_scratch.acquire(required)
+    }
+
+    pub(crate) fn command_storage_limits(&self) -> VulkanCommandStorageLimits {
+        self.command_limits
+    }
+
+    pub(crate) fn external_wait_storage_capacity(&self) -> usize {
+        self.external_wait_bank
+            .as_ref()
+            .map_or(0, ExternalWaitBank::capacity)
+    }
+
+    pub(crate) fn external_wait_storage_is_prepared(&self) -> bool {
+        self.external_wait_bank.is_some()
+    }
+
+    pub(crate) fn prepare_external_wait_storage(&mut self, count: usize) -> Result<(), VulkanRendererError> {
+        if self.device.is_lost() {
+            return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
+        }
+        if self.completion_unknown {
+            return Err(VulkanRendererError::CommandCompletionUnavailable);
+        }
+        if count > self.command_limits.waits_per_submission {
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "prepared external waits",
+                requested: count,
+                limit: self.command_limits.waits_per_submission,
+            });
+        }
+        if count != 0 && !self.supports_sync_file_import() {
+            return Err(VulkanRendererError::NotImplemented(
+                "prepared external waits require SYNC_FD semaphore import",
+            ));
+        }
+        self.clear_pending_wait_semaphores();
+        self.reclaim_completed_submissions()?;
+        if let Some(bank) = &self.external_wait_bank {
+            if bank.capacity() >= count {
+                return Ok(());
+            }
+            if bank.available() != bank.capacity() {
+                self.external_wait_pressure = bank.capacity();
+                return Err(VulkanRendererError::CommandCapacityExhausted {
+                    slots: bank.capacity(),
+                });
+            }
+        }
+        // The old bank remains intact if cold creation fails. Both replacement
+        // and eventual old native destruction happen outside selected draws.
+        let replacement = ExternalWaitBank::cold(self.device.clone(), count)?;
+        self.external_wait_bank = Some(replacement);
+        self.external_wait_pressure = 0;
+        Ok(())
+    }
+
+    pub(crate) fn begin_external_wait_batch(&mut self, required: usize) -> Result<(), VulkanRendererError> {
+        if self.device.is_lost() {
+            return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
+        }
+        if self.completion_unknown {
+            return Err(VulkanRendererError::CommandCompletionUnavailable);
+        }
+        let capacity = self.external_wait_storage_capacity();
+        if self.external_wait_bank.is_none() || required > capacity {
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "prepared external waits",
+                requested: required,
+                limit: capacity,
+            });
+        }
+        // A failed pre-GPU importer may leave exact unsubmitted loans. Cancel
+        // them before retrying the original frame rather than duplicating them.
+        self.clear_pending_wait_semaphores();
+        self.reclaim_completed_submissions()?;
+        let bank = self.external_wait_bank.as_ref().unwrap();
+        if let Err(error) = bank.admit_batch(required) {
+            self.external_wait_pressure = required;
+            return Err(error);
+        }
+        self.external_wait_pressure = 0;
+        self.external_wait_batch.begin(required);
+        Ok(())
+    }
+
+    pub(crate) fn command_capacity_edge(&mut self) -> Result<Option<SyncPoint>, VulkanRendererError> {
+        self.reclaim_completed_submissions()?;
+        if self.external_wait_pressure != 0 {
+            let bank = self
+                .external_wait_bank
+                .as_ref()
+                .expect("native wait pressure bank");
+            if bank.available() < self.external_wait_pressure {
+                // Every unavailable handle was transferred to a native slot;
+                // a free command slot is unrelated to this source-fence loan.
+                let native = self
+                    .in_flight_submissions
+                    .iter()
+                    .find(|slot| slot.wait_semaphores.iter().any(|wait| wait.pooled))
+                    .map(|slot| slot.fence.clone());
+                return Ok(Some(native.unwrap_or_else(|| bank.all_returned_edge())));
+            }
+            // Reclaim may race the error observer to readiness. Return the
+            // same real CPU capacity predicate rather than losing the retry.
+            return Ok(Some(bank.all_returned_edge()));
+        }
+        if self
+            .free_submissions
+            .iter()
+            .any(InFlightSubmission::readers_returned)
+            && !self.reusable_command_buffers.is_empty()
+        {
+            return Ok(None);
+        }
+        if let Some(submission) = self.in_flight_submissions.front() {
+            return Ok(Some(submission.fence.clone()));
+        }
+        // Native fences here are already ready. An exact logical-return fence
+        // prevents an immediate-ready FD from producing a busy retry loop.
+        Ok(self
+            .free_submissions
+            .iter()
+            .find(|slot| !slot.readers_returned())
+            .map(|slot| slot.reader_return.clone()))
     }
 
     fn validate_required_extensions(
@@ -1867,7 +2264,14 @@ impl Drop for DeviceState {
         };
         let commands = node.value_mut();
         commands.submissions = std::mem::take(&mut self.in_flight_submissions);
+        commands.free_submissions = std::mem::take(&mut self.free_submissions);
+        commands.reusable_command_buffers = std::mem::take(&mut self.reusable_command_buffers);
+        commands.recording_storage = Some(self.recording_storage.clone());
+        commands.bank_return = Some(self.bank_return.clone());
+        commands.damage_scratch = Some(self.damage_scratch.clone());
+        commands.failed_recording = self.failed_recording.take();
         commands.pending_waits = std::mem::take(&mut self.pending_waits);
+        commands.external_wait_bank = self.external_wait_bank.take();
         commands.pending_uploads = std::mem::take(&mut self.pending_uploads);
         commands.upload_arena = Some(std::mem::replace(
             &mut self.upload_arena,
@@ -1976,16 +2380,16 @@ mod tests {
             .expect("submission should succeed");
 
         let sync_file = fence
-            .export_sync_file()
+            .export()
             .expect("submission must carry an exportable sync_file");
         assert!(
-            fence.export_sync_file().is_some(),
+            fence.export().is_some(),
             "sync_file export must be an idempotent dup, not a consuming operation"
         );
 
-        fence.wait_vk().expect("fence wait should succeed");
+        fence.wait().expect("fence wait should succeed");
         assert!(
-            fence.status().unwrap_or(false),
+            fence.is_reached(),
             "the never-exported fence must report true completion state"
         );
 

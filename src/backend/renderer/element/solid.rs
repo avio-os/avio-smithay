@@ -132,7 +132,7 @@ pub struct SolidColorRenderElement {
     id: Id,
     geometry: Rectangle<i32, Physical>,
     src: Rectangle<f64, Buffer>,
-    opaque_regions: Vec<Rectangle<i32, Physical>>,
+    opaque_regions: Option<Rectangle<i32, Physical>>,
     commit: CommitCounter,
     color: Color32F,
     kind: Kind,
@@ -166,9 +166,9 @@ impl SolidColorRenderElement {
             .to_logical(1f64)
             .to_buffer(1f64, Transform::Normal, &geometry.size.to_f64().to_logical(1f64));
         let opaque_regions = if color.is_opaque() {
-            vec![Rectangle::from_size(geometry.size)]
+            Some(Rectangle::from_size(geometry.size))
         } else {
-            vec![]
+            None
         };
         SolidColorRenderElement {
             id: id.into(),
@@ -205,7 +205,7 @@ impl Element for SolidColorRenderElement {
     }
 
     fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        OpaqueRegions::from_slice(&self.opaque_regions)
+        OpaqueRegions::from_slice(self.opaque_regions.as_slice())
     }
 
     fn alpha(&self) -> f32 {

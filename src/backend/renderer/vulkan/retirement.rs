@@ -30,7 +30,6 @@ impl<T> RetirementNode<T> {
         self.next.store(next, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     pub(super) fn into_value(self: Box<Self>) -> T {
         self.value
     }
@@ -68,6 +67,15 @@ pub(super) struct RetirementQueue<T> {
 impl<T: Send + 'static> RetirementQueue<T> {
     pub(super) fn start(
         mut destroy: impl FnMut(T) + Send + 'static,
+        finish: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::start_with_nodes(move |node| destroy(node.into_value()), finish)
+    }
+
+    /// A native owner may return this exact cold-allocated node to its fixed
+    /// bank after disposal, avoiding a release-path allocation or replacement.
+    pub(super) fn start_with_nodes(
+        mut destroy: impl FnMut(Box<RetirementNode<T>>) + Send + 'static,
         finish: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
@@ -114,9 +122,8 @@ impl<T: Send + 'static> RetirementQueue<T> {
                         // of the entire list. Each node was Box::into_raw once,
                         // and each is reconstructed exactly once here.
                         let node = unsafe { Box::from_raw(batch) };
-                        let RetirementNode { value, next } = *node;
-                        batch = next.into_inner();
-                        destroy(value);
+                        batch = node.next.swap(ptr::null_mut(), Ordering::Relaxed);
+                        destroy(node);
                     }
                 }
                 finish();

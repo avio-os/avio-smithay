@@ -178,6 +178,7 @@ impl VulkanKawaseOutput {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct ResolvedKawasePass {
     pub(super) source: Arc<VulkanImage>,
     pub(super) destination: Arc<VulkanImage>,
@@ -248,6 +249,23 @@ impl VulkanRenderer {
         passes: &[VulkanKawasePass],
     ) -> Result<Vec<ResolvedKawasePass>, VulkanRendererError> {
         let mut resolved = Vec::with_capacity(passes.len());
+        self.resolve_kawase_passes_into(passes, &mut resolved)?;
+        Ok(resolved)
+    }
+
+    pub(super) fn resolve_kawase_passes_into(
+        &mut self,
+        passes: &[VulkanKawasePass],
+        resolved: &mut Vec<ResolvedKawasePass>,
+    ) -> Result<(), VulkanRendererError> {
+        let requested = resolved.len().saturating_add(passes.len());
+        if requested > resolved.capacity() {
+            return Err(VulkanRendererError::CommandStorageLimitExceeded {
+                resource: "resolved Kawase passes",
+                requested,
+                limit: resolved.capacity(),
+            });
+        }
         for pass in passes {
             let Some(source) = pass.source.image_resource().cloned() else {
                 return Err(VulkanRendererError::NotImplemented(
@@ -331,7 +349,7 @@ impl VulkanRenderer {
                 destination_extent: pass.destination_extent,
             });
         }
-        Ok(resolved)
+        Ok(())
     }
 
     /// Records and submits a dual-Kawase pyramid in one command buffer.
@@ -485,7 +503,7 @@ impl VulkanRenderer {
         if let Err(err) = record() {
             let _ = self
                 .device
-                .discard_recording_resources(command_buffer, std::mem::take(&mut framebuffers));
+                .discard_recording_resources(command_buffer, &mut framebuffers);
             self.descriptors.abort_recording();
             restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err);
@@ -517,28 +535,28 @@ impl VulkanRenderer {
         if let Err(err) = unsafe { vk_device.end_command_buffer(command_buffer) } {
             let _ = self
                 .device
-                .discard_recording_resources(command_buffer, std::mem::take(&mut framebuffers));
+                .discard_recording_resources(command_buffer, &mut framebuffers);
             self.descriptors.abort_recording();
             restore_unsubmitted_foreign_acquires(&foreign_images);
             return Err(err.into());
         }
 
-        let retained_images = resolved
+        let mut retained_images = resolved
             .iter()
             .flat_map(|pass| [pass.source.clone(), pass.destination.clone()])
             .collect::<Vec<_>>();
-        let (submission_id, submission_fence) =
-            match self
-                .device
-                .submit_with_resources_and_fence(command_buffer, framebuffers, retained_images)
-            {
-                Ok(submission) => submission,
-                Err(err) => {
-                    self.descriptors.abort_recording();
-                    restore_unsubmitted_foreign_acquires(&foreign_images);
-                    return Err(err);
-                }
-            };
+        let (submission_id, submission_fence) = match self.device.submit_with_resources_and_fence(
+            command_buffer,
+            &mut framebuffers,
+            &mut retained_images,
+        ) {
+            Ok(submission) => submission,
+            Err(err) => {
+                self.descriptors.abort_recording();
+                restore_unsubmitted_foreign_acquires(&foreign_images);
+                return Err(err);
+            }
+        };
         self.descriptors.commit_submission(submission_id);
 
         for tracked in layouts.values() {
@@ -546,7 +564,7 @@ impl VulkanRenderer {
         }
         commit_foreign_releases(&foreign_images);
 
-        Ok(SyncPoint::from(submission_fence))
+        Ok(submission_fence)
     }
 }
 

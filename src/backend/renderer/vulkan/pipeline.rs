@@ -1,4 +1,11 @@
-use std::{io::Cursor, sync::Arc};
+use std::{
+    io::Cursor,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
+
+mod creation;
+pub(super) mod preparation;
 
 use ash::{util::read_spv, vk};
 use indexmap::IndexMap;
@@ -379,10 +386,13 @@ struct FormatPipelineSet {
     kawase_pipeline: vk::Pipeline,
 }
 
+/// Native creation handles shared only with this exact context's cold factory.
+/// The cache mutex is used by cold native operations, never prepared lookup.
 #[derive(Debug)]
-pub(crate) struct PipelineState {
+pub(crate) struct PipelineCreationAuthority {
     device: Arc<DeviceHandle>,
     pipeline_cache: vk::PipelineCache,
+    cache_access: Mutex<()>,
     solid_layout: vk::PipelineLayout,
     textured_layout: vk::PipelineLayout,
     solid_vertex_module: vk::ShaderModule,
@@ -391,7 +401,24 @@ pub(crate) struct PipelineState {
     texture_fragment_module: vk::ShaderModule,
     kawase_fragment_module: vk::ShaderModule,
     kawase_layout: vk::PipelineLayout,
+}
+
+// The cold cache reserves both native storage and linear render-view variants
+// of the actual known-format table, plus the material working F16 format.
+fn prepared_format_capacity() -> usize {
+    crate::backend::allocator::vulkan::format::known_formats().len() * 2 + 1
+}
+
+#[derive(Debug)]
+pub(crate) struct PipelineState {
+    authority: Arc<PipelineCreationAuthority>,
     per_format: IndexMap<vk::Format, FormatPipelineSet>,
+}
+impl Deref for PipelineState {
+    type Target = PipelineCreationAuthority;
+    fn deref(&self) -> &Self::Target {
+        &self.authority
+    }
 }
 
 impl PipelineState {
@@ -548,17 +575,20 @@ impl PipelineState {
         };
 
         Ok(Self {
-            device,
-            pipeline_cache,
-            solid_layout,
-            textured_layout,
-            solid_vertex_module,
-            solid_fragment_module,
-            texture_vertex_module,
-            texture_fragment_module,
-            kawase_fragment_module,
-            kawase_layout,
-            per_format: IndexMap::new(),
+            authority: Arc::new(PipelineCreationAuthority {
+                device,
+                pipeline_cache,
+                cache_access: Mutex::new(()),
+                solid_layout,
+                textured_layout,
+                solid_vertex_module,
+                solid_fragment_module,
+                texture_vertex_module,
+                texture_fragment_module,
+                kawase_fragment_module,
+                kawase_layout,
+            }),
+            per_format: IndexMap::with_capacity(prepared_format_capacity()),
         })
     }
 
@@ -575,6 +605,10 @@ impl PipelineState {
     }
 
     pub(crate) fn pipeline_cache_data(&self) -> Result<Vec<u8>, VulkanRendererError> {
+        let _cache = self
+            .cache_access
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // SAFETY: Pipeline cache belongs to this device and is valid while `self` is alive.
         Ok(unsafe { self.device.handle().get_pipeline_cache_data(self.pipeline_cache) }?)
     }
@@ -584,6 +618,10 @@ impl PipelineState {
             return Ok(());
         }
 
+        let _cache = self
+            .cache_access
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let vk_device = self.device.handle();
         let cache_info = vk::PipelineCacheCreateInfo::default().initial_data(cache_data);
 
@@ -639,276 +677,45 @@ impl PipelineState {
             kawase_layout: self.kawase_layout,
         })
     }
-
-    fn create_format_pipeline_set(
-        &self,
-        format: vk::Format,
-    ) -> Result<FormatPipelineSet, VulkanRendererError> {
-        let vk_device = self.device.handle();
-        let render_pass = create_render_pass(vk_device, format)?;
-
-        let solid_pipeline = match self.create_graphics_pipeline(
-            render_pass,
-            self.solid_layout,
-            self.solid_vertex_module,
-            self.solid_fragment_module,
-            true,
-            false,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(err) => {
-                unsafe { vk_device.destroy_render_pass(render_pass, None) };
-                return Err(err);
-            }
-        };
-
-        let solid_opaque_pipeline = match self.create_graphics_pipeline(
-            render_pass,
-            self.solid_layout,
-            self.solid_vertex_module,
-            self.solid_fragment_module,
-            false,
-            false,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(err) => {
-                unsafe {
-                    vk_device.destroy_pipeline(solid_pipeline, None);
-                    vk_device.destroy_render_pass(render_pass, None);
-                }
-                return Err(err);
-            }
-        };
-
-        let textured_pipeline = match self.create_graphics_pipeline(
-            render_pass,
-            self.textured_layout,
-            self.texture_vertex_module,
-            self.texture_fragment_module,
-            true,
-            false,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(err) => {
-                unsafe {
-                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
-                    vk_device.destroy_pipeline(solid_pipeline, None);
-                    vk_device.destroy_render_pass(render_pass, None);
-                }
-                return Err(err);
-            }
-        };
-
-        let textured_opaque_pipeline = match self.create_graphics_pipeline(
-            render_pass,
-            self.textured_layout,
-            self.texture_vertex_module,
-            self.texture_fragment_module,
-            false,
-            false,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(err) => {
-                unsafe {
-                    vk_device.destroy_pipeline(textured_pipeline, None);
-                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
-                    vk_device.destroy_pipeline(solid_pipeline, None);
-                    vk_device.destroy_render_pass(render_pass, None);
-                }
-                return Err(err);
-            }
-        };
-
-        // Kawase writes every covered pixel; blending stays disabled so the
-        // pass is a pure resample (opaque overwrite).
-        let kawase_pipeline = match self.create_graphics_pipeline(
-            render_pass,
-            self.kawase_layout,
-            self.texture_vertex_module,
-            self.kawase_fragment_module,
-            false,
-            false,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(err) => {
-                unsafe {
-                    vk_device.destroy_pipeline(textured_opaque_pipeline, None);
-                    vk_device.destroy_pipeline(textured_pipeline, None);
-                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
-                    vk_device.destroy_pipeline(solid_pipeline, None);
-                    vk_device.destroy_render_pass(render_pass, None);
-                }
-                return Err(err);
-            }
-        };
-
-        let prefix_mix_pipeline = match self.create_graphics_pipeline(
-            render_pass,
-            self.textured_layout,
-            self.texture_vertex_module,
-            self.texture_fragment_module,
-            true,
-            true,
-        ) {
-            Ok(pipeline) => pipeline,
-            Err(err) => {
-                unsafe {
-                    vk_device.destroy_pipeline(kawase_pipeline, None);
-                    vk_device.destroy_pipeline(textured_opaque_pipeline, None);
-                    vk_device.destroy_pipeline(textured_pipeline, None);
-                    vk_device.destroy_pipeline(solid_opaque_pipeline, None);
-                    vk_device.destroy_pipeline(solid_pipeline, None);
-                    vk_device.destroy_render_pass(render_pass, None);
-                }
-                return Err(err);
-            }
-        };
-
-        Ok(FormatPipelineSet {
-            render_pass,
-            solid_pipeline,
-            solid_opaque_pipeline,
-            textured_pipeline,
-            textured_opaque_pipeline,
-            prefix_mix_pipeline,
-            kawase_pipeline,
-        })
-    }
-
-    fn create_graphics_pipeline(
-        &self,
-        render_pass: vk::RenderPass,
-        layout: vk::PipelineLayout,
-        vertex_shader_module: vk::ShaderModule,
-        fragment_shader_module: vk::ShaderModule,
-        blend_enabled: bool,
-        prefix_mix: bool,
-    ) -> Result<vk::Pipeline, VulkanRendererError> {
-        let vk_device = self.device.handle();
-
-        let shader_stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex_shader_module)
-                .name(c"main"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment_shader_module)
-                .name(c"main"),
-        ];
-
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP)
-            .primitive_restart_enable(false);
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .line_width(1.0)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        // Shader outputs are premultiplied, matching Wayland/Impeller texture
-        // contents and the compositor's solid color path.
-        let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(blend_enabled)
-            .src_color_blend_factor(if prefix_mix {
-                vk::BlendFactor::CONSTANT_ALPHA
-            } else {
-                vk::BlendFactor::ONE
-            })
-            .dst_color_blend_factor(if prefix_mix {
-                vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA
-            } else {
-                vk::BlendFactor::ONE_MINUS_SRC_ALPHA
-            })
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(if prefix_mix {
-                vk::BlendFactor::CONSTANT_ALPHA
-            } else {
-                vk::BlendFactor::ONE
-            })
-            .dst_alpha_blend_factor(if prefix_mix {
-                vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA
-            } else {
-                vk::BlendFactor::ONE_MINUS_SRC_ALPHA
-            })
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
-        let color_blend =
-            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-        let dynamic_states = [
-            vk::DynamicState::VIEWPORT,
-            vk::DynamicState::SCISSOR,
-            vk::DynamicState::BLEND_CONSTANTS,
-        ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-
-        let create_info = [vk::GraphicsPipelineCreateInfo::default()
-            .stages(&shader_stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .color_blend_state(&color_blend)
-            .dynamic_state(&dynamic_state)
-            .layout(layout)
-            .render_pass(render_pass)
-            .subpass(0)];
-
-        // SAFETY: Device and pipeline cache are valid; create-info references live data.
-        let pipelines =
-            unsafe { vk_device.create_graphics_pipelines(self.pipeline_cache, &create_info, None) }.map_err(
-                |(pipelines, err)| {
-                    for pipeline in pipelines {
-                        unsafe { vk_device.destroy_pipeline(pipeline, None) };
-                    }
-                    VulkanRendererError::from(err)
-                },
-            )?;
-
-        pipelines
-            .into_iter()
-            .next()
-            .ok_or(VulkanRendererError::TemporaryFailure(
-                "Vulkan did not return a graphics pipeline",
-            ))
-    }
 }
 
 impl Drop for PipelineState {
     fn drop(&mut self) {
-        // Skipped on a lost device: destroying these objects on a lost VkDevice faults on NVIDIA.
-        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
         let per_format = std::mem::take(&mut self.per_format);
         self.device.destroy_with(|device| {
             for (_, set) in per_format {
-                unsafe {
-                    device.destroy_pipeline(set.prefix_mix_pipeline, None);
-                    device.destroy_pipeline(set.kawase_pipeline, None);
-                    device.destroy_pipeline(set.textured_opaque_pipeline, None);
-                    device.destroy_pipeline(set.textured_pipeline, None);
-                    device.destroy_pipeline(set.solid_opaque_pipeline, None);
-                    device.destroy_pipeline(set.solid_pipeline, None);
-                    device.destroy_render_pass(set.render_pass, None);
-                }
+                destroy_format_set(device, set);
             }
+        });
+    }
+}
 
-            unsafe {
-                device.destroy_shader_module(self.kawase_fragment_module, None);
-                device.destroy_shader_module(self.texture_fragment_module, None);
-                device.destroy_shader_module(self.texture_vertex_module, None);
-                device.destroy_shader_module(self.solid_fragment_module, None);
-                device.destroy_shader_module(self.solid_vertex_module, None);
-                device.destroy_pipeline_layout(self.kawase_layout, None);
-                device.destroy_pipeline_layout(self.textured_layout, None);
-                device.destroy_pipeline_layout(self.solid_layout, None);
-                device.destroy_pipeline_cache(self.pipeline_cache, None);
-            }
+fn destroy_format_set(device: &ash::Device, set: FormatPipelineSet) {
+    unsafe {
+        device.destroy_pipeline(set.prefix_mix_pipeline, None);
+        device.destroy_pipeline(set.kawase_pipeline, None);
+        device.destroy_pipeline(set.textured_opaque_pipeline, None);
+        device.destroy_pipeline(set.textured_pipeline, None);
+        device.destroy_pipeline(set.solid_opaque_pipeline, None);
+        device.destroy_pipeline(set.solid_pipeline, None);
+        device.destroy_render_pass(set.render_pass, None);
+    }
+}
+
+impl Drop for PipelineCreationAuthority {
+    fn drop(&mut self) {
+        // The final factory/renderer owner is the only destruction authority.
+        // Device loss retains the existing no-native-destruction policy.
+        self.device.destroy_with(|device| unsafe {
+            device.destroy_shader_module(self.kawase_fragment_module, None);
+            device.destroy_shader_module(self.texture_fragment_module, None);
+            device.destroy_shader_module(self.texture_vertex_module, None);
+            device.destroy_shader_module(self.solid_fragment_module, None);
+            device.destroy_shader_module(self.solid_vertex_module, None);
+            device.destroy_pipeline_layout(self.kawase_layout, None);
+            device.destroy_pipeline_layout(self.textured_layout, None);
+            device.destroy_pipeline_layout(self.solid_layout, None);
+            device.destroy_pipeline_cache(self.pipeline_cache, None);
         });
     }
 }

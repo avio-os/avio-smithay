@@ -1,7 +1,10 @@
 use std::{
     fmt,
     os::fd::{AsFd, OwnedFd},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use ash::{khr, vk};
@@ -11,9 +14,8 @@ use crate::backend::renderer::sync::{Fence, Interrupted};
 
 use super::{device::DeviceHandle, VulkanRendererError};
 
-#[derive(Clone)]
 pub(crate) struct VulkanFence {
-    inner: Arc<VulkanFenceInner>,
+    inner: VulkanFenceInner,
 }
 
 struct VulkanFenceInner {
@@ -31,14 +33,17 @@ struct VulkanFenceInner {
     /// fragility in this stack). Keeping the fence un-exported means
     /// `is_signaled`/`wait` always reflect true completion state, and
     /// `export` is an idempotent dup of this fd.
-    sync_file: OnceLock<Arc<OwnedFd>>,
+    sync_file: Mutex<Option<OwnedFd>>,
+    submitted_native: AtomicBool,
+    native_attempted: AtomicBool,
+    retirement: Option<Box<super::retirement::RetirementNode<super::device_handle::DeviceRetirement>>>,
 }
 
 impl fmt::Debug for VulkanFence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VulkanFence")
             .field("fence", &self.inner.fence)
-            .field("has_sync_file", &self.inner.sync_file.get().is_some())
+            .field("has_sync_file", &self.inner.sync_file.lock().unwrap().is_some())
             .finish()
     }
 }
@@ -54,12 +59,35 @@ impl VulkanFence {
         let fence = device.observe_result(unsafe { device.handle().create_fence(&create_info, None) })?;
 
         Ok(Self {
-            inner: Arc::new(VulkanFenceInner {
+            inner: VulkanFenceInner {
                 device,
                 fence,
-                sync_file: OnceLock::new(),
-            }),
+                sync_file: Mutex::new(None),
+                submitted_native: AtomicBool::new(false),
+                native_attempted: AtomicBool::new(false),
+                retirement: Some(super::retirement::RetirementNode::new(
+                    super::device_handle::DeviceRetirement::Fence(fence),
+                )),
+            },
         })
+    }
+
+    pub(super) fn belongs_to(&self, device: &Arc<DeviceHandle>) -> bool {
+        self.inner.submitted_native.load(Ordering::Acquire) && Arc::ptr_eq(&self.inner.device, device)
+    }
+
+    pub(super) fn native_attempted(&self) -> bool {
+        self.inner.native_attempted.load(Ordering::Acquire)
+    }
+    pub(super) fn mark_native_attempt(&self) {
+        self.inner.native_attempted.store(true, Ordering::Release);
+    }
+    pub(super) fn cancel_unsubmitted_attempt(&self) {
+        self.inner.native_attempted.store(false, Ordering::Release);
+    }
+
+    pub(super) fn mark_submitted(&self) {
+        self.inner.submitted_native.store(true, Ordering::Release);
     }
 
     pub(crate) fn handle(&self) -> vk::Fence {
@@ -69,8 +97,11 @@ impl VulkanFence {
     /// Attach the SYNC_FD exported from the submission's export semaphore.
     /// Called exactly once by the device right after a successful submit.
     pub(crate) fn set_exported_sync_file(&self, fd: OwnedFd) {
-        if self.inner.sync_file.set(Arc::new(fd)).is_err() {
+        let mut exported = self.inner.sync_file.lock().unwrap();
+        if exported.is_some() {
             warn!("submission sync_file was already attached; ignoring duplicate");
+        } else {
+            *exported = Some(fd);
         }
     }
 
@@ -103,7 +134,8 @@ impl VulkanFence {
     }
 
     pub(crate) fn export_sync_file(&self) -> Option<OwnedFd> {
-        let fd = self.inner.sync_file.get()?;
+        let exported = self.inner.sync_file.lock().unwrap();
+        let fd = exported.as_ref()?;
         match fd.as_fd().try_clone_to_owned() {
             Ok(fd) => Some(fd),
             Err(err) => {
@@ -124,7 +156,7 @@ impl Fence for VulkanFence {
     }
 
     fn is_exportable(&self) -> bool {
-        self.inner.sync_file.get().is_some()
+        self.inner.sync_file.lock().unwrap().is_some()
     }
 
     fn export(&self) -> Option<OwnedFd> {
@@ -132,14 +164,23 @@ impl Fence for VulkanFence {
     }
 }
 
+impl VulkanFence {
+    /// Called only with the slot's sole logical reader and proven completion.
+    pub(super) fn reset_for_reuse(&self) -> Result<(), VulkanRendererError> {
+        self.inner
+            .device
+            .observe_result(unsafe { self.inner.device.handle().reset_fences(&[self.inner.fence]) })?;
+        self.inner.sync_file.lock().unwrap().take();
+        self.inner.submitted_native.store(false, Ordering::Release);
+        self.inner.native_attempted.store(false, Ordering::Release);
+        Ok(())
+    }
+}
 impl Drop for VulkanFenceInner {
     fn drop(&mut self) {
-        // SAFETY: Fence belongs to this device and is only destroyed once when the final owner drops.
-        // Skipped on a lost device: destroying a fence on a lost VkDevice faults on NVIDIA
-        // (destroy_fence → libnvidia-eglcore SIGSEGV — the device-loss teardown crash this guards).
-        // `destroy_with` is the single ownership-encoded teardown gate; a no-op when lost.
-        self.device
-            .destroy_with(|device| unsafe { device.destroy_fence(self.fence, None) });
+        if let Some(node) = self.retirement.take() {
+            self.device.retire_resource(node);
+        }
     }
 }
 
@@ -194,6 +235,22 @@ pub(crate) fn import_sync_file_to_semaphore(
             Err(err) => return Err(err.into()),
         };
 
+    if let Err(error) = import_sync_file_into_semaphore(device, external_semaphore_fd, semaphore, sync_file) {
+        device.destroy_with(|device| unsafe { device.destroy_semaphore(semaphore, None) });
+        return Err(error);
+    }
+    Ok(semaphore)
+}
+
+/// Import into a cold-owned binary semaphore. A failed import retains the
+/// old payload and closes the exact untransferred FD. A successful TEMPORARY
+/// import replaces any previous temporary payload and transfers the FD.
+pub(crate) fn import_sync_file_into_semaphore(
+    device: &DeviceHandle,
+    external_semaphore_fd: &khr::external_semaphore_fd::Device,
+    semaphore: vk::Semaphore,
+    sync_file: OwnedFd,
+) -> Result<(), VulkanRendererError> {
     let sync_file_raw = std::os::fd::IntoRawFd::into_raw_fd(sync_file);
     // SAFETY: `fd` is owned by this guard and closed exactly once on early-return paths.
     let sync_file_guard = scopeguard::guard(sync_file_raw, |fd| unsafe {
@@ -210,12 +267,11 @@ pub(crate) fn import_sync_file_to_semaphore(
     if let Err(err) =
         device.observe_result(unsafe { external_semaphore_fd.import_semaphore_fd(&import_info) })
     {
-        device.destroy_with(|device| unsafe { device.destroy_semaphore(semaphore, None) });
         return Err(err.into());
     }
 
     // Ownership moved to Vulkan on successful import.
     let _ = scopeguard::ScopeGuard::into_inner(sync_file_guard);
 
-    Ok(semaphore)
+    Ok(())
 }
