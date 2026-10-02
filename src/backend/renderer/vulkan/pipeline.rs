@@ -43,9 +43,21 @@ impl From<crate::utils::Transform> for TextureTransform {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct SolidPushConstants {
     pub(crate) color: [f32; 4],
+    pub(crate) owner_rect: [f32; 4],
+    pub(crate) owner_radius: f32,
+}
+
+impl Default for SolidPushConstants {
+    fn default() -> Self {
+        Self {
+            color: [0.0; 4],
+            owner_rect: [0.0; 4],
+            owner_radius: -1.0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -66,6 +78,11 @@ pub(crate) struct TexturePushConstants {
     pub(crate) source_encoding: u32,
     /// Physical pixels per authored logical pixel for parametric clips.
     pub(crate) clip_scale: f32,
+    // vec2 spelling in GLSL avoids vec4 alignment padding past the minimum
+    // 128-byte Vulkan push-constant allowance.
+    pub(crate) outer_origin: [f32; 2],
+    pub(crate) outer_size: [f32; 2],
+    pub(crate) outer_radius: f32,
 }
 
 const BOTTOM_EDGE_CLIP_FLAG: u32 = 1 << 31;
@@ -102,6 +119,9 @@ impl Default for TexturePushConstants {
             effect_params: [0.0, 0.0, 0.0, 0.0],
             source_encoding: SOURCE_ENCODING_PASSTHROUGH,
             clip_scale: 1.0,
+            outer_origin: [0.0; 2],
+            outer_size: [0.0; 2],
+            outer_radius: -1.0,
         }
     }
 }
@@ -112,15 +132,7 @@ impl TexturePushConstants {
             alpha,
             transform: transform as u32,
             y_inverted: u32::from(y_inverted),
-            rounded_clip_flags: 0,
-            src_offset: [0.0, 0.0],
-            src_scale: [1.0, 1.0],
-            clip_rect: [0.0, 0.0, 0.0, 0.0],
-            clip_params: [0.0, 2.0, 0.5, 0.0],
-            effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
-            effect_params: [0.0, 0.0, 0.0, 0.0],
-            source_encoding: SOURCE_ENCODING_PASSTHROUGH,
-            clip_scale: 1.0,
+            ..Self::default()
         }
     }
 
@@ -150,6 +162,13 @@ impl TexturePushConstants {
         self
     }
 
+    pub(crate) fn with_outer_rounded_clip(mut self, origin: [f32; 2], size: [f32; 2], radius: f32) -> Self {
+        self.outer_origin = origin;
+        self.outer_size = size;
+        self.outer_radius = radius;
+        self
+    }
+
     pub(crate) fn with_bottom_edge_clip(
         mut self,
         transform: TextureTransform,
@@ -161,6 +180,51 @@ impl TexturePushConstants {
         self.clip_rect = rect;
         self.clip_params = params;
         self.clip_scale = geometry_scale;
+        self
+    }
+
+    pub(crate) fn with_owner_resolve(
+        mut self,
+        extent: crate::utils::Size<i32, crate::utils::Physical>,
+        capacity: crate::utils::Size<i32, crate::utils::Buffer>,
+    ) -> Self {
+        self.effect = [
+            7.0,
+            extent.w as f32 / capacity.w as f32,
+            extent.h as f32 / capacity.h as f32,
+            0.0,
+        ];
+        self
+    }
+
+    pub(crate) fn with_material_tone(mut self, tint: super::VulkanMaterialTint) -> Self {
+        self.effect = [5.0, tint.color[0], tint.color[1], tint.color[2]];
+        self.effect_params = [
+            tint.color[3],
+            tint.body_lights[0],
+            tint.body_lights[1],
+            tint.body_lights[2],
+        ];
+        self
+    }
+
+    pub(crate) fn with_kawase_output(
+        mut self,
+        output: super::kawase::VulkanKawaseOutput,
+        capacity: crate::utils::Size<i32, crate::utils::Buffer>,
+    ) -> Self {
+        self.effect = [
+            if output.upsample { 4.0 } else { 6.0 },
+            output.offset,
+            output.transform.saturation,
+            output.transform.contrast,
+        ];
+        self.effect_params = [
+            output.transform.brightness,
+            output.extent.w as f32 / capacity.w as f32,
+            output.extent.h as f32 / capacity.h as f32,
+            0.0,
+        ];
         self
     }
 
@@ -178,7 +242,7 @@ impl TexturePushConstants {
 
 /// Push constants for the dual-Kawase blur pass. Layout mirrors the GLSL
 /// push-constant block in `shaders/kawase.frag` (std430: vec2 at offset 0,
-/// scalars packed after, followed by three vec2 region bounds; 64 bytes).
+/// scalars packed after, followed by four vec2 region bounds; 72 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KawasePushConstants {
@@ -204,6 +268,7 @@ pub(crate) struct KawasePushConstants {
     pub(crate) source_uv_scale: [f32; 2],
     pub(crate) source_uv_min: [f32; 2],
     pub(crate) source_uv_max: [f32; 2],
+    pub(crate) source_uv_offset: [f32; 2],
 }
 
 impl KawasePushConstants {
@@ -228,10 +293,19 @@ impl KawasePushConstants {
             source_uv_scale: [1.0; 2],
             source_uv_min: [0.0; 2],
             source_uv_max: [1.0; 2],
+            source_uv_offset: [0.0; 2],
         }
     }
     pub(crate) fn with_source_extent(
+        self,
+        extent: crate::utils::Size<i32, crate::utils::Buffer>,
+        capacity: crate::utils::Size<i32, crate::utils::Buffer>,
+    ) -> Self {
+        self.with_source_region((0, 0).into(), extent, capacity)
+    }
+    pub(crate) fn with_source_region(
         mut self,
+        origin: crate::utils::Point<i32, crate::utils::Buffer>,
         extent: crate::utils::Size<i32, crate::utils::Buffer>,
         capacity: crate::utils::Size<i32, crate::utils::Buffer>,
     ) -> Self {
@@ -239,10 +313,17 @@ impl KawasePushConstants {
             extent.w as f32 / capacity.w as f32,
             extent.h as f32 / capacity.h as f32,
         ];
-        self.source_uv_min = [0.5 / capacity.w as f32, 0.5 / capacity.h as f32];
+        self.source_uv_offset = [
+            origin.x as f32 / capacity.w as f32,
+            origin.y as f32 / capacity.h as f32,
+        ];
+        self.source_uv_min = [
+            (origin.x as f32 + 0.5) / capacity.w as f32,
+            (origin.y as f32 + 0.5) / capacity.h as f32,
+        ];
         self.source_uv_max = [
-            (extent.w as f32 - 0.5) / capacity.w as f32,
-            (extent.h as f32 - 0.5) / capacity.h as f32,
+            ((origin.x + extent.w) as f32 - 0.5) / capacity.w as f32,
+            ((origin.y + extent.h) as f32 - 0.5) / capacity.h as f32,
         ];
         self
     }
@@ -884,9 +965,10 @@ mod tests {
         super::descriptor::{DescriptorState, TextureSampler},
         super::device::DeviceHandle,
         super::device::DeviceState,
-        push_constants_bytes, PipelineState, SolidPushConstants, TexturePushConstants, TextureTransform,
-        BOTTOM_EDGE_CLIP_FLAG, CLIP_TRANSFORM_SHIFT, SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
-        SOURCE_ENCODING_LINEAR_PREMULTIPLIED, SOURCE_ENCODING_PASSTHROUGH,
+        push_constants_bytes, KawaseColorTransform, KawasePushConstants, PipelineState, SolidPushConstants,
+        TexturePushConstants, TextureTransform, BOTTOM_EDGE_CLIP_FLAG, CLIP_TRANSFORM_SHIFT,
+        SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED, SOURCE_ENCODING_LINEAR_PREMULTIPLIED,
+        SOURCE_ENCODING_PASSTHROUGH,
     };
 
     const TEST_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -916,14 +998,20 @@ mod tests {
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut format_list);
 
-        let image = unsafe { vk_device.create_image(&image_create_info, None) }?;
+        let image = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_image(&image_create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanImage,
+        )?;
         let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
         let memory_type_index = pick_image_memory_type(device, memory_requirements.memory_type_bits)
             .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = unsafe { vk_device.allocate_memory(&allocate_info, None) }?;
+        let memory = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.allocate_memory(&allocate_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        )?;
         unsafe { vk_device.bind_image_memory(image, memory, 0) }?;
 
         let view_info = vk::ImageViewCreateInfo::default()
@@ -955,7 +1043,10 @@ mod tests {
             .size(size as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { vk_device.create_buffer(&buffer_create_info, None) }?;
+        let buffer = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_buffer(&buffer_create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanBuffer,
+        )?;
         let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
         let (memory_type_index, coherent) =
             pick_host_visible_memory_type(device, memory_requirements.memory_type_bits)
@@ -963,7 +1054,10 @@ mod tests {
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = unsafe { vk_device.allocate_memory(&allocate_info, None) }?;
+        let memory = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.allocate_memory(&allocate_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        )?;
         unsafe { vk_device.bind_buffer_memory(buffer, memory, 0) }?;
 
         unsafe {
@@ -1525,6 +1619,39 @@ mod tests {
     }
 
     #[test]
+    fn material_body_lights_reuse_exact_tint_packet_without_overwriting_owner_clip() {
+        let tint = super::super::VulkanMaterialTint::new([0.2, 0.3, 0.4, 0.5]).with_body_lights([
+            41.0 / 255.0,
+            56.0 / 255.0,
+            128.0 / 255.0,
+        ]);
+        let constants = TexturePushConstants::default()
+            .with_outer_rounded_clip([3.0, 5.0], [200.0, 112.0], 9.0)
+            .with_material_tone(tint);
+        assert_eq!(constants.effect, [5.0, 0.2, 0.3, 0.4]);
+        assert_eq!(
+            constants.effect_params,
+            [0.5, 41.0 / 255.0, 56.0 / 255.0, 128.0 / 255.0]
+        );
+        assert_eq!(constants.outer_origin, [3.0, 5.0]);
+        assert_eq!(constants.outer_size, [200.0, 112.0]);
+        assert_eq!(constants.outer_radius, 9.0);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 124);
+    }
+
+    #[test]
+    fn owner_resolve_samples_only_the_four_admitted_atlas_extents() {
+        let constants = TexturePushConstants::default().with_owner_resolve(
+            crate::utils::Size::from((200, 112)),
+            crate::utils::Size::from((512, 256)),
+        );
+        assert_eq!(constants.effect, [7.0, 200.0 / 512.0, 112.0 / 256.0, 0.0]);
+        assert_eq!(std::mem::size_of::<SolidPushConstants>(), 36);
+        assert_eq!(std::mem::offset_of!(SolidPushConstants, owner_rect), 16);
+        assert_eq!(std::mem::offset_of!(SolidPushConstants, owner_radius), 32);
+    }
+
+    #[test]
     fn texture_push_constants_encode_bottom_edge_clip() {
         let constants = TexturePushConstants::new(1.0, TextureTransform::Normal, false)
             .with_bottom_edge_clip(
@@ -1545,11 +1672,14 @@ mod tests {
 
     #[test]
     fn texture_push_constant_layout_matches_the_shader_block() {
-        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 104);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 124);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, alpha), 0);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_rect), 32);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, source_encoding), 96);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_scale), 100);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, outer_origin), 104);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, outer_size), 112);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, outer_radius), 120);
     }
 
     #[derive(Debug)]
@@ -1856,6 +1986,8 @@ mod tests {
 
             let solid_constants = SolidPushConstants {
                 color: [0.0, 1.0, 0.0, 1.0],
+                owner_radius: -1.0,
+                ..SolidPushConstants::default()
             };
             vk_device.cmd_push_constants(
                 command_buffer,
@@ -2049,7 +2181,10 @@ mod tests {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let image = unsafe { vk_device.create_image(&image_create_info, None) }?;
+        let image = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_image(&image_create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanImage,
+        )?;
         let memory_requirements = unsafe { vk_device.get_image_memory_requirements(image) };
 
         let memory_type_index = pick_image_memory_type(device, memory_requirements.memory_type_bits)
@@ -2058,7 +2193,10 @@ mod tests {
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = match unsafe { vk_device.allocate_memory(&allocate_info, None) } {
+        let memory = match crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.allocate_memory(&allocate_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        ) {
             Ok(memory) => memory,
             Err(err) => {
                 unsafe { vk_device.destroy_image(image, None) };
@@ -2135,7 +2273,10 @@ mod tests {
             .size(size as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { vk_device.create_buffer(&buffer_create_info, None) }?;
+        let buffer = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_buffer(&buffer_create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanBuffer,
+        )?;
         let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
 
         let (memory_type_index, coherent) =
@@ -2145,7 +2286,10 @@ mod tests {
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_requirements.size)
             .memory_type_index(memory_type_index);
-        let memory = match unsafe { vk_device.allocate_memory(&allocate_info, None) } {
+        let memory = match crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.allocate_memory(&allocate_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        ) {
             Ok(memory) => memory,
             Err(err) => {
                 unsafe { vk_device.destroy_buffer(buffer, None) };
@@ -2293,5 +2437,32 @@ mod tests {
             .iter()
             .zip(expected.iter())
             .all(|(actual, expected)| actual.abs_diff(*expected) <= tolerance)
+    }
+    #[test]
+    fn direct_prefix_clamps_to_offset_region_and_keeps_shader_abi() {
+        let constants = KawasePushConstants::new(
+            [0.01, 0.02],
+            1.5,
+            false,
+            false,
+            KawaseColorTransform::IDENTITY,
+            true,
+        )
+        .with_source_region((17, 23).into(), (101, 77).into(), (400, 300).into());
+        assert_eq!(constants.source_uv_offset, [17.0 / 400.0, 23.0 / 300.0]);
+        assert_eq!(constants.source_uv_min, [17.5 / 400.0, 23.5 / 300.0]);
+        assert_eq!(constants.source_uv_max, [117.5 / 400.0, 99.5 / 300.0]);
+        assert_eq!(std::mem::size_of::<KawasePushConstants>(), 72);
+        assert_eq!(std::mem::offset_of!(KawasePushConstants, source_uv_offset), 64);
+    }
+
+    #[test]
+    fn fused_final_pass_preserves_texture_push_size_and_css_order() {
+        let output =
+            super::super::kawase::VulkanKawaseOutput::new((101, 77).into(), 1.5).with_filter(1.2, 0.8, 0.6);
+        let constants = TexturePushConstants::default().with_kawase_output(output, (128, 128).into());
+        assert_eq!(constants.effect, [4.0, 1.5, 0.6, 1.2]);
+        assert_eq!(constants.effect_params, [0.8, 101.0 / 128.0, 77.0 / 128.0, 0.0]);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 124);
     }
 }

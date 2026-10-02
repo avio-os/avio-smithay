@@ -60,6 +60,48 @@ fn chain() -> Swapchain<TestAllocator> {
 }
 
 #[test]
+fn prepared_only_acquisition_never_allocates_on_a_miss_or_full_pool() {
+    let mut chain = chain();
+    assert!(chain.acquire_existing().is_none());
+    assert_eq!(chain.allocator.allocations, 0);
+    let cold = chain.acquire().unwrap().unwrap();
+    assert!(chain.acquire_existing().is_none());
+    assert_eq!(chain.allocator.allocations, 1);
+    drop(cold);
+    let warm = chain.acquire_existing().unwrap();
+    assert_eq!(chain.allocator.allocations, 1);
+    assert_eq!(chain.allocated_slots(), 1);
+    drop(warm);
+}
+
+#[test]
+fn completion_extraction_preserves_frame_owners_and_defers_destruction() {
+    let mut chain = chain();
+    let presented = chain.acquire().unwrap().unwrap();
+    let unused = chain.acquire().unwrap().unwrap();
+    unused.userdata().insert_if_missing_threadsafe(|| 41u64);
+    drop(unused);
+    let retired = chain.take_unreferenced();
+    assert_eq!(retired.iter().flatten().count(), 1);
+    assert_eq!(chain.allocated_slots(), 1);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        retired.iter().flatten().next().unwrap().userdata().get::<u64>(),
+        Some(&41)
+    );
+    assert_eq!(presented.size().w, 640);
+    drop(retired);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 1);
+    drop(presented);
+    let retired = chain.take_unreferenced();
+    assert_eq!(chain.allocated_slots(), 0);
+    assert!(chain.acquire_existing().is_none());
+    assert_eq!(chain.allocator.allocations, 2);
+    drop(retired);
+    assert_eq!(chain.allocator.live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn adoption_preserves_off_thread_userdata_without_an_allocator_call() {
     let mut chain = chain();
     let buffer = chain

@@ -24,7 +24,14 @@ pub mod gbm;
 #[cfg(feature = "backend_vulkan")]
 pub mod vulkan;
 
+mod observation;
 mod swapchain;
+pub use observation::{
+    gpu_frame_allocation_snapshot, set_gpu_allocation_observer, GpuAllocationKind,
+    GpuFrameAllocationExclusion, GpuFrameAllocationExclusionScope, GpuFrameAllocationScope,
+    GpuFrameAllocationSnapshot,
+};
+pub(crate) use observation::{note_gpu_allocation, observe_gpu_allocation};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -32,7 +39,7 @@ use std::{
 };
 
 use crate::utils::{Buffer as BufferCoords, Size};
-pub use swapchain::{AdoptionFailure, RejectedSlots, Slot, Swapchain, SLOT_CAP};
+pub use swapchain::{AdoptionFailure, RejectedSlots, RetiredSlot, Slot, Swapchain, SLOT_CAP};
 
 pub use drm_fourcc::{
     DrmFormat as Format, DrmFourcc as Fourcc, DrmModifier as Modifier, DrmVendor as Vendor,

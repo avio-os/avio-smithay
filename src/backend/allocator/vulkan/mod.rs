@@ -163,6 +163,8 @@ struct AllocatorDevice(
     /// Kept alive until the device above is destroyed.
     #[allow(dead_code)]
     Instance,
+    #[cfg(feature = "renderer_vulkan")]
+    Option<Arc<crate::backend::renderer::vulkan::device_handle::DeviceHandle>>,
 );
 
 impl Drop for AllocatorDevice {
@@ -170,6 +172,10 @@ impl Drop for AllocatorDevice {
         // SAFETY: Every image created on this device holds this owner and
         // destroys its own handles first; the device records no commands.
         // The instance in `self.1` is released only after this returns.
+        #[cfg(feature = "renderer_vulkan")]
+        if self.2.is_some() {
+            return;
+        }
         unsafe { self.0.destroy_device(None) };
     }
 }
@@ -285,12 +291,79 @@ impl VulkanAllocator {
             phd: phd.clone(),
             #[cfg(feature = "backend_drm")]
             node,
-            device: Arc::new(AllocatorDevice(device, phd.instance().clone())),
+            device: Arc::new(AllocatorDevice(
+                device,
+                phd.instance().clone(),
+                #[cfg(feature = "renderer_vulkan")]
+                None,
+            )),
         };
 
         allocator.init_formats();
 
         Ok(allocator)
+    }
+
+    /// Renderer-owned construction retains its exact logical-device owner;
+    /// it cannot accept an arbitrary handle or destroy the device on drop.
+    #[cfg(feature = "renderer_vulkan")]
+    pub(crate) fn from_renderer_device(
+        phd: &PhysicalDevice,
+        owner: Arc<crate::backend::renderer::vulkan::device_handle::DeviceHandle>,
+        enabled: &[&'static CStr],
+        default_usage: ImageUsageFlags,
+    ) -> Result<Self, Error> {
+        if default_usage.is_empty() {
+            return Err(Error::Setup);
+        }
+        // These are the actual required modifier/export extensions. 4444 is
+        // optional and not required by our ARGB/XRGB export contracts.
+        if [
+            ext::image_drm_format_modifier::NAME,
+            ext::external_memory_dma_buf::NAME,
+            khr::external_memory_fd::NAME,
+        ]
+        .iter()
+        .any(|extension| !enabled.contains(extension))
+        {
+            return Err(Error::Setup);
+        }
+        let raw = owner.handle().clone();
+        let instance = phd.instance().handle();
+        let extension_fns = ExtensionFns {
+            ext_image_format_modifier: ext::image_drm_format_modifier::Device::new(instance, &raw),
+            khr_external_memory_fd: khr::external_memory_fd::Device::new(instance, &raw),
+        };
+        #[cfg(feature = "backend_drm")]
+        let node = phd
+            .render_node()
+            .ok()
+            .flatten()
+            .or_else(|| phd.primary_node().ok().flatten());
+        let mut allocator = Self {
+            formats: Vec::new(),
+            default_usage,
+            remaining_allocations: Arc::new(AtomicU32::new(phd.limits().max_memory_allocation_count)),
+            extension_fns,
+            phd: phd.clone(),
+            #[cfg(feature = "backend_drm")]
+            node,
+            device: Arc::new(AllocatorDevice(raw, phd.instance().clone(), Some(owner))),
+        };
+        allocator.init_formats();
+        Ok(allocator)
+    }
+
+    /// Tag the calling owner's explicit preparation/maintenance operation.
+    #[cfg(feature = "renderer_vulkan")]
+    pub fn allocation_phase_scope(
+        &self,
+        phase: crate::backend::renderer::vulkan::VulkanAllocationPhase,
+    ) -> Option<crate::backend::renderer::vulkan::VulkanAllocationPhaseGuard> {
+        self.device
+            .2
+            .as_ref()
+            .map(|owner| owner.allocation_ledger().enter_phase(phase))
     }
 
     /// Returns whether this allocator supports the specified format with the usage flags.
@@ -358,7 +431,10 @@ impl VulkanAllocator {
             return Err(Error::UnsupportedFormat);
         }
 
-        Ok(unsafe { self.create_image(width, height, vk_format, vk_usage, fourcc, &modifiers[..]) }?)
+        Ok(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { self.create_image(width, height, vk_format, vk_usage, fourcc, &modifiers[..]) },
+            crate::backend::allocator::GpuAllocationKind::VulkanImage,
+        )?)
     }
 
     /// Returns the [`PhysicalDevice`] this allocator was created with.
@@ -387,11 +463,13 @@ impl Allocator for VulkanAllocator {
 /// This type implements [`Buffer`] and the underlying image may be exported as a dmabuf.
 ///
 /// Dropping the image destroys it and frees its memory at once. That is safe
-/// whatever still reads the pixels: the allocator's device never records or
-/// submits a command, so no submission on it can reference the image, and a
+/// whatever still reads the pixels: the allocator never records or submits a
+/// command referring to its export image (even when its device is shared), and a
 /// consumer reads an exported dmabuf through its own import, whose kernel
 /// object the dmabuf keeps alive after this device lets go of it.
 pub struct VulkanImage {
+    #[cfg(feature = "renderer_vulkan")]
+    _allocation: Option<crate::backend::renderer::vulkan::allocation::AllocationGuard>,
     inner: ImageInner,
     width: u32,
     height: u32,
@@ -502,10 +580,18 @@ impl Drop for VulkanImage {
         // SAFETY: The image and memory belong to `self.device`, which this
         // image keeps alive, and no other owner can name them. See the type
         // documentation for why no GPU work can still use them.
-        unsafe {
-            self.device.0.destroy_image(self.inner.image, None);
-            self.device.0.free_memory(self.inner.memory, None);
+        let destroy = |device: &ash::Device| unsafe {
+            device.destroy_image(self.inner.image, None);
+            device.free_memory(self.inner.memory, None);
+        };
+        #[cfg(feature = "renderer_vulkan")]
+        if let Some(owner) = &self.device.2 {
+            owner.destroy_with(destroy);
+        } else {
+            destroy(&self.device.0);
         }
+        #[cfg(not(feature = "renderer_vulkan"))]
+        destroy(&self.device.0);
         self.remaining_allocations.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -733,10 +819,18 @@ impl VulkanAllocator {
         let mut guard = scopeguard::guard(
             ImageInner {
                 // This is the only spot where ? may be used to detect and error since no previous handles have been created.
-                image: unsafe { self.device.0.create_image(&image_create_info, None) }?,
+                image: crate::backend::allocator::observe_gpu_allocation(
+                    unsafe { self.device.0.create_image(&image_create_info, None) },
+                    crate::backend::allocator::GpuAllocationKind::VulkanImage,
+                )?,
                 memory: vk::DeviceMemory::null(),
             },
-            |inner| unsafe { self.device.0.destroy_image(inner.image, None) },
+            |inner| unsafe {
+                self.device.0.destroy_image(inner.image, None);
+                if inner.memory != vk::DeviceMemory::null() {
+                    self.device.0.free_memory(inner.memory, None);
+                }
+            },
         );
 
         // Get the modifier Vulkan created the image using.
@@ -782,11 +876,23 @@ impl VulkanAllocator {
             .push_next(&mut export_memory_allocate_info)
             .push_next(&mut dedicated_info);
 
+        // Record exact successful bytes only; export/kernel backing census is
+        // separate from this explicit VkDeviceMemory owner lifetime.
         unsafe {
-            // Allocate memory for the image.
             guard.memory = self.device.0.allocate_memory(&alloc_create_info, None)?;
-            // Finally bind the memory to the image
-            self.device.0.bind_image_memory(guard.image, guard.memory, 0)?;
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        let allocation = self.device.2.as_ref().map(|owner| {
+            owner.allocation_ledger().record(
+                crate::backend::renderer::vulkan::VulkanAllocationReason::RenderTarget,
+                memory_reqs.size,
+            )
+        });
+        if let Err(error) = unsafe { self.device.0.bind_image_memory(guard.image, guard.memory, 0) } {
+            drop(guard);
+            #[cfg(feature = "renderer_vulkan")]
+            drop(allocation);
+            return Err(error);
         }
 
         // Initialization is complete, prevent the scope guard from running it's dropfn.
@@ -796,6 +902,8 @@ impl VulkanAllocator {
         self.remaining_allocations.fetch_sub(1, Ordering::Relaxed);
 
         Ok(VulkanImage {
+            #[cfg(feature = "renderer_vulkan")]
+            _allocation: allocation,
             inner,
             width,
             height,

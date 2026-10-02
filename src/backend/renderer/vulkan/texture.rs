@@ -61,6 +61,16 @@ impl VulkanTexture {
         }
     }
 
+    pub(super) fn from_framebuffer_image(image: Arc<VulkanImage>) -> Self {
+        Self {
+            size: image.size(),
+            format: Some(image.format().code),
+            y_inverted: false,
+            image: Some(image),
+            memory_writable: false,
+        }
+    }
+
     /// Returns if this texture originates from y-inverted dma-buf contents.
     pub fn y_inverted(&self) -> bool {
         self.y_inverted

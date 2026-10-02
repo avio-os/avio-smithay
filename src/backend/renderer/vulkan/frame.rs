@@ -91,6 +91,10 @@ pub struct VulkanFrame<'frame> {
     renderer: &'frame mut VulkanRenderer,
     state: VulkanFrameState,
     recording: Option<FrameRecording>,
+    draw_alpha: f32,
+    outer_rounded_clip: Option<RoundedClip>,
+    owner_sample_replay: Option<OwnerSampleReplay>,
+    resolved_sample_texture: bool,
 }
 
 impl RendererSuper for VulkanRenderer {
@@ -209,6 +213,10 @@ impl Renderer for VulkanRenderer {
         let mut frame = VulkanFrame {
             renderer: self,
             state: VulkanFrameState::Recording,
+            draw_alpha: 1.0,
+            outer_rounded_clip: None,
+            owner_sample_replay: None,
+            resolved_sample_texture: false,
             recording: Some(FrameRecording {
                 command_buffer,
                 framebuffer,
@@ -328,6 +336,11 @@ impl Frame for VulkanFrame<'_> {
     #[instrument(level = "trace", skip(self, at))]
     #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+        if self.owner_sample_replay.is_some() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner replay cannot clear its frozen prefix",
+            ));
+        }
         let (command_buffer, transform, output_size, size, linear_blending) = {
             let recording = self.recording()?;
             (
@@ -397,6 +410,11 @@ impl Frame for VulkanFrame<'_> {
         damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), Self::Error> {
+        if self.outer_rounded_clip.is_some() && self.owner_sample_replay.is_none() {
+            return Err(VulkanRendererError::NotImplemented(
+                "solid draws require an explicit owner-mask packet",
+            ));
+        }
         if damage.is_empty() {
             return Ok(());
         }
@@ -412,15 +430,22 @@ impl Frame for VulkanFrame<'_> {
             )
         };
 
-        let Some(viewport_rect) = framebuffer_rect(transform, output_size, size, dst) else {
+        let size = self.geometry_frame_size(size);
+        let Some(viewport_rect) = self.draw_viewport_rect(transform, output_size, size, dst) else {
             return Ok(());
         };
 
         let draw_damage = Self::transformed_damage_rects(transform, output_size, size, dst, damage);
+        let draw_damage = if let Some(replay) = self.owner_sample_replay {
+            replay.damage(draw_damage)
+        } else {
+            draw_damage
+        };
         if draw_damage.is_empty() {
             return Ok(());
         }
 
+        let color = color * self.draw_alpha;
         let pipeline = if color.is_opaque() {
             pipelines.solid_opaque_pipeline
         } else {
@@ -429,14 +454,26 @@ impl Frame for VulkanFrame<'_> {
 
         // The shader premultiplies by alpha; linearizing the channels first makes that
         // a premultiplied-*linear* value, which is what a linear-light blend expects.
-        let constants = SolidPushConstants {
+        let mut constants = SolidPushConstants {
             color: encode_color_for_target(
                 color,
                 self.recording()?
                     .encoding
                     .blends_in_linear_light(&self.recording()?.target),
             ),
+            owner_radius: -1.0,
+            ..SolidPushConstants::default()
         };
+        if let Some(TransformedAnalyticClip::Rounded(clip)) = self.outer_rounded_clip.map(|clip| {
+            self.shift_analytic_clip(transform_analytic_clip(
+                transform,
+                output_size,
+                AnalyticClip::Rounded(clip),
+            ))
+        }) {
+            constants.owner_rect = analytic_clip_rect_push_constant(clip.rect);
+            constants.owner_radius = clip.radius;
+        }
 
         // SAFETY: Command buffer recording is active and all pipeline/layout handles are valid.
         unsafe {
@@ -454,7 +491,7 @@ impl Frame for VulkanFrame<'_> {
             self.renderer.device.device_handle().cmd_set_viewport(
                 command_buffer,
                 0,
-                &[to_vk_viewport(viewport_rect)],
+                &[self.sample_viewport(viewport_rect)],
             );
 
             self.renderer.device.device_handle().cmd_push_constants(
@@ -480,6 +517,38 @@ impl Frame for VulkanFrame<'_> {
         Ok(())
     }
 
+    fn canonical_coverage_lane(&self) -> Option<usize> {
+        VulkanFrame::canonical_coverage_lane(self)
+    }
+
+    fn render_texture_from_to_resolved_sample_lane(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+    ) -> Result<(), Self::Error> {
+        let previous = self.resolved_sample_texture;
+        self.resolved_sample_texture = true;
+        let result = self.render_texture_from_to_internal(
+            texture,
+            src,
+            dst,
+            damage,
+            &[],
+            src_transform,
+            alpha,
+            None,
+            TextureRenderEffect::NONE,
+            None,
+            None,
+        );
+        self.resolved_sample_texture = previous;
+        result
+    }
+
     #[instrument(level = "trace", skip(self, texture, damage, opaque_regions))]
     #[profiling::function]
     fn render_texture_from_to(
@@ -502,6 +571,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             None,
             TextureRenderEffect::NONE,
+            None,
             None,
         )
     }
@@ -530,6 +600,7 @@ impl Frame for VulkanFrame<'_> {
             Some(AnalyticClip::Rounded(rounded_clip)),
             TextureRenderEffect::NONE,
             None,
+            None,
         )
     }
 
@@ -556,6 +627,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             Some(AnalyticClip::BottomEdge(bottom_edge_clip)),
             TextureRenderEffect::NONE,
+            None,
             None,
         )
     }
@@ -584,6 +656,7 @@ impl Frame for VulkanFrame<'_> {
             None,
             effect,
             None,
+            None,
         )
     }
 
@@ -611,6 +684,7 @@ impl Frame for VulkanFrame<'_> {
             alpha,
             Some(AnalyticClip::Rounded(rounded_clip)),
             effect,
+            None,
             None,
         )
     }
@@ -716,6 +790,11 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<(), Self::Error> {
+        if self.owner_sample_replay.is_some() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner replay cannot submit a partial recording",
+            ));
+        }
         let resume_context = self.flush_recording_segment()?;
         let resume_target = Self::frame_target_from_context(&resume_context);
         let blit_result = self.renderer.blit(&resume_target, to, src, dst, filter);
@@ -740,6 +819,11 @@ impl BlitFrame<VulkanTarget> for VulkanFrame<'_> {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<(), Self::Error> {
+        if self.owner_sample_replay.is_some() {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner replay cannot submit a partial recording",
+            ));
+        }
         let resume_context = self.flush_recording_segment()?;
         let mut resume_target = Self::frame_target_from_context(&resume_context);
         let blit_result = self.renderer.blit(from, &mut resume_target, src, dst, filter);
@@ -778,12 +862,14 @@ impl VulkanFrame<'_> {
         if !group_opacity.is_finite() || !(0.0..=1.0).contains(&group_opacity) {
             return Err(VulkanRendererError::TemporaryFailure("invalid group opacity"));
         }
-        let (transform, output_size, frame_size) = {
-            let recording = self.recording()?;
-            (recording.transform, recording.output_size, recording.size)
+        let Some(region) = self
+            .owner_sample_replay
+            .map_or(Some(region), |replay| replay.clip_output_region(region))
+        else {
+            return Ok(());
         };
         // The capture blitted exactly this framebuffer area to the origin.
-        let Some(captured) = framebuffer_rect(transform, output_size, frame_size, region) else {
+        let Some(captured) = self.effect_framebuffer_rect(region)? else {
             return Ok(());
         };
         let prefix_size = prefix.size();
@@ -794,7 +880,9 @@ impl VulkanFrame<'_> {
         }
         let source =
             Rectangle::from_size(Size::<i32, BufferCoord>::from((captured.size.w, captured.size.h)).to_f64());
-        self.render_texture_from_to_internal(
+        let previous = self.resolved_sample_texture;
+        self.resolved_sample_texture = self.owner_sample_replay.is_some();
+        let result = self.render_texture_from_to_internal(
             prefix,
             source,
             region,
@@ -805,197 +893,10 @@ impl VulkanFrame<'_> {
             None,
             TextureRenderEffect::NONE,
             Some(1.0 - group_opacity),
-        )
-    }
-
-    /// Capture a bounded rectangle from the current output prefix and execute
-    /// a Kawase filter graph in this frame's active command buffer.
-    ///
-    /// The main render pass is paused and resumed with `LOAD`; no queue submit,
-    /// host wait, or second renderer authority is introduced. Every image and
-    /// transient framebuffer is retained by the final frame submission.
-    pub fn capture_and_filter_framebuffer(
-        &mut self,
-        backdrop_read_area: Rectangle<i32, Physical>,
-        capture: &VulkanTexture,
-        passes: &[VulkanKawasePass],
-    ) -> Result<(), VulkanRendererError> {
-        let Some(capture_image) = capture.image_resource().cloned() else {
-            return Err(VulkanRendererError::NotImplemented(
-                "framebuffer-effect capture requires an image-backed Vulkan texture",
-            ));
-        };
-        if !capture_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture texture lacks transfer-destination usage",
-            ));
-        }
-
-        let resolved = self.renderer.resolve_kawase_passes(passes)?;
-        let (command_buffer, target, transform, output_size, frame_size, main_render_pass, main_framebuffer) = {
-            let recording = self.recording()?;
-            (
-                recording.command_buffer,
-                recording.target.clone(),
-                recording.transform,
-                recording.output_size,
-                recording.size,
-                recording.pipelines.render_pass,
-                recording.framebuffer,
-            )
-        };
-        let Some(source_area) = framebuffer_rect(transform, output_size, frame_size, backdrop_read_area)
-        else {
-            return Ok(());
-        };
-        let capture_size = capture_image.size();
-        let capture_area: Rectangle<i32, Physical> = Rectangle::from_size(source_area.size);
-        if capture_size.w < source_area.size.w || capture_size.h < source_area.size.h {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture capacity is smaller than transformed read area",
-            ));
-        }
-        if target.vk_format() != capture_image.vk_format() {
-            return Err(VulkanRendererError::TemporaryFailure(
-                "framebuffer-effect capture format must match the active target format",
-            ));
-        }
-
-        self.renderer.blit.validate_blit_images(
-            &target,
-            &capture_image,
-            source_area,
-            capture_area,
-            TextureFilter::Linear,
-        )?;
-
-        // SAFETY: The frame owns an active render pass in this command buffer.
-        unsafe {
-            self.renderer.device.insert_debug_label(
-                command_buffer,
-                c"vulkan.frame.framebuffer_effect",
-                [0.67, 0.34, 0.91, 1.0],
-            );
-            self.renderer
-                .device
-                .device_handle()
-                .cmd_end_render_pass(command_buffer);
-        }
-
-        self.transition_image_layout(&target, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
-        self.transition_image_layout(&capture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
-        record_image_blit(
-            self.renderer.device.device_handle(),
-            command_buffer,
-            &target,
-            &capture_image,
-            source_area,
-            capture_area,
-            TextureFilter::Linear,
+            None,
         );
-
-        for pass in &resolved {
-            self.record_kawase_pass(command_buffer, pass)?;
-        }
-
-        self.transition_image_layout(&target, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
-        let render_pass_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(main_render_pass)
-            .framebuffer(main_framebuffer)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: frame_size.w.max(1) as u32,
-                    height: frame_size.h.max(1) as u32,
-                },
-            });
-        // SAFETY: Main framebuffer/render pass are live for the frame and use
-        // LOAD, preserving the completed lower scene captured above.
-        unsafe {
-            self.renderer.device.device_handle().cmd_begin_render_pass(
-                command_buffer,
-                &render_pass_begin,
-                vk::SubpassContents::INLINE,
-            );
-        }
-        Ok(())
-    }
-
-    fn record_kawase_pass(
-        &mut self,
-        command_buffer: vk::CommandBuffer,
-        pass: &ResolvedKawasePass,
-    ) -> Result<(), VulkanRendererError> {
-        self.transition_image_layout(&pass.source, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
-        self.transition_image_layout(&pass.destination, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)?;
-
-        let destination_size = pass.destination_extent;
-        let extent = vk::Extent2D {
-            width: destination_size.w.max(1) as u32,
-            height: destination_size.h.max(1) as u32,
-        };
-        let attachments = [pass.destination_view];
-        let framebuffer_info = vk::FramebufferCreateInfo::default()
-            .render_pass(pass.render_pass)
-            .attachments(&attachments)
-            .width(extent.width)
-            .height(extent.height)
-            .layers(1);
-        // SAFETY: Device and render-pass handles are live for this renderer.
-        let framebuffer = unsafe {
-            self.renderer
-                .device
-                .device_handle()
-                .create_framebuffer(&framebuffer_info, None)
-        }?;
-        self.recording_mut()?.effect_framebuffers.push(framebuffer);
-
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
-        let render_pass_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(pass.render_pass)
-            .framebuffer(framebuffer)
-            .render_area(render_area);
-        // SAFETY: All handles are valid, recording is active, and every pass
-        // overwrites its complete destination.
-        unsafe {
-            let device = self.renderer.device.device_handle();
-            device.cmd_begin_render_pass(command_buffer, &render_pass_begin, vk::SubpassContents::INLINE);
-            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pass.pipeline);
-            device.cmd_set_viewport(
-                command_buffer,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            device.cmd_set_scissor(command_buffer, 0, &[render_area]);
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                pass.layout,
-                0,
-                &[pass.descriptor_set],
-                &[],
-            );
-            device.cmd_push_constants(
-                command_buffer,
-                pass.layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                push_constants_bytes(&pass.constants),
-            );
-            device.cmd_draw(command_buffer, 4, 1, 0, 0);
-            device.cmd_end_render_pass(command_buffer);
-        }
-        Ok(())
+        self.resolved_sample_texture = previous;
+        result
     }
 
     fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
@@ -1184,6 +1085,41 @@ impl VulkanFrame<'_> {
         }
     }
 
+    /// Jointly evaluate an immutable owner mask with a draw's existing clip
+    /// at Vulkan's canonical four sample identities, before resolving coverage.
+    /// This scope records no image, descriptor, or allocation of its own.
+    pub fn with_outer_rounded_clip<T>(
+        &mut self,
+        clip: Option<RoundedClip>,
+        draw: impl FnOnce(&mut Self) -> Result<T, VulkanRendererError>,
+    ) -> Result<T, VulkanRendererError> {
+        let previous = self.outer_rounded_clip;
+        if previous.is_some() && clip.is_some() && previous != clip {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "nested distinct outer clips exceed the declared sample-mask packet",
+            ));
+        }
+        self.outer_rounded_clip = clip.or(previous);
+        let result = draw(self);
+        self.outer_rounded_clip = previous;
+        result
+    }
+
+    /// Apply a group opacity to independent source-over primitives whose
+    /// destination supports are disjoint. Framebuffer effects must retain their
+    /// ordinary prefix-interpolation path; they cannot use this operation.
+    pub fn with_draw_alpha<T>(
+        &mut self,
+        alpha: f32,
+        draw: impl FnOnce(&mut Self) -> Result<T, VulkanRendererError>,
+    ) -> Result<T, VulkanRendererError> {
+        let previous = self.draw_alpha;
+        self.draw_alpha *= alpha;
+        let result = draw(self);
+        self.draw_alpha = previous;
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_texture_from_to_internal(
         &mut self,
@@ -1197,7 +1133,9 @@ impl VulkanFrame<'_> {
         analytic_clip: Option<AnalyticClip>,
         effect: TextureRenderEffect,
         prefix_weight: Option<f32>,
+        material_operation: Option<MaterialTextureOperation>,
     ) -> Result<(), VulkanRendererError> {
+        let alpha = alpha * self.draw_alpha;
         if damage.is_empty() {
             return Ok(());
         }
@@ -1222,16 +1160,40 @@ impl VulkanFrame<'_> {
             )
         };
 
-        let Some(viewport_rect) = framebuffer_rect(transform, output_size, size, dst) else {
+        let size = self.geometry_frame_size(size);
+        let Some(viewport_rect) = self.draw_viewport_rect(transform, output_size, size, dst) else {
             return Ok(());
         };
 
-        let analytic_clip = analytic_clip.map(|clip| transform_analytic_clip(transform, output_size, clip));
+        if prefix_weight.is_some() && self.outer_rounded_clip.is_some() && self.owner_sample_replay.is_none()
+        {
+            return Err(VulkanRendererError::TemporaryFailure(
+                "owner mask cannot clip a constant-factor prefix resolve",
+            ));
+        }
+        let outer_clip = self
+            .outer_rounded_clip
+            .filter(|_| prefix_weight.is_none())
+            .map(|clip| {
+                self.shift_analytic_clip(transform_analytic_clip(
+                    transform,
+                    output_size,
+                    AnalyticClip::Rounded(clip),
+                ))
+            });
+        let analytic_clip = analytic_clip
+            .map(|clip| self.shift_analytic_clip(transform_analytic_clip(transform, output_size, clip)));
         let has_analytic_clip = analytic_clip
             .map(TransformedAnalyticClip::has_coverage_mask)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || outer_clip.is_some();
 
         let draw_damage = Self::transformed_damage_rects(transform, output_size, size, dst, damage);
+        let draw_damage = if let Some(replay) = self.owner_sample_replay {
+            replay.damage(draw_damage)
+        } else {
+            draw_damage
+        };
         if draw_damage.is_empty() {
             return Ok(());
         }
@@ -1243,6 +1205,19 @@ impl VulkanFrame<'_> {
             ));
         }
 
+        if let Some(MaterialTextureOperation::Kawase(output)) = material_operation {
+            if output.extent.w <= 0
+                || output.extent.h <= 0
+                || output.extent.w > texture_size.w
+                || output.extent.h > texture_size.h
+                || !output.offset.is_finite()
+                || output.offset < 0.0
+            {
+                return Err(VulkanRendererError::TemporaryFailure(
+                    "invalid fused Kawase source extent",
+                ));
+            }
+        }
         if src.size.w <= 0.0 || src.size.h <= 0.0 {
             return Ok(());
         }
@@ -1257,7 +1232,13 @@ impl VulkanFrame<'_> {
             ));
         }
 
-        let texture_transform = combine_image_transform(src_transform, transform);
+        let texture_transform = if prefix_weight.is_some()
+            || material_operation.is_some_and(MaterialTextureOperation::framebuffer_coordinates)
+        {
+            Transform::Normal
+        } else {
+            combine_image_transform(src_transform, transform)
+        };
         let src_offset = [
             src.loc.x as f32 / texture_size.w as f32,
             src.loc.y as f32 / texture_size.h as f32,
@@ -1276,6 +1257,30 @@ impl VulkanFrame<'_> {
         .with_source_encoding(texture_image.color_encoding(), linear_blending)
         .with_effect(effect);
 
+        if let Some(TransformedAnalyticClip::Rounded(clip)) = outer_clip {
+            push_constants = push_constants.with_outer_rounded_clip(
+                [clip.rect.loc.x as f32, clip.rect.loc.y as f32],
+                [clip.rect.size.w as f32, clip.rect.size.h as f32],
+                clip.radius,
+            );
+        }
+        if let Some(operation) = material_operation {
+            push_constants = match operation {
+                MaterialTextureOperation::Kawase(output) => {
+                    push_constants.with_kawase_output(output, texture_size)
+                }
+                MaterialTextureOperation::FramebufferCopy => push_constants,
+                MaterialTextureOperation::OwnerResolve(extent) => {
+                    push_constants.with_owner_resolve(extent, texture_size)
+                }
+                MaterialTextureOperation::Tint(tint) => {
+                    push_constants.with_material_tone(tint).with_source_encoding(
+                        super::format::ColorEncoding::ElectricalPremultiplied,
+                        linear_blending,
+                    )
+                }
+            };
+        }
         if let Some(clip) = analytic_clip {
             push_constants = match clip {
                 TransformedAnalyticClip::Rounded(clip) => push_constants.with_rounded_clip(
@@ -1303,20 +1308,33 @@ impl VulkanFrame<'_> {
             };
         }
 
-        let sampler = texture_sampler_for_render(
-            src,
-            dst,
-            src_transform,
-            self.renderer.downscale_filter,
-            self.renderer.upscale_filter,
-        );
+        if self.owner_sample_replay.is_some() {
+            push_constants.rounded_clip_flags |= 1 << 30;
+        }
+        let sampler = if matches!(
+            material_operation,
+            Some(MaterialTextureOperation::OwnerResolve(_))
+        ) || self.resolved_sample_texture
+        {
+            TextureSampler::NEAREST
+        } else if material_operation.is_some() || self.owner_sample_replay.is_some() {
+            TextureSampler::LINEAR
+        } else {
+            texture_sampler_for_render(
+                src,
+                dst,
+                src_transform,
+                self.renderer.downscale_filter,
+                self.renderer.upscale_filter,
+            )
+        };
         let descriptor_set = self
             .renderer
             .descriptors
             .texture_descriptor_set(texture_image.view(), sampler)?;
 
         let texture_has_alpha = texture.format().map(has_alpha).unwrap_or(true);
-        let has_shader_effect = !effect.is_none();
+        let has_shader_effect = !effect.is_none() || material_operation.is_some();
         let use_opaque_only = prefix_weight.is_none()
             && alpha >= 1.0
             && !texture_has_alpha
@@ -1362,7 +1380,7 @@ impl VulkanFrame<'_> {
             self.renderer.device.device_handle().cmd_set_viewport(
                 command_buffer,
                 0,
-                &[to_vk_viewport(viewport_rect)],
+                &[self.sample_viewport(viewport_rect)],
             );
 
             if !opaque_draws.is_empty() {
@@ -1756,6 +1774,9 @@ fn framebuffer_rect(
         .intersection(Rectangle::from_size(target_size))
 }
 
+include!("frame_material.rs");
+include!("frame_owner.rs");
+
 impl Drop for VulkanFrame<'_> {
     fn drop(&mut self) {
         if self.state != VulkanFrameState::Recording {
@@ -2086,6 +2107,7 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 #[cfg(test)]
 mod tests {
     include!("frame/window_group_tests.rs");
+    include!("frame/owner_group_tests.rs");
     use super::{
         combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
         AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,

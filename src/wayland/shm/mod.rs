@@ -112,6 +112,7 @@ use wayland_server::{
 };
 
 mod handlers;
+pub(crate) mod host_memory;
 mod pool;
 
 use crate::{
@@ -292,6 +293,20 @@ where
             Err(BufferAccessError::BadMap)
         }
     }
+}
+
+/// Query the monotonic kernel shrink seal without reading client pixel memory.
+/// This proves address stability only; it does not forbid client writes.
+pub fn buffer_has_shrink_seal(buffer: &wl_buffer::WlBuffer) -> Result<bool, BufferAccessError> {
+    use std::os::fd::AsRawFd;
+    let data = buffer
+        .data::<ShmBufferUserData>()
+        .ok_or(BufferAccessError::NotManaged)?;
+    let Ok(fd) = data.pool.duplicate_fd() else {
+        return Ok(false);
+    };
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    Ok(seals >= 0 && seals & libc::F_SEAL_SHRINK != 0)
 }
 
 /// Returns the bpp of the format
@@ -481,6 +496,14 @@ pub struct ShmBufferUserData {
 }
 
 impl ShmBufferUserData {
+    #[cfg(test)]
+    pub(crate) fn test_data(fd: std::os::fd::OwnedFd, pool_len: usize, data: BufferData) -> Self {
+        Self {
+            pool: Arc::new(Pool::new(fd, std::num::NonZeroUsize::new(pool_len).unwrap()).unwrap()),
+            data,
+            destruction_hooks: Mutex::new(Vec::new()),
+        }
+    }
     pub(crate) fn add_destruction_hook(
         &self,
         hook: impl Fn(&mut dyn Any, &wl_buffer::WlBuffer) + Send + Sync + 'static,

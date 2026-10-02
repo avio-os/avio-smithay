@@ -15,6 +15,9 @@ use crate::{
 };
 
 #[cfg(feature = "wayland_frontend")]
+use crate::reexports::wayland_server::Resource;
+
+#[cfg(feature = "wayland_frontend")]
 use crate::{
     backend::renderer::ImportMemWl,
     reexports::wayland_server::protocol::wl_buffer,
@@ -567,6 +570,61 @@ mod callback_custody_tests {
 }
 
 impl ImportMem for VulkanRenderer {
+    #[cfg(feature = "wayland_frontend")]
+    fn import_host_shm(
+        &mut self,
+        source: &crate::backend::renderer::utils::Buffer,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<crate::backend::renderer::MemoryHostUpload<Self::TextureId>, Self::Error> {
+        use crate::backend::renderer::MemoryHostUpload;
+        validate_memory_format(format)?;
+        let bytes = expected_len_for_size(format, size)?;
+        let Some(copy) = host_copy_region(source, format, size, Rectangle::from_size(size)) else {
+            return Ok(MemoryHostUpload::Unavailable(
+                crate::backend::renderer::MemoryHostUnavailable::Layout,
+            ));
+        };
+        let buffer = match self.device.prepare_host_buffer(source)? {
+            Ok(buffer) => buffer,
+            Err(reason) => return Ok(MemoryHostUpload::Unavailable(reason)),
+        };
+        let image = create_upload_image(&self.device, self.upload.next_upload_id(), format, size, false)?;
+        self.device
+            .queue_host_image_upload(Arc::clone(&image), buffer, copy, bytes)?;
+        Ok(MemoryHostUpload::Queued(VulkanTexture::from_renderer_image(
+            image, size, format, false, true,
+        )))
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn update_host_shm(
+        &mut self,
+        texture: &Self::TextureId,
+        source: &crate::backend::renderer::utils::Buffer,
+        region: Rectangle<i32, BufferCoord>,
+    ) -> Result<crate::backend::renderer::MemoryHostUpload<()>, Self::Error> {
+        use crate::backend::renderer::MemoryHostUpload;
+        let (image, format) = writable_memory_image(texture)?;
+        validate_region(texture.size(), region)?;
+        let Some(copy) = host_copy_region(source, format, texture.size(), region) else {
+            return Ok(MemoryHostUpload::Unavailable(
+                crate::backend::renderer::MemoryHostUnavailable::Layout,
+            ));
+        };
+        let buffer = match self.device.prepare_host_buffer(source)? {
+            Ok(buffer) => buffer,
+            Err(reason) => return Ok(MemoryHostUpload::Unavailable(reason)),
+        };
+        self.device.queue_host_image_upload(
+            Arc::clone(image),
+            buffer,
+            copy,
+            expected_len_for_size(format, region.size)?,
+        )?;
+        Ok(MemoryHostUpload::Queued(()))
+    }
+
     fn import_memory(
         &mut self,
         data: &[u8],
@@ -657,6 +715,26 @@ impl ImportMem for VulkanRenderer {
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
         Box::new(self.upload.supported_formats().iter().copied())
     }
+}
+
+#[cfg(feature = "wayland_frontend")]
+fn host_copy_region(
+    source: &crate::backend::renderer::utils::Buffer,
+    format: Fourcc,
+    size: Size<i32, BufferCoord>,
+    region: Rectangle<i32, BufferCoord>,
+) -> Option<vk::BufferImageCopy> {
+    let data = source.data::<shm::ShmBufferUserData>()?.data;
+    if shm::shm_format_to_fourcc(data.format)? != format || data.width != size.w || data.height != size.h {
+        return None;
+    }
+    super::host_memory::checked_extent(data.offset, data.width, data.height, data.stride)?;
+    let mut copy = buffer_image_copy(region);
+    copy.buffer_offset = (region.loc.y as u64)
+        .checked_mul(data.stride as u64)?
+        .checked_add((region.loc.x as u64).checked_mul(4)?)?;
+    copy.buffer_row_length = u32::try_from(data.stride / 4).ok()?;
+    Some(copy)
 }
 
 #[cfg(feature = "wayland_frontend")]
@@ -1042,7 +1120,10 @@ fn create_upload_image(
         .initial_layout(vk::ImageLayout::UNDEFINED);
 
     // SAFETY: Device is valid and image create info references live data for the duration of the call.
-    let image = match device_handle.observe_result(unsafe { vk_device.create_image(&create_info, None) }) {
+    let image = match device_handle.observe_result(crate::backend::allocator::observe_gpu_allocation(
+        unsafe { vk_device.create_image(&create_info, None) },
+        crate::backend::allocator::GpuAllocationKind::VulkanImage,
+    )) {
         Ok(image) => image,
         Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
             return Err(VulkanRendererError::UnsupportedMemoryFormat(format))
@@ -1059,15 +1140,17 @@ fn create_upload_image(
         .allocation_size(memory_requirements.size)
         .memory_type_index(memory_type_index);
     // SAFETY: Device is valid and allocation info references live memory.
-    let memory =
-        match device_handle.observe_result(unsafe { vk_device.allocate_memory(&allocate_info, None) }) {
-            Ok(memory) => memory,
-            Err(err) => {
-                // SAFETY: Image belongs to this device and allocation failed before binding.
-                device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_image(image, None) });
-                return Err(err.into());
-            }
-        };
+    let memory = match device_handle.observe_result(crate::backend::allocator::observe_gpu_allocation(
+        unsafe { vk_device.allocate_memory(&allocate_info, None) },
+        crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+    )) {
+        Ok(memory) => memory,
+        Err(err) => {
+            // SAFETY: Image belongs to this device and allocation failed before binding.
+            device_handle.destroy_with(|vk_device| unsafe { vk_device.destroy_image(image, None) });
+            return Err(err.into());
+        }
+    };
 
     let allocation = device_handle
         .allocation_ledger()

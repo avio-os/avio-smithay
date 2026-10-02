@@ -74,6 +74,27 @@ impl<A: Allocator> fmt::Debug for Swapchain<A> {
 #[derive(Debug)]
 pub struct Slot<B: Buffer>(Arc<InternalSlot<B>>);
 
+/// Buffer and associated framebuffer/import owners detached at a proven
+/// completion edge. Move this value to a non-realtime disposal owner before
+/// dropping it; extraction itself performs no allocation or driver call.
+#[derive(Debug)]
+pub struct RetiredSlot<B: Buffer> {
+    buffer: B,
+    userdata: UserDataMap,
+}
+
+impl<B: Buffer> RetiredSlot<B> {
+    /// Exported buffer metadata retained through off-thread disposal.
+    pub fn userdata(&self) -> &UserDataMap {
+        &self.userdata
+    }
+
+    /// The exact retired allocation.
+    pub fn buffer(&self) -> &B {
+        &self.buffer
+    }
+}
+
 #[derive(Debug)]
 struct InternalSlot<B: Buffer> {
     buffer: Option<B>,
@@ -233,6 +254,40 @@ where
 
         // no free slots
         Ok(None)
+    }
+
+    /// Acquire only an owner-prepared buffer. Vacant slots stay vacant:
+    /// neither an allocator nor a framebuffer exporter is called here.
+    pub fn acquire_existing(&mut self) -> Option<Slot<A::Buffer>> {
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.buffer.is_some() && !slot.acquired.swap(true, Ordering::SeqCst))
+            .map(|slot| Slot(slot.clone()))
+    }
+
+    /// Number of actual allocations retained by the reusable pool.
+    pub fn allocated_slots(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.buffer.is_some()).count()
+    }
+
+    /// Extract unreferenced allocations into a fixed-size disposal batch.
+    /// In-flight frame owners keep their buffers and framebuffer userdata.
+    /// Empty slot containers are reused, so the completion callback allocates
+    /// no replacement Arcs and makes no framebuffer/GEM destruction call.
+    pub fn take_unreferenced(&mut self) -> [Option<RetiredSlot<A::Buffer>>; SLOT_CAP] {
+        std::array::from_fn(|index| {
+            let slot = &mut self.slots[index];
+            if slot.acquired.load(Ordering::SeqCst) {
+                return None;
+            }
+            let slot = Arc::get_mut(slot)?;
+            let buffer = slot.buffer.take()?;
+            slot.age.store(0, Ordering::SeqCst);
+            Some(RetiredSlot {
+                buffer,
+                userdata: std::mem::take(&mut slot.userdata),
+            })
+        })
     }
 
     /// Remove a held buffer from the reusable pool without releasing it.

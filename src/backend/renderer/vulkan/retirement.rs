@@ -18,6 +18,26 @@ pub(super) struct RetirementNode<T> {
 }
 
 impl<T> RetirementNode<T> {
+    pub(super) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(super) fn next_detached(&self) -> *mut Self {
+        self.next.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_next_detached(&self, next: *mut Self) {
+        self.next.store(next, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_value(self: Box<Self>) -> T {
+        self.value
+    }
+    pub(super) fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
     pub(super) fn new(value: T) -> Box<Self> {
         Box::new(Self {
             value,
@@ -77,6 +97,18 @@ impl<T: Send + 'static> RetirementQueue<T> {
                         thread::park();
                         continue;
                     }
+                    // Reverse the detached producer stack once. FIFO native
+                    // disposal makes a cold drain marker an exact edge for
+                    // everything published before that marker.
+                    let mut fifo = ptr::null_mut();
+                    while !batch.is_null() {
+                        // SAFETY: Detach grants exclusive list ownership.
+                        let next = unsafe { (*batch).next.load(Ordering::Relaxed) };
+                        unsafe { (*batch).next.store(fifo, Ordering::Relaxed) };
+                        fifo = batch;
+                        batch = next;
+                    }
+                    batch = fifo;
                     while !batch.is_null() {
                         // SAFETY: Atomic detach transferred exclusive ownership
                         // of the entire list. Each node was Box::into_raw once,
@@ -97,6 +129,10 @@ impl<T: Send + 'static> RetirementQueue<T> {
 }
 
 impl<T> RetirementQueue<T> {
+    pub(super) fn worker_thread(&self) -> thread::Thread {
+        self.executor.clone()
+    }
+
     pub(super) fn retire(&self, node: Box<RetirementNode<T>>) {
         let node = Box::into_raw(node);
         let mut head = self.shared.head.load(Ordering::Relaxed);

@@ -223,6 +223,11 @@ impl<A: AsFd + 'static> GbmAllocator<A> {
         let result = self
             .device
             .create_buffer_object_with_modifiers2(width, height, fourcc, modifiers.iter().copied(), flags)
+            .inspect(|_| {
+                crate::backend::allocator::note_gpu_allocation(
+                    crate::backend::allocator::GpuAllocationKind::GbmBuffer,
+                )
+            })
             .map_err(std::io::Error::from)
             .and_then(|bo| Self::wrap_with_modifiers_result(bo, modifiers, self.drm_node));
 
@@ -230,6 +235,11 @@ impl<A: AsFd + 'static> GbmAllocator<A> {
         let result = if (flags & !(GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING)).is_empty() {
             self.device
                 .create_buffer_object_with_modifiers(width, height, fourcc, modifiers.iter().copied())
+                .inspect(|_| {
+                    crate::backend::allocator::note_gpu_allocation(
+                        crate::backend::allocator::GpuAllocationKind::GbmBuffer,
+                    )
+                })
                 .map_err(std::io::Error::from)
                 .and_then(|bo| Self::wrap_with_modifiers_result(bo, modifiers, self.drm_node))
         } else if modifiers.contains(&Modifier::Invalid) || modifiers.contains(&Modifier::Linear) {
@@ -324,6 +334,11 @@ impl<A: AsFd + 'static> GbmAllocator<A> {
         if !force_linear {
             return device
                 .create_buffer_object(width, height, fourcc, flags)
+                .inspect(|_| {
+                    crate::backend::allocator::note_gpu_allocation(
+                        crate::backend::allocator::GpuAllocationKind::GbmBuffer,
+                    )
+                })
                 .map(|bo| GbmBuffer::from_bo_with_node(bo, true, drm_node));
         }
 
@@ -353,7 +368,13 @@ impl<A: AsFd + 'static> GbmAllocator<A> {
         ];
         let mut last_err: Option<std::io::Error> = None;
         for attempt_flags in attempts {
-            match device.create_buffer_object(width, height, fourcc, attempt_flags) {
+            match device
+                .create_buffer_object(width, height, fourcc, attempt_flags)
+                .inspect(|_| {
+                    crate::backend::allocator::note_gpu_allocation(
+                        crate::backend::allocator::GpuAllocationKind::GbmBuffer,
+                    )
+                }) {
                 Ok(bo) => {
                     return Ok(GbmBuffer::from_bo_with_explicit_modifier(
                         bo,

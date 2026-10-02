@@ -47,9 +47,75 @@ struct InFlightSubmission {
     command_buffers: Vec<vk::CommandBuffer>,
     framebuffers: Vec<vk::Framebuffer>,
     retained_images: Vec<Arc<VulkanImage>>,
-    staging_reservations: Vec<StagingReservation>,
+    upload_sources: Vec<UploadSource>,
+    _readback: Option<Arc<super::readback::ReadbackBuffer>>,
     wait_semaphores: Vec<vk::Semaphore>,
     submitted_at: Instant,
+}
+
+/// Exact queue readers moved intact to the device's off-thread command
+/// retirement owner. A failed wait retains this whole object, including every
+/// foreign host mapping, instead of asserting that GPU access ended.
+pub(super) struct RetiredCommands {
+    command_pool: vk::CommandPool,
+    submissions: VecDeque<InFlightSubmission>,
+    pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
+    pending_uploads: PendingUploadBatch,
+    upload_arena: Option<UploadArena>,
+    context_state: Option<(super::pipeline::PipelineState, super::descriptor::DescriptorState)>,
+    device: Option<Arc<DeviceHandle>>,
+}
+
+impl RetiredCommands {
+    fn empty(command_pool: vk::CommandPool) -> Self {
+        Self {
+            command_pool,
+            submissions: VecDeque::new(),
+            pending_waits: Vec::new(),
+            pending_uploads: Default::default(),
+            upload_arena: None,
+            context_state: None,
+            device: None,
+        }
+    }
+
+    /// The native VkFence is never exported/consumed. Success for every
+    /// reader is the only proof that allows destruction of this command pool.
+    pub(super) fn wait_complete(&self, raw: &ash::Device) -> Result<(), vk::Result> {
+        for submission in &self.submissions {
+            unsafe { raw.wait_for_fences(&[submission.fence.handle()], true, u64::MAX) }?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn destroy(mut self, raw: &ash::Device) {
+        for submission in &self.submissions {
+            if let Some(semaphore) = submission.export_semaphore {
+                unsafe { raw.destroy_semaphore(semaphore, None) };
+            }
+            for semaphore in &submission.wait_semaphores {
+                unsafe { raw.destroy_semaphore(*semaphore, None) };
+            }
+            for framebuffer in &submission.framebuffers {
+                unsafe { raw.destroy_framebuffer(*framebuffer, None) };
+            }
+            if let Some(device) = &self.device {
+                device.mark_submission_completed();
+                device.note_submission_completed(submission.id);
+            }
+        }
+        for (semaphore, _) in &self.pending_waits {
+            unsafe { raw.destroy_semaphore(*semaphore, None) };
+        }
+        unsafe { raw.destroy_command_pool(self.command_pool, None) };
+        // Drop GPU readers and host mappings only after their exact fences and
+        // command-pool destruction; device ownership is released last.
+        self.submissions.clear();
+        self.pending_uploads.operations.clear();
+        self.upload_arena.take();
+        self.context_state.take();
+        self.device.take();
+    }
 }
 
 /// The two legal queue-submission contracts.
@@ -61,6 +127,7 @@ struct InFlightSubmission {
 enum SubmissionKind {
     Render,
     MemoryUploadBatch,
+    Readback,
 }
 
 impl SubmissionKind {
@@ -69,13 +136,33 @@ impl SubmissionKind {
     }
 
     fn exports_completion(self) -> bool {
-        true
+        !matches!(self, Self::Readback)
+    }
+}
+
+pub(crate) enum BlockingSubmitError {
+    NotSubmitted(VulkanRendererError),
+    Submitted(VulkanRendererError),
+}
+
+enum UploadSource {
+    Staging(StagingReservation),
+    #[cfg(feature = "wayland_frontend")]
+    Host(Arc<super::host_memory::HostBuffer>),
+}
+
+impl UploadSource {
+    fn release(&self, arena: &mut UploadArena) {
+        if let Self::Staging(reservation) = self {
+            arena.release(*reservation);
+        }
     }
 }
 
 struct PendingUpload {
     image: Arc<VulkanImage>,
-    reservation: StagingReservation,
+    source: UploadSource,
+    bytes: usize,
     region: vk::BufferImageCopy,
     old_layout: vk::ImageLayout,
 }
@@ -146,8 +233,10 @@ impl PendingUploadBatch {
                 if !Arc::ptr_eq(&other.image, &image) {
                     return true;
                 }
-                *bytes = bytes.saturating_sub(other.reservation.len());
-                arena.release(other.reservation);
+                *bytes = bytes.saturating_sub(other.bytes);
+                if let UploadSource::Staging(reservation) = &other.source {
+                    arena.release(*reservation);
+                }
                 false
             });
         }
@@ -212,6 +301,7 @@ pub(crate) struct DeviceState {
     queue_family_index: u32,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
+    command_retirement: Option<Box<super::retirement::RetirementNode<RetiredCommands>>>,
     reusable_command_buffers: Vec<vk::CommandBuffer>,
     in_flight_submissions: VecDeque<InFlightSubmission>,
     upload_arena: UploadArena,
@@ -222,6 +312,8 @@ pub(crate) struct DeviceState {
     pending_waits: Vec<(vk::Semaphore, vk::PipelineStageFlags)>,
     next_submission_id: u64,
     device: Arc<DeviceHandle>,
+    #[cfg(feature = "wayland_frontend")]
+    host_memory: super::host_memory::HostMemorySupport,
     external_fence_fd: Option<Arc<khr::external_fence_fd::Device>>,
     external_semaphore_fd: Option<Arc<khr::external_semaphore_fd::Device>>,
     debug_utils: Option<Arc<ext::debug_utils::Device>>,
@@ -318,6 +410,42 @@ impl DeviceState {
         };
 
         let device = Arc::new(DeviceHandle::new(raw_device, physical_device.instance().clone())?);
+        Self::from_parts(
+            physical_device,
+            enabled_extensions,
+            capabilities,
+            queue_family_index,
+            queue,
+            device,
+        )
+    }
+
+    pub(crate) fn from_origin(origin: &super::VulkanDeviceOrigin) -> Result<Self, VulkanRendererError> {
+        Self::from_parts(
+            &origin.physical_device,
+            origin.enabled_extensions.clone(),
+            origin.capabilities,
+            origin.queue_family_index,
+            origin.queue,
+            origin.device.clone(),
+        )
+    }
+
+    fn from_parts(
+        physical_device: &PhysicalDevice,
+        enabled_extensions: Vec<&'static CStr>,
+        capabilities: DeviceCapabilities,
+        queue_family_index: u32,
+        queue: vk::Queue,
+        device: Arc<DeviceHandle>,
+    ) -> Result<Self, VulkanRendererError> {
+        let instance = physical_device.instance().handle();
+        #[cfg(feature = "wayland_frontend")]
+        let host_memory = super::host_memory::HostMemorySupport::new(
+            physical_device,
+            device.handle(),
+            enabled_extensions.contains(&ext::external_memory_host::NAME),
+        );
         let external_fence_fd = enabled_extensions
             .contains(&khr::external_fence_fd::NAME)
             .then(|| Arc::new(khr::external_fence_fd::Device::new(instance, device.handle())));
@@ -363,6 +491,9 @@ impl DeviceState {
             queue_family_index,
             queue,
             command_pool,
+            command_retirement: Some(super::retirement::RetirementNode::new(RetiredCommands::empty(
+                command_pool,
+            ))),
             reusable_command_buffers: Vec::new(),
             in_flight_submissions: VecDeque::new(),
             upload_arena,
@@ -373,6 +504,8 @@ impl DeviceState {
             pending_waits: Vec::new(),
             next_submission_id: 0,
             device,
+            #[cfg(feature = "wayland_frontend")]
+            host_memory,
             external_fence_fd,
             external_semaphore_fd,
             debug_utils,
@@ -381,6 +514,22 @@ impl DeviceState {
                 ..DeviceDiagnostics::default()
             },
         })
+    }
+
+    pub(super) fn retain_context_state(
+        &mut self,
+        pipelines: super::pipeline::PipelineState,
+        descriptors: super::descriptor::DescriptorState,
+    ) {
+        self.command_retirement
+            .as_mut()
+            .expect("live renderer has command retirement custody")
+            .value_mut()
+            .context_state = Some((pipelines, descriptors));
+    }
+
+    pub(super) fn queue(&self) -> vk::Queue {
+        self.queue
     }
 
     pub(crate) fn queue_family_index(&self) -> u32 {
@@ -403,8 +552,20 @@ impl DeviceState {
         self.device.handle()
     }
 
+    #[cfg(test)]
+    pub(super) fn wait_retirement_drained(&self) {
+        self.device.wait_retirement_drained();
+    }
+
     pub(crate) fn shared_device(&self) -> Arc<DeviceHandle> {
         self.device.clone()
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    pub(super) fn host_memory_alignment(
+        &self,
+    ) -> Result<usize, crate::backend::renderer::MemoryHostUnavailable> {
+        self.host_memory.alignment
     }
 
     pub(crate) fn mark_lost(&self) {
@@ -488,6 +649,40 @@ impl DeviceState {
         Ok(configured)
     }
 
+    pub(crate) fn memory_upload_storage_matches(&self, structural: usize, generation: usize) -> bool {
+        self.upload_arena.capacity_matches(structural.max(generation))
+            && self.owner_upload_structural_bytes == structural
+            && self.owner_upload_exception_bytes == generation.saturating_sub(structural)
+    }
+
+    pub(crate) fn adopt_memory_upload_storage(
+        &mut self,
+        storage: &mut super::VulkanUploadStorage,
+        structural: usize,
+        generation: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        if storage.requested_bytes() != structural.max(generation) {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "prepared arena differs from the exact owner extent",
+            ));
+        }
+        self.reclaim_completed_submissions()?;
+        self.drop_unsampleable_uploads();
+        if !self.upload_arena.adopt(&self.device, storage)? {
+            return Ok(false);
+        }
+        let exception = generation.saturating_sub(structural);
+        if exception != 0
+            && (self.owner_upload_structural_bytes != structural
+                || self.owner_upload_exception_bytes != exception)
+        {
+            self.owner_upload_extent_exceptions = self.owner_upload_extent_exceptions.saturating_add(1);
+        }
+        self.owner_upload_structural_bytes = structural;
+        self.owner_upload_exception_bytes = exception;
+        Ok(true)
+    }
+
     fn release_upload(&mut self, reservation: StagingReservation) {
         self.upload_arena.release(reservation);
     }
@@ -511,6 +706,55 @@ impl DeviceState {
         }
         let reservation = self.reserve_image_upload(upload.byte_len()?)?;
         self.queue_reserved_image_upload(image, reservation, upload)
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    pub(super) fn prepare_host_buffer(
+        &mut self,
+        source: &crate::backend::renderer::utils::Buffer,
+    ) -> Result<
+        Result<Arc<super::host_memory::HostBuffer>, crate::backend::renderer::MemoryHostUnavailable>,
+        VulkanRendererError,
+    > {
+        self.reclaim_completed_submissions()?;
+        self.drop_unsampleable_uploads();
+        if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
+            return Err(VulkanRendererError::UploadBatchFull {
+                limit: MAX_UPLOAD_BATCH_OPERATIONS,
+            });
+        }
+        self.host_memory
+            .import(&self.physical_device, self.shared_device(), source)
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    pub(super) fn queue_host_image_upload(
+        &mut self,
+        image: Arc<VulkanImage>,
+        source: Arc<super::host_memory::HostBuffer>,
+        region: vk::BufferImageCopy,
+        bytes: usize,
+    ) -> Result<(), VulkanRendererError> {
+        self.drop_unsampleable_uploads();
+        if self.pending_uploads.operations.len() >= MAX_UPLOAD_BATCH_OPERATIONS {
+            return Err(VulkanRendererError::UploadBatchFull {
+                limit: MAX_UPLOAD_BATCH_OPERATIONS,
+            });
+        }
+        let old_layout = self
+            .pending_uploads
+            .layout_after_pending(image.id())
+            .unwrap_or_else(|| image.current_layout());
+        self.pending_uploads.bytes = self.pending_uploads.bytes.saturating_add(bytes);
+        image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        self.pending_uploads.operations.push(PendingUpload {
+            image,
+            source: UploadSource::Host(source),
+            bytes,
+            region,
+            old_layout,
+        });
+        Ok(())
     }
 
     /// Whole-generation admission before an initial import allocates its image.
@@ -607,7 +851,8 @@ impl DeviceState {
         image.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         self.pending_uploads.operations.push(PendingUpload {
             image,
-            reservation,
+            source: UploadSource::Staging(reservation),
+            bytes: reservation.len(),
             region,
             old_layout,
         });
@@ -657,11 +902,42 @@ impl DeviceState {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             );
             let mut copy_region = operation.region;
-            copy_region.buffer_offset = operation.reservation.offset();
+            let buffer = match &operation.source {
+                UploadSource::Staging(reservation) => {
+                    copy_region.buffer_offset += reservation.offset();
+                    self.upload_arena.buffer(*reservation)
+                }
+                #[cfg(feature = "wayland_frontend")]
+                UploadSource::Host(buffer) => {
+                    copy_region.buffer_offset += buffer.source_offset;
+                    // Coherent imported host pages need execution/visibility
+                    // ordering, but no CPU copy or noncoherent flush.
+                    let barrier = vk::BufferMemoryBarrier::default()
+                        .buffer(buffer.buffer)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                    unsafe {
+                        self.device.handle().cmd_pipeline_barrier(
+                            command_buffer,
+                            vk::PipelineStageFlags::HOST,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[barrier],
+                            &[],
+                        );
+                    }
+                    buffer.buffer
+                }
+            };
             unsafe {
                 self.device.handle().cmd_copy_buffer_to_image(
                     command_buffer,
-                    self.upload_arena.buffer(operation.reservation),
+                    buffer,
                     operation.image.image(),
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[copy_region],
@@ -715,7 +991,7 @@ impl DeviceState {
                 .in_flight_submissions
                 .iter()
                 .rev()
-                .find(|submission| !submission.staging_reservations.is_empty())
+                .find(|submission| !submission.upload_sources.is_empty())
                 .map(|submission| {
                     MemoryUploadCapacityEdge::InFlight(SyncPoint::from(submission.fence.clone()))
                 })
@@ -758,6 +1034,7 @@ impl DeviceState {
             command_buffer,
             Vec::new(),
             Vec::new(),
+            None,
             SubmissionKind::MemoryUploadBatch,
         ) {
             Ok((_, fence)) => Ok(MemoryUploadCapacityEdge::Submitted(SyncPoint::from(fence))),
@@ -941,17 +1218,22 @@ impl DeviceState {
             command_buffer,
             framebuffers,
             retained_images,
+            None,
             SubmissionKind::Render,
         )
     }
 
-    #[instrument(level = "trace", skip(self, command_buffer, framebuffers, retained_images))]
+    #[instrument(
+        level = "trace",
+        skip(self, command_buffer, framebuffers, retained_images, readback)
+    )]
     #[profiling::function]
     fn submit_tracked(
         &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffers: Vec<vk::Framebuffer>,
         mut retained_images: Vec<Arc<VulkanImage>>,
+        readback: Option<Arc<super::readback::ReadbackBuffer>>,
         kind: SubmissionKind,
     ) -> Result<(SubmissionId, VulkanFence), VulkanRendererError> {
         if self.device.is_lost() {
@@ -1027,36 +1309,35 @@ impl DeviceState {
         }
         let submit_info = [submit];
 
-        // SAFETY: Queue, fence, and command buffers are valid; host-side synchronization is upheld by
-        // requiring &mut self for submissions.
-        if let Err(err) = self.device.observe_result(unsafe {
-            self.device
-                .handle()
-                .queue_submit(self.queue, &submit_info, fence.handle())
-        }) {
-            if let Some(recorded_uploads) = recorded_uploads {
-                if self
-                    .discard_command_buffer(recorded_uploads.command_buffer)
-                    .is_ok()
-                {
-                    self.restore_pending_uploads(recorded_uploads.batch);
+        // Every output context shares this queue's host synchronization and
+        // identity order; command pools and recording stay context-local.
+        let id = match self.device.submit_queue(self.queue, &submit_info, fence.handle()) {
+            Ok(id) => id,
+            Err(err) => {
+                if let Some(recorded_uploads) = recorded_uploads {
+                    if self
+                        .discard_command_buffer(recorded_uploads.command_buffer)
+                        .is_ok()
+                    {
+                        self.restore_pending_uploads(recorded_uploads.batch);
+                    }
                 }
+                let _ = self.discard_recording_resources(command_buffer, framebuffers);
+                self.device.destroy_with(|device| {
+                    for semaphore in wait_semaphores {
+                        // SAFETY: Semaphore belongs to this device and the submission did not succeed.
+                        unsafe { device.destroy_semaphore(semaphore, None) };
+                    }
+                    if let Some(semaphore) = export_semaphore {
+                        // SAFETY: Semaphore belongs to this device and was never submitted.
+                        unsafe { device.destroy_semaphore(semaphore, None) };
+                    }
+                });
+                return Err(err);
             }
-            let _ = self.discard_recording_resources(command_buffer, framebuffers);
-            self.device.destroy_with(|device| {
-                for semaphore in wait_semaphores {
-                    // SAFETY: Semaphore belongs to this device and the submission did not succeed.
-                    unsafe { device.destroy_semaphore(semaphore, None) };
-                }
-                if let Some(semaphore) = export_semaphore {
-                    // SAFETY: Semaphore belongs to this device and was never submitted.
-                    unsafe { device.destroy_semaphore(semaphore, None) };
-                }
-            });
-            return Err(err.into());
-        }
+        };
 
-        let (staging_reservations, upload_operation_count, upload_bytes) = if let Some(recorded_uploads) =
+        let (upload_sources, upload_operation_count, upload_bytes) = if let Some(recorded_uploads) =
             recorded_uploads
         {
             let upload_operation_count = recorded_uploads.batch.operations.len();
@@ -1064,7 +1345,7 @@ impl DeviceState {
             let mut reservations = Vec::with_capacity(upload_operation_count);
             for operation in recorded_uploads.batch.operations {
                 retained_images.push(operation.image);
-                reservations.push(operation.reservation);
+                reservations.push(operation.source);
             }
             self.diagnostics.upload_batches = self.diagnostics.upload_batches.saturating_add(1);
             self.diagnostics.upload_operations = self
@@ -1095,7 +1376,6 @@ impl DeviceState {
             self.diagnostics.total_submit_cpu_ns.saturating_add(submit_cpu_ns);
         self.diagnostics.max_submit_cpu_ns = self.diagnostics.max_submit_cpu_ns.max(submit_cpu_ns);
 
-        let id = SubmissionId(self.next_submission_id);
         self.next_submission_id = self.next_submission_id.wrapping_add(1);
         self.device.mark_submission_pending();
         self.in_flight_submissions.push_back(InFlightSubmission {
@@ -1105,7 +1385,8 @@ impl DeviceState {
             command_buffers,
             framebuffers,
             retained_images,
-            staging_reservations,
+            upload_sources,
+            _readback: readback,
             wait_semaphores,
             submitted_at: submit_started_at,
         });
@@ -1121,110 +1402,50 @@ impl DeviceState {
         Ok((id, fence))
     }
 
-    #[instrument(level = "trace", skip(self, command_buffer))]
+    #[instrument(level = "trace", skip(self, command_buffer, image, readback))]
     #[profiling::function]
     pub(crate) fn submit_blocking(
         &mut self,
         command_buffer: vk::CommandBuffer,
-    ) -> Result<(), VulkanRendererError> {
+        image: Arc<VulkanImage>,
+        readback: Arc<super::readback::ReadbackBuffer>,
+    ) -> Result<(), BlockingSubmitError> {
+        // Tracking happens before any host wait. Once queue submission
+        // succeeds, every native fence, upload source and destination owner
+        // stays in the exact submission even if completion is unobservable.
+        let (id, fence) = self
+            .submit_tracked(
+                command_buffer,
+                Vec::new(),
+                vec![image],
+                Some(readback),
+                SubmissionKind::Readback,
+            )
+            .map_err(BlockingSubmitError::NotSubmitted)?;
+        self.diagnostics.blocking_submissions = self.diagnostics.blocking_submissions.saturating_add(1);
         if self.device.is_lost() {
-            return Err(VulkanRendererError::ContextLost("vulkan device already lost"));
+            return Err(BlockingSubmitError::Submitted(VulkanRendererError::ContextLost(
+                "readback completion became unobservable on lost device",
+            )));
         }
-        let submit_started_at = Instant::now();
-        let fence_info = vk::FenceCreateInfo::default();
-        // SAFETY: Device is valid and create info references no borrowed resources.
-        let fence = self
-            .device
-            .observe_result(unsafe { self.device.handle().create_fence(&fence_info, None) })?;
-        let recorded_uploads = match self.record_pending_uploads() {
-            Ok(recorded) => recorded,
-            Err(error) => {
-                self.device
-                    .destroy_with(|device| unsafe { device.destroy_fence(fence, None) });
-                return Err(error);
-            }
-        };
-
-        // Blocking submission remains only for synchronous GPU-to-CPU
-        // readback. It must not consume `pending_waits`: those waits belong to
-        // the next render submission, the first pass that samples the fenced
-        // client buffers. Draining them here would both host-block readback on
-        // unrelated producers and strip synchronization from the guarded
-        // render.
-        let mut command_buffers = Vec::with_capacity(2);
-        if let Some(upload) = recorded_uploads.as_ref() {
-            command_buffers.push(upload.command_buffer);
-        }
-        command_buffers.push(command_buffer);
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-
-        // SAFETY: Queue, fence, and command buffers are valid; queue access is serialized by `&mut self`.
-        if let Err(err) = self
-            .device
-            .observe_result(unsafe { self.device.handle().queue_submit(self.queue, &submit_info, fence) })
-        {
-            if let Some(recorded_uploads) = recorded_uploads {
-                let _ = self.discard_command_buffer(recorded_uploads.command_buffer);
-                self.restore_pending_uploads(recorded_uploads.batch);
-            }
-            self.device.destroy_with(|device| {
-                // SAFETY: Fence belongs to this device and is not in-flight after failed submission.
-                unsafe { device.destroy_fence(fence, None) };
-            });
-            let _ = self.discard_command_buffer(command_buffer);
-            return Err(err.into());
-        }
-
-        // SAFETY: Fence belongs to this device and was submitted by the queue_submit call above.
-        let wait_result = self
-            .device
-            .observe_result(unsafe { self.device.handle().wait_for_fences(&[fence], true, u64::MAX) });
-        self.device.destroy_with(|device| {
-            // SAFETY: Fence belongs to this device and is no longer needed after wait completes/errors.
-            unsafe { device.destroy_fence(fence, None) };
-        });
-        wait_result?;
-
-        let (upload_operation_count, upload_bytes) = if let Some(recorded_uploads) = recorded_uploads {
-            for operation in &recorded_uploads.batch.operations {
-                self.release_upload(operation.reservation);
-            }
-            let operation_count = recorded_uploads.batch.operations.len();
-            self.diagnostics.upload_batches = self.diagnostics.upload_batches.saturating_add(1);
-            self.diagnostics.upload_operations = self
-                .diagnostics
-                .upload_operations
-                .saturating_add(operation_count as u64);
-            self.diagnostics.upload_bytes = self
-                .diagnostics
-                .upload_bytes
-                .saturating_add(recorded_uploads.batch.bytes as u64);
-            (operation_count, recorded_uploads.batch.bytes)
-        } else {
-            (0, 0)
-        };
-
-        for command_buffer in command_buffers {
-            // SAFETY: Command buffer belongs to this command pool and execution completed after host wait.
-            self.device.observe_result(unsafe {
+        self.device
+            .observe_result(unsafe {
                 self.device
                     .handle()
-                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-            })?;
-            self.reusable_command_buffers.push(command_buffer);
-        }
-        let submit_cpu_ns = duration_to_ns(submit_started_at.elapsed());
-        self.diagnostics.total_submissions = self.diagnostics.total_submissions.saturating_add(1);
-        self.diagnostics.blocking_submissions = self.diagnostics.blocking_submissions.saturating_add(1);
-        self.diagnostics.total_submit_cpu_ns =
-            self.diagnostics.total_submit_cpu_ns.saturating_add(submit_cpu_ns);
-        self.diagnostics.max_submit_cpu_ns = self.diagnostics.max_submit_cpu_ns.max(submit_cpu_ns);
-        trace!(
-            upload_operation_count,
-            upload_bytes,
-            "completed blocking Vulkan submission"
-        );
-        Ok(())
+                    .wait_for_fences(&[fence.handle()], true, u64::MAX)
+            })
+            .map_err(|error| BlockingSubmitError::Submitted(error.into()))?;
+        let index = self
+            .in_flight_submissions
+            .iter()
+            .position(|submission| submission.id == id)
+            .expect("successful readback remains tracked until its exact fence completes");
+        let completed = self
+            .in_flight_submissions
+            .remove(index)
+            .expect("located submission");
+        self.recycle_submission(completed)
+            .map_err(BlockingSubmitError::Submitted)
     }
 
     pub(crate) fn discard_command_buffer(
@@ -1279,11 +1500,8 @@ impl DeviceState {
         if snapshot.next_submission_id == self.next_submission_id {
             return None;
         }
-        let newest = SubmissionId(self.next_submission_id.wrapping_sub(1));
         self.in_flight_submissions
-            .iter()
-            .rev()
-            .find(|submission| submission.id == newest)
+            .back()
             .map(|submission| SyncPoint::from(submission.fence.clone()))
             .or_else(|| Some(SyncPoint::signaled()))
     }
@@ -1383,6 +1601,7 @@ impl DeviceState {
                     .handle()
                     .wait_for_fences(&[submission.fence.handle()], true, u64::MAX)
             }) {
+                self.in_flight_submissions.push_front(submission);
                 return Err(err.into());
             }
             self.recycle_submission(submission)?;
@@ -1398,7 +1617,7 @@ impl DeviceState {
             export_semaphore,
             command_buffers,
             framebuffers,
-            staging_reservations,
+            upload_sources,
             wait_semaphores,
             submitted_at,
             ..
@@ -1430,8 +1649,8 @@ impl DeviceState {
                 unsafe { device.destroy_semaphore(semaphore, None) };
             }
         });
-        for reservation in staging_reservations {
-            self.release_upload(reservation);
+        for source in upload_sources {
+            source.release(&mut self.upload_arena);
         }
 
         self.device.mark_submission_completed();
@@ -1461,6 +1680,9 @@ impl DeviceState {
 
         if missing.is_empty() {
             let mut enabled = required;
+            if physical_device.has_device_extension(ext::external_memory_host::NAME) {
+                enabled.push(ext::external_memory_host::NAME);
+            }
             if physical_device.has_device_extension(khr::external_fence_fd::NAME) {
                 enabled.push(khr::external_fence_fd::NAME);
             }
@@ -1590,8 +1812,14 @@ mod submission_kind_tests {
         assert!(SubmissionKind::Render.exports_completion());
         assert!(!SubmissionKind::MemoryUploadBatch.consumes_pending_waits());
         assert!(SubmissionKind::MemoryUploadBatch.exports_completion());
+        assert!(!SubmissionKind::Readback.consumes_pending_waits());
+        assert!(!SubmissionKind::Readback.exports_completion());
     }
 }
+
+#[cfg(test)]
+#[path = "device/readback_custody_tests.rs"]
+mod readback_custody_tests;
 
 fn duration_to_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
@@ -1599,49 +1827,21 @@ fn duration_to_ns(duration: std::time::Duration) -> u64 {
 
 impl Drop for DeviceState {
     fn drop(&mut self) {
-        // Vulkan permits teardown after device loss, but this driver path has been observed
-        // to fault in object destroys. Once loss is marked, intentionally leak device children
-        // rather than calling back into the wedged driver during Drop.
-        if self.device.is_lost() {
+        let Some(mut node) = self.command_retirement.take() else {
             return;
-        }
-
-        if let Err(err) = self.wait_for_all_submissions() {
-            warn!(
-                ?err,
-                "failed to drain Vulkan submissions during renderer teardown"
-            );
-        }
-        if self.device.is_lost() {
-            return;
-        }
-        let pending_waits = std::mem::take(&mut self.pending_waits);
-
-        // `wait_for_all_submissions` marks the device lost on `ERROR_DEVICE_LOST`; re-check so a
-        // loss observed mid-drain still skips the queue wait and the destroys below.
-        self.device.destroy_with(|device| {
-            // SAFETY: Synchronization for queue operations is handled by `&mut self` in all queue-touching APIs.
-            if let Err(err) = self
-                .device
-                .observe_result(unsafe { device.queue_wait_idle(self.queue) })
-            {
-                warn!(
-                    ?err,
-                    "failed to wait for Vulkan queue idle during renderer teardown"
-                );
-                if self.device.is_lost() {
-                    return;
-                }
-            }
-
-            for (semaphore, _) in pending_waits {
-                // SAFETY: Semaphore belongs to this device and was never submitted.
-                unsafe { device.destroy_semaphore(semaphore, None) };
-            }
-
-            // SAFETY: Command pool belongs to this device and may be destroyed after queue idle.
-            unsafe { device.destroy_command_pool(self.command_pool, None) };
-        });
+        };
+        let commands = node.value_mut();
+        commands.submissions = std::mem::take(&mut self.in_flight_submissions);
+        commands.pending_waits = std::mem::take(&mut self.pending_waits);
+        commands.pending_uploads = std::mem::take(&mut self.pending_uploads);
+        commands.upload_arena = Some(std::mem::replace(
+            &mut self.upload_arena,
+            UploadArena::new(&self.physical_device),
+        ));
+        commands.device = Some(self.device.clone());
+        // This final drop may run on Wayland or a frame worker. Publishing a
+        // node allocated at construction performs no wait or driver call.
+        self.device.retire_commands(node);
     }
 }
 

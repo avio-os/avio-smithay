@@ -489,6 +489,26 @@ pub trait Frame {
         alpha: f32,
     ) -> Result<(), Self::Error>;
 
+    /// Physical canonical sample identity while replaying an unresolved owner group.
+    fn canonical_coverage_lane(&self) -> Option<usize> {
+        None
+    }
+
+    /// Draw an already evaluated canonical sample raster without shifting its texel grid.
+    /// The default is sufficient for renderers without owner-group replay.
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_from_to_resolved_sample_lane(
+        &mut self,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+    ) -> Result<(), Self::Error> {
+        self.render_texture_from_to(texture, src, dst, damage, &[], src_transform, alpha)
+    }
+
     /// Render a texture with an analytic rounded clip mask applied in the
     /// destination coordinate space.
     #[allow(clippy::too_many_arguments)]
@@ -759,8 +779,65 @@ pub enum MemoryRowUpload<T> {
     Queued(T),
 }
 
+/// A measured reason an asynchronous foreign-host-pointer upload is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryHostUnavailable {
+    /// The renderer has no foreign host-memory import implementation.
+    Renderer,
+    /// The optional external host-memory extension is absent.
+    Extension,
+    /// Transfer-source foreign host buffers are not importable on this device.
+    BufferUsage,
+    /// The backing file has no monotonic shrink seal.
+    Unsealed,
+    /// Source metadata cannot be represented by a Vulkan buffer-image copy.
+    Layout,
+    /// The alignment-rounded mapping would exceed the sealed file extent.
+    Extent,
+    /// The measured host-pointer or buffer allocation alignment is incompatible.
+    Alignment,
+    /// No compatible host-visible coherent memory type exists.
+    MemoryType,
+    /// The driver rejected this external host pointer.
+    Pointer,
+}
+
+/// Whole-generation admission from an independently owned, sealed mapping.
+#[derive(Debug)]
+pub enum MemoryHostUpload<T> {
+    /// Use the existing bounded copy path for this source/device combination.
+    Unavailable(MemoryHostUnavailable),
+    /// No CPU row copy or staging reservation was made. GPU work retains the
+    /// exact source attachment and independent mapping until real completion.
+    Queued(T),
+}
+
 /// Trait for renderers supporting importing bitmaps from memory.
 pub trait ImportMem: Renderer {
+    /// Prepare a sealed Wayland SHM generation on a non-frame turn. The exact
+    /// attachment owner prevents early protocol release; implementations must
+    /// independently pin the mapping, and must never retain a pool callback address.
+    #[cfg(feature = "wayland_frontend")]
+    fn import_host_shm(
+        &mut self,
+        _source: &utils::Buffer,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+    ) -> Result<MemoryHostUpload<Self::TextureId>, Self::Error> {
+        Ok(MemoryHostUpload::Unavailable(MemoryHostUnavailable::Renderer))
+    }
+
+    /// Prepare damage from the same independently owned SHM mapping. This
+    /// shares the whole-generation submission and lifetime contract above.
+    #[cfg(feature = "wayland_frontend")]
+    fn update_host_shm(
+        &mut self,
+        _texture: &Self::TextureId,
+        _source: &utils::Buffer,
+        _region: Rectangle<i32, BufferCoord>,
+    ) -> Result<MemoryHostUpload<()>, Self::Error> {
+        Ok(MemoryHostUpload::Unavailable(MemoryHostUnavailable::Renderer))
+    }
     /// Import a given chunk of memory into the renderer.
     ///
     /// Returns a texture_id, which can be used with [`Frame::render_texture_from_to`] (or [`Frame::render_texture_at`])

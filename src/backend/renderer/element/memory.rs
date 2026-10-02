@@ -402,6 +402,59 @@ impl MemoryRenderBuffer {
         }
     }
 
+    /// Whether this renderer already owns the current generation's texture.
+    pub fn is_prepared<R>(&self, renderer: &R) -> bool
+    where
+        R: Renderer,
+        R::TextureId: Send + Clone + 'static,
+    {
+        let inner = self.inner.lock().unwrap();
+        let context = renderer.context_id().erased();
+        inner.renderer_seen.get(&context).copied() == Some(inner.damage_bag.current_commit())
+            && inner
+                .textures
+                .get(&context)
+                .is_some_and(|texture| texture.is::<R::TextureId>())
+    }
+
+    /// Provision the current immutable generation before building frame elements.
+    /// Upload pressure leaves the generation unprepared until this is retried.
+    pub fn prepare<R>(&self, renderer: &mut R) -> Result<(), R::Error>
+    where
+        R: Renderer + ImportMem,
+        R::TextureId: Send + Clone + 'static,
+    {
+        self.inner.lock().unwrap().import_texture(renderer).map(|_| ())
+    }
+
+    /// Capture the exact current CPU generation for an off-thread image preparer.
+    /// Cloning the bytes is refcounted; later writes use copy-on-write storage.
+    pub fn preparation_source(&self) -> (Id, CommitCounter, MemoryBuffer) {
+        let inner = self.inner.lock().unwrap();
+        (
+            self.id.clone(),
+            inner.damage_bag.current_commit(),
+            inner.mem.clone(),
+        )
+    }
+
+    /// Adopt an already uploaded image only for the still-current generation.
+    /// A delayed result cannot make a newer CPU generation appear prepared.
+    pub fn adopt_prepared<R>(&self, renderer: &R, commit: CommitCounter, texture: R::TextureId) -> bool
+    where
+        R: Renderer,
+        R::TextureId: Send + Clone + 'static,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.damage_bag.current_commit() != commit {
+            return false;
+        }
+        let context = renderer.context_id().erased();
+        inner.textures.insert(context.clone(), Box::new(texture));
+        inner.renderer_seen.insert(context, commit);
+        true
+    }
+
     /// Render to the memory buffer
     pub fn render(&mut self) -> RenderContext<'_> {
         let guard = self.inner.lock().unwrap();
@@ -494,13 +547,76 @@ impl<R: Renderer> MemoryRenderBufferRenderElement<R> {
         let mut inner = buffer.inner.lock().unwrap();
         let texture = inner.import_texture(renderer)?;
 
+        Ok(Self::from_imported(
+            renderer,
+            location.into(),
+            buffer,
+            &inner,
+            texture,
+            alpha,
+            src,
+            size,
+            kind,
+        ))
+    }
+
+    /// Build an element only from this renderer's already prepared generation.
+    /// This never imports an image, copies pixels, or updates a GPU texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_prepared_buffer(
+        renderer: &R,
+        location: impl Into<Point<f64, Physical>>,
+        buffer: &MemoryRenderBuffer,
+        alpha: Option<f32>,
+        src: Option<Rectangle<f64, Logical>>,
+        size: Option<Size<i32, Logical>>,
+        kind: Kind,
+    ) -> Option<Self>
+    where
+        R::TextureId: Send + Clone + 'static,
+    {
+        let inner = buffer.inner.lock().unwrap();
+        let context = renderer.context_id().erased();
+        if inner.renderer_seen.get(&context).copied() != Some(inner.damage_bag.current_commit()) {
+            return None;
+        }
+        let texture = inner
+            .textures
+            .get(&context)?
+            .downcast_ref::<R::TextureId>()?
+            .clone();
+        Some(Self::from_imported(
+            renderer,
+            location.into(),
+            buffer,
+            &inner,
+            texture,
+            alpha,
+            src,
+            size,
+            kind,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_imported(
+        _renderer: &R,
+        location: Point<f64, Physical>,
+        buffer: &MemoryRenderBuffer,
+        inner: &MemoryRenderBufferInner,
+        texture: R::TextureId,
+        alpha: Option<f32>,
+        src: Option<Rectangle<f64, Logical>>,
+        size: Option<Size<i32, Logical>>,
+        kind: Kind,
+    ) -> Self {
         let size = size
             .or_else(|| src.map(|src| Size::from((src.size.w as i32, src.size.h as i32))))
             .unwrap_or_else(|| inner.mem.size().to_logical(inner.scale, inner.transform));
 
         let src = src.unwrap_or_else(|| Rectangle::from_size(size.to_f64()));
 
-        Ok(MemoryRenderBufferRenderElement {
+        MemoryRenderBufferRenderElement {
             id: buffer.id.clone(),
             buffer: inner.mem.clone(),
             location: location.into(),
@@ -517,7 +633,7 @@ impl<R: Renderer> MemoryRenderBufferRenderElement<R> {
             damage: inner.damage_bag.snapshot(),
             texture,
             kind,
-        })
+        }
     }
 
     fn physical_size(&self, scale: Scale<f64>) -> Size<i32, Physical> {
@@ -657,5 +773,83 @@ where
     #[inline]
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         Some(UnderlyingStorage::Memory(&self.buffer))
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::backend::renderer::test::{DummyRenderer, DummyTexture};
+
+    #[test]
+    fn prepared_draw_never_imports_and_old_reader_keeps_its_cpu_generation() {
+        let renderer = DummyRenderer;
+        let mut buffer =
+            MemoryRenderBuffer::from_slice(&[7; 16], Fourcc::Argb8888, (2, 2), 1, Transform::Normal, None);
+        assert!(!buffer.is_prepared(&renderer));
+        assert!(MemoryRenderBufferRenderElement::from_prepared_buffer(
+            &renderer,
+            (0.0, 0.0),
+            &buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor
+        )
+        .is_none());
+        let (_, first, bytes) = buffer.preparation_source();
+        assert!(buffer.adopt_prepared(&renderer, first, DummyTexture::test_size(2, 2)));
+        // DummyRenderer's import/update methods panic. The real prepared draw
+        // must use neither, including repeated cursor-only movement.
+        let old = MemoryRenderBufferRenderElement::from_prepared_buffer(
+            &renderer,
+            (3.0, 4.0),
+            &buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        )
+        .unwrap();
+        for x in 0..100 {
+            assert!(MemoryRenderBufferRenderElement::from_prepared_buffer(
+                &renderer,
+                (x as f64, 0.0),
+                &buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor
+            )
+            .is_some());
+        }
+        buffer
+            .render()
+            .draw(|pixels| {
+                pixels.fill(9);
+                Ok::<_, ()>(vec![Rectangle::from_size((2, 2).into())])
+            })
+            .unwrap();
+        assert_eq!(&*bytes, &[7; 16]);
+        assert_eq!(&*old.buffer, &[7; 16]);
+        assert!(!buffer.is_prepared(&renderer));
+        assert!(!buffer.adopt_prepared(&renderer, first, DummyTexture::test_size(2, 2)));
+        let (_, next, next_bytes) = buffer.preparation_source();
+        assert_ne!(first, next);
+        assert_eq!(&*next_bytes, &[9; 16]);
+        assert!(buffer.adopt_prepared(&renderer, next, DummyTexture::test_size(2, 2)));
+        let new = MemoryRenderBufferRenderElement::from_prepared_buffer(
+            &renderer,
+            (5.0, 6.0),
+            &buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        )
+        .unwrap();
+        assert_eq!(&*new.buffer, &[9; 16]);
+        assert_eq!(old.current_commit(), first);
+        assert_eq!(new.current_commit(), next);
     }
 }

@@ -15,6 +15,9 @@ layout(push_constant) uniform TexturePushConstants {
     vec4 effect_params;
     uint source_encoding;
     float clip_scale;
+    vec2 outer_origin;
+    vec2 outer_size;
+    float outer_radius;
 } constants;
 
 // Must match the SOURCE_ENCODING_* constants in pipeline.rs.
@@ -410,6 +413,96 @@ vec2 apply_texture_effect(vec2 uv, out float coverage) {
     return uv;
 }
 
+// Same final Kawase upsample and CSS transform as the former full-size
+// intermediate, applied before the source's single colour-space conversion.
+vec4 material_tap(vec2 uv) {
+    vec2 half_texel = vec2(0.5) / vec2(textureSize(texture_sampler, 0));
+    return texture(texture_sampler, clamp(uv, half_texel, constants.effect_params.yz - half_texel));
+}
+vec4 material_upsample(vec2 uv) {
+    vec2 hp = vec2(0.5) / vec2(textureSize(texture_sampler, 0)) * constants.effect.y;
+    vec4 sum;
+    if (int(constants.effect.x + 0.5) == 6) {
+        sum = material_tap(uv) * 4.0;
+        sum += material_tap(uv - hp);
+        sum += material_tap(uv + hp);
+        sum += material_tap(uv + vec2(hp.x, -hp.y));
+        sum += material_tap(uv - vec2(hp.x, -hp.y));
+        sum /= 8.0;
+    } else {
+    sum = material_tap(uv + vec2(-2.0 * hp.x, 0.0));
+    sum += material_tap(uv + vec2(-hp.x, hp.y)) * 2.0;
+    sum += material_tap(uv + vec2(0.0, 2.0 * hp.y));
+    sum += material_tap(uv + hp) * 2.0;
+    sum += material_tap(uv + vec2(2.0 * hp.x, 0.0));
+    sum += material_tap(uv + vec2(hp.x, -hp.y)) * 2.0;
+    sum += material_tap(uv + vec2(0.0, -2.0 * hp.y));
+    sum += material_tap(uv - hp) * 2.0;
+    sum /= 12.0;
+    }
+    vec3 pivot = vec3(0.5 * sum.a);
+    sum.rgb = clamp((sum.rgb - pivot) * constants.effect.w + pivot, vec3(0.0), vec3(sum.a));
+    sum.rgb = clamp(sum.rgb * constants.effect_params.x, vec3(0.0), vec3(sum.a));
+    float luma = dot(sum.rgb, vec3(0.213, 0.715, 0.072));
+    sum.rgb = clamp(vec3(luma) + (sum.rgb - vec3(luma)) * constants.effect.z,
+                    vec3(0.0), vec3(sum.a));
+    return sum;
+}
+
+// One premultiplied paint packet, with no silhouette upload. Compose all
+// authored electrical-sRGB lights before conversion and clip quantization.
+vec4 material_tone(vec2 frag_pos) {
+    vec4 result = vec4(constants.effect.yzw * constants.effect_params.x,
+                       constants.effect_params.x);
+    uint transform = (constants.rounded_clip_flags >> CLIP_TRANSFORM_SHIFT) & 0x7u;
+    vec2 uv = apply_transform((frag_pos - constants.clip_rect.xy) /
+                             max(constants.clip_rect.zw, vec2(0.0001)), transform);
+    float radial = max(0.0, 1.0 - length((uv - vec2(0.5, 0.0)) / vec2(0.58, 1.3)) / 0.68);
+    vec3 weights = vec3(radial, max(0.0, 1.0 - (1.0 - uv.y) / 0.22),
+                                max(0.0, 1.0 - uv.y / 0.26));
+    vec3 opacities = clamp(constants.effect_params.yzw * weights, vec3(0.0), vec3(1.0));
+    for (int light = 0; light < 3; light++) {
+        float alpha = opacities[light];
+        result = vec4(vec3(alpha), alpha) + result * (1.0 - alpha);
+    }
+    return result;
+}
+
+bool outer_rounded_contains(vec2 point) {
+    vec2 local = point - constants.outer_origin;
+    vec2 extent = constants.outer_size;
+    if (any(lessThan(local, vec2(0.0))) || any(greaterThanEqual(local, extent))) {
+        return false;
+    }
+    float radius = min(constants.outer_radius, min(extent.x, extent.y) * 0.5);
+    vec2 delta = max(max(vec2(radius) - local, local - (extent - vec2(radius))), vec2(0.0));
+    return dot(delta, delta) <= radius * radius;
+}
+
+float joint_owner_coverage(vec2 pixel_center) {
+    if ((constants.rounded_clip_flags & 0x40000000u) != 0u) {
+        return rounded_clip_alpha(pixel_center) >= 0.5 && bottom_edge_clip_alpha(pixel_center) >= 0.5 &&
+            (constants.outer_radius < 0.0 || outer_rounded_contains(pixel_center)) ? 1.0 : 0.0;
+    }
+    if (constants.outer_radius < 0.0) {
+        return rounded_clip_alpha(pixel_center) * bottom_edge_clip_alpha(pixel_center);
+    }
+    // Standard Vulkan 4x positions, matching the engine clip-mask contract.
+    const vec2 samples[4] = vec2[4](vec2(0.375,0.125),vec2(0.875,0.375),
+                                   vec2(0.125,0.625),vec2(0.625,0.875));
+    vec2 origin = floor(pixel_center);
+    uint inner_mask = 0u;
+    uint owner_mask = 0u;
+    for (uint i = 0u; i < 4u; ++i) {
+        vec2 point = origin + samples[i];
+        if (rounded_clip_alpha(point) >= 0.5 && bottom_edge_clip_alpha(point) >= 0.5) {
+            inner_mask |= 1u << i;
+        }
+        if (outer_rounded_contains(point)) { owner_mask |= 1u << i; }
+    }
+    return float(bitCount(inner_mask & owner_mask)) * 0.25;
+}
+
 void main() {
     float effect_coverage = 1.0;
     vec2 uv = apply_texture_effect(in_uv, effect_coverage);
@@ -421,8 +514,24 @@ void main() {
 
     uv = constants.src_offset + (uv * constants.src_scale);
 
-    vec4 sampled = to_linear_premultiplied(texture(texture_sampler, uv));
-    float coverage = rounded_clip_alpha(gl_FragCoord.xy) *
-        bottom_edge_clip_alpha(gl_FragCoord.xy);
+    int material_kind = int(constants.effect.x + 0.5);
+    vec4 encoded;
+    if (material_kind == 5) {
+        encoded = material_tone(gl_FragCoord.xy);
+    } else {
+        encoded = (material_kind == 4 || material_kind == 6) ? material_upsample(uv) : texture(texture_sampler, uv);
+    }
+    vec4 sampled = to_linear_premultiplied(encoded);
+    if (material_kind == 7) {
+        vec2 stride = constants.effect.yz;
+        sampled = (to_linear_premultiplied(texture(texture_sampler, uv)) +
+                   to_linear_premultiplied(texture(texture_sampler, uv + vec2(stride.x, 0.0))) +
+                   to_linear_premultiplied(texture(texture_sampler, uv + vec2(0.0, stride.y))) +
+                   to_linear_premultiplied(texture(texture_sampler, uv + stride))) * 0.25;
+    }
+    float coverage = joint_owner_coverage(gl_FragCoord.xy);
+    if ((constants.rounded_clip_flags & 0x40000000u) != 0u) {
+        effect_coverage = effect_coverage >= 0.5 ? 1.0 : 0.0;
+    }
     out_color = vec4(sampled.rgb * constants.alpha, sampled.a * constants.alpha) * coverage * effect_coverage;
 }

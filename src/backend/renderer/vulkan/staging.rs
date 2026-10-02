@@ -61,6 +61,50 @@ impl fmt::Debug for UploadArena {
     }
 }
 
+/// A same-device fixed arena prepared by an allocation helper. Unused or
+/// replaced storage is disposed on the logical device's retirement actor.
+pub struct VulkanUploadStorage {
+    device: Arc<DeviceHandle>,
+    arena: Option<UploadArena>,
+    retirement: Option<super::VulkanRetirementSlot<UploadArena>>,
+    requested_bytes: usize,
+}
+impl fmt::Debug for VulkanUploadStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VulkanUploadStorage")
+            .field("requested_bytes", &self.requested_bytes)
+            .finish_non_exhaustive()
+    }
+}
+impl VulkanUploadStorage {
+    pub(super) fn prepare(
+        physical: &PhysicalDevice,
+        device: Arc<DeviceHandle>,
+        bytes: usize,
+    ) -> Result<Self, VulkanRendererError> {
+        let retirement = super::VulkanRetirementSlot::new(device.clone());
+        let mut arena = UploadArena::new(physical);
+        arena.configure_fixed(physical, device.clone(), bytes)?;
+        Ok(Self {
+            device,
+            arena: Some(arena),
+            retirement: Some(retirement),
+            requested_bytes: bytes,
+        })
+    }
+    /// Exact unaligned owner request which created this transaction.
+    pub fn requested_bytes(&self) -> usize {
+        self.requested_bytes
+    }
+}
+impl Drop for VulkanUploadStorage {
+    fn drop(&mut self) {
+        if let (Some(arena), Some(retirement)) = (self.arena.take(), self.retirement.take()) {
+            retirement.retire(arena);
+        }
+    }
+}
+
 impl UploadArena {
     pub(crate) fn new(physical_device: &PhysicalDevice) -> Self {
         let atom_size = usize::try_from(physical_device.limits().non_coherent_atom_size)
@@ -114,6 +158,45 @@ impl UploadArena {
         self.chunks.extend(replacement);
         self.stats.capacity_bytes = capacity;
         self.stats.chunk_count = usize::from(capacity != 0);
+        Ok(true)
+    }
+
+    pub(crate) fn capacity_matches(&self, bytes: usize) -> bool {
+        align_up(bytes, self.atom_size) == Some(self.stats.capacity_bytes)
+    }
+
+    /// Adoption performs no native allocation or destruction. Failed admission
+    /// leaves both the old arena and the exact prepared replacement untouched.
+    pub(crate) fn adopt(
+        &mut self,
+        device: &Arc<DeviceHandle>,
+        storage: &mut VulkanUploadStorage,
+    ) -> Result<bool, VulkanRendererError> {
+        if !Arc::ptr_eq(device, &storage.device) {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "prepared upload storage belongs to a different logical device",
+            ));
+        }
+        self.reap_parked();
+        if self.stats.in_use_bytes != 0
+            || self
+                .chunks
+                .iter()
+                .any(|chunk| Arc::strong_count(&chunk.memory) != 1)
+        {
+            return Ok(false);
+        }
+        let Some(replacement) = storage.arena.take() else {
+            return Err(VulkanRendererError::InvalidMemoryUpload(
+                "prepared upload storage was already consumed",
+            ));
+        };
+        let old = std::mem::replace(self, replacement);
+        storage
+            .retirement
+            .take()
+            .expect("prepared disposal custody")
+            .retire(old);
         Ok(true)
     }
 
@@ -371,7 +454,10 @@ impl StagingChunk {
             .size(size as vk::DeviceSize)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = device.observe_result(unsafe { device.handle().create_buffer(&create_info, None) })?;
+        let buffer = device.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { device.handle().create_buffer(&create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanBuffer,
+        ))?;
         let memory_requirements = unsafe { device.handle().get_buffer_memory_requirements(buffer) };
         let (memory_type_index, coherent) =
             match pick_host_visible_memory_type(physical_device, memory_requirements.memory_type_bits) {
@@ -385,14 +471,16 @@ impl StagingChunk {
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(allocation_size)
             .memory_type_index(memory_type_index);
-        let memory =
-            match device.observe_result(unsafe { device.handle().allocate_memory(&allocate_info, None) }) {
-                Ok(memory) => memory,
-                Err(error) => {
-                    device.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
-                    return Err(error.into());
-                }
-            };
+        let memory = match device.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { device.handle().allocate_memory(&allocate_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        )) {
+            Ok(memory) => memory,
+            Err(error) => {
+                device.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
+                return Err(error.into());
+            }
+        };
         let allocation = device
             .allocation_ledger()
             .record(VulkanAllocationReason::Upload, allocation_size);
@@ -833,6 +921,61 @@ mod tests {
         assert!(renderer.configure_memory_upload_capacity(2048).unwrap());
         assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);
         assert!(renderer.configure_memory_upload_capacity(0).unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 0);
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 0);
+    }
+
+    #[test]
+    #[ignore = "[laptop] requires the renderer Vulkan device extensions"]
+    fn helper_storage_admits_only_its_device_after_exact_writer_returns() {
+        use crate::backend::{allocator::Fourcc, renderer::ImportMem};
+        let Some(physical) = super::super::test_support::physical_device() else {
+            return;
+        };
+        let Some(mut renderer) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let Some(mut other) = super::super::test_support::renderer(&physical) else {
+            return;
+        };
+        let allocator = renderer.offscreen_allocator();
+        let cold = allocator.clone();
+        let mut prepared = std::thread::spawn(move || cold.prepare_upload_storage(4096))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(other.adopt_memory_upload_storage(&mut prepared, 0, 4096).is_err());
+        assert_eq!(other.diagnostics().uploads.arena_capacity_bytes, 0);
+        assert!(renderer
+            .adopt_memory_upload_storage(&mut prepared, 0, 4096)
+            .unwrap());
+        let (texture, update, rows) = renderer
+            .stage_memory_import(Fourcc::Argb8888, (16, 16).into(), false)
+            .unwrap()
+            .unwrap();
+        renderer.cancel_staged_memory_update(update);
+        let cold = allocator.clone();
+        let mut successor = std::thread::spawn(move || cold.prepare_upload_storage(2048))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(!renderer
+            .adopt_memory_upload_storage(&mut successor, 0, 2048)
+            .unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 4096);
+        assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 1);
+        drop(rows);
+        drop(texture);
+        assert!(renderer
+            .adopt_memory_upload_storage(&mut successor, 0, 2048)
+            .unwrap());
+        assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 2048);
+        assert_eq!(renderer.diagnostics().uploads.arena_growth_count, 0);
+        let mut retired = std::thread::spawn(move || allocator.prepare_upload_storage(0))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(renderer.adopt_memory_upload_storage(&mut retired, 0, 0).unwrap());
         assert_eq!(renderer.diagnostics().uploads.arena_capacity_bytes, 0);
         assert_eq!(renderer.diagnostics().uploads.arena_chunk_count, 0);
     }

@@ -69,6 +69,10 @@ impl Allocator for DumbAllocator {
             get_bpp(fourcc).ok_or(rustix::io::Errno::INVAL)? as u32,
         )?;
 
+        crate::backend::allocator::note_gpu_allocation(
+            crate::backend::allocator::GpuAllocationKind::DrmDumbBuffer,
+        );
+
         Ok(DumbBuffer {
             fd: self.fd.clone(),
             handle,

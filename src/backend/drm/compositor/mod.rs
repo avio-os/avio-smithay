@@ -184,7 +184,9 @@ use crate::{
 };
 
 mod composition;
-pub use composition::{CompositionAllocator, PreparedCompositionBuffers};
+pub use composition::{
+    CompositionAllocator, CompositionBufferCounts, PreparedCompositionBuffers, RetiredCompositionBuffers,
+};
 mod elements;
 mod frame_result;
 mod native_black;
@@ -1355,6 +1357,9 @@ where
     /// Last frame's primary disposition (Some(true) = swapchain composite,
     /// Some(false) = element scanout); drives the rare seam-change witness.
     primary_was_composited: Option<bool>,
+    // Output owners prepare every composition allocation and framebuffer
+    // outside render_frame before enabling this production policy.
+    composition_prepared_only: bool,
     native_black_enabled: bool,
     native_black_repaint: native_black::NativeBlackRepaint,
     // An unobservable cold render stays outside reusable slots until retry.
@@ -1617,6 +1622,7 @@ where
                         element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
                         primary_was_composited: None,
+                        composition_prepared_only: false,
                         native_black_enabled: false,
                         native_black_repaint: Default::default(),
                         native_black_uncompleted: None,
@@ -1790,6 +1796,7 @@ where
             element_opaque_regions_workhouse: Vec::new(),
             supports_fencing,
             primary_was_composited: None,
+            composition_prepared_only: false,
             native_black_enabled: false,
             native_black_repaint: Default::default(),
             native_black_uncompleted: None,
@@ -2254,6 +2261,7 @@ where
                 &self.framebuffer_exporter,
                 self.primary_is_opaque,
                 current_size,
+                self.composition_prepared_only,
             )
         })? {
             composition::PrimaryPreparation::Direct(direct) => Some(direct),
@@ -2396,6 +2404,7 @@ where
                     &self.framebuffer_exporter,
                     self.primary_is_opaque,
                     current_size,
+                    self.composition_prepared_only,
                 )?;
                 next_frame_state.set_state(self.surface.plane(), state);
             }
@@ -2462,6 +2471,7 @@ where
                                         &self.framebuffer_exporter,
                                         self.primary_is_opaque,
                                         current_size,
+                                        self.composition_prepared_only,
                                     )?,
                                 );
                                 primary_plane_scanout_element = None;
@@ -2581,6 +2591,7 @@ where
                         &self.framebuffer_exporter,
                         self.primary_is_opaque,
                         current_size,
+                        self.composition_prepared_only,
                     )?,
                 );
             }
@@ -2623,6 +2634,7 @@ where
                         &self.framebuffer_exporter,
                         self.primary_is_opaque,
                         current_size,
+                        self.composition_prepared_only,
                     )?,
                 );
 
@@ -4170,7 +4182,12 @@ where
                 let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() else {
                     return Err(None);
                 };
-                match output_layer_swapchain.acquire() {
+                let acquired = if self.composition_prepared_only {
+                    Ok(output_layer_swapchain.acquire_existing())
+                } else {
+                    output_layer_swapchain.acquire()
+                };
+                match acquired {
                     Ok(Some(slot)) => slot,
                     Ok(None) => return Err(Some(RenderingReason::ScanoutFailed)),
                     Err(err) => {
@@ -4200,6 +4217,9 @@ where
                 .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>()
                 .is_none()
             {
+                if self.composition_prepared_only {
+                    continue;
+                }
                 let fb_buffer = match self.framebuffer_exporter.add_framebuffer(
                     self.surface.device_fd(),
                     ExportBuffer::Allocator(&slot),
@@ -5697,6 +5717,9 @@ pub enum FrameError<
     /// denied via [`FrameFlags::DENY_PRIMARY_PLANE_RENDER`]
     #[error("The frame required a primary plane re-render, which the frame flags deny")]
     PrimaryPlaneRenderDenied,
+    /// The output owner must provision a target outside realtime rendering.
+    #[error("No owner-prepared composition target is available")]
+    CompositionTargetUnavailable,
     /// Native-black configuration needs a completed target or capability.
     #[error(transparent)]
     NativeBlack(#[from] NativeBlackError),
@@ -5779,6 +5802,7 @@ impl<
             x @ FrameError::NoFreeSlotsError
             | x @ FrameError::EmptyFrame
             | x @ FrameError::PrimaryPlaneRenderDenied
+            | x @ FrameError::CompositionTargetUnavailable
             | x @ FrameError::NativeBlack(_) => SwapBuffersError::TemporaryFailure(Box::new(x)),
             FrameError::DrmError(err) => err.into(),
             FrameError::Allocator(err) => SwapBuffersError::ContextLost(Box::new(err)),

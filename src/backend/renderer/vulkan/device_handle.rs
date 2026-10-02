@@ -17,13 +17,28 @@ use super::{
 use crate::backend::vulkan::Instance;
 use ash::vk;
 
-pub(super) struct DeviceHandle {
+pub(super) enum DeviceRetirement {
+    Image(RetiredImage),
+    /// A context returns the exact actor-allocated notification node here.
+    ViewNotification(vk::ImageView),
+    #[cfg(test)]
+    Drain(std::sync::mpsc::SyncSender<()>),
+    OpaqueCustody(Box<dyn std::any::Any + Send + Sync>),
+    ReadbackBuffer(super::readback::RetiredReadbackBuffer),
+    #[cfg(feature = "wayland_frontend")]
+    HostBuffer(super::host_memory::RetiredHostBuffer),
+}
+
+pub(crate) struct DeviceHandle {
     device: ash::Device,
+    queue_order: super::ordered_queue::OrderedQueue,
+    offscreen_ids: Arc<std::sync::atomic::AtomicU64>,
     allocation_ledger: Arc<AllocationLedger>,
     /// The executor owns the parent Instance and logical-device destruction.
     /// Every child keeps this endpoint alive through its DeviceHandle Arc;
     /// endpoint closure drains images before destroying device and instance.
-    retirement: RetirementQueue<RetiredImage>,
+    retirement: RetirementQueue<DeviceRetirement>,
+    command_retirement: RetirementQueue<super::device::RetiredCommands>,
     /// Set once the device has been observed to be lost (any Vulkan call returning
     /// `VK_ERROR_DEVICE_LOST`). Owned by the device abstraction so that teardown paths
     /// can consult a single source of truth instead of scattering guards at call sites.
@@ -47,7 +62,7 @@ pub(super) struct DeviceHandle {
     /// fill the cache in under a minute and then refuse under load, and a
     /// driver reusing the raw handle value could even alias a stale set
     /// onto a new texture.
-    retired_texture_views: Arc<std::sync::Mutex<Vec<vk::ImageView>>>,
+    retired_texture_views: Arc<super::retired_views::RetirementSubscribers<DeviceRetirement>>,
 }
 
 #[cfg(test)]
@@ -75,7 +90,7 @@ impl DeviceHandle {
         parent: impl Send + Sync + 'static,
     ) -> std::io::Result<Self> {
         let lost = Arc::new(AtomicBool::new(false));
-        let retired_texture_views = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retired_texture_views = Arc::new(super::retired_views::RetirementSubscribers::default());
         let destroy_device = device.clone();
         let destroy_lost = lost.clone();
         let destroy_instance_lost = instance_lost.clone();
@@ -86,20 +101,85 @@ impl DeviceHandle {
         // Keep a local parent owner through a possible spawn failure, so even
         // initialization cleanup destroys the device before its parent.
         let parent = Arc::new(parent);
+        let commands_device = device.clone();
+        let commands_lost = lost.clone();
+        let commands_instance_lost = instance_lost.clone();
+        let command_retirement = match RetirementQueue::start(
+            move |commands: super::device::RetiredCommands| {
+                let mut reported = false;
+                loop {
+                    let valid = !commands_lost.load(Ordering::Acquire)
+                        && !commands_instance_lost.load(Ordering::Acquire);
+                    if valid && commands.wait_complete(&commands_device).is_ok() {
+                        commands.destroy(&commands_device);
+                        break;
+                    }
+                    if !reported {
+                        tracing::error!("Vulkan command completion is unobservable; retaining exact GPU/host reader custody");
+                        reported = true;
+                    }
+                    // A concrete image retirement or another command retirement
+                    // may restore enough driver memory to observe completion. No
+                    // timer, fabricated signal or inline-free fallback exists.
+                    std::thread::park();
+                }
+            },
+            || {},
+        ) {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                unsafe { device.destroy_device(None) };
+                return Err(error);
+            }
+        };
+        let command_wake = command_retirement.worker_thread();
         let executor_parent = parent.clone();
         let retirement = match RetirementQueue::start(
-            move |image: RetiredImage| {
-                // Publish death before the driver may recycle the view handle.
-                // The descriptor cache can drain on its normal ownership turn.
-                retired_views
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(image.sampled_view);
-                if !destroy_lost.load(Ordering::Acquire) && !destroy_instance_lost.load(Ordering::Acquire) {
-                    image.destroy(&destroy_device);
+            move |resource: DeviceRetirement| {
+                let valid =
+                    !destroy_lost.load(Ordering::Acquire) && !destroy_instance_lost.load(Ordering::Acquire);
+                match resource {
+                    DeviceRetirement::ViewNotification(_) => {}
+                    #[cfg(test)]
+                    DeviceRetirement::Drain(completed) => {
+                        let _ = completed.send(());
+                    }
+                    DeviceRetirement::OpaqueCustody(custody) => {
+                        if valid {
+                            drop(custody);
+                        } else {
+                            // Foreign export owners can contain their own native
+                            // device bindings. Preserve the exact owner after
+                            // loss instead of running an unknown destructor.
+                            std::mem::forget(custody);
+                        }
+                    }
+                    DeviceRetirement::ReadbackBuffer(buffer) => {
+                        if valid {
+                            buffer.destroy(&destroy_device);
+                        } else {
+                            std::mem::forget(buffer);
+                        }
+                    }
+                    DeviceRetirement::Image(image) => {
+                        retired_views.retired(|| DeviceRetirement::ViewNotification(image.sampled_view));
+                        if valid {
+                            image.destroy(&destroy_device);
+                        }
+                    }
+                    #[cfg(feature = "wayland_frontend")]
+                    DeviceRetirement::HostBuffer(buffer) => {
+                        if valid {
+                            buffer.destroy(&destroy_device);
+                        } else {
+                            // A lost device can still retain an imported pointer.
+                            // Keep its exact mapping/FD/source quarantined with
+                            // the skipped driver binding, rather than unmapping it.
+                            std::mem::forget(buffer);
+                        }
+                    }
                 }
-                // Lost-device cleanup intentionally skips driver calls. Owner
-                // counters retire here; they do not claim the driver freed it.
+                command_wake.unpark();
             },
             move || {
                 if !finish_lost.load(Ordering::Acquire) && !finish_instance_lost.load(Ordering::Acquire) {
@@ -122,8 +202,11 @@ impl DeviceHandle {
         };
         Ok(Self {
             device,
+            queue_order: Default::default(),
+            offscreen_ids: Arc::new(std::sync::atomic::AtomicU64::new(1u64 << 61)),
             allocation_ledger: Arc::new(AllocationLedger::default()),
             retirement,
+            command_retirement,
             lost,
             instance_lost,
             pending_submissions: std::sync::atomic::AtomicUsize::new(0),
@@ -132,8 +215,34 @@ impl DeviceHandle {
         })
     }
 
-    pub(super) fn retire_image(&self, image: Box<RetirementNode<RetiredImage>>) {
-        self.retirement.retire(image);
+    pub(super) fn offscreen_ids(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.offscreen_ids.clone()
+    }
+
+    pub(super) fn submit_queue(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<SubmissionId, super::VulkanRendererError> {
+        self.queue_order
+            .submit(|| self.observe_result(unsafe { self.device.queue_submit(queue, submits, fence) }))
+            .map(SubmissionId)
+            .map_err(queue_error)
+    }
+
+    pub(super) fn wait_queue_idle(&self, queue: vk::Queue) -> Result<(), super::VulkanRendererError> {
+        self.queue_order
+            .access(|| self.observe_result(unsafe { self.device.queue_wait_idle(queue) }))
+            .map_err(queue_error)
+    }
+
+    pub(super) fn retire_commands(&self, commands: Box<RetirementNode<super::device::RetiredCommands>>) {
+        self.command_retirement.retire(commands);
+    }
+
+    pub(super) fn retire_resource(&self, resource: Box<RetirementNode<DeviceRetirement>>) {
+        self.retirement.retire(resource);
     }
 
     #[cfg(test)]
@@ -141,14 +250,14 @@ impl DeviceHandle {
         Self::with_retirement(device, Arc::new(AtomicBool::new(false)), parent).unwrap()
     }
 
-    pub(super) fn allocation_ledger(&self) -> &Arc<AllocationLedger> {
+    pub(crate) fn allocation_ledger(&self) -> &Arc<AllocationLedger> {
         &self.allocation_ledger
     }
 
     /// Live-operation accessor. Always returns the device regardless of validity — callers on
     /// the live render path must keep using this so a single observed loss does not silently
     /// disable in-flight work that the caller is already prepared to error out of.
-    pub(super) fn handle(&self) -> &ash::Device {
+    pub(crate) fn handle(&self) -> &ash::Device {
         &self.device
     }
 
@@ -185,18 +294,22 @@ impl DeviceHandle {
     #[cfg(test)]
     pub(super) fn note_view_retired(&self, view: vk::ImageView) {
         self.retired_texture_views
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(view);
+            .retired(|| DeviceRetirement::ViewNotification(view));
     }
 
-    pub(super) fn take_retired_views(&self) -> Vec<vk::ImageView> {
-        std::mem::take(
-            &mut *self
-                .retired_texture_views
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+    /// Cold test-only completion edge for all previously published native
+    /// resource nodes. Never polls a driver or relies on a timing delay.
+    #[cfg(test)]
+    pub(super) fn wait_retirement_drained(&self) {
+        let (completed, received) = std::sync::mpsc::sync_channel(1);
+        self.retire_resource(RetirementNode::new(DeviceRetirement::Drain(completed)));
+        received.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    pub(super) fn retired_view_subscription(
+        &self,
+    ) -> super::retired_views::RetirementSubscription<DeviceRetirement> {
+        self.retired_texture_views.subscribe()
     }
 
     pub(super) fn note_submission_completed(&self, id: SubmissionId) {
@@ -227,7 +340,7 @@ impl DeviceHandle {
     /// Runs `f` with the device only while it is still valid. The single teardown pattern:
     /// a no-op on a lost device, otherwise a normal destroy. Healthy-path cost is one
     /// relaxed atomic load.
-    pub(super) fn destroy_with(&self, f: impl FnOnce(&ash::Device)) {
+    pub(crate) fn destroy_with(&self, f: impl FnOnce(&ash::Device)) {
         if let Some(device) = self.handle_for_destroy() {
             f(device);
         }
@@ -241,5 +354,17 @@ impl DeviceHandle {
         self.lost.store(false, Ordering::Release);
         self.instance_lost.store(false, Ordering::Release);
         self.pending_submissions.store(0, Ordering::Release);
+    }
+}
+
+fn queue_error(error: super::ordered_queue::QueueError<vk::Result>) -> super::VulkanRendererError {
+    match error {
+        super::ordered_queue::QueueError::Backend(error) => error.into(),
+        super::ordered_queue::QueueError::Poisoned => {
+            super::VulkanRendererError::TemporaryFailure("shared queue owner panicked")
+        }
+        super::ordered_queue::QueueError::Exhausted => {
+            super::VulkanRendererError::TemporaryFailure("shared queue submission identities exhausted")
+        }
     }
 }

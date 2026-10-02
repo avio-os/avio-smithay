@@ -16,7 +16,7 @@ use tracing::{instrument, trace};
 
 use crate::{
     backend::renderer::{sync::SyncPoint, Texture},
-    utils::{Buffer as BufferCoord, Size},
+    utils::{Buffer as BufferCoord, Point, Size},
 };
 
 use super::{
@@ -44,6 +44,7 @@ pub struct VulkanKawasePass {
     pub(super) offset: f32,
     pub(super) transform: KawaseColorTransform,
     pub(super) encoding: VulkanKawaseEncoding,
+    pub(super) source_origin: Point<i32, BufferCoord>,
     pub(super) source_extent: Size<i32, BufferCoord>,
     pub(super) destination_extent: Size<i32, BufferCoord>,
 }
@@ -69,6 +70,7 @@ impl VulkanKawasePass {
             offset,
             transform: KawaseColorTransform::IDENTITY,
             encoding: VulkanKawaseEncoding::LinearLight,
+            source_origin: (0, 0).into(),
             source_extent: source.size(),
             destination_extent: destination.size(),
         }
@@ -85,6 +87,11 @@ impl VulkanKawasePass {
     ) -> Self {
         self.source_extent = source;
         self.destination_extent = destination;
+        self
+    }
+
+    pub(super) fn with_source_origin(mut self, origin: Point<i32, BufferCoord>) -> Self {
+        self.source_origin = origin;
         self
     }
 
@@ -119,6 +126,45 @@ impl VulkanKawasePass {
     /// Select CSS-compatible filtering over encoded sRGB channel values.
     pub fn with_encoded_srgb(mut self) -> Self {
         self.encoding = VulkanKawaseEncoding::EncodedSrgb;
+        self
+    }
+}
+
+/// Final encoded-sRGB eight-tap upsample fused into a clipped material draw.
+/// The source remains the immutable half-resolution prefix captured before all cards.
+#[derive(Debug, Clone, Copy)]
+pub struct VulkanKawaseOutput {
+    pub(super) extent: Size<i32, BufferCoord>,
+    pub(super) upsample: bool,
+    pub(super) offset: f32,
+    pub(super) transform: KawaseColorTransform,
+}
+impl VulkanKawaseOutput {
+    /// Create a fused final pass over the initialized origin-aligned source region.
+    pub fn new(extent: Size<i32, BufferCoord>, offset: f32) -> Self {
+        Self {
+            extent,
+            offset,
+            upsample: true,
+            transform: KawaseColorTransform::IDENTITY,
+        }
+    }
+    /// Fuse the original five-tap zero-depth blur over one frozen full-size prefix.
+    pub fn new_downsample(extent: Size<i32, BufferCoord>, offset: f32) -> Self {
+        Self {
+            extent,
+            offset,
+            upsample: false,
+            transform: KawaseColorTransform::IDENTITY,
+        }
+    }
+    /// Set the CSS filter-list transform, in contrast/brightness/saturation order.
+    pub fn with_filter(mut self, contrast: f32, brightness: f32, saturation: f32) -> Self {
+        self.transform = KawaseColorTransform {
+            contrast: contrast.clamp(0.0, 4.0),
+            brightness: brightness.clamp(0.0, 4.0),
+            saturation: saturation.clamp(0.0, 4.0),
+        };
         self
     }
 }
@@ -174,6 +220,15 @@ impl VulkanRenderer {
                     ));
                 }
             }
+            if pass.source_origin.x < 0
+                || pass.source_origin.y < 0
+                || pass.source_origin.x > source.size().w - pass.source_extent.w
+                || pass.source_origin.y > source.size().h - pass.source_extent.h
+            {
+                return Err(VulkanRendererError::TemporaryFailure(
+                    "kawase source region exceeds image capacity",
+                ));
+            }
             if source.id() == destination.id() {
                 return Err(VulkanRendererError::TemporaryFailure(
                     "kawase source and destination must be different images",
@@ -216,7 +271,7 @@ impl VulkanRenderer {
                 pass.transform,
                 encoded_srgb,
             )
-            .with_source_extent(pass.source_extent, source.size());
+            .with_source_region(pass.source_origin, pass.source_extent, source.size());
             resolved.push(ResolvedKawasePass {
                 source,
                 destination,

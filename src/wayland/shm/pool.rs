@@ -173,6 +173,10 @@ impl InnerPool {
 }
 
 impl Pool {
+    /// Take independent file custody without retaining the remappable pool address.
+    pub(crate) fn duplicate_fd(&self) -> std::io::Result<OwnedFd> {
+        self.inner.as_ref().unwrap().fd.try_clone()
+    }
     pub fn new(fd: OwnedFd, size: NonZeroUsize) -> Result<Self, OwnedFd> {
         InnerPool::new(fd, size).map(|p| Self { inner: Some(p) })
     }

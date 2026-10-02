@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     ffi::c_void,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, OnceLock,
     },
@@ -22,6 +22,9 @@ use std::{
 
 #[derive(Debug, PartialEq, Eq)]
 pub(in super::super) enum Operation {
+    Buffer(u64),
+    Fence(u64),
+    CommandPool(u64),
     View(u64),
     Image(u64),
     Memory(u64),
@@ -29,8 +32,20 @@ pub(in super::super) enum Operation {
     Parent,
 }
 
+unsafe extern "system" fn destroy_buffer(
+    device: vk::Device,
+    buffer: vk::Buffer,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
+    record(device, Operation::Buffer(buffer.as_raw()));
+}
+
 type Event = (Operation, ThreadId);
-static DEVICES: OnceLock<Mutex<HashMap<u64, Sender<Event>>>> = OnceLock::new();
+struct TestDispatch {
+    events: Sender<Event>,
+    wait_result: Arc<AtomicI32>,
+}
+static DEVICES: OnceLock<Mutex<HashMap<u64, TestDispatch>>> = OnceLock::new();
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1);
 
 fn record(device: vk::Device, operation: Operation) {
@@ -41,8 +56,51 @@ fn record(device: vk::Device, operation: Operation) {
         .unwrap()
         .get(&device.as_raw())
         .unwrap()
+        .events
         .send((operation, thread::current().id()))
         .unwrap();
+}
+
+unsafe extern "system" fn create_fence(
+    device: vk::Device,
+    _: *const vk::FenceCreateInfo<'_>,
+    _: *const vk::AllocationCallbacks<'_>,
+    fence: *mut vk::Fence,
+) -> vk::Result {
+    unsafe {
+        fence.write(vk::Fence::from_raw(device.as_raw() + 1000));
+    }
+    vk::Result::SUCCESS
+}
+unsafe extern "system" fn destroy_fence(
+    device: vk::Device,
+    fence: vk::Fence,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
+    record(device, Operation::Fence(fence.as_raw()));
+}
+unsafe extern "system" fn wait_for_fences(
+    device: vk::Device,
+    _: u32,
+    _: *const vk::Fence,
+    _: vk::Bool32,
+    _: u64,
+) -> vk::Result {
+    let devices = DEVICES.get().unwrap().lock().unwrap();
+    vk::Result::from_raw(
+        devices
+            .get(&device.as_raw())
+            .unwrap()
+            .wait_result
+            .load(Ordering::Acquire),
+    )
+}
+unsafe extern "system" fn destroy_command_pool(
+    device: vk::Device,
+    pool: vk::CommandPool,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
+    record(device, Operation::CommandPool(pool.as_raw()));
 }
 
 unsafe extern "system" fn destroy_view(
@@ -88,13 +146,21 @@ impl Drop for Parent {
 }
 
 pub(in super::super) fn device() -> (Arc<DeviceHandle>, Receiver<Event>) {
+    device_with_wait_result(Arc::new(AtomicI32::new(vk::Result::SUCCESS.as_raw())))
+}
+
+pub(in super::super) fn device_with_wait_result(
+    wait_result: Arc<AtomicI32>,
+) -> (Arc<DeviceHandle>, Receiver<Event>) {
     let id = NEXT_DEVICE.fetch_add(1, Ordering::Relaxed);
     let (events, received) = mpsc::channel();
-    DEVICES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(id, events.clone());
+    DEVICES.get_or_init(Default::default).lock().unwrap().insert(
+        id,
+        TestDispatch {
+            events: events.clone(),
+            wait_result,
+        },
+    );
     // SAFETY: Only the supplied destructor functions are invoked by this
     // fixture. All handles are test identities, never handed to a real driver.
     let raw = unsafe {
@@ -102,6 +168,11 @@ pub(in super::super) fn device() -> (Arc<DeviceHandle>, Receiver<Event>) {
             |name| match name.to_bytes() {
                 b"vkDestroyImageView" => destroy_view as *const c_void,
                 b"vkDestroyImage" => destroy_image as *const c_void,
+                b"vkDestroyBuffer" => destroy_buffer as *const c_void,
+                b"vkCreateFence" => create_fence as *const c_void,
+                b"vkDestroyFence" => destroy_fence as *const c_void,
+                b"vkWaitForFences" => wait_for_fences as *const c_void,
+                b"vkDestroyCommandPool" => destroy_command_pool as *const c_void,
                 b"vkFreeMemory" => free_memory as *const c_void,
                 b"vkDestroyDevice" => destroy_device as *const c_void,
                 _ => std::ptr::null(),
@@ -152,6 +223,7 @@ pub(in super::super) fn next(events: &Receiver<Event>) -> Event {
 fn final_image_drop_wakes_idle_device_and_frees_on_executor() {
     let (device, events) = device();
     let ledger = device.allocation_ledger().clone();
+    let retired_views = device.retired_view_subscription();
     let image = image(device.clone(), 10);
     let weak = Arc::downgrade(&image);
     let dropping_thread = thread::spawn(move || {
@@ -170,7 +242,14 @@ fn final_image_drop_wakes_idle_device_and_frees_on_executor() {
     }
     // The executor woke and freed memory while the owner remained idle/live.
     assert!(events.try_recv().is_err());
-    assert_eq!(device.take_retired_views(), [vk::ImageView::from_raw(12)]);
+    let mut views = Vec::new();
+    retired_views.drain(|node| {
+        if let super::DeviceRetirement::ViewNotification(view) = node.value() {
+            views.push(*view);
+        }
+        device.retire_resource(node);
+    });
+    assert_eq!(views, [vk::ImageView::from_raw(12)]);
     drop(device);
     assert_eq!(next(&events), (Operation::Device, executor));
     assert_eq!(next(&events), (Operation::Parent, executor));
@@ -223,8 +302,7 @@ fn poisoned_view_notifications_cannot_make_final_drop_panic() {
     let (device, events) = device();
     let image = image(device.clone(), 30);
     let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _views = device.retired_texture_views.lock().unwrap();
-        panic!("renderer fault");
+        device.retired_texture_views.poison_registry();
     }));
     assert!(poison.is_err());
     drop(image);

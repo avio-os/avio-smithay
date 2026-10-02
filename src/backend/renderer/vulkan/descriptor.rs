@@ -48,6 +48,7 @@ struct TextureDescriptorKey {
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     device: Arc<DeviceHandle>,
+    retired_views: super::retired_views::RetirementSubscription<super::device_handle::DeviceRetirement>,
     texture_layout: vk::DescriptorSetLayout,
     texture_samplers: IndexMap<TextureSampler, vk::Sampler>,
     pools: Vec<vk::DescriptorPool>,
@@ -128,16 +129,18 @@ impl DescriptorState {
             }
         };
 
+        let retired_views = device.retired_view_subscription();
         Ok(Self {
             device,
+            retired_views,
             texture_layout,
             texture_samplers,
             pools: Vec::new(),
-            texture_sets: IndexMap::new(),
-            retired_sets: VecDeque::new(),
-            free_sets: Vec::new(),
-            last_submissions: HashMap::new(),
-            recording_sets: HashSet::new(),
+            texture_sets: IndexMap::with_capacity(max_sets),
+            retired_sets: VecDeque::with_capacity(max_sets),
+            free_sets: Vec::with_capacity(max_sets),
+            last_submissions: HashMap::with_capacity(max_sets),
+            recording_sets: HashSet::with_capacity(max_sets),
             cache_target,
             page_size,
             max_sets,
@@ -242,38 +245,45 @@ impl DescriptorState {
     /// set, and capacity pressure only ever means "this many textures are
     /// genuinely in flight right now".
     fn retire_dead_views(&mut self) {
-        let retired = self.device.take_retired_views();
-        if retired.is_empty() {
-            return;
-        }
-        for view in retired {
-            let dead: Vec<TextureDescriptorKey> = self
-                .texture_sets
-                .keys()
-                .filter(|key| key.image_view == view)
-                .copied()
-                .collect();
-            for key in dead {
-                if let Some(entry) = self.texture_sets.shift_remove(&key) {
-                    self.cache_stats.dead_view_reclaims =
-                        self.cache_stats.dead_view_reclaims.saturating_add(1);
-                    self.retired_sets.push_back(entry.set);
+        let sets = &mut self.texture_sets;
+        let retired = &mut self.retired_sets;
+        let stats = &mut self.cache_stats;
+        let device = &self.device;
+        self.retired_views.drain(|node| {
+            if let super::device_handle::DeviceRetirement::ViewNotification(view) = node.value() {
+                let mut index = 0;
+                while index < sets.len() {
+                    if sets
+                        .get_index(index)
+                        .is_some_and(|(key, _)| key.image_view == *view)
+                    {
+                        let (_, entry) = sets.shift_remove_index(index).expect("index is in range");
+                        stats.dead_view_reclaims = stats.dead_view_reclaims.saturating_add(1);
+                        retired.push_back(entry.set);
+                    } else {
+                        index += 1;
+                    }
                 }
             }
-        }
+            // Reuse the notification's own queue node. No Box/Vec disposal,
+            // allocation or actor mutex can run on this descriptor draw path.
+            device.retire_resource(node);
+        });
     }
 
     fn reclaim_rewriteable_sets(&mut self) {
         self.retire_dead_views();
-        let mut retained = VecDeque::with_capacity(self.retired_sets.len());
-        while let Some(set) = self.retired_sets.pop_front() {
+        for _ in 0..self.retired_sets.len() {
+            let set = self
+                .retired_sets
+                .pop_front()
+                .expect("bounded initial queue length");
             if self.is_rewriteable(set) {
                 self.free_sets.push(set);
             } else {
-                retained.push_back(set);
+                self.retired_sets.push_back(set);
             }
         }
-        self.retired_sets = retained;
 
         while self.texture_sets.len() > self.cache_target {
             let Some(set) = self.evict_oldest_rewriteable_cache_entry() else {
@@ -443,19 +453,16 @@ impl DescriptorState {
             return Ok(());
         }
 
-        let mut sets = self
-            .texture_sets
-            .values()
-            .map(|entry| entry.set)
-            .collect::<Vec<_>>();
-        sets.extend(self.retired_sets.iter().copied());
-        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(sets.len() as u64);
-        self.texture_sets.clear();
-        self.retired_sets.clear();
-        for set in &sets {
-            self.last_submissions.insert(*set, None);
+        let removed = self.texture_sets.len() + self.retired_sets.len();
+        self.cache_stats.evictions = self.cache_stats.evictions.saturating_add(removed as u64);
+        while let Some((_, entry)) = self.texture_sets.pop() {
+            self.last_submissions.insert(entry.set, None);
+            self.free_sets.push(entry.set);
         }
-        self.free_sets.extend(sets);
+        while let Some(set) = self.retired_sets.pop_front() {
+            self.last_submissions.insert(set, None);
+            self.free_sets.push(set);
+        }
 
         Ok(())
     }
@@ -598,13 +605,20 @@ mod tests {
             .usage(vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = unsafe { vk_device.create_image(&image_info, None) }.ok()?;
+        let image = crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_image(&image_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanImage,
+        )
+        .ok()?;
         let requirements = unsafe { vk_device.get_image_memory_requirements(image) };
         let memory_type = (0..32).find(|index| requirements.memory_type_bits & (1 << index) != 0)?;
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type);
-        let memory = match unsafe { vk_device.allocate_memory(&alloc, None) } {
+        let memory = match crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.allocate_memory(&alloc, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        ) {
             Ok(memory) => memory,
             Err(_) => {
                 unsafe { vk_device.destroy_image(image, None) };

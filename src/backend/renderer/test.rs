@@ -284,6 +284,13 @@ pub struct DummyTexture {
     height: u32,
 }
 
+#[cfg(test)]
+impl DummyTexture {
+    pub(crate) fn test_size(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
 impl Texture for DummyTexture {
     fn width(&self) -> u32 {
         self.width

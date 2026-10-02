@@ -63,6 +63,10 @@ pub enum PixmanError {
     SyncInterrupted,
 }
 
+// Pixman executes on the CPU. Buffer mapping or synchronization failures do
+// not represent the loss of a logical graphics device.
+impl crate::backend::renderer::damage::MaybeDeviceLost for PixmanError {}
+
 impl From<PixmanError> for SwapBuffersError {
     #[inline]
     fn from(value: PixmanError) -> Self {

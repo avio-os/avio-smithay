@@ -63,6 +63,10 @@ impl DmabufState {
     }
 
     pub(crate) fn client_first_imports_on_frame(&self) -> u64 {
-        self.client_first_imports_on_frame
+        self.client_first_imports_on_frame.total()
+    }
+
+    pub(crate) fn client_import_observer(&self) -> super::super::VulkanClientImportObserver {
+        self.client_first_imports_on_frame.observer()
     }
 }

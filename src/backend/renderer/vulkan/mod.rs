@@ -149,36 +149,51 @@
 
 #![allow(dead_code)]
 
-mod allocation;
+pub(crate) mod allocation;
+mod client_import_census;
+pub use client_import_census::VulkanClientImportObserver;
 mod blit;
 mod descriptor;
 mod device;
-mod device_handle;
+pub(crate) mod device_handle;
+mod device_origin;
+mod ordered_queue;
+pub use device_origin::VulkanDeviceOrigin;
 mod dmabuf;
 mod error;
 mod format;
 mod frame;
+mod material_tint;
+pub use material_tint::VulkanMaterialTint;
+#[cfg(feature = "wayland_frontend")]
+mod host_memory;
 mod image;
 mod kawase;
 #[cfg(test)]
 mod kawase_calibration;
+mod offscreen;
 mod pipeline;
 mod readback;
+mod retired_views;
+mod retirement_slot;
+pub use retirement_slot::VulkanRetirementSlot;
 mod retirement;
 mod staging;
+pub use staging::VulkanUploadStorage;
 mod sync;
 mod target;
 mod texture;
 mod upload;
 
 pub use allocation::{
-    VulkanAllocationPhase, VulkanAllocationPhaseGuard, VulkanAllocationReason, VulkanAllocationSnapshot,
-    VulkanAllocationStats,
+    VulkanAllocationObserver, VulkanAllocationPhase, VulkanAllocationPhaseGuard, VulkanAllocationReason,
+    VulkanAllocationSnapshot, VulkanAllocationStats, VulkanImportedBackingSnapshot,
 };
 pub use blit::VulkanBlitChainStep;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
 pub use frame::VulkanFrame;
-pub use kawase::{VulkanKawaseEncoding, VulkanKawasePass};
+pub use kawase::{VulkanKawaseEncoding, VulkanKawaseOutput, VulkanKawasePass};
+pub use offscreen::VulkanOffscreenAllocator;
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
 
@@ -334,11 +349,32 @@ pub struct VulkanRenderer {
     upload: UploadState,
     readback: ReadbackState,
     blit: BlitState,
-    descriptors: DescriptorState,
-    pipelines: PipelineState,
+    descriptors: std::mem::ManuallyDrop<DescriptorState>,
+    pipelines: std::mem::ManuallyDrop<PipelineState>,
+}
+
+impl Drop for VulkanRenderer {
+    fn drop(&mut self) {
+        // Both states are used by submitted command buffers. Their exact
+        // objects follow the command pool to its proven-completion retiree.
+        // SAFETY: Each field is taken once here and ManuallyDrop suppresses
+        // the subsequent field destructor.
+        let pipelines = unsafe { std::mem::ManuallyDrop::take(&mut self.pipelines) };
+        let descriptors = unsafe { std::mem::ManuallyDrop::take(&mut self.descriptors) };
+        self.device.retain_context_state(pipelines, descriptors);
+    }
 }
 
 impl VulkanRenderer {
+    /// Actual foreign-host transfer-source support queried from this physical
+    /// device. The returned alignment is a requirement, not a claimed platform
+    /// constant. Each source still needs seal, extent and memory-type validation.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn host_memory_import_alignment(
+        &self,
+    ) -> Result<usize, crate::backend::renderer::MemoryHostUnavailable> {
+        self.device.host_memory_alignment()
+    }
     /// Returns the required device extensions for this renderer.
     pub fn required_extensions(physical_device: &PhysicalDevice) -> Vec<&'static CStr> {
         DeviceState::required_extensions(physical_device)
@@ -346,7 +382,21 @@ impl VulkanRenderer {
 
     /// Creates a new Vulkan renderer and initializes device/queue infrastructure.
     pub fn new(physical_device: &PhysicalDevice) -> Result<Self, VulkanRendererError> {
-        let device = DeviceState::new(physical_device)?;
+        Self::from_device_state(DeviceState::new(physical_device)?)
+    }
+
+    /// Creates an output context without creating another logical device.
+    pub fn from_device_origin(origin: &VulkanDeviceOrigin) -> Result<Self, VulkanRendererError> {
+        Self::from_device_state(DeviceState::from_origin(origin)?)
+    }
+
+    /// Retains this context's GPU origin for other output contexts/export allocation.
+    pub fn device_origin(&self) -> VulkanDeviceOrigin {
+        VulkanDeviceOrigin::from_state(&self.device)
+    }
+
+    fn from_device_state(device: DeviceState) -> Result<Self, VulkanRendererError> {
+        let physical_device = device.physical_device();
         let _initialization = device
             .shared_device()
             .allocation_ledger()
@@ -354,19 +404,21 @@ impl VulkanRenderer {
         let descriptors = DescriptorState::new(device.shared_device())?;
         let pipelines = PipelineState::new(device.shared_device(), descriptors.texture_layout())?;
 
+        let formats = FormatCapabilities::new(physical_device)?;
+        let readback = ReadbackState::new(device.shared_device().offscreen_ids());
         Ok(Self {
             context_id: ContextId::new(),
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
             device,
-            formats: FormatCapabilities::new(physical_device)?,
+            formats,
             dmabuf: DmabufState::default(),
             upload: UploadState::default(),
-            readback: ReadbackState::default(),
+            readback,
             blit: BlitState,
-            descriptors,
-            pipelines,
+            descriptors: std::mem::ManuallyDrop::new(descriptors),
+            pipelines: std::mem::ManuallyDrop::new(pipelines),
         })
     }
 
@@ -543,6 +595,17 @@ impl VulkanRenderer {
         Ok(target)
     }
 
+    /// Whether every advertised framebuffer-effect/capture modifier for this
+    /// format supports combined sampled and target usage. Mixed sets use copy capture.
+    pub fn framebuffer_sampling_supported(&self, format: crate::backend::allocator::Fourcc) -> bool {
+        self.formats.framebuffer_sampling_supported(format)
+    }
+
+    /// Clone renderer-origin image allocation for an off-frame provisioning helper.
+    pub fn offscreen_allocator(&self) -> VulkanOffscreenAllocator {
+        self.readback.offscreen_allocator(&self.device)
+    }
+
     /// Bind a dma-buf as the active accumulator for inline framebuffer
     /// effects. The imported Vulkan image declares both color-attachment and
     /// transfer-source usage.
@@ -644,6 +707,11 @@ impl VulkanRenderer {
         self.dmabuf.client_first_imports_on_frame()
     }
 
+    /// Weak, numeric-only access to the exact first-client-import owner.
+    pub fn client_import_observer(&self) -> VulkanClientImportObserver {
+        self.dmabuf.client_import_observer()
+    }
+
     /// Take (and drop) any wait semaphores staged via [`Renderer::wait`] that
     /// no submission has consumed yet, returning how many there were.
     ///
@@ -722,6 +790,22 @@ impl VulkanRenderer {
     ) -> Result<bool, VulkanRendererError> {
         self.device
             .configure_memory_upload_capacity_for_extent(structural_bytes, generation_bytes)
+    }
+
+    /// Exact owner metadata/capacity comparison; performs no GPU work.
+    pub fn memory_upload_storage_matches(&self, structural: usize, generation: usize) -> bool {
+        self.device.memory_upload_storage_matches(structural, generation)
+    }
+    /// Adopt an exact helper result after prior reservations/readers retire.
+    /// No mapping, native allocation, destruction or wait occurs in adoption.
+    pub fn adopt_memory_upload_storage(
+        &mut self,
+        storage: &mut VulkanUploadStorage,
+        structural: usize,
+        generation: usize,
+    ) -> Result<bool, VulkanRendererError> {
+        self.device
+            .adopt_memory_upload_storage(storage, structural, generation)
     }
 
     /// Tags allocations on this thread for this renderer's device until the

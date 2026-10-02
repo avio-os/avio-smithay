@@ -3,6 +3,38 @@
 use super::*;
 use crate::backend::allocator::{Fourcc, Modifier};
 
+/// Fixed, allocation-free retirement handoff for both composition pools.
+#[derive(Debug)]
+pub struct RetiredCompositionBuffers<B: Buffer> {
+    primary: [Option<crate::backend::allocator::RetiredSlot<B>>; crate::backend::allocator::SLOT_CAP],
+    output_layer: [Option<crate::backend::allocator::RetiredSlot<B>>; crate::backend::allocator::SLOT_CAP],
+}
+
+impl<B: Buffer> RetiredCompositionBuffers<B> {
+    /// Actual allocations in this disposal handoff.
+    pub fn len(&self) -> usize {
+        self.primary
+            .iter()
+            .chain(self.output_layer.iter())
+            .flatten()
+            .count()
+    }
+
+    /// Whether no allocation owners were detached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Actual reusable composition allocations, excluding the immutable shield.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompositionBufferCounts {
+    /// Actual primary composition allocations.
+    pub primary: usize,
+    /// Actual above-primary composition allocations.
+    pub output_layer: usize,
+}
+
 // Direct ARGB scanout can be fully opaque. Its alpha-channel capability is
 // not evidence of a compositor-rendered transparent hole over an underlay.
 pub(super) fn underlay_preserves_visibility(
@@ -20,6 +52,7 @@ pub(super) fn composition_primary<A, F>(
     framebuffer_exporter: &F,
     primary_is_opaque: bool,
     current_size: Size<i32, Physical>,
+    prepared_only: bool,
 ) -> FrameResult<PlaneState<A::Buffer, F::Framebuffer>, A, F>
 where
     A: Allocator,
@@ -33,10 +66,20 @@ where
     if let Some(state) = cached {
         return Ok(state.clone());
     }
-    let primary_plane_buffer = swapchain
-        .acquire()
-        .map_err(FrameError::Allocator)?
-        .ok_or(FrameError::NoFreeSlotsError)?;
+    let primary_plane_buffer = if prepared_only {
+        swapchain.acquire_existing().ok_or_else(|| {
+            if swapchain.allocated_slots() == 0 {
+                FrameError::CompositionTargetUnavailable
+            } else {
+                FrameError::NoFreeSlotsError
+            }
+        })?
+    } else {
+        swapchain
+            .acquire()
+            .map_err(FrameError::Allocator)?
+            .ok_or(FrameError::NoFreeSlotsError)?
+    };
 
     // It is safe to call export multiple times as the Slot will cache the dmabuf for us
     let dmabuf = primary_plane_buffer.export().map_err(FrameError::AsDmabufError)?;
@@ -47,6 +90,9 @@ where
         .userdata()
         .get::<CachedDrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>();
     if maybe_buffer.is_none() {
+        if prepared_only {
+            return Err(FrameError::CompositionTargetUnavailable);
+        }
         let fb_buffer = framebuffer_exporter
             .add_framebuffer(
                 surface.device_fd(),
@@ -166,6 +212,24 @@ pub struct PreparedCompositionBuffers<B: Buffer> {
     device_fd: crate::backend::drm::DrmDeviceFd,
     crtc: crtc::Handle,
     slots: Vec<Slot<B>>,
+    output_layer: bool,
+}
+
+impl<B: Buffer> PreparedCompositionBuffers<B> {
+    /// Whether these allocations belong to the above-primary output layer.
+    pub fn is_output_layer(&self) -> bool {
+        self.output_layer
+    }
+    /// Already-exported DMA-BUFs, for renderer import preparation on a cold
+    /// owner turn before the batch becomes available to realtime rendering.
+    pub fn dmabufs(&self) -> impl Iterator<Item = crate::backend::allocator::dmabuf::Dmabuf> + '_ {
+        self.slots.iter().map(|slot| {
+            slot.userdata()
+                .get::<crate::backend::allocator::dmabuf::Dmabuf>()
+                .expect("prepared composition buffer was exported")
+                .clone()
+        })
+    }
 }
 
 impl<B: Buffer> std::fmt::Debug for PreparedCompositionBuffers<B> {
@@ -193,6 +257,7 @@ pub struct CompositionAllocator<A: Allocator, F> {
     fourcc: Fourcc,
     modifiers: Vec<Modifier>,
     primary_is_opaque: bool,
+    output_layer: bool,
 }
 
 impl<A, F> CompositionAllocator<A, F>
@@ -240,6 +305,7 @@ where
             device_fd: self.device_fd.clone(),
             crtc: self.crtc,
             slots,
+            output_layer: self.output_layer,
         })
     }
 }
@@ -269,7 +335,26 @@ where
             fourcc: self.swapchain.format(),
             modifiers: self.swapchain.modifiers().to_vec(),
             primary_is_opaque: self.primary_is_opaque,
+            output_layer: false,
         }
+    }
+
+    /// Snapshot the independently formatted above-primary composition target.
+    pub fn output_layer_composition_allocator(&self) -> Option<CompositionAllocator<A, F>> {
+        let swapchain = self.output_layer_swapchain.as_ref()?;
+        let (width, height) = swapchain.dimensions();
+        Some(CompositionAllocator {
+            allocator: swapchain.allocator.clone(),
+            framebuffer_exporter: self.framebuffer_exporter.clone(),
+            device_fd: self.surface.device_fd().clone(),
+            crtc: self.surface.crtc(),
+            width,
+            height,
+            fourcc: swapchain.format(),
+            modifiers: swapchain.modifiers().to_vec(),
+            primary_is_opaque: false,
+            output_layer: true,
+        })
     }
 
     /// Adopt slots prepared by this output's composition allocator.
@@ -285,13 +370,28 @@ where
             device_fd,
             crtc,
             slots,
+            output_layer,
         } = buffers;
-        self.swapchain
+        let swapchain = if output_layer {
+            let Some(layer) = self.output_layer_swapchain.as_mut() else {
+                return Err(PreparedCompositionBuffers {
+                    device_fd,
+                    crtc,
+                    slots,
+                    output_layer,
+                });
+            };
+            layer
+        } else {
+            &mut self.swapchain
+        };
+        swapchain
             .adopt(slots)
             .map_err(|rejected| PreparedCompositionBuffers {
                 device_fd,
                 crtc,
                 slots: rejected.slots,
+                output_layer,
             })
     }
 
@@ -303,5 +403,49 @@ where
             retired += layer.retire_unreferenced();
         }
         retired
+    }
+
+    /// Enable allocation-free composition acquisition after the cold owner has
+    /// prepared its allocator and wakeup lane. An unexpected plane-test miss
+    /// returns a typed request for preparation; it never allocates or AddFB2s.
+    pub fn use_prepared_composition_buffers(&mut self, enabled: bool) {
+        self.composition_prepared_only = enabled;
+    }
+
+    /// Actual reusable targets retained by this output.
+    pub fn composition_buffer_counts(&self) -> CompositionBufferCounts {
+        CompositionBufferCounts {
+            primary: self.swapchain.allocated_slots(),
+            output_layer: self
+                .output_layer_swapchain
+                .as_ref()
+                .map_or(0, Swapchain::allocated_slots),
+        }
+    }
+
+    /// Whether the current physical frame still uses a composition allocation.
+    /// Immutable opaque-black shield buffers belong to separate custody.
+    pub fn current_frame_is_composited(&self) -> bool {
+        !self.current_frame.opaque_black
+            && !self.current_frame.native_black
+            && self.current_frame.planes.iter().any(|(_, state)| {
+                state
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| matches!(config.buffer.buffer, ScanoutBuffer::Swapchain(_)))
+            })
+    }
+
+    /// Detach only targets no prepared/current/pending/queued frame owns. Call
+    /// after the actual direct-scanout flip retires the previous frame; move
+    /// the returned value to the output's off-thread disposal owner.
+    pub fn take_unreferenced_composition_buffers(&mut self) -> RetiredCompositionBuffers<A::Buffer> {
+        RetiredCompositionBuffers {
+            primary: self.swapchain.take_unreferenced(),
+            output_layer: self
+                .output_layer_swapchain
+                .as_mut()
+                .map_or_else(|| std::array::from_fn(|_| None), Swapchain::take_unreferenced),
+        }
     }
 }

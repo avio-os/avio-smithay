@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    allocation::{AllocationGuard, VulkanAllocationReason},
+    allocation::AllocationGuard,
     device::{DeviceHandle, DeviceState},
     format::{
         optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
@@ -161,7 +161,7 @@ pub(crate) struct DmabufState {
     cache_stats: VulkanCacheStats,
     frame_client_sources: HashSet<WeakDmabuf>,
     frame_client_scope: bool,
-    client_first_imports_on_frame: u64,
+    client_first_imports_on_frame: super::client_import_census::ClientImportCounter,
 }
 
 const MAX_DMABUF_CACHE_ENTRIES: usize = 256;
@@ -308,7 +308,14 @@ impl DmabufState {
         self.import_attempts_total = self.import_attempts_total.saturating_add(1);
         self.maybe_cleanup();
 
-        let requested_usage = role.required_usage();
+        let mut requested_usage = role.required_usage();
+        if matches!(
+            role,
+            DmabufRole::FramebufferEffectTarget | DmabufRole::CaptureTarget
+        ) && formats.has_sampled_framebuffer_format(dmabuf.format())
+        {
+            requested_usage |= vk::ImageUsageFlags::SAMPLED;
+        }
         let key = dmabuf.weak();
 
         if let Some(cached) = self.cache.get(&key) {
@@ -357,10 +364,21 @@ impl DmabufState {
             .cache
             .get(&key)
             .is_none_or(|entry| entry.imported.upgrade().is_none());
+        let first_client =
+            first_import && self.frame_client_scope && self.frame_client_sources.contains(&key);
+        let mut exclusion = first_client.then(|| {
+            crate::backend::allocator::GpuFrameAllocationExclusionScope::enter(
+                crate::backend::allocator::GpuFrameAllocationExclusion::ClientFirstImport,
+            )
+        });
         let imported = self.create_image_resource(device, dmabuf, &descriptor, usage)?;
-        if first_import && self.frame_client_scope && self.frame_client_sources.contains(&key) {
-            self.client_first_imports_on_frame = self.client_first_imports_on_frame.saturating_add(1);
+        if first_client {
+            self.client_first_imports_on_frame.created();
+            if let Some(exclusion) = &mut exclusion {
+                exclusion.accepted();
+            }
         }
+        drop(exclusion);
         let custody = dmabuf.resource_custody::<ImportCustody<VulkanImage>>();
         let device_key = Arc::as_ptr(&device.shared_device()) as usize;
         custody.insert(device_key, imported.clone());
@@ -647,14 +665,16 @@ impl DmabufState {
 
         image_create_info = image_create_info.push_next(&mut external_memory_image_info);
 
-        let image =
-            match device_handle.observe_result(unsafe { vk_device.create_image(&image_create_info, None) }) {
-                Ok(image) => image,
-                Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
-                    return Err(VulkanRendererError::UnsupportedDmabufFormat(format))
-                }
-                Err(err) => return Err(err.into()),
-            };
+        let image = match device_handle.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { vk_device.create_image(&image_create_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanImage,
+        )) {
+            Ok(image) => image,
+            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => {
+                return Err(VulkanRendererError::UnsupportedDmabufFormat(format))
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let handles = dmabuf.handles().collect::<Vec<_>>();
         let memory_count = if disjoint {
@@ -681,8 +701,14 @@ impl DmabufState {
                 ));
             };
 
-            match Self::allocate_imported_memory(&device_handle, &external_memory_fd, image, fd, requirements)
-            {
+            match Self::allocate_imported_memory(
+                &device_handle,
+                &external_memory_fd,
+                image,
+                fd,
+                requirements,
+                dmabuf.backing_metadata(),
+            ) {
                 Ok((memory, allocation)) => {
                     memories.push(memory);
                     allocations.push(allocation);
@@ -839,6 +865,7 @@ impl DmabufState {
         image: vk::Image,
         fd: BorrowedFd<'_>,
         requirements: vk::MemoryRequirements,
+        backing: Arc<crate::backend::allocator::dmabuf::DmabufBackingMetadata>,
     ) -> Result<(vk::DeviceMemory, AllocationGuard), VulkanRendererError> {
         let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
         device.observe_result(unsafe {
@@ -867,12 +894,15 @@ impl DmabufState {
             .push_next(&mut import_info)
             .push_next(&mut dedicated_info);
 
-        let memory = device.observe_result(unsafe { device.handle().allocate_memory(&alloc_info, None) })?;
+        let memory = device.observe_result(crate::backend::allocator::observe_gpu_allocation(
+            unsafe { device.handle().allocate_memory(&alloc_info, None) },
+            crate::backend::allocator::GpuAllocationKind::VulkanDeviceMemory,
+        ))?;
         // A successful import transfers ownership of the duplicated FD to Vulkan.
         let _ = ScopeGuard::into_inner(import_fd_guard);
         let allocation = device
             .allocation_ledger()
-            .record(VulkanAllocationReason::Import, requirements.size);
+            .record_import(requirements.size, backing);
         Ok((memory, allocation))
     }
 

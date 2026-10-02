@@ -27,6 +27,10 @@ pub enum NativeBlackError {
     /// A mode or connector change requires a fresh black target/capability.
     #[error("native black belongs to an earlier output configuration")]
     ConfigurationChanged,
+    /// A previously accepted planeless request was refused. Keep the current
+    /// front and ask the cold configuration owner for a completed replacement.
+    #[error("planeless black was refused; a cold opaque-black fallback is required")]
+    ColdFallbackRequired,
     /// A configuration target's rendering could not be observed complete.
     #[error("native-black rendering completion was interrupted")]
     RenderCompletionInterrupted,
@@ -45,6 +49,7 @@ pub enum NativeBlackError {
 pub(super) struct NativeBlackTarget<B: Buffer, F: Framebuffer> {
     config: Option<PlaneConfig<B, F>>,
     planeless: bool,
+    modeset_fallback: bool,
     mode: drm::control::Mode,
     connectors: HashSet<connector::Handle>,
 }
@@ -52,6 +57,14 @@ pub(super) struct NativeBlackTarget<B: Buffer, F: Framebuffer> {
 impl<B: Buffer, F: Framebuffer> NativeBlackTarget<B, F> {
     fn matches(&self, mode: drm::control::Mode, connectors: &HashSet<connector::Handle>) -> bool {
         self.mode == mode && self.connectors == *connectors
+    }
+
+    fn retained_configuration(
+        accepted: bool,
+        commit_pending: bool,
+        candidate: Option<PlaneConfig<B, F>>,
+    ) -> Result<Option<PlaneConfig<B, F>>, NativeBlackError> {
+        shield_configuration(!needs_buffered_fallback(accepted, commit_pending), candidate)
     }
 }
 
@@ -251,7 +264,7 @@ where
                 .filter(|config| config.properties.dst.size == size)
         });
         self.native_black_uncompleted = None;
-        self.install_native_black(candidate)
+        self.install_native_black(candidate, true)
     }
 
     fn completed_black_candidate(&self) -> Option<PlaneConfig<A::Buffer, F::Framebuffer>> {
@@ -286,33 +299,33 @@ where
     fn install_native_black(
         &mut self,
         candidate: Option<PlaneConfig<A::Buffer, F::Framebuffer>>,
+        allow_planeless: bool,
     ) -> Result<NativeBlackKind, NativeBlackError> {
         // Legacy outputs need a buffered target and must not attempt a
         // planeless atomic request during bring-up.
-        let accepted = probe_planeless(
-            self.surface.is_legacy(),
-            self.surface.commit_pending(),
-            |allow_modeset| {
-                let mut frame = self.native_black_frame()?;
-                self.surface
-                    .test_state(
-                        frame.build_planes(
-                            &self.surface,
-                            self.supports_fencing,
-                            true,
-                            PlaneSyncMode::TestOnly,
-                        ),
-                        allow_modeset,
-                    )
-                    .map_err(NativeBlackError::Drm)
-            },
-        );
-        let config = shield_configuration(
-            !needs_buffered_fallback(accepted, self.surface.commit_pending()),
-            candidate,
-        )?
-        .map(|config| self.complete_black_candidate(config))
-        .transpose()?;
+        let accepted = allow_planeless
+            && probe_planeless(
+                self.surface.is_legacy(),
+                self.surface.commit_pending(),
+                |allow_modeset| {
+                    let mut frame = self.native_black_frame()?;
+                    self.surface
+                        .test_state(
+                            frame.build_planes(
+                                &self.surface,
+                                self.supports_fencing,
+                                true,
+                                PlaneSyncMode::TestOnly,
+                            ),
+                            allow_modeset,
+                        )
+                        .map_err(NativeBlackError::Drm)
+                },
+            );
+        let config =
+            NativeBlackTarget::retained_configuration(accepted, self.surface.commit_pending(), candidate)?
+                .map(|config| self.complete_black_candidate(config))
+                .transpose()?;
         let kind = if accepted {
             NativeBlackKind::Planeless
         } else {
@@ -326,10 +339,31 @@ where
         self.native_black = Some(NativeBlackTarget {
             config,
             planeless: accepted,
+            modeset_fallback: self.surface.commit_pending(),
             mode: self.surface.pending_mode(),
             connectors: self.surface.pending_connectors().into_iter().collect(),
         });
         Ok(kind)
+    }
+
+    /// A modeset-only probe needs one committed-state cold refresh. The owner
+    /// invokes this only after a real full flip completion, never from elapsed
+    /// time or a speculative capability test.
+    pub fn native_black_needs_committed_refresh(&self) -> bool {
+        self.native_black
+            .as_ref()
+            .is_some_and(|black| black.modeset_fallback)
+            && !self.surface.commit_pending()
+    }
+
+    /// Probe the completed configuration without ALLOW_MODESET and release its
+    /// modeset fallback when this exact steady-state request is accepted.
+    /// This cold-only API neither allocates nor submits a physical frame.
+    pub fn refresh_committed_native_black(&mut self) -> Result<(), NativeBlackError> {
+        if self.native_black_needs_committed_refresh() {
+            self.initialize_native_black()?;
+        }
+        Ok(())
     }
 
     /// Prepare capability and, when necessary, a completed immutable shield
@@ -348,11 +382,45 @@ where
         R: Renderer + Bind<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
+        self.configure_native_black_impl(renderer, false)
+    }
+
+    /// Cold replacement after a real planeless preparation was rejected.
+    /// Retains a completed buffered shield even if a later speculative probe
+    /// would accept planeless again; no speculative test retires this fallback.
+    pub fn configure_native_black_fallback<R>(
+        &mut self,
+        renderer: &mut R,
+    ) -> Result<NativeBlackKind, RenderFrameErrorType<A, F, R>>
+    where
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+    {
+        self.configure_native_black_impl(renderer, true)
+    }
+
+    fn configure_native_black_impl<R>(
+        &mut self,
+        renderer: &mut R,
+        force_buffered: bool,
+    ) -> Result<NativeBlackKind, RenderFrameErrorType<A, F, R>>
+    where
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+    {
         self.native_black_enabled = true;
-        match self.initialize_native_black() {
-            Ok(kind) => return Ok(kind),
-            Err(NativeBlackError::MissingBlackTarget) => {}
-            Err(error) => return Err(FrameError::NativeBlack(error).into()),
+        if force_buffered {
+            if let Some(candidate) = self.completed_black_candidate() {
+                return self
+                    .install_native_black(Some(candidate), false)
+                    .map_err(|error| FrameError::NativeBlack(error).into());
+            }
+        } else {
+            match self.initialize_native_black() {
+                Ok(kind) => return Ok(kind),
+                Err(NativeBlackError::MissingBlackTarget) => {}
+                Err(error) => return Err(FrameError::NativeBlack(error).into()),
+            }
         }
         // A configuration transaction must not replace work accepted by KMS.
         if !self.is_frame_pipeline_idle() {
@@ -371,6 +439,9 @@ where
             transform: Transform::Normal,
         });
         self.native_black_repaint.request();
+        // This API is cold-only: exact-mode shield provisioning is independent
+        // of the ordinary realtime prepared-target admission policy.
+        let prepared_only = std::mem::replace(&mut self.composition_prepared_only, false);
         let result = self
             .render_frame(
                 renderer,
@@ -379,6 +450,7 @@ where
                 FrameFlags::empty(),
             )
             .map(|_| ());
+        self.composition_prepared_only = prepared_only;
         self.set_output_mode_source(source);
         result?;
         let prepared = self.next_frame.take().ok_or(FrameError::EmptyFrame)?;
@@ -393,8 +465,33 @@ where
             .map(|config| self.complete_black_candidate(config))
             .transpose()
             .map_err(FrameError::NativeBlack)?;
-        self.install_native_black(candidate)
+        self.install_native_black(candidate, !force_buffered)
             .map_err(|error| FrameError::NativeBlack(error).into())
+    }
+
+    /// Already-exported immutable shield allocation, if this exact configuration
+    /// needs one. Census registration must occur on a cold owner turn; no buffer
+    /// is allocated or exported by this read-only accessor.
+    pub fn native_black_dmabuf(&self) -> Option<Dmabuf> {
+        let config = self.native_black.as_ref()?.config.as_ref()?;
+        let ScanoutBuffer::Swapchain(slot) = &config.buffer.buffer else {
+            return None;
+        };
+        slot.userdata().get::<Dmabuf>().cloned()
+    }
+
+    /// Read the accepted cold shield capability without a TEST_ONLY operation,
+    /// allocating connectors, or creating/exporting a shield. Missing cold
+    /// configuration remains unavailable. A pending reconfiguration owner must
+    /// invalidate its own prior census until that transaction completes.
+    pub fn configured_native_black_kind(&self) -> Option<NativeBlackKind> {
+        self.native_black.as_ref().map(|black| {
+            if black.planeless {
+                NativeBlackKind::Planeless
+            } else {
+                NativeBlackKind::Buffered
+            }
+        })
     }
 
     /// Prepare a full native-black frame for ordinary [`Self::queue_frame`].
@@ -430,7 +527,7 @@ where
             let config = black
                 .config
                 .as_ref()
-                .ok_or(NativeBlackError::MissingBlackTarget)?;
+                .ok_or(NativeBlackError::ColdFallbackRequired)?;
             let mut primary = PlaneState {
                 skip: false,
                 ..Default::default()
@@ -441,15 +538,17 @@ where
         } else {
             NativeBlackKind::Planeless
         };
-        self.surface.test_state(
-            frame.build_planes(
-                &self.surface,
-                self.supports_fencing,
-                true,
-                PlaneSyncMode::TestOnly,
-            ),
-            self.surface.commit_pending(),
-        )?;
+        if !planeless {
+            self.surface.test_state(
+                frame.build_planes(
+                    &self.surface,
+                    self.supports_fencing,
+                    true,
+                    PlaneSyncMode::TestOnly,
+                ),
+                self.surface.commit_pending(),
+            )?;
+        }
         self.next_frame = Some(PreparedFrame {
             kind: PreparedFrameKind::Full,
             frame,
@@ -618,6 +717,7 @@ mod tests {
             connectors: old_connectors.clone(),
             config: Some(config()),
             planeless: false,
+            modeset_fallback: false,
         };
         assert!(
             !old.matches(mode(144), &old_connectors),
@@ -645,6 +745,7 @@ mod tests {
             connectors: old_connectors.clone(),
             config: Some(reused),
             planeless: false,
+            modeset_fallback: false,
         };
         assert!(refreshed.matches(mode(144), &old_connectors));
         assert!(!refreshed.matches(mode(144), &HashSet::from([handle(31)])));
@@ -700,6 +801,59 @@ mod tests {
             fallback.is_some(),
             "pending modeset acceptance does not prove the next ordinary flip"
         );
+    }
+
+    #[test]
+    fn completed_same_size_modeset_releases_only_the_retained_fallback_after_steady_probe() {
+        let candidate = config();
+        let ScanoutBuffer::Swapchain(slot) = &candidate.buffer.buffer else {
+            panic!("expected slot");
+        };
+        let weak = Arc::downgrade(slot);
+        let mut retained = NativeBlackTarget::<TestBuffer, TestFramebuffer>::retained_configuration(
+            true,
+            true,
+            Some(candidate.clone()),
+        )
+        .unwrap();
+        // The initial probe only permits a modeset; its shield remains owned.
+        drop(candidate);
+        assert!(weak.upgrade().is_some());
+        let modeset_still_pending = true;
+        let first =
+            NativeBlackTarget::retained_configuration(true, modeset_still_pending, retained.take()).unwrap();
+        assert!(first.is_some());
+        // An ordinary committed probe now accepted the exact all-planes-off
+        // request. It releases the configuration owner, without inventing a
+        // physical black frame or revoking another current/pending reader.
+        let scanned_out = first.as_ref().unwrap().clone();
+        let refreshed = NativeBlackTarget::retained_configuration(true, false, first).unwrap();
+        assert!(refreshed.is_none());
+        assert!(
+            weak.upgrade().is_some(),
+            "actual scanout reader still pins its shield"
+        );
+        drop(scanned_out);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn refused_committed_probe_preserves_exact_fallback_while_accepted_probe_needs_no_candidate() {
+        let candidate = config();
+        let framebuffer = candidate.buffer.fb.clone();
+        let fallback = NativeBlackTarget::retained_configuration(false, false, Some(candidate))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.buffer.fb, framebuffer);
+        assert!(
+            NativeBlackTarget::<TestBuffer, TestFramebuffer>::retained_configuration(true, false, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            NativeBlackTarget::<TestBuffer, TestFramebuffer>::retained_configuration(false, false, None),
+            Err(NativeBlackError::MissingBlackTarget)
+        ));
     }
 
     #[test]

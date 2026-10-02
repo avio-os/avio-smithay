@@ -44,7 +44,7 @@ impl VulkanImageOrigin {
 pub(crate) struct VulkanImage {
     resource_id: u64,
     image: vk::Image,
-    retirement: Option<Box<RetirementNode<RetiredImage>>>,
+    retirement: Option<Box<RetirementNode<super::device_handle::DeviceRetirement>>>,
     sampled_view: vk::ImageView,
     render_view: vk::ImageView,
     size: Size<i32, BufferCoord>,
@@ -178,13 +178,15 @@ impl VulkanImage {
         Self {
             resource_id,
             image,
-            retirement: Some(RetirementNode::new(RetiredImage {
-                image,
-                sampled_view,
-                render_view,
-                memories,
-                _allocations: allocations,
-            })),
+            retirement: Some(RetirementNode::new(
+                super::device_handle::DeviceRetirement::Image(RetiredImage {
+                    image,
+                    sampled_view,
+                    render_view,
+                    memories,
+                    _allocations: allocations,
+                }),
+            )),
             sampled_view,
             render_view,
             size,
@@ -299,7 +301,7 @@ impl Drop for VulkanImage {
         // may then drop on Wayland, input, or frame work, so transfer its
         // preallocated node without any driver call, allocation or wait.
         if let Some(retirement) = self.retirement.take() {
-            self.device.retire_image(retirement);
+            self.device.retire_resource(retirement);
         }
     }
 }

@@ -413,7 +413,6 @@ fn plane_formats(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> 
     Ok(FormatSet::from_formats(formats))
 }
 
-#[cfg(feature = "backend_gbm")]
 fn plane_has_property(
     dev: &(impl drm::control::Device + DevPath),
     plane: plane::Handle,

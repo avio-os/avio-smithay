@@ -7,11 +7,12 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, Weak,
     },
     thread::{self, ThreadId},
 };
 
+use crate::backend::allocator::dmabuf::{DmabufBackingInfo, DmabufBackingMetadata};
 use tracing::trace;
 
 /// The operation that owns a Vulkan device-memory allocation.
@@ -113,6 +114,38 @@ impl VulkanAllocationSnapshot {
     /// Returns the counters for the phase that created an allocation.
     pub fn phase(&self, phase: VulkanAllocationPhase) -> VulkanAllocationStats {
         self.by_phase[phase.index()]
+    }
+}
+
+/// Weak census access to one real allocation ledger. Observing a device never
+/// extends its GPU/resource lifetime; a retired origin yields no snapshot.
+#[derive(Clone, Debug)]
+pub struct VulkanAllocationObserver(Weak<AllocationLedger>);
+
+/// Real imported allocation owners, including bindings whose source FD closed.
+#[derive(Debug, Default)]
+pub struct VulkanImportedBackingSnapshot {
+    /// Live imported memory allocation guards.
+    pub allocations: usize,
+    /// Live guards with complete captured inode/size metadata.
+    pub allocations_with_metadata: usize,
+    /// Captured per-plane physical identities. Consumers deduplicate by inode.
+    pub backings: Vec<DmabufBackingInfo>,
+}
+
+impl VulkanAllocationObserver {
+    pub(super) fn new(ledger: &Arc<AllocationLedger>) -> Self {
+        Self(Arc::downgrade(ledger))
+    }
+
+    /// Read exact successful allocation-owner counters without touching Vulkan.
+    pub fn snapshot(&self) -> Option<VulkanAllocationSnapshot> {
+        self.0.upgrade().map(|ledger| ledger.snapshot())
+    }
+
+    /// Fair-thread census only. This performs no Vulkan or descriptor I/O.
+    pub fn imported_backings(&self) -> Option<VulkanImportedBackingSnapshot> {
+        self.0.upgrade().map(|ledger| ledger.imported_backings())
     }
 }
 
@@ -226,10 +259,11 @@ thread_local! {
 
 /// One independent logical device's allocation counters.
 #[derive(Debug)]
-pub(super) struct AllocationLedger {
+pub(crate) struct AllocationLedger {
     id: u64,
     by_reason: [Counters; 5],
     by_phase: [Counters; 5],
+    imported_allocations: Mutex<Vec<Weak<ImportBacking>>>,
 }
 
 impl Default for AllocationLedger {
@@ -238,6 +272,7 @@ impl Default for AllocationLedger {
             id: NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed),
             by_reason: std::array::from_fn(|_| Counters::default()),
             by_phase: std::array::from_fn(|_| Counters::default()),
+            imported_allocations: Mutex::new(Vec::new()),
         }
     }
 }
@@ -246,7 +281,7 @@ impl AllocationLedger {
     /// Register only after `vkAllocateMemory` succeeds, and move the returned
     /// guard into the actual memory owner. Drops happen after Vulkan teardown,
     /// outside any cache or allocation-custody mutex.
-    pub(super) fn record(self: &Arc<Self>, reason: VulkanAllocationReason, bytes: u64) -> AllocationGuard {
+    pub(crate) fn record(self: &Arc<Self>, reason: VulkanAllocationReason, bytes: u64) -> AllocationGuard {
         let phase = PHASES.with(|phases| phases.borrow().phase(self.id));
         self.by_reason[reason.index()].acquire(bytes);
         self.by_phase[phase.index()].acquire(bytes);
@@ -267,7 +302,56 @@ impl AllocationLedger {
             phase,
             bytes,
             thread,
+            _backing: None,
         }
+    }
+
+    /// The numeric backing cell is retained by the actual allocation guard,
+    /// never by a dma-buf FD or weak cache's sweep cadence.
+    pub(super) fn record_import(
+        self: &Arc<Self>,
+        bytes: u64,
+        metadata: Arc<DmabufBackingMetadata>,
+    ) -> AllocationGuard {
+        let mut guard = self.record(VulkanAllocationReason::Import, bytes);
+        // One independently owned numeric cell per binding distinguishes two
+        // allocations importing the same source, without pinning that source.
+        let copy = Arc::new(ImportBacking { metadata });
+        let mut allocations = self
+            .imported_allocations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        allocations.retain(|allocation| allocation.strong_count() != 0);
+        allocations.push(Arc::downgrade(&copy));
+        guard._backing = Some(copy);
+        guard
+    }
+
+    fn imported_backings(&self) -> VulkanImportedBackingSnapshot {
+        let mut result = VulkanImportedBackingSnapshot::default();
+        self.imported_allocations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|allocation| {
+                let Some(allocation) = allocation.upgrade() else {
+                    return false;
+                };
+                result.allocations += 1;
+                if let Some(backings) = allocation.metadata.get() {
+                    let mut complete = false;
+                    for backing in backings.iter().flatten() {
+                        complete = true;
+                        if backing.allocation_bytes.is_none() {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    result.allocations_with_metadata += usize::from(complete);
+                    result.backings.extend(backings.iter().flatten().copied());
+                }
+                true
+            });
+        result
     }
 
     /// Atomic counters avoid adding a contended lock to allocation/free paths.
@@ -281,7 +365,7 @@ impl AllocationLedger {
         }
     }
 
-    pub(super) fn enter_phase(&self, phase: VulkanAllocationPhase) -> VulkanAllocationPhaseGuard {
+    pub(crate) fn enter_phase(&self, phase: VulkanAllocationPhase) -> VulkanAllocationPhaseGuard {
         let scope = NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
         let overflow = PHASES.with(|phases| {
             phases.borrow_mut().enter(PhaseScope {
@@ -338,12 +422,18 @@ impl Drop for VulkanAllocationPhaseGuard {
 /// Non-cloneable custody for one successful Vulkan memory allocation. Sharing
 /// the image/chunk via Arc shares this guard instead of recording another one.
 #[derive(Debug)]
-pub(super) struct AllocationGuard {
+pub(crate) struct AllocationGuard {
     ledger: Arc<AllocationLedger>,
     reason: VulkanAllocationReason,
     phase: VulkanAllocationPhase,
     bytes: u64,
     thread: ThreadId,
+    _backing: Option<Arc<ImportBacking>>,
+}
+
+#[derive(Debug)]
+struct ImportBacking {
+    metadata: Arc<DmabufBackingMetadata>,
 }
 
 impl Drop for AllocationGuard {
@@ -365,6 +455,82 @@ impl Drop for AllocationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_memory_keeps_numeric_backing_after_last_source_fd_closes() {
+        use crate::backend::allocator::{
+            dmabuf::{Dmabuf, DmabufBackingOrigin, DmabufFlags},
+            Fourcc, Modifier,
+        };
+        let fd = rustix::fs::memfd_create("backing-lifetime", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(fd, 0, 0, 4));
+        let buffer = builder.build().unwrap();
+        let weak_buffer = buffer.weak();
+        let ledger = Arc::new(AllocationLedger::default());
+        let first = ledger.record_import(4096, buffer.backing_metadata());
+        let second = ledger.record_import(4096, buffer.backing_metadata());
+        assert_eq!(ledger.imported_backings().allocations_with_metadata, 0);
+        // Late cold capture (e.g. initialization shield) completes the already
+        // existing import's numeric cell, without replacing its memory guard.
+        assert!(buffer.set_backing_metadata([
+            Some(DmabufBackingInfo {
+                inode: 71,
+                allocation_bytes: Some(8192),
+                origin: DmabufBackingOrigin::Compositor,
+                role: "shield",
+            }),
+            None,
+            None,
+            None
+        ]));
+        drop(buffer);
+        assert!(weak_buffer.is_gone(), "metadata may not pin the source FD");
+        let snapshot = ledger.imported_backings();
+        assert_eq!(snapshot.allocations, 2);
+        assert_eq!(snapshot.allocations_with_metadata, 2);
+        assert!(snapshot
+            .backings
+            .iter()
+            .all(|backing| backing.inode == 71 && backing.allocation_bytes == Some(8192)));
+        drop(first);
+        assert_eq!(ledger.imported_backings().allocations, 1);
+        drop(second);
+        assert_eq!(ledger.imported_backings().allocations, 0);
+    }
+
+    #[test]
+    fn unsupported_or_external_backing_is_not_invented_as_a_compositor_export() {
+        use crate::backend::allocator::{
+            dmabuf::{Dmabuf, DmabufBackingOrigin, DmabufFlags},
+            Fourcc, Modifier,
+        };
+        let fd = rustix::fs::memfd_create("external-backing", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(fd, 0, 0, 4));
+        let buffer = builder.build().unwrap();
+        assert!(buffer.set_backing_metadata([
+            Some(DmabufBackingInfo {
+                inode: 72,
+                allocation_bytes: None,
+                origin: DmabufBackingOrigin::External,
+                role: "client_image",
+            }),
+            None,
+            None,
+            None
+        ]));
+        assert!(
+            !buffer.set_backing_metadata([None; 4]),
+            "allocation identity is immutable"
+        );
+        let ledger = Arc::new(AllocationLedger::default());
+        let _allocation = ledger.record_import(4096, buffer.backing_metadata());
+        let snapshot = ledger.imported_backings();
+        assert_eq!(snapshot.allocations_with_metadata, 0);
+        assert_eq!(snapshot.backings[0].origin, DmabufBackingOrigin::External);
+        assert_eq!(snapshot.backings[0].allocation_bytes, None);
+    }
 
     #[test]
     fn shared_and_submitted_owners_count_once_until_final_retirement() {

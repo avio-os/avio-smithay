@@ -255,6 +255,11 @@ impl AtomicDrmSurface {
         let db = self
             .fd
             .create_dumb_buffer((w as u32, h as u32), format, get_bpp(format).unwrap() as u32)
+            .inspect(|_| {
+                crate::backend::allocator::note_gpu_allocation(
+                    crate::backend::allocator::GpuAllocationKind::DrmDumbBuffer,
+                )
+            })
             .map_err(|source| {
                 Error::Access(AccessError {
                     errmsg: "Failed to create dumb buffer",
@@ -269,6 +274,11 @@ impl AtomicDrmSurface {
                 get_depth(format).unwrap() as u32,
                 get_bpp(format).unwrap() as u32,
             )
+            .inspect(|_| {
+                crate::backend::allocator::note_gpu_allocation(
+                    crate::backend::allocator::GpuAllocationKind::DrmFramebuffer,
+                )
+            })
             .map_err(|source| {
                 Error::Access(AccessError {
                     errmsg: "Failed to create framebuffer",
