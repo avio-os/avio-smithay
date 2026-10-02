@@ -7,8 +7,8 @@ use crate::{
     backend::{
         allocator::{format::get_bpp, Format, Fourcc, Modifier},
         renderer::{
-            ImportMem, MemoryUploadCapacityEdge, MemoryUploadErrorKind, StagedMemoryRows, StagedMemoryUpdate,
-            Texture,
+            ImportMem, MemoryRowUpload, MemoryUploadCapacityEdge, MemoryUploadErrorKind, StagedMemoryRows,
+            StagedMemoryUpdate, Texture,
         },
     },
     utils::{Buffer as BufferCoord, Rectangle, Size},
@@ -88,7 +88,8 @@ impl UploadState {
         ))
     }
 
-    /// Reserve staging for `region` of `texture`, to be written off-thread.
+    /// Admit a complete initial generation before allocating its image, then
+    /// expose its exclusive mapped rows to a guarded source copy.
     pub(crate) fn stage_memory_import(
         &mut self,
         device: &mut DeviceState,
@@ -98,6 +99,11 @@ impl UploadState {
     ) -> Result<(VulkanTexture, StagedMemoryUpdate, StagedMemoryRows), VulkanRendererError> {
         validate_memory_format(format)?;
         let len = expected_len_for_size(format, size)?;
+        // Dimension and format validation above proves both values. Derive
+        // them before reserving so no fallible arithmetic can leak capacity.
+        let rows = usize::try_from(size.h)
+            .map_err(|_| VulkanRendererError::InvalidMemoryUpload("invalid row count"))?;
+        let row_bytes = len / rows;
         // Admit the complete generation before creating its image. Capacity
         // pressure cannot create and immediately discard a full-size texture.
         let (reservation, ptr, memory) = device.reserve_staged_upload(len)?;
@@ -116,8 +122,6 @@ impl UploadState {
             reservation,
             copy: buffer_image_copy(region),
         };
-        let row_bytes = usize::try_from(size.w).unwrap() * bytes_per_pixel(format)?;
-        let rows = usize::try_from(size.h).unwrap();
         // SAFETY: The whole-generation reservation bounds these rows. Only
         // this exclusive writer can access them; `memory` owns the mapping.
         let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, ticket, memory) };
@@ -126,6 +130,67 @@ impl UploadState {
             StagedMemoryUpdate::new(ticket, region, Box::new(staged)),
             rows,
         ))
+    }
+
+    pub(crate) fn import_memory_rows(
+        &mut self,
+        device: &mut DeviceState,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+        flipped: bool,
+        fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<VulkanTexture>, VulkanRendererError> {
+        validate_memory_format(format)?;
+        let len = expected_len_for_size(format, size)?;
+        let rows = size.h as usize;
+        let (reservation, ptr, memory) = device.reserve_staged_upload(len)?;
+        let image = match create_upload_image(device, self.next_upload_id(), format, size, flipped) {
+            Ok(image) => image,
+            Err(error) => {
+                device.release_staged_image_upload(reservation);
+                return Err(error);
+            }
+        };
+        let texture = VulkanTexture::from_renderer_image(Arc::clone(&image), size, format, flipped, true);
+        // SAFETY: The complete reservation bounds these exclusive rows.
+        let rows = unsafe { StagedMemoryRows::new(ptr, len / rows, rows, 0, memory) };
+        fill_and_queue_rows(device, image, reservation, rows, Rectangle::from_size(size), fill).map(
+            |queued| {
+                if queued {
+                    MemoryRowUpload::Queued(texture)
+                } else {
+                    MemoryRowUpload::SourceFailed
+                }
+            },
+        )
+    }
+
+    pub(crate) fn update_memory_rows(
+        &mut self,
+        device: &mut DeviceState,
+        texture: &VulkanTexture,
+        region: Rectangle<i32, BufferCoord>,
+        fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<()>, VulkanRendererError> {
+        let (image, format) = writable_memory_image(texture)?;
+        validate_region(texture.size(), region)?;
+        let row_bytes = region.size.w as usize * bytes_per_pixel(format)?;
+        let rows = region.size.h as usize;
+        let len = row_bytes
+            .checked_mul(rows)
+            .ok_or(VulkanRendererError::InvalidMemoryUpload(
+                "mapped row size overflowed",
+            ))?;
+        let (reservation, ptr, memory) = device.stage_image_upload(image, len)?;
+        // SAFETY: The region reservation bounds these exclusive rows.
+        let rows = unsafe { StagedMemoryRows::new(ptr, row_bytes, rows, 0, memory) };
+        fill_and_queue_rows(device, Arc::clone(image), reservation, rows, region, fill).map(|queued| {
+            if queued {
+                MemoryRowUpload::Queued(())
+            } else {
+                MemoryRowUpload::SourceFailed
+            }
+        })
     }
 
     /// Reserve staging for `region` of `texture`, to be written off-thread.
@@ -258,6 +323,24 @@ impl UploadState {
     }
 }
 
+fn fill_and_queue_rows(
+    device: &mut DeviceState,
+    image: Arc<VulkanImage>,
+    reservation: StagingReservation,
+    mut rows: StagedMemoryRows,
+    region: Rectangle<i32, BufferCoord>,
+    fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+) -> Result<bool, VulkanRendererError> {
+    let copied = fill(&mut rows);
+    drop(rows);
+    if !copied {
+        device.release_staged_image_upload(reservation);
+        return Ok(false);
+    }
+    device.queue_staged_image_upload(image, reservation, buffer_image_copy(region))?;
+    Ok(true)
+}
+
 impl ImportMem for VulkanRenderer {
     fn import_memory(
         &mut self,
@@ -310,6 +393,27 @@ impl ImportMem for VulkanRenderer {
         self.upload
             .stage_memory_import(&mut self.device, format, size, flipped)
             .map(Some)
+    }
+
+    fn import_memory_rows(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+        flipped: bool,
+        fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<Self::TextureId>, Self::Error> {
+        self.upload
+            .import_memory_rows(&mut self.device, format, size, flipped, fill)
+    }
+
+    fn update_memory_rows(
+        &mut self,
+        texture: &Self::TextureId,
+        region: Rectangle<i32, BufferCoord>,
+        fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<()>, Self::Error> {
+        self.upload
+            .update_memory_rows(&mut self.device, texture, region, fill)
     }
 
     fn submit_staged_memory_update(

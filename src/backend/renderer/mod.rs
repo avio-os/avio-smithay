@@ -738,6 +738,17 @@ pub enum MemoryUploadCapacityEdge {
     InFlight(sync::SyncPoint),
 }
 
+/// Disposition of a synchronous guarded copy into renderer-mapped rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRowUpload<T> {
+    /// The renderer requires the ordinary slice-import path.
+    Unsupported,
+    /// The source callback refused the copy. No GPU upload was queued.
+    SourceFailed,
+    /// The whole generation joins the next dependent render submission.
+    Queued(T),
+}
+
 /// Trait for renderers supporting importing bitmaps from memory.
 pub trait ImportMem: Renderer {
     /// Import a given chunk of memory into the renderer.
@@ -831,6 +842,31 @@ pub trait ImportMem: Renderer {
         _flipped: bool,
     ) -> Result<Option<(Self::TextureId, StagedMemoryUpdate, StagedMemoryRows)>, Self::Error> {
         Ok(None)
+    }
+
+    /// Fill mapped rows of a complete new texture without allocating a
+    /// detached update ticket. Return false from `fill` to cancel the copy.
+    /// The callback must finish before the renderer queues the upload.
+    fn import_memory_rows(
+        &mut self,
+        _format: Fourcc,
+        _size: Size<i32, BufferCoord>,
+        _flipped: bool,
+        _fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<Self::TextureId>, Self::Error> {
+        Ok(MemoryRowUpload::Unsupported)
+    }
+
+    /// Fill mapped rows of one complete update region. This synchronous
+    /// path has no detached heap ticket; a guarded source may fill directly
+    /// into its reservation. False from `fill` preserves existing pixels.
+    fn update_memory_rows(
+        &mut self,
+        _texture: &Self::TextureId,
+        _region: Rectangle<i32, BufferCoord>,
+        _fill: &mut dyn FnMut(&mut StagedMemoryRows) -> bool,
+    ) -> Result<MemoryRowUpload<()>, Self::Error> {
+        Ok(MemoryRowUpload::Unsupported)
     }
 
     /// Apply a staged update whose rows are all written. The whole region

@@ -367,8 +367,13 @@ impl StagingChunk {
         let buffer = device.observe_result(unsafe { device.handle().create_buffer(&create_info, None) })?;
         let memory_requirements = unsafe { device.handle().get_buffer_memory_requirements(buffer) };
         let (memory_type_index, coherent) =
-            pick_host_visible_memory_type(physical_device, memory_requirements.memory_type_bits)
-                .ok_or(VulkanRendererError::NoCompatibleMemoryType)?;
+            match pick_host_visible_memory_type(physical_device, memory_requirements.memory_type_bits) {
+                Some(memory_type) => memory_type,
+                None => {
+                    device.destroy_with(|vk_device| unsafe { vk_device.destroy_buffer(buffer, None) });
+                    return Err(VulkanRendererError::NoCompatibleMemoryType);
+                }
+            };
         let allocation_size = memory_requirements.size.max(size as vk::DeviceSize);
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(allocation_size)
