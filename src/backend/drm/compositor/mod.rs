@@ -2697,6 +2697,17 @@ where
                         self.composition_prepared_only,
                     )?;
                     next_frame_state.set_state(self.surface.plane(), state);
+                    // Auxiliary planes were validated against the direct
+                    // primary just replaced; the complete test must validate
+                    // the real submission (a refusal demotes them into this
+                    // composition). The primary itself is not marked: its
+                    // failure loop must not leave `needs_test` set for commit.
+                    let primary = self.surface.plane();
+                    for (handle, plane_state) in next_frame_state.planes.iter_mut() {
+                        if *handle != primary && plane_state.config.is_some() {
+                            plane_state.needs_test = true;
+                        }
+                    }
                 }
             }
 
@@ -3170,7 +3181,10 @@ where
                     }
                     Err(err) => {
                         if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
-                            output_layer_swapchain.reset_buffers();
+                            discard_composition_contents(
+                                output_layer_swapchain,
+                                self.composition_prepared_only,
+                            );
                         }
                         return Err(RenderFrameError::from(err));
                     }
@@ -3448,7 +3462,7 @@ where
                 Err(err) => {
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
-                    self.swapchain.reset_buffers();
+                    discard_composition_contents(&mut self.swapchain, self.composition_prepared_only);
                     return Err(RenderFrameError::from(err));
                 }
             }
@@ -4046,11 +4060,14 @@ where
         }
     }
 
-    /// Reset the underlying buffers
+    /// Reset the underlying buffers.
+    ///
+    /// With owner-prepared composition targets this discards contents only:
+    /// the owner releases targets through `take_unreferenced_composition_buffers`.
     pub fn reset_buffers(&mut self) {
-        self.swapchain.reset_buffers();
+        discard_composition_contents(&mut self.swapchain, self.composition_prepared_only);
         if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
-            output_layer_swapchain.reset_buffers();
+            discard_composition_contents(output_layer_swapchain, self.composition_prepared_only);
         }
     }
 
@@ -4076,9 +4093,9 @@ where
     /// This can be used to efficiently clear the damage history without having to
     /// modify the damage for each surface.
     pub fn reset_buffer_ages(&mut self) {
-        self.swapchain.reset_buffer_ages();
+        invalidate_composition_ages(&mut self.swapchain, self.composition_prepared_only);
         if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
-            output_layer_swapchain.reset_buffer_ages();
+            invalidate_composition_ages(output_layer_swapchain, self.composition_prepared_only);
         }
     }
 
@@ -4200,7 +4217,7 @@ where
     pub fn set_debug_flags(&mut self, flags: DebugFlags) {
         if self.debug_flags != flags {
             self.debug_flags = flags;
-            self.swapchain.reset_buffers();
+            discard_composition_contents(&mut self.swapchain, self.composition_prepared_only);
         }
     }
 
@@ -4509,7 +4526,7 @@ where
         });
         if !layer_was_active {
             if let Some(output_layer_swapchain) = self.output_layer_swapchain.as_mut() {
-                output_layer_swapchain.reset_buffer_ages();
+                invalidate_composition_ages(output_layer_swapchain, self.composition_prepared_only);
             }
         }
 
@@ -6429,5 +6446,24 @@ mod cursor_plane_fill_tests {
     #[test]
     fn cursor_plane_fill_refuses_an_element_without_storage() {
         assert_eq!(allocations_for(None), (false, 0));
+    }
+}
+
+/// Failed renders and resets invalidate composition contents. Owner-prepared
+/// targets keep one release authority: `take_unreferenced_composition_buffers`.
+fn discard_composition_contents<A: Allocator>(swapchain: &mut Swapchain<A>, prepared_only: bool) {
+    if prepared_only {
+        swapchain.invalidate_contents();
+    } else {
+        swapchain.reset_buffers();
+    }
+}
+
+/// Damage-history resets on owner-prepared targets keep every allocation.
+fn invalidate_composition_ages<A: Allocator>(swapchain: &mut Swapchain<A>, prepared_only: bool) {
+    if prepared_only {
+        swapchain.invalidate_contents();
+    } else {
+        swapchain.reset_buffer_ages();
     }
 }

@@ -511,6 +511,15 @@ where
         }
     }
 
+    /// Force a full repaint of every retained allocation without releasing any
+    /// buffer, exported DMA-BUF or framebuffer userdata. Ages are atomics, so
+    /// slots still held by frame owners need no unique access.
+    pub fn invalidate_contents(&self) {
+        for slot in &self.slots {
+            slot.age.store(0, Ordering::SeqCst);
+        }
+    }
+
     /// Dimensions required by newly allocated or adopted buffers.
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
