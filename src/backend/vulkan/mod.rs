@@ -16,6 +16,10 @@
 //!
 //! An instance is constructed using an [`Instance::new`] or [`Instance::with_extensions`].
 //!
+//! [`Instance::with_direct_drivers`] instead creates an instance served only by the drivers the
+//! caller loaded itself ([`DirectDriver`], `VK_LUNARG_direct_driver_loading` in exclusive mode). The
+//! system loader then loads no other driver into the process.
+//!
 //! ## Layers
 //!
 //! The validation layers will be enabled if debug assertions are enabled and the validation layers are
@@ -98,12 +102,14 @@ use self::{inner::InstanceInner, version::Version};
 #[cfg(feature = "backend_drm")]
 use super::drm::DrmNode;
 
+mod direct_driver;
 mod inner;
 mod phd;
 mod queue_priority;
 
 pub mod version;
 
+pub use self::direct_driver::{DirectDriver, DirectDriverError};
 pub use self::queue_priority::{
     create_device_with_queue_priority, QueueGlobalPriority, QueuePriorityGrant, QueuePriorityOutcome,
     QueuePriorityRequest,
@@ -127,6 +133,10 @@ pub enum InstanceError {
     /// Failed to load the Vulkan library.
     #[error(transparent)]
     Load(#[from] LoadError),
+
+    /// [`Instance::with_direct_drivers`] was given no driver.
+    #[error("an exclusive direct-driver instance needs at least one driver")]
+    NoDirectDrivers,
 
     /// Vulkan API error.
     #[error(transparent)]
@@ -194,6 +204,43 @@ impl Instance {
         app_info: Option<AppInfo>,
         extensions: &[&'static CStr],
     ) -> Result<Instance, InstanceError> {
+        unsafe { Self::create(max_version, app_info, extensions, None) }
+    }
+
+    /// Creates a new [`Instance`] served only by `drivers`.
+    ///
+    /// The instance enables `VK_LUNARG_direct_driver_loading` in exclusive mode, so the loader does
+    /// not search the system or the environment for drivers: no other installed driver is loaded
+    /// into the process, and only devices of `drivers` are enumerated. Layers still apply.
+    ///
+    /// Unlike [`Instance::with_extensions`], this never enumerates the instance extensions first:
+    /// `vkEnumerateInstanceExtensionProperties` loads every installed driver, and some (any linking
+    /// LLVM, for one) can never be unloaded again. `VK_EXT_debug_utils` is implemented by the loader
+    /// and is always enabled.
+    ///
+    /// The instance owns `drivers` and keeps them loaded until after `vkDestroyInstance`.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Instance::with_extensions`] apply.
+    pub unsafe fn with_direct_drivers(
+        max_version: Version,
+        app_info: Option<AppInfo>,
+        extensions: &[&'static CStr],
+        drivers: Vec<DirectDriver>,
+    ) -> Result<Instance, InstanceError> {
+        if drivers.is_empty() {
+            return Err(InstanceError::NoDirectDrivers);
+        }
+        unsafe { Self::create(max_version, app_info, extensions, Some(drivers)) }
+    }
+
+    unsafe fn create(
+        max_version: Version,
+        app_info: Option<AppInfo>,
+        extensions: &[&'static CStr],
+        direct_drivers: Option<Vec<DirectDriver>>,
+    ) -> Result<Instance, InstanceError> {
         assert!(
             max_version >= Version::VERSION_1_1,
             "Smithay requires at least Vulkan 1.1"
@@ -228,7 +275,6 @@ impl Instance {
         span.record("version", tracing::field::display(api_version));
 
         let available_layers = Self::enumerate_layers()?.collect::<Vec<_>>();
-        let available_extensions = Self::enumerate_extensions()?.collect::<Vec<_>>();
 
         let mut layers = Vec::new();
 
@@ -249,10 +295,16 @@ impl Instance {
         let mut enabled_extensions = Vec::<&'static CStr>::new();
         enabled_extensions.extend(extensions);
 
-        // Enable debug utils if available.
-        let has_debug_utils = available_extensions
-            .iter()
-            .any(|name| name.as_c_str() == ext::debug_utils::NAME);
+        // Enable debug utils if available. With direct drivers the instance extensions are never
+        // enumerated (that would load every installed driver); the loader implements both
+        // `VK_EXT_debug_utils` and `VK_LUNARG_direct_driver_loading` itself.
+        let has_debug_utils = match &direct_drivers {
+            Some(_) => true,
+            None => Self::enumerate_extensions()?.any(|name| name.as_c_str() == ext::debug_utils::NAME),
+        };
+        if direct_drivers.is_some() {
+            enabled_extensions.push(ash::lunarg::direct_driver_loading::NAME);
+        }
 
         if has_debug_utils {
             enabled_extensions.push(ext::debug_utils::NAME);
@@ -283,10 +335,21 @@ impl Instance {
         }
 
         let library = LIBRARY.as_ref().map_err(|_| LoadError)?;
-        let create_info = vk::InstanceCreateInfo::default()
+        let direct_driver_infos = direct_drivers
+            .iter()
+            .flatten()
+            .map(DirectDriver::loading_info)
+            .collect::<Vec<_>>();
+        let mut direct_driver_list = vk::DirectDriverLoadingListLUNARG::default()
+            .mode(vk::DirectDriverLoadingModeLUNARG::EXCLUSIVE)
+            .drivers(&direct_driver_infos);
+        let mut create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_layer_names(&layer_pointers)
             .enabled_extension_names(&extension_pointers);
+        if direct_drivers.is_some() {
+            create_info = create_info.push_next(&mut direct_driver_list);
+        }
 
         // Place the instance in a scopeguard in case creating the debug messenger fails.
         let instance = scopeguard::guard(
@@ -347,6 +410,7 @@ impl Instance {
             span,
             lost: Arc::new(AtomicBool::new(false)),
             enabled_extensions,
+            direct_drivers: direct_drivers.unwrap_or_default(),
         };
 
         info!("Created new instance");
@@ -371,6 +435,12 @@ impl Instance {
             .into_iter();
 
         Ok(extensions)
+    }
+
+    /// Returns the libraries of the drivers this instance was created exclusively from, or nothing
+    /// for an instance served by the system loader.
+    pub fn direct_drivers(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.0.direct_drivers.iter().map(DirectDriver::path)
     }
 
     /// Returns the enabled instance extensions.

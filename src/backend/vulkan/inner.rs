@@ -9,7 +9,7 @@ use std::{
 
 use ash::{ext, vk};
 
-use super::{version::Version, LoadError, LIBRARY};
+use super::{version::Version, DirectDriver, LoadError, LIBRARY};
 
 pub struct InstanceInner {
     pub instance: ash::Instance,
@@ -20,6 +20,10 @@ pub struct InstanceInner {
 
     /// Enabled instance extensions.
     pub enabled_extensions: Vec<&'static CStr>,
+
+    /// Drivers the instance was created exclusively from. Declared last and dropped after
+    /// [`Drop::drop`] has destroyed the instance, so the libraries outlive `vkDestroyInstance`.
+    pub direct_drivers: Vec<DirectDriver>,
 }
 
 // SAFETY: Destruction is externally synchronized (`InstanceInner` owns the
