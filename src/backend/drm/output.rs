@@ -58,6 +58,7 @@ where
     color_formats: Vec<DrmFourcc>,
     renderer_formats: Vec<DrmFormat>,
     native_black_enabled: bool,
+    output_layer_enabled: bool,
 }
 
 /// Locked variant of the [`DrmOutputManager`].
@@ -77,6 +78,7 @@ where
     color_formats: &'a [DrmFourcc],
     renderer_formats: &'a [DrmFormat],
     native_black_enabled: bool,
+    output_layer_enabled: bool,
 }
 
 impl<A, F, U, G> fmt::Debug for DrmOutputManager<A, F, U, G>
@@ -261,6 +263,7 @@ where
             color_formats: color_formats.into_iter().collect(),
             renderer_formats: renderer_formats.into_iter().collect(),
             native_black_enabled: false,
+            output_layer_enabled: false,
         }
     }
 
@@ -268,6 +271,15 @@ where
     /// for subsequently initialized outputs. Does not change existing outputs.
     pub fn enable_native_black(mut self) -> Self {
         self.native_black_enabled = true;
+        self
+    }
+
+    /// Give subsequently initialized outputs an above-primary output-layer
+    /// swapchain only when `enabled`. Without it a compositor has no layer
+    /// allocator, so no output-layer target can be prepared or rendered.
+    /// Does not change existing outputs.
+    pub fn with_output_layer(mut self, enabled: bool) -> Self {
+        self.output_layer_enabled = enabled;
         self
     }
 
@@ -287,6 +299,7 @@ where
             color_formats: &self.color_formats,
             renderer_formats: &self.renderer_formats,
             native_black_enabled: self.native_black_enabled,
+            output_layer_enabled: self.output_layer_enabled,
         }
     }
 }
@@ -356,7 +369,7 @@ where
                         surface,
                         planes.clone(),
                         self.allocator.clone(),
-                        Some(self.allocator.clone()),
+                        self.output_layer_enabled.then(|| self.allocator.clone()),
                         self.exporter.clone(),
                         self.color_formats.iter().copied(),
                         self.renderer_formats
@@ -372,7 +385,7 @@ where
                         surface,
                         planes.clone(),
                         self.allocator.clone(),
-                        Some(self.allocator.clone()),
+                        self.output_layer_enabled.then(|| self.allocator.clone()),
                         self.exporter.clone(),
                         self.color_formats.iter().copied(),
                         self.renderer_formats.iter().copied(),
