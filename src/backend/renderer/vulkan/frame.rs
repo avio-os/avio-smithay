@@ -2958,7 +2958,7 @@ mod tests {
             .expect_err("material capture must not convert channel layouts");
         assert!(error
             .to_string()
-            .contains("capture format must match the active target format"));
+            .contains("capture format must match active target"));
     }
 
     #[test]
