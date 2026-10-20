@@ -4,18 +4,18 @@ use std::{
     marker::PhantomData,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
 };
 
 use super::{GlesError, GlesRenderer, GlesTexture};
 use crate::{
     backend::{
-        allocator::Fourcc,
+        allocator::{format::FormatSet, Fourcc},
         egl::{EGLContext, EGLDisplay},
         renderer::{
             retirement::{RetirementNode, RetirementQueue},
-            Offscreen, Renderer,
+            Offscreen,
         },
     },
     utils::{Buffer, Size},
@@ -29,6 +29,7 @@ struct Shared {
     // transfer a live renderer or any current context across threads.
     root: Mutex<EGLContext>,
     available: AtomicBool,
+    operational_2d_formats: OnceLock<FormatSet>,
 }
 
 /// Failure to construct a complete cold GLES device owner.
@@ -70,7 +71,10 @@ fn renderer_for(shared: &Shared) -> Result<GlesRenderer, GlesError> {
         return Err(GlesError::UnobservableCompletion);
     }
     let context = {
-        let root = shared.root.lock().map_err(|_| GlesError::UnobservableCompletion)?;
+        let root = shared
+            .root
+            .lock()
+            .map_err(|_| GlesError::UnobservableCompletion)?;
         EGLContext::new_shared(root.display(), &root).map_err(GlesError::ContextCreationError)?
     };
     // SAFETY: This fresh child has never been current on any thread. Its
@@ -79,6 +83,37 @@ fn renderer_for(shared: &Shared) -> Result<GlesRenderer, GlesError> {
 }
 
 impl GlesDeviceOrigin {
+    /// Seal exact formats proved by actual import, rendering, sampling and
+    /// native-fence operations on a renderer created from this same origin.
+    /// Call only after those operations succeed and before admitting workers.
+    /// This does not rewrite EGL query results or infer support from a format.
+    pub fn seal_operational_2d_formats(
+        &self,
+        witness: &GlesRenderer,
+        formats: FormatSet,
+    ) -> Result<(), GlesError> {
+        self.check_health()?;
+        witness.check_completion_health()?;
+        if !witness
+            .device_origin()
+            .is_some_and(|origin| self.same_device(&origin))
+        {
+            return Err(GlesError::Composition(
+                "operational role witness belongs to another GLES origin",
+            ));
+        }
+        self.shared
+            .operational_2d_formats
+            .set(formats)
+            .map_err(|_| GlesError::Composition("GLES operational roles already sealed"))
+    }
+
+    /// The immutable operation-proved 2D roles of this exact share group.
+    /// None means admission has not yet sealed a result, including an empty one.
+    pub fn operational_2d_formats(&self) -> Option<&FormatSet> {
+        self.shared.operational_2d_formats.get()
+    }
+
     /// Create the exact display's share group and initialize its retirement
     /// context. This cold constructor waits only for its own initialization.
     pub fn new(display: &EGLDisplay) -> Result<Self, GlesDeviceError> {
@@ -86,6 +121,7 @@ impl GlesDeviceOrigin {
         let shared = Arc::new(Shared {
             root: Mutex::new(root),
             available: AtomicBool::new(true),
+            operational_2d_formats: OnceLock::new(),
         });
         let initialize_shared = shared.clone();
         let destroy_shared = shared.clone();
@@ -103,9 +139,10 @@ impl GlesDeviceOrigin {
                 }
             },
             move |renderer, node| {
-                let Some(renderer) = renderer.as_mut().filter(|_| {
-                    destroy_shared.available.load(Ordering::Acquire)
-                }) else {
+                let Some(renderer) = renderer
+                    .as_mut()
+                    .filter(|_| destroy_shared.available.load(Ordering::Acquire))
+                else {
                     // A failure is not reader completion or safe reuse.
                     std::mem::forget(node);
                     return;
@@ -113,7 +150,7 @@ impl GlesDeviceOrigin {
                 drop(node);
                 // Only shareable GL objects enter the shared cleanup queue.
                 // Context-local framebuffer cleanup stays with its renderer.
-                if renderer.cleanup_texture_cache().is_err() {
+                if renderer.cleanup_retired_resources().is_err() {
                     destroy_shared.available.store(false, Ordering::Release);
                 }
             },
@@ -148,6 +185,10 @@ impl GlesDeviceOrigin {
         } else {
             Err(GlesError::UnobservableCompletion)
         }
+    }
+
+    pub(super) fn mark_unavailable(&self) {
+        self.shared.available.store(false, Ordering::Release);
     }
 
     /// Cold allocation authority; each operation creates its helper context
@@ -191,6 +232,13 @@ impl<T: Send + Sync + 'static> std::fmt::Debug for GlesRetirementSlot<T> {
 }
 
 impl<T: Send + Sync + 'static> GlesRetirementSlot<T> {
+    pub(super) fn quarantine(self) {
+        self.origin.mark_unavailable();
+        // Keep the exact share root and retirement context alive. An unwound
+        // native resource owner supplies no completion evidence.
+        std::mem::forget(self);
+    }
+
     /// Publish without allocating, locking, waiting, or calling a driver.
     pub fn retire(mut self, value: T) {
         let node = self.node.as_mut().expect("unused retirement publication");
@@ -214,6 +262,19 @@ impl<T: Send + Sync + 'static> Drop for GlesRetirementSlot<T> {
 pub struct GlesOffscreenAllocator(GlesDeviceOrigin);
 
 impl GlesOffscreenAllocator {
+    /// Allocate the explicit sRGB composition attachment. Memory-source
+    /// textures use `create_memory_buffer` and retain their client encoding.
+    pub fn create_composition_buffer(
+        &self,
+        format: Fourcc,
+        size: Size<i32, Buffer>,
+    ) -> Result<GlesTexture, GlesError> {
+        let mut renderer = self.0.create_renderer()?;
+        let texture = renderer.create_composition_buffer(format, size)?;
+        texture.0.sync.write().unwrap().update_write(&renderer.gl)?;
+        Ok(texture)
+    }
+
     /// Allocate a sampleable color attachment and publish its creation to
     /// other contexts through a real shared GL fence.
     pub fn create_buffer(&self, format: Fourcc, size: Size<i32, Buffer>) -> Result<GlesTexture, GlesError> {
@@ -224,7 +285,11 @@ impl GlesOffscreenAllocator {
     }
 
     /// Allocate a writable sampled image on a cold helper turn.
-    pub fn create_memory_buffer(&self, format: Fourcc, size: Size<i32, Buffer>) -> Result<GlesTexture, GlesError> {
+    pub fn create_memory_buffer(
+        &self,
+        format: Fourcc,
+        size: Size<i32, Buffer>,
+    ) -> Result<GlesTexture, GlesError> {
         self.create_buffer(format, size)
     }
 }

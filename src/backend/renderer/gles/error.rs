@@ -7,6 +7,9 @@ use wayland_server::protocol::wl_shm;
 /// Error returned during rendering using GL ES
 #[derive(thiserror::Error, Debug)]
 pub enum GlesError {
+    /// A composition packet exceeds its admitted format, storage or geometry.
+    #[error("GLES composition refused: {0}")]
+    Composition(&'static str),
     /// An EGL context could not be created on its owning thread.
     #[error("Failed to create EGL context")]
     ContextCreationError(#[source] crate::backend::egl::Error),
@@ -98,6 +101,9 @@ pub enum GlesError {
     /// receipt and the strict renderer refuses further submissions.
     #[error("Required native fence operation failed")]
     NativeFence(#[source] crate::backend::egl::Error),
+    /// Native resource deletion failed. The share group must be quarantined.
+    #[error("Native EGL resource cleanup failed")]
+    NativeCleanup(#[source] crate::backend::egl::EGLError),
     /// A retained dependency could not produce a native fence descriptor.
     #[error("Required dependency has no exportable native fence")]
     NativeFenceUnavailable,
@@ -128,11 +134,13 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::EGLExtensionNotSupported(_)
             | x @ GlesError::GLVersionNotSupported(_)
             | x @ GlesError::NativeFence(_)
+            | x @ GlesError::NativeCleanup(_)
             | x @ GlesError::NativeFenceUnavailable
             | x @ GlesError::GlSync { .. }
             | x @ GlesError::UnobservableCompletion => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
-            x @ GlesError::FramebufferContextMismatch
+            x @ GlesError::Composition(_)
+            | x @ GlesError::FramebufferContextMismatch
             | x @ GlesError::FramebufferBindingError
             | x @ GlesError::BindBufferEGLError(_)
             | x @ GlesError::UnknownPixelFormat
@@ -163,11 +171,13 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::EGLExtensionNotSupported(_)
             | x @ GlesError::GLVersionNotSupported(_)
             | x @ GlesError::NativeFence(_)
+            | x @ GlesError::NativeCleanup(_)
             | x @ GlesError::NativeFenceUnavailable
             | x @ GlesError::GlSync { .. }
             | x @ GlesError::UnobservableCompletion => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
-            x @ GlesError::FramebufferContextMismatch
+            x @ GlesError::Composition(_)
+            | x @ GlesError::FramebufferContextMismatch
             | x @ GlesError::FramebufferBindingError
             | x @ GlesError::MappingError
             | x @ GlesError::UnknownPixelFormat
@@ -212,6 +222,7 @@ impl GlesError {
         matches!(
             self,
             Self::NativeFence(_)
+                | Self::NativeCleanup(_)
                 | Self::NativeFenceUnavailable
                 | Self::GlSync { .. }
                 | Self::UnobservableCompletion

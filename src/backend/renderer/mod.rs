@@ -435,6 +435,16 @@ pub trait Frame {
     /// Returns the [`ContextId`] of the associated renderer.
     fn context_id(&self) -> ContextId<Self::TextureId>;
 
+    /// Declare the complete output damage before any drawing or opaque-region
+    /// subtraction. Renderers with a terminal encoding pass use this to
+    /// preserve destination pixels outside the authoritative repair region.
+    ///
+    /// Rectangles use the same transformed output coordinates as draw damage.
+    /// Implementations must use storage admitted before the frame began.
+    fn set_output_damage(&mut self, _damage: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Clear the complete current target with a single given color.
     ///
     /// The `at` parameter specifies a set of rectangles to clear in the current target. This allows partially

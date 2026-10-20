@@ -102,3 +102,43 @@ fn replacement_wait_precedes_fence_and_old_handle_retirement() {
     assert_eq!(*sync.write_sync.get_mut().unwrap(), Some(2 as _));
     CALLS.with_borrow(|state| assert_eq!(state.events, ["gpu_wait", "fence", "delete", "flush"]));
 }
+
+#[test]
+fn poisoned_texture_final_drop_never_panics_or_publishes_native_deletion() {
+    use std::sync::{mpsc, Arc, RwLock};
+    for poison_inner in [false, true] {
+        let (sender, receiver) = mpsc::channel();
+        let texture = GlesTexture(Arc::new(GlesTextureInternal {
+            context: super::ContextId::new(),
+            encoding: GlesTextureEncoding::ElectricalPremultiplied,
+            storage_is_srgb: false,
+            is_composition: false,
+            retirement: None,
+            texture: 17,
+            sync: RwLock::new(TextureSync::default()),
+            format: Some(ffi::RGBA8),
+            has_alpha: true,
+            is_external: false,
+            y_inverted: false,
+            size: (1, 1).into(),
+            egl_images: Some(vec![std::ptr::dangling_mut()]),
+            destruction_callback_sender: sender,
+        }));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if poison_inner {
+                let sync = texture.0.sync.read().unwrap();
+                let _held = sync.read_sync.lock().unwrap();
+                panic!("unwound native read synchronization");
+            } else {
+                let _held = texture.0.sync.write().unwrap();
+                panic!("unwound native framebuffer write");
+            }
+        }));
+        assert!(panic.is_err());
+        drop(texture);
+        assert!(
+            receiver.try_recv().is_err(),
+            "uncertain native handles escaped quarantine"
+        );
+    }
+}

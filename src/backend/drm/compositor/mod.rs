@@ -145,7 +145,9 @@ use wayland_server::{protocol::wl_buffer::WlBuffer, Resource};
 
 use super::{
     error::AccessError,
-    exporter::{gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer},
+    exporter::{
+        gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer, FramebufferPolicy,
+    },
     surface::VrrSupport,
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
 };
@@ -186,6 +188,7 @@ use crate::{
 };
 
 mod composition;
+mod framebuffer_policy;
 pub use composition::{
     CompositionAllocator, CompositionBufferCounts, PreparedCompositionBuffers, RetiredCompositionBuffers,
 };
@@ -837,9 +840,17 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
+        strict_fencing: bool,
         event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        if strict_fencing {
+            for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
+                if let Some((sync, fence)) = state.config.as_mut().and_then(|config| config.sync.as_mut()) {
+                    framebuffer_policy::admit_fence(sync, fence, supports_fencing)?;
+                }
+            }
+        }
         surface.commit(
             self.build_planes(
                 surface,
@@ -857,9 +868,17 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
+        strict_fencing: bool,
         event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        if strict_fencing {
+            for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
+                if let Some((sync, fence)) = state.config.as_mut().and_then(|config| config.sync.as_mut()) {
+                    framebuffer_policy::admit_fence(sync, fence, supports_fencing)?;
+                }
+            }
+        }
         surface.page_flip(
             self.build_planes(
                 surface,
@@ -1403,6 +1422,7 @@ where
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
     supports_fencing: bool,
+    strict_fencing: bool,
     reset_pending: bool,
     /// Last frame's primary disposition (Some(true) = swapchain composite,
     /// Some(false) = element scanout); drives the rare seam-change witness.
@@ -1524,7 +1544,7 @@ where
     #[instrument(skip_all)]
     pub fn new_with_output_layer_allocator(
         output_mode_source: impl Into<OutputModeSource> + Debug,
-        surface: DrmSurface,
+        surface: impl Into<Arc<DrmSurface>>,
         planes: Option<Planes>,
         mut allocator: A,
         mut output_layer_allocator: Option<A>,
@@ -1534,6 +1554,7 @@ where
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
     ) -> FrameResult<Self, A, F> {
+        let surface = surface.into();
         let span = info_span!(
             parent: None,
             "drm_compositor",
@@ -1545,7 +1566,6 @@ where
         let renderer_formats = renderer_formats.into_iter().collect::<Vec<_>>();
 
         let mut error = None;
-        let surface = Arc::new(surface);
         let mut planes = match planes {
             Some(planes) => planes,
             None => surface.planes().clone(),
@@ -1580,19 +1600,27 @@ where
 
         let cursor_size = Size::from((cursor_size.w as i32, cursor_size.h as i32));
         let damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
-        let supports_fencing = !surface.is_legacy()
-            && surface
+        let strict_fencing = framebuffer_exporter.framebuffer_policy() != FramebufferPolicy::Legacy;
+        // Atomic IN_FENCE_FD accepts sync_file descriptors independently of
+        // the optional DRM syncobj timeline API.
+        let timeline_or_strict = strict_fencing
+            || surface
                 .get_driver_capability(DriverCapability::SyncObj)
-                .map(|val| val != 0)
-                .map_err(|err| {
+                .map(|value| value != 0)
+                .map_err(|source| {
                     FrameError::DrmError(DrmError::Access(AccessError {
                         errmsg: "Failed to query driver capability",
                         dev: surface.dev_path(),
-                        source: err,
+                        source,
                     }))
-                })?
+                })?;
+        let supports_fencing = !surface.is_legacy()
+            && timeline_or_strict
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
+        if strict_fencing && !supports_fencing {
+            return Err(FrameError::DrmError(DrmError::NativeFenceUnavailable));
+        }
 
         for format in color_formats {
             debug!("Testing color format: {}", format);
@@ -1694,6 +1722,7 @@ where
                         previous_element_states: IndexMap::new(),
 
                         supports_fencing,
+                        strict_fencing,
                         primary_was_composited: None,
                         composition_prepared_only: false,
                         native_black_enabled: false,
@@ -1790,19 +1819,27 @@ where
         let cursor_size = Size::from((cursor_size.w as i32, cursor_size.h as i32));
         let damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         let output_layer_damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
-        let supports_fencing = !surface.is_legacy()
-            && surface
+        let strict_fencing = framebuffer_exporter.framebuffer_policy() != FramebufferPolicy::Legacy;
+        // Atomic IN_FENCE_FD accepts sync_file descriptors independently of
+        // the optional DRM syncobj timeline API.
+        let timeline_or_strict = strict_fencing
+            || surface
                 .get_driver_capability(DriverCapability::SyncObj)
-                .map(|val| val != 0)
-                .map_err(|err| {
+                .map(|value| value != 0)
+                .map_err(|source| {
                     FrameError::DrmError(DrmError::Access(AccessError {
                         errmsg: "Failed to query driver capability",
                         dev: surface.dev_path(),
-                        source: err,
+                        source,
                     }))
-                })?
+                })?;
+        let supports_fencing = !surface.is_legacy()
+            && timeline_or_strict
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
+        if strict_fencing && !supports_fencing {
+            return Err(FrameError::DrmError(DrmError::NativeFenceUnavailable));
+        }
 
         let (swapchain, is_opaque) = Self::test_format(
             &surface,
@@ -1871,6 +1908,7 @@ where
             previous_element_states: IndexMap::new(),
 
             supports_fencing,
+            strict_fencing,
             primary_was_composited: None,
             composition_prepared_only: false,
             native_black_enabled: false,
@@ -1909,15 +1947,32 @@ where
             return Err((allocator, FrameError::NoSupportedPlaneFormat));
         }
 
-        let plane_modifiers = plane_formats
+        let requested = modifiers
             .iter()
-            .map(|fmt| fmt.modifier)
-            .collect::<IndexSet<_>>();
-
-        let swapchain_modifiers = plane_modifiers
-            .intersection(&modifiers)
-            .copied()
+            .map(|modifier| DrmFormat {
+                code,
+                modifier: *modifier,
+            })
             .collect::<Vec<_>>();
+        let swapchain_modifiers = if framebuffer_exporter.framebuffer_policy() == FramebufferPolicy::Legacy {
+            plane_formats
+                .iter()
+                .map(|format| format.modifier)
+                .collect::<IndexSet<_>>()
+                .intersection(&modifiers)
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            framebuffer_policy::select_formats(
+                code,
+                &plane_formats,
+                &requested,
+                framebuffer_exporter.framebuffer_policy(),
+            )
+            .into_iter()
+            .map(|format| format.modifier)
+            .collect::<Vec<_>>()
+        };
 
         if swapchain_modifiers.is_empty() {
             return Err((allocator, FrameError::NoSupportedPlaneFormat));
@@ -2059,7 +2114,12 @@ where
             return Err((allocator, FrameError::NoSupportedRendererFormat));
         }
 
-        let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
+        let formats = framebuffer_policy::select_formats(
+            code,
+            &plane_formats,
+            &renderer_formats,
+            framebuffer_exporter.framebuffer_policy(),
+        );
 
         debug!("Testing Formats: {:?}", formats);
 
@@ -3633,9 +3693,13 @@ where
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
 
-        let flip = prepared_frame
-            .frame
-            .commit(&self.surface, self.supports_fencing, false, false);
+        let flip = prepared_frame.frame.commit(
+            &self.surface,
+            self.supports_fencing,
+            false,
+            self.strict_fencing,
+            false,
+        );
 
         if flip.is_ok() {
             self.queued_frame = None;
@@ -3670,13 +3734,21 @@ where
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
         let flip = if self.surface.commit_pending() {
-            prepared_frame
-                .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+            prepared_frame.frame.commit(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                self.strict_fencing,
+                true,
+            )
         } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+            prepared_frame.frame.page_flip(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                self.strict_fencing,
+                true,
+            )
         };
 
         self.handle_flip(prepared_frame, Some(user_data), flip)

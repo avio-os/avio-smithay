@@ -127,6 +127,8 @@ mod shaper;
 pub(crate) mod workspace;
 
 #[cfg(test)]
+mod output_damage_tests;
+#[cfg(test)]
 mod storage_tests;
 
 use shaper::DamageShaper;
@@ -1223,6 +1225,9 @@ impl OutputDamageTracker {
             let mut frame = renderer
                 .render(framebuffer, output_size, output_transform)
                 .map_err(Error::Rendering)?;
+            frame.set_output_damage(&self.damage).map_err(|error| {
+                Error::from_frame_rendering(error, frame.completion_unobservable_on_error())
+            })?;
 
             self.element_damage.clear();
             workspace::extend(

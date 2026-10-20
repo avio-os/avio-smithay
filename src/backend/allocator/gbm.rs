@@ -16,6 +16,9 @@ pub use gbm::{BufferObjectFlags as GbmBufferFlags, Device as GbmDevice};
 use std::os::unix::io::{AsFd, BorrowedFd};
 use tracing::instrument;
 
+mod explicit;
+pub use explicit::ExplicitGbmAllocator;
+
 /// A GBM buffer object
 #[derive(Debug)]
 pub struct GbmBuffer {

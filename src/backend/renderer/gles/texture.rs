@@ -3,6 +3,15 @@ use ffi::Gles2;
 use super::*;
 use std::sync::Arc;
 
+/// Meaning of the stored sRGB channel values before composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlesTextureEncoding {
+    /// Client/shell channels were premultiplied in electrical sRGB.
+    ElectricalPremultiplied,
+    /// Compositor channels were premultiplied in linear light before encoding.
+    LinearPremultiplied,
+}
+
 /// A handle to a GLES texture
 ///
 /// The texture can be used with the same [`GlesRenderer`] it was created with, or one using a
@@ -28,6 +37,7 @@ impl GlesTexture {
         size: Size<i32, BufferCoord>,
     ) -> GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
+            context: renderer.context_id(),
             texture: tex,
             sync: RwLock::default(),
             format: internal_format,
@@ -36,9 +46,41 @@ impl GlesTexture {
             y_inverted: false,
             size,
             retirement: renderer.origin.as_ref().map(GlesDeviceOrigin::retirement_slot),
+            encoding: GlesTextureEncoding::ElectricalPremultiplied,
+            storage_is_srgb: false,
+            is_composition: false,
             egl_images: None,
             destruction_callback_sender: renderer.gles_cleanup().sender.clone(),
         }))
+    }
+
+    /// Take ownership of an existing `GL_TEXTURE_EXTERNAL_OES` texture.
+    ///
+    /// Its pixels are client electrical-premultiplied values. Imported
+    /// allocation custody must outlive every reader's native completion.
+    ///
+    /// # Safety
+    ///
+    /// `tex` must be a valid external texture in this renderer's share group,
+    /// with the stated extent and alpha convention. Ownership transfers to
+    /// this handle; no caller may delete it or change its attached image.
+    pub unsafe fn from_raw_external(
+        renderer: &GlesRenderer,
+        opaque: bool,
+        tex: ffi::types::GLuint,
+        size: Size<i32, BufferCoord>,
+        y_inverted: bool,
+    ) -> GlesTexture {
+        let mut texture = unsafe { Self::from_raw(renderer, None, opaque, tex, size) };
+        let internal = Arc::get_mut(&mut texture.0).expect("new external texture");
+        internal.is_external = true;
+        internal.y_inverted = y_inverted;
+        texture
+    }
+
+    /// Identity of the exact native share group that owns this texture.
+    pub fn context_id(&self) -> ContextId<GlesTexture> {
+        self.0.context.clone()
     }
 
     /// OpenGL texture id of this texture
@@ -51,6 +93,13 @@ impl GlesTexture {
     /// Whether the texture is upside down
     pub fn is_y_inverted(&self) -> bool {
         self.0.y_inverted
+    }
+
+    /// Whether this handle has no other strong native texture readers.
+    /// Weak FBO inventory identities do not count. Reuse additionally requires
+    /// the caller's complete GPU reader fences and external allocation custody.
+    pub fn is_externally_idle(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
     }
 
     /// Whether this is the only reference to this texture (strong or weak)
@@ -151,7 +200,11 @@ fn replace_syncpoint(sync: &mut Option<ffi::types::GLsync>, gl: &Gles2) -> Resul
 
 #[derive(Debug)]
 pub(super) struct GlesTextureInternal {
-    pub(super) retirement: Option<GlesRetirementSlot<()>>,
+    pub(super) context: ContextId<GlesTexture>,
+    pub(super) encoding: GlesTextureEncoding,
+    pub(super) storage_is_srgb: bool,
+    pub(super) is_composition: bool,
+    pub(super) retirement: Option<GlesRetirementSlot<GlesSharedCleanup>>,
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
     pub(super) format: Option<ffi::types::GLenum>,
@@ -167,30 +220,50 @@ unsafe impl Sync for GlesTextureInternal {}
 
 impl Drop for GlesTextureInternal {
     fn drop(&mut self) {
-        let _ = self
-            .destruction_callback_sender
-            .send(CleanupResource::Texture(self.texture));
-        let mut sync = self.sync.write().unwrap();
-        if let Some(sync) = sync.read_sync.get_mut().unwrap().take() {
-            let _ = self
-                .destruction_callback_sender
-                .send(CleanupResource::Sync(sync as *const _));
-        }
-        if let Some(sync) = sync.write_sync.get_mut().unwrap().take() {
-            let _ = self
-                .destruction_callback_sender
-                .send(CleanupResource::Sync(sync as *const _));
-        }
-        drop(sync);
-        if let Some(images) = self.egl_images.take() {
-            for image in images {
-                let _ = self
-                    .destruction_callback_sender
-                    .send(CleanupResource::EGLImage(image));
+        // The final Arc owns this lock exclusively: no lock acquisition, driver
+        // call, or native cleanup queue allocation runs on the dropping thread.
+        let poisoned = self.sync.is_poisoned()
+            || self
+                .sync
+                .get_mut()
+                .map(|sync| sync.read_sync.is_poisoned() || sync.write_sync.is_poisoned())
+                .unwrap_or(true);
+        if poisoned {
+            if let Some(retirement) = self.retirement.take() {
+                retirement.quarantine();
             }
+            // Neither recovering a poisoned guard nor unwinding is GPU
+            // completion. Leave every native handle untouched, including EGL
+            // image siblings, and never cause a second panic during final Drop.
+            if let Some(images) = self.egl_images.take() {
+                std::mem::forget(images);
+            }
+            return;
         }
-        // Publish only after every shared cleanup command is queued.
-        drop(self.retirement.take());
+        let sync = self.sync.get_mut().expect("exclusive unpoisoned texture");
+        let cleanup = GlesSharedCleanup {
+            resources: [
+                Some(CleanupResource::Texture(self.texture)),
+                sync.read_sync
+                    .get_mut()
+                    .unwrap()
+                    .take()
+                    .map(CleanupResource::Sync),
+                sync.write_sync
+                    .get_mut()
+                    .unwrap()
+                    .take()
+                    .map(CleanupResource::Sync),
+            ],
+            images: self.egl_images.take(),
+            sender: self.destruction_callback_sender.clone(),
+        };
+        if let Some(retirement) = self.retirement.take() {
+            retirement.retire(cleanup);
+        } else {
+            // Legacy renderers retain their existing shared cleanup queue.
+            drop(cleanup);
+        }
     }
 }
 
@@ -217,6 +290,7 @@ impl Texture for GlesTexture {
 /// Texture mapping of a GLES2 texture
 #[derive(Debug)]
 pub struct GlesMapping {
+    pub(super) context: ContextId<GlesTexture>,
     pub(super) pbo: ffi::types::GLuint,
     pub(super) format: ffi::types::GLenum,
     pub(super) layout: ffi::types::GLenum,
@@ -224,6 +298,16 @@ pub struct GlesMapping {
     pub(super) size: Size<i32, BufferCoord>,
     pub(super) mapping: AtomicPtr<std::ffi::c_void>,
     pub(super) destruction_callback_sender: Sender<CleanupResource>,
+    pub(super) completion: Option<SyncPoint>,
+    pub(super) retirement: Option<GlesRetirementSlot<GlesSharedCleanup>>,
+}
+
+impl GlesMapping {
+    /// Actual native completion of the GPU readback, when produced by a strict
+    /// renderer. Callers retain external source custody through this receipt.
+    pub fn completion(&self) -> Option<&SyncPoint> {
+        self.completion.as_ref()
+    }
 }
 
 impl Texture for GlesMapping {
@@ -256,9 +340,77 @@ impl TextureMapping for GlesMapping {
 
 impl Drop for GlesMapping {
     fn drop(&mut self) {
-        let _ = self.destruction_callback_sender.send(CleanupResource::Mapping(
-            self.pbo,
-            self.mapping.load(Ordering::SeqCst),
-        ));
+        let cleanup = GlesSharedCleanup {
+            resources: [
+                Some(CleanupResource::Mapping(
+                    self.pbo,
+                    self.mapping.load(Ordering::SeqCst),
+                )),
+                None,
+                None,
+            ],
+            images: None,
+            sender: self.destruction_callback_sender.clone(),
+        };
+        if let Some(retirement) = self.retirement.take() {
+            retirement.retire(cleanup);
+        } else {
+            drop(cleanup);
+        }
+    }
+}
+
+/// Owns the Arc which pins the lock for the guard's entire lifetime. The guard
+/// remains !Send and is explicitly released before dropping that Arc.
+#[derive(Debug)]
+pub(super) struct OwnedTextureSync {
+    guard: std::mem::ManuallyDrop<RwLockWriteGuard<'static, TextureSync>>,
+    _texture: GlesTexture,
+}
+impl OwnedTextureSync {
+    pub(super) fn new(texture: &GlesTexture) -> Result<Self, GlesError> {
+        let texture = texture.clone();
+        // SAFETY: Arc's inner allocation never moves. `_texture` retains that
+        // exact allocation until Drop explicitly releases `guard` first. No
+        // reference to this extended lifetime escapes the owning wrapper.
+        let lock: &'static RwLock<TextureSync> = unsafe { &(*Arc::as_ptr(&texture.0)).sync };
+        let guard = lock
+            .try_write()
+            .map_err(|_| GlesError::Composition("texture is already bound or sampled"))?;
+        Ok(Self {
+            guard: std::mem::ManuallyDrop::new(guard),
+            _texture: texture,
+        })
+    }
+}
+impl Drop for OwnedTextureSync {
+    fn drop(&mut self) {
+        // SAFETY: The guard is initialized exactly once and is not otherwise
+        // moved or dropped. The Arc keeping the lock live is still retained.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.guard);
+        }
+    }
+}
+#[derive(Debug)]
+pub(super) enum TextureSyncGuard<'a> {
+    Borrowed(RwLockWriteGuard<'a, TextureSync>),
+    Owned(OwnedTextureSync),
+}
+impl std::ops::Deref for TextureSyncGuard<'_> {
+    type Target = TextureSync;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(guard) => guard,
+            Self::Owned(guard) => &guard.guard,
+        }
+    }
+}
+impl std::ops::DerefMut for TextureSyncGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Borrowed(guard) => guard,
+            Self::Owned(guard) => &mut guard.guard,
+        }
     }
 }
