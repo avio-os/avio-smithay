@@ -16,5 +16,7 @@ void main() {
         vec2 d = max(max(vec2(r) - p, p - (size - vec2(r))), vec2(0.0));
         if (any(lessThan(p, vec2(0.0))) || any(greaterThanEqual(p, size)) || dot(d,d) > r*r) { discard; }
     }
-    out_color = vec4(constants.color.rgb * constants.color.a, constants.color.a);
+    // Color32F is premultiplied encoded sRGB, and draw opacity has already
+    // scaled all four channels, so the colour enters the blend as given.
+    out_color = constants.color;
 }

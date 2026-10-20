@@ -50,8 +50,8 @@ fn owner_group_resolves_overlapping_paint_and_opacity_once() {
                 frame
                     .render_owner_clipped_group(&atlas, full, full, clip, &[full], |frame| {
                         frame.capture_and_filter_framebuffer(full, &prefix, &[])?;
-                        frame.draw_solid(full, &[full], Color32F::new(1.0, 0.0, 0.0, 0.5))?;
-                        frame.draw_solid(full, &[full], Color32F::new(0.0, 1.0, 0.0, 0.5))?;
+                        frame.draw_solid(full, &[full], Color32F::new(0.5, 0.0, 0.0, 0.5))?;
+                        frame.draw_solid(full, &[full], Color32F::new(0.0, 0.5, 0.0, 0.5))?;
                         frame.interpolate_framebuffer_prefix(&prefix, full, &[full], opacity)
                     })
                     .expect("all ordered sample lanes");

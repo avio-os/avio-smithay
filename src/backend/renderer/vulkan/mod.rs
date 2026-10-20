@@ -45,9 +45,10 @@
 //! attachments are viewed through their own UNORM storage format on 8-bit and
 //! 2101010 targets alike, sampled texels (electrically premultiplied client
 //! buffers and the renderer's own offscreens) enter the blend unconverted, and
-//! clear and solid colours are written as given. Authored alpha, coverage,
-//! opacity, tints and the material filter therefore keep their CSS meaning, and
-//! an opaque 1:1 composite stores exactly its source bytes.
+//! clear and solid colours (premultiplied [`Color32F`](crate::backend::renderer::Color32F))
+//! are written as given. Authored alpha, coverage, opacity, tints and the
+//! material filter therefore keep their CSS meaning, and an opaque 1:1
+//! composite stores exactly its source bytes.
 //!
 //! # Explicit Device-Memory Census
 //!

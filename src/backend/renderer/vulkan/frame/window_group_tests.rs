@@ -63,9 +63,9 @@ fn framebuffer_group_prefix_interpolates_premultiplied_rgba() {
                         .transform_rect_in(Rectangle::new(location.into(), (1, 1).into()), &output)
                         .loc;
                     let index = ((pixel.y * storage.w + pixel.x) * 4) as usize;
-                    // Color32F solids are straight encoded colours, and the
-                    // attachment blends their premultiplied values as stored.
-                    let half = 0.5 * 0.5;
+                    // Color32F solids are premultiplied encoded colours, and
+                    // the attachment blends them as given.
+                    let half = 0.5;
                     let blue = background_alpha;
                     let completed = if covered_twice {
                         [half * 0.5, half, blue * 0.25, 0.75 + background_alpha * 0.25]

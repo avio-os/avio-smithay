@@ -7,14 +7,25 @@ struct BlendProbe {
     renderer: VulkanRenderer,
 }
 
-/// A source drawn over a solid backdrop, in the three shapes the compositor
-/// feeds the blend: a premultiplied client texel, an opaque texel faded by
-/// draw opacity, and a straight solid colour.
+/// A source drawn over a solid backdrop, in the shapes the compositor feeds
+/// the blend: a premultiplied client texel, an opaque texel faded by draw
+/// opacity, a premultiplied solid colour, and an opaque solid faded by a group
+/// opacity (`with_draw_alpha`).
 #[derive(Debug, Clone, Copy)]
 enum SourceShape {
     PremultipliedTexel,
     FadedOpaqueTexel,
     Solid,
+    FadedSolid,
+}
+
+impl SourceShape {
+    const ALL: [Self; 4] = [
+        Self::PremultipliedTexel,
+        Self::FadedOpaqueTexel,
+        Self::Solid,
+        Self::FadedSolid,
+    ];
 }
 
 const PROBE_EXTENT: i32 = 8;
@@ -123,7 +134,9 @@ impl BlendProbe {
                     (alpha * 255.0).round() as u8,
                 ]
             }
-            SourceShape::FadedOpaqueTexel | SourceShape::Solid => [ink[0], ink[1], ink[2], 255],
+            SourceShape::FadedOpaqueTexel | SourceShape::Solid | SourceShape::FadedSolid => {
+                [ink[0], ink[1], ink[2], 255]
+            }
         };
         let source = self.import_abgr(size, &texel.repeat((size.w * size.h) as usize));
         let encoded = |channel: u8| f32::from(channel) / 255.0;
@@ -152,13 +165,29 @@ impl BlendProbe {
                         },
                     )
                     .expect("texture draw"),
+                // Color32F is premultiplied: the authored ink at `alpha`.
                 SourceShape::Solid => frame
                     .draw_solid(
                         full,
                         &[full],
-                        Color32F::new(encoded(ink[0]), encoded(ink[1]), encoded(ink[2]), alpha),
+                        Color32F::new(
+                            encoded(ink[0]) * alpha,
+                            encoded(ink[1]) * alpha,
+                            encoded(ink[2]) * alpha,
+                            alpha,
+                        ),
                     )
                     .expect("solid draw"),
+                // A group fade scales the opaque colour exactly once.
+                SourceShape::FadedSolid => frame
+                    .with_draw_alpha(alpha, |frame| {
+                        frame.draw_solid(
+                            full,
+                            &[full],
+                            Color32F::new(encoded(ink[0]), encoded(ink[1]), encoded(ink[2]), 1.0),
+                        )
+                    })
+                    .expect("faded solid draw"),
             },
         )
     }
@@ -231,11 +260,7 @@ fn css_ink_tokens_store_css_source_over_bytes_on_every_target_format() {
     for format in probe.target_formats() {
         for (ink, alpha, backdrop) in cases {
             let expected = css_source_over(ink, f64::from(alpha), backdrop);
-            for shape in [
-                SourceShape::PremultipliedTexel,
-                SourceShape::FadedOpaqueTexel,
-                SourceShape::Solid,
-            ] {
+            for shape in SourceShape::ALL {
                 let pixels = probe.composite(format, shape, ink, alpha, backdrop);
                 assert_rgb_near(
                     &pixels,

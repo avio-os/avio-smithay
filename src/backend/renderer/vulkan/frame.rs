@@ -452,8 +452,10 @@ impl Frame for VulkanFrame<'_> {
             pipelines.solid_pipeline
         };
 
-        // Solid colours are sRGB-encoded straight colours by contract; the shader
-        // premultiplies them, so the blend sees the CSS `rgba()` value.
+        // `Color32F` is premultiplied encoded sRGB by contract, as every
+        // producer (single-pixel buffers, solid elements, the GLES renderer)
+        // assumes, and draw opacity scaled all four channels above. The shader
+        // writes it unchanged, so the blend sees the CSS `rgba()` value once.
         let mut constants = SolidPushConstants {
             color: [color.r(), color.g(), color.b(), color.a()],
             owner_radius: -1.0,
