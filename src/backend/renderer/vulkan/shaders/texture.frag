@@ -106,7 +106,11 @@ float rounded_clip_alpha(vec2 frag_pos) {
 
     vec2 delta = abs(clip_pos - center);
     float dist = pow(pow(delta.x, exponent) + pow(delta.y, exponent), 1.0 / exponent) - radius;
-    return 1.0 - smoothstep(-aa_width, aa_width, dist);
+    // Plain encoded coverage: a linear ramp aa_width physical pixels wide in
+    // total, centred on the edge (RoundedClip::aa_width). At 1.0 this is the
+    // area a pixel straddling a straight edge covers, so a corner meets its
+    // straight sides without a seam and crosses 0.5 exactly on the curve.
+    return clamp(0.5 - dist / aa_width, 0.0, 1.0);
 }
 
 float cubic_component(float p0, float p1, float p2, float p3, float t) {
@@ -274,7 +278,6 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
     float foot_left = plateau_left - side_run;
     float cosine = cos(angle_radians);
     float sine = sin(angle_radians);
-    bool outside_height = point.y < plateau_top || point.y > baseline;
 
     float left = bottom_edge_left_boundary(
         point.y,
@@ -294,11 +297,17 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
         min(point.x - left, right - point.x),
         min(point.y - plateau_top, baseline - point.y)
     );
-    // Fragment-dependent early returns before fwidth leave quad derivatives
-    // undefined. Every lane computes the field and its footprint first;
-    // visibility still masks the same authored rectangle and height afterward.
-    float aa_width = max(fwidth(signed_inside) * 0.75, 0.5 * geometry_scale);
-    float coverage = smoothstep(-aa_width, aa_width, signed_inside);
+    // Fragment-dependent early returns before the derivatives leave quad
+    // derivatives undefined. Every lane computes the field and its footprint
+    // first; visibility still masks the authored rectangle afterward. The
+    // field is a horizontal distance on the slanted sides, so its screen-space
+    // gradient converts it to device pixels along the edge normal: the ramp is
+    // 1 device px in total, centred on the edge, at every geometry scale.
+    float ramp = max(length(vec2(dFdx(signed_inside), dFdy(signed_inside))), 1.0);
+    float coverage = clamp(0.5 + signed_inside / ramp, 0.0, 1.0);
+    // The plateau top ramps on both sides of the authored height; nothing of
+    // the pull reaches more than half a ramp above it.
+    bool outside_height = point.y < plateau_top - 0.5 * ramp || point.y > baseline;
     return outside_rect || outside_height ? 0.0 : coverage;
 }
 

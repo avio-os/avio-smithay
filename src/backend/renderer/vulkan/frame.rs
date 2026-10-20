@@ -2116,6 +2116,7 @@ mod tests {
     include!("frame/window_group_tests.rs");
     include!("frame/owner_group_tests.rs");
     include!("frame/blend_space_tests.rs");
+    include!("frame/clip_coverage_tests.rs");
     use super::{
         combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
         AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,

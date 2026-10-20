@@ -48,7 +48,10 @@
 //! clear and solid colours (premultiplied [`Color32F`](crate::backend::renderer::Color32F))
 //! are written as given. Authored alpha, coverage, opacity, tints and the
 //! material filter therefore keep their CSS meaning, and an opaque 1:1
-//! composite stores exactly its source bytes.
+//! composite stores exactly its source bytes. Analytic clip edges are plain
+//! coverage on a linear ramp centred on the edge: [`RoundedClip::aa_width`](crate::backend::renderer::RoundedClip::aa_width)
+//! wide for rounded corners, and 1 device pixel for the bottom-edge pull at
+//! every geometry scale.
 //!
 //! # Explicit Device-Memory Census
 //!
