@@ -1198,7 +1198,7 @@ fn create_upload_image(
     let render_view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
-        .format(vk_format)
+        .format(VulkanRenderer::BLEND_SPACE.attachment_format(vk_format))
         .subresource_range(
             vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
