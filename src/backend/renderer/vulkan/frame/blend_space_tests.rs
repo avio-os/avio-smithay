@@ -2,9 +2,12 @@
 // authored value (token alpha, draw opacity, solid colour, material filter and
 // tint) must store the CSS SourceOver result on 8-bit and 2101010 targets alike.
 
-/// One renderer plus the small upload ring its memory sources need.
+/// One renderer plus the small upload ring its memory sources need, and the
+/// physical device it runs on (for DMA-BUF allocation).
 struct BlendProbe {
     renderer: VulkanRenderer,
+    #[cfg_attr(not(feature = "backend_gbm"), allow(dead_code))]
+    physical: PhysicalDevice,
 }
 
 /// A source drawn over a solid backdrop, in the shapes the compositor feeds
@@ -37,7 +40,7 @@ impl BlendProbe {
         assert!(renderer
             .configure_memory_upload_capacity(64 * 1024)
             .expect("provision probe upload ring"));
-        Some(Self { renderer })
+        Some(Self { renderer, physical })
     }
 
     /// Target formats whose offscreens this device supports. 8-bit storage is
@@ -387,6 +390,131 @@ fn translucent_offscreen_hop_equals_direct_composition() {
             .unwrap();
     });
     assert_eq!(direct, hopped);
+}
+
+/// DMA-BUF targets bind through the ordinary attachment, so a translucent
+/// texel copied 1:1 over transparent black stores its encoded premultiplied
+/// channels (the frozen-snapshot copy relies on this): sampled back 1:1 into a
+/// cleared offscreen it reproduces the texel, and over paper it composites
+/// like the texel itself. An opaque (X) format keeps the colour channels and
+/// samples as opaque whatever its padding byte received.
+#[cfg(feature = "backend_gbm")]
+#[test]
+fn dmabuf_targets_store_and_sample_encoded_premultiplied_texels() {
+    use crate::backend::{
+        allocator::{
+            format::has_alpha,
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            Modifier,
+        },
+        renderer::ImportDma,
+    };
+    let Some(mut probe) = BlendProbe::new() else {
+        return;
+    };
+    // GBM on the renderer's own node, as the compositor's outputs allocate.
+    // A DMA-BUF exported by a second VkDevice loses the consumer device on
+    // NVIDIA's proprietary driver at first use, before and after this change.
+    let Some(node) = super::super::test_support::present(
+        probe.physical.render_node().ok().flatten(),
+        "Vulkan device render node",
+    ) else {
+        return;
+    };
+    let Some(device) = super::super::test_support::available(
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(node.dev_path().expect("render node path")),
+        "render node",
+    ) else {
+        return;
+    };
+    let Some(gbm) = super::super::test_support::available(GbmDevice::new(device), "GBM device") else {
+        return;
+    };
+    let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+    const PAPER: [u8; 3] = [254, 254, 253];
+    let size = Size::<i32, BufferCoord>::from((PROBE_EXTENT, PROBE_EXTENT));
+    let physical = Size::<i32, Physical>::from((PROBE_EXTENT, PROBE_EXTENT));
+    let full = Rectangle::from_size(physical);
+    let src = Rectangle::from_size((f64::from(PROBE_EXTENT), f64::from(PROBE_EXTENT)).into());
+    let texel = [6u8, 8, 12, 163];
+    let source = probe.import_abgr(size, &texel.repeat((size.w * size.h) as usize));
+    let texel_rgba = stored_rgba(Fourcc::Abgr8888, &texel);
+    for fourcc in [Fourcc::Argb8888, Fourcc::Xrgb8888] {
+        let modifiers = probe
+            .renderer
+            .dmabuf_render_formats()
+            .iter()
+            .filter(|format| {
+                format.code == fourcc
+                    && format.modifier != Modifier::Invalid
+                    && probe.renderer.has_dmabuf_import_format(**format)
+            })
+            .map(|format| format.modifier)
+            .collect::<Vec<_>>();
+        if modifiers.is_empty() {
+            super::super::test_support::capability_unavailable(format_args!(
+                "{fourcc:?} sampled DMA-BUF render target"
+            ));
+            continue;
+        }
+        let Some(buffer) = super::super::test_support::available(
+            allocator.create_buffer(PROBE_EXTENT as u32, PROBE_EXTENT as u32, fourcc, &modifiers),
+            "GBM allocation",
+        ) else {
+            return;
+        };
+        let Some(mut dmabuf) = super::super::test_support::available(buffer.export(), "DMA-BUF export")
+        else {
+            return;
+        };
+        {
+            let mut target = probe.renderer.bind(&mut dmabuf).expect("bind DMA-BUF target");
+            let mut frame = probe
+                .renderer
+                .render(&mut target, physical, Transform::Normal)
+                .expect("frame");
+            frame.clear(Color32F::TRANSPARENT, &[full]).expect("clear");
+            frame
+                .render_texture_from_to(&source, src, full, &[full], &[], Transform::Normal, 1.0)
+                .expect("copy");
+            frame.finish().expect("submit").wait().expect("complete");
+        }
+
+        let opaque = !has_alpha(fourcc);
+        let texture = probe
+            .renderer
+            .import_dmabuf(&dmabuf, None)
+            .expect("sample DMA-BUF");
+        let mut sample_over = |backdrop: [f32; 4]| {
+            probe.render(Fourcc::Abgr8888, size, backdrop, |frame, full| {
+                frame
+                    .render_texture_from_to(&texture, src, full, &[full], &[], Transform::Normal, 1.0)
+                    .expect("draw DMA-BUF");
+            })
+        };
+        let stored = sample_over([0.0; 4]);
+        let expected_rgba = [
+            texel_rgba[0],
+            texel_rgba[1],
+            texel_rgba[2],
+            if opaque { 255.0 } else { texel_rgba[3] },
+        ];
+        assert!(
+            stored.iter().all(|pixel| *pixel == expected_rgba),
+            "{fourcc:?} stores the texel unconverted: {:?}, expected {expected_rgba:?}",
+            stored[0]
+        );
+
+        let paper = PAPER.map(|channel| f32::from(channel) / 255.0);
+        let sampled = sample_over([paper[0], paper[1], paper[2], 1.0]);
+        let coverage = expected_rgba[3] / 255.0;
+        let expected: [f64; 3] =
+            std::array::from_fn(|channel| texel_rgba[channel] + f64::from(PAPER[channel]) * (1.0 - coverage));
+        assert_rgb_near(&sampled, expected, 1.0, &format!("{fourcc:?} sampled over paper"));
+    }
 }
 
 /// CSS `contrast() brightness() saturate()` of an encoded colour, each clamped.
