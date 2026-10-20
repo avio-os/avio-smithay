@@ -109,15 +109,6 @@ fn transpose(sizes: &[Size<i32, BufferCoord>]) -> Vec<Size<i32, BufferCoord>> {
     sizes.iter().map(|size| Size::from((size.h, size.w))).collect()
 }
 
-fn srgb_byte_to_linear(byte: u8) -> f64 {
-    let c = f64::from(byte) / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 /// Abramowitz & Stegun 7.1.26; |error| < 1.5e-7, far below the 8-bit floor the
 /// measurement itself sits on.
 fn erf(x: f64) -> f64 {
@@ -252,8 +243,8 @@ fn fit_profile(profile: &[f64]) -> Option<Fit> {
         residual: erf_residual(profile, mean, sigma_rms),
         support_1pct: tail_support(profile, mean, 0.01)?,
         support_0p1pct: tail_support(profile, mean, 0.001)?,
-        // One 8-bit sRGB code is 3.04e-4 of linear range, so this threshold finds
-        // the last sample the chain left exactly black.
+        // Far below one stored code, so this threshold finds the last sample the
+        // chain left exactly black.
         support_hard: tail_support(profile, mean, 1e-5)?,
         settled: (profile[1] - profile[0]).abs() < 1e-9 && (profile[last] - profile[last - 1]).abs() < 1e-9,
     })
@@ -312,8 +303,8 @@ impl EdgeProbe {
 
     /// Paints a hard black|white step into level 0 with the boundary at
     /// `edge_x`, so the continuous edge sits at `edge_x - 0.5` in texel-centre
-    /// coordinates. Both clears land on exact bytes (0 and 255) whichever way the
-    /// attachment encodes, so the input carries no encoding error of its own.
+    /// coordinates. Both clears land on exact bytes (0 and 255), so the input
+    /// carries no quantization error of its own.
     fn paint_step(&mut self, pyramid: &mut Pyramid, edge_x: i32) -> Option<()> {
         let root = pyramid.sizes[0];
         let physical = Size::<i32, Physical>::from((root.w, root.h));
@@ -341,9 +332,9 @@ impl EdgeProbe {
         Some(())
     }
 
-    /// Reads the middle scanline of level 0 back and decodes it to linear light.
-    /// Storage is sRGB-encoded (the attachment view does the encode), so the
-    /// decode here is the exact inverse of what the chain wrote.
+    /// Reads the middle scanline of level 0 back as normalized stored values.
+    /// The chain filters those same encoded-sRGB values, so the profile is the
+    /// kernel's response in the working space it actually runs in.
     fn read_profile(&mut self, pyramid: &mut Pyramid) -> Option<Vec<f64>> {
         let root = pyramid.sizes[0];
         let target = self.renderer.bind(&mut pyramid.levels[0]).ok()?;
@@ -356,14 +347,14 @@ impl EdgeProbe {
         let row = (root.h / 2) as usize * stride;
         Some(
             (0..root.w as usize)
-                .map(|x| srgb_byte_to_linear(data[row + x * 4]))
+                .map(|x| f64::from(data[row + x * 4]) / 255.0)
                 .collect(),
         )
     }
 
     /// Runs the shell's chain — `levels` downsamples followed by the mirrored
     /// upsamples, every pass at the same `offset` — and returns the normalised
-    /// edge profile in linear light.
+    /// edge profile.
     fn measure(
         &mut self,
         pyramid: &mut Pyramid,

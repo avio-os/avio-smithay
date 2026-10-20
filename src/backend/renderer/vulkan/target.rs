@@ -3,44 +3,19 @@ use crate::{
     utils::{Buffer as BufferCoord, Size},
 };
 
-use super::{format::render_view_format, image::VulkanImage};
+use super::image::VulkanImage;
 use std::sync::Arc;
 
-/// Whether a pass composites in linear light or preserves sampled storage.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) enum VulkanTargetEncoding {
-    #[default]
-    LinearBlend,
-    PreserveStorage,
-}
-
-impl VulkanTargetEncoding {
-    pub(crate) fn format(self, storage: ash::vk::Format) -> ash::vk::Format {
-        match self {
-            Self::LinearBlend => render_view_format(storage),
-            Self::PreserveStorage => storage,
-        }
-    }
-
-    pub(crate) fn view(self, image: &VulkanImage) -> ash::vk::ImageView {
-        match self {
-            Self::LinearBlend => image.render_view(),
-            Self::PreserveStorage => image.view(),
-        }
-    }
-
-    pub(crate) fn blends_in_linear_light(self, image: &VulkanImage) -> bool {
-        self.format(image.vk_format()) != image.vk_format()
-    }
-}
-
-/// Vulkan render-target handle with explicit attachment encoding.
+/// Vulkan render-target handle.
+///
+/// Every target composites in [`VulkanRenderer::BLEND_SPACE`](super::VulkanRenderer::BLEND_SPACE)
+/// through its image's colour-attachment view; no target selects a different
+/// attachment encoding.
 #[derive(Debug, Clone)]
 pub struct VulkanTarget {
     size: Size<i32, BufferCoord>,
     format: Option<Fourcc>,
     image: Option<Arc<VulkanImage>>,
-    pub(crate) encoding: VulkanTargetEncoding,
 }
 
 impl VulkanTarget {
@@ -50,7 +25,6 @@ impl VulkanTarget {
             size,
             format,
             image: None,
-            encoding: VulkanTargetEncoding::LinearBlend,
         }
     }
 
@@ -63,7 +37,6 @@ impl VulkanTarget {
             size,
             format,
             image: Some(image),
-            encoding: VulkanTargetEncoding::LinearBlend,
         }
     }
 
@@ -73,27 +46,6 @@ impl VulkanTarget {
 
     pub(crate) fn image_resource(&self) -> Option<&Arc<VulkanImage>> {
         self.image.as_ref()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::VulkanTargetEncoding;
-    use ash::vk;
-
-    #[test]
-    fn storage_copy_does_not_linearize_or_reencode_translucent_pixels() {
-        for (storage, composited) in [
-            (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB),
-            (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB),
-            (
-                vk::Format::A2B10G10R10_UNORM_PACK32,
-                vk::Format::A2B10G10R10_UNORM_PACK32,
-            ),
-        ] {
-            assert_eq!(VulkanTargetEncoding::PreserveStorage.format(storage), storage);
-            assert_eq!(VulkanTargetEncoding::LinearBlend.format(storage), composited);
-        }
     }
 }
 

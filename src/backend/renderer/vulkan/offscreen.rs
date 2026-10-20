@@ -3,13 +3,10 @@ use super::{
     allocation::VulkanAllocationReason,
     device::DeviceState,
     device_handle::DeviceHandle,
-    format::{
-        optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
-        ColorEncoding,
-    },
+    format::{optimal_tiling_features, texture_view_components},
     image::VulkanImage,
     readback::format_supports_offscreen_usage,
-    VulkanRendererError, VulkanTexture,
+    VulkanRenderer, VulkanRendererError, VulkanTexture,
 };
 use crate::{
     backend::{
@@ -124,11 +121,7 @@ impl VulkanOffscreenAllocator {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST;
 
-        // Offscreens are both rendered into and sampled back, so they carry an `_SRGB`
-        // attachment view alongside the encoded UNORM sampled view.
-        let view_formats = srgb_view_format_list(vk_format);
-        let mut format_list_info;
-        let mut create_info = vk::ImageCreateInfo::default()
+        let create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
             .extent(vk::Extent3D {
@@ -141,17 +134,8 @@ impl VulkanOffscreenAllocator {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
-            .flags(match view_formats {
-                Some(_) => vk::ImageCreateFlags::MUTABLE_FORMAT,
-                None => vk::ImageCreateFlags::empty(),
-            })
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        if let Some(formats) = view_formats.as_ref() {
-            format_list_info = vk::ImageFormatListCreateInfo::default().view_formats(formats);
-            create_info = create_info.push_next(&mut format_list_info);
-        }
 
         // SAFETY: Device is valid and create info references live memory.
         let image = device_handle.observe_result(crate::backend::allocator::observe_gpu_allocation(
@@ -231,8 +215,7 @@ impl VulkanOffscreenAllocator {
         let render_view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            // Linear-light blending, same rule as every other colour attachment.
-            .format(render_view_format(vk_format))
+            .format(VulkanRenderer::BLEND_SPACE.attachment_format(vk_format))
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -272,13 +255,6 @@ impl VulkanOffscreenAllocator {
             },
             vk_format,
             format_features,
-            // Offscreens are filled by our own linear-blending render passes, so their
-            // stored bytes are the sRGB encoding of a premultiplied *linear* value.
-            if memory_writable {
-                ColorEncoding::ElectricalPremultiplied
-            } else {
-                ColorEncoding::LinearPremultiplied
-            },
             usage,
             false,
             vk::ImageLayout::UNDEFINED,

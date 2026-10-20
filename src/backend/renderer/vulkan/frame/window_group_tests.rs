@@ -63,25 +63,10 @@ fn framebuffer_group_prefix_interpolates_premultiplied_rgba() {
                         .transform_rect_in(Rectangle::new(location.into(), (1, 1).into()), &output)
                         .loc;
                     let index = ((pixel.y * storage.w + pixel.x) * 4) as usize;
-                    // Color32F solids are straight electrical colors; the
-                    // attachment blends premultiplied linear light and stores
-                    // sRGB. Alpha is linear throughout.
-                    let decode = |c: f32| {
-                        if c <= 0.04045 {
-                            c / 12.92
-                        } else {
-                            ((c + 0.055) / 1.055).powf(2.4)
-                        }
-                    };
-                    let encode = |c: f32| {
-                        if c <= 0.0031308 {
-                            c * 12.92
-                        } else {
-                            1.055 * c.powf(1.0 / 2.4) - 0.055
-                        }
-                    };
-                    let half = decode(0.5) * 0.5;
-                    let blue = decode(background_alpha);
+                    // Color32F solids are straight encoded colours, and the
+                    // attachment blends their premultiplied values as stored.
+                    let half = 0.5 * 0.5;
+                    let blue = background_alpha;
                     let completed = if covered_twice {
                         [half * 0.5, half, blue * 0.25, 0.75 + background_alpha * 0.25]
                     } else {
@@ -90,8 +75,7 @@ fn framebuffer_group_prefix_interpolates_premultiplied_rgba() {
                     let lower = [0.0, 0.0, blue, background_alpha];
                     for channel in 0..4 {
                         let mixed = lower[channel] * (1.0 - opacity) + completed[channel] * opacity;
-                        let expected =
-                            ((if channel == 3 { mixed } else { encode(mixed) }) * 255.0).round() as i32;
+                        let expected = (mixed * 255.0).round() as i32;
                         assert!((bytes[index+channel] as i32 - expected).abs() <= 3,
                             "{transform:?}, background={background_alpha}, opacity={opacity}, overlap={covered_twice}, channel={channel}: got {}, expected {expected}", bytes[index+channel]);
                     }

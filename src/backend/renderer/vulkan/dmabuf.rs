@@ -22,12 +22,9 @@ use crate::{
 use super::{
     allocation::AllocationGuard,
     device::{DeviceHandle, DeviceState},
-    format::{
-        optimal_tiling_features, render_view_format, srgb_view_format_list, texture_view_components,
-        ColorEncoding, FormatCapabilities, ModifierCapability,
-    },
+    format::{optimal_tiling_features, texture_view_components, FormatCapabilities, ModifierCapability},
     image::VulkanImage,
-    VulkanCacheStats, VulkanRendererError, VulkanTarget, VulkanTexture,
+    VulkanCacheStats, VulkanRenderer, VulkanRendererError, VulkanTarget, VulkanTexture,
 };
 
 mod custody;

@@ -24,14 +24,12 @@ use crate::backend::renderer::ImportDmaWl;
 use super::{
     blit::record_image_blit,
     descriptor::TextureSampler,
-    format::srgb_channel_to_linear,
     image::{stage_access_for_layout, VulkanImage},
     kawase::ResolvedKawasePass,
     pipeline::{
         push_constants_bytes, PipelineHandles, SolidPushConstants, TexturePushConstants, TextureTransform,
     },
     sync::VulkanFence,
-    target::VulkanTargetEncoding,
     VulkanKawasePass, VulkanRenderer, VulkanRendererError, VulkanRendererErrorKind, VulkanTarget,
     VulkanTexture,
 };
@@ -51,7 +49,6 @@ struct FrameRecording {
     framebuffer: vk::Framebuffer,
     storage: super::recording_storage::RecordingStorageLease,
     target: Arc<VulkanImage>,
-    encoding: VulkanTargetEncoding,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -83,7 +80,6 @@ impl FrameRecording {
 #[derive(Debug)]
 struct FrameResumeContext {
     target: Arc<VulkanImage>,
-    encoding: VulkanTargetEncoding,
     pipelines: PipelineHandles,
     transform: Transform,
     output_size: Size<i32, Physical>,
@@ -181,12 +177,11 @@ impl Renderer for VulkanRenderer {
             ));
         }
 
-        // Keyed on the attachment view's format, not the image's storage format: the
-        // render pass and pipelines must agree with the `_SRGB` view that makes the
-        // fixed-function blend operate in linear light.
+        // Keyed on the attachment view's format, which the renderer's blend space
+        // derives from storage: the render pass and pipelines must agree with it.
         let pipelines = self
             .pipelines
-            .pipelines_for_format(target.encoding.format(target_image.vk_format()))?;
+            .pipelines_for_format(target_image.attachment_format())?;
 
         let storage = self.device.acquire_recording_storage()?;
         let command_buffer = self.device.acquire_command_buffer()?;
@@ -207,7 +202,7 @@ impl Renderer for VulkanRenderer {
         let framebuffer = match create_framebuffer(
             self.device.device_handle(),
             pipelines.render_pass,
-            target.encoding.view(&target_image),
+            target_image.render_view(),
             transformed_size,
         ) {
             Ok(framebuffer) => framebuffer,
@@ -230,7 +225,6 @@ impl Renderer for VulkanRenderer {
                 framebuffer,
                 storage,
                 target: target_image,
-                encoding: target.encoding,
                 pipelines,
                 transform: dst_transform,
                 output_size,
@@ -346,14 +340,13 @@ impl Frame for VulkanFrame<'_> {
                 "owner replay cannot clear its frozen prefix",
             ));
         }
-        let (command_buffer, transform, output_size, size, linear_blending) = {
+        let (command_buffer, transform, output_size, size) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.transform,
                 recording.output_size,
                 recording.size,
-                recording.encoding.blends_in_linear_light(&recording.target),
             )
         };
 
@@ -374,10 +367,9 @@ impl Frame for VulkanFrame<'_> {
             .color_attachment(0)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
-                    // Vulkan treats a clear value as linear and encodes it for an `_SRGB`
-                    // attachment, so the caller's sRGB-encoded colour is linearized here
-                    // to land on exactly the same stored bytes as before.
-                    float32: encode_color_for_target(color, linear_blending),
+                    // Clear colours are sRGB-encoded by contract and the attachment
+                    // stores encoded values, so the colour is written unconverted.
+                    float32: [color.r(), color.g(), color.b(), color.a()],
                 },
             })];
 
@@ -460,15 +452,10 @@ impl Frame for VulkanFrame<'_> {
             pipelines.solid_pipeline
         };
 
-        // The shader premultiplies by alpha; linearizing the channels first makes that
-        // a premultiplied-*linear* value, which is what a linear-light blend expects.
+        // Solid colours are sRGB-encoded straight colours by contract; the shader
+        // premultiplies them, so the blend sees the CSS `rgba()` value.
         let mut constants = SolidPushConstants {
-            color: encode_color_for_target(
-                color,
-                self.recording()?
-                    .encoding
-                    .blends_in_linear_light(&self.recording()?.target),
-            ),
+            color: [color.r(), color.g(), color.b(), color.a()],
             owner_radius: -1.0,
             ..SolidPushConstants::default()
         };
@@ -948,10 +935,7 @@ impl VulkanFrame<'_> {
 
     fn frame_target_from_context(context: &FrameResumeContext) -> VulkanTarget {
         let format = Some(context.target.format().code);
-        let mut target =
-            VulkanTarget::from_image_resource(context.target.clone(), context.target.size(), format);
-        target.encoding = context.encoding;
-        target
+        VulkanTarget::from_image_resource(context.target.clone(), context.target.size(), format)
     }
 
     fn recording(&self) -> Result<&FrameRecording, VulkanRendererError> {
@@ -1195,7 +1179,7 @@ impl VulkanFrame<'_> {
 
         self.transition_image_layout(&texture_image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
 
-        let (command_buffer, pipelines, transform, output_size, size, linear_blending) = {
+        let (command_buffer, pipelines, transform, output_size, size) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
@@ -1203,7 +1187,6 @@ impl VulkanFrame<'_> {
                 recording.transform,
                 recording.output_size,
                 recording.size,
-                recording.encoding.blends_in_linear_light(&recording.target),
             )
         };
 
@@ -1307,7 +1290,6 @@ impl VulkanFrame<'_> {
             texture.y_inverted(),
         )
         .with_src_rect(src_offset, src_scale)
-        .with_source_encoding(texture_image.color_encoding(), linear_blending)
         .with_effect(effect);
 
         if let Some(TransformedAnalyticClip::Rounded(clip)) = outer_clip {
@@ -1326,12 +1308,7 @@ impl VulkanFrame<'_> {
                 MaterialTextureOperation::OwnerResolve(extent) => {
                     push_constants.with_owner_resolve(extent, texture_size)
                 }
-                MaterialTextureOperation::Tint(tint) => {
-                    push_constants.with_material_tone(tint).with_source_encoding(
-                        super::format::ColorEncoding::ElectricalPremultiplied,
-                        linear_blending,
-                    )
-                }
+                MaterialTextureOperation::Tint(tint) => push_constants.with_material_tone(tint),
             };
         }
         if let Some(clip) = analytic_clip {
@@ -1696,7 +1673,6 @@ impl VulkanFrame<'_> {
         self.state = VulkanFrameState::Idle;
         Ok(FrameResumeContext {
             target: recording.target,
-            encoding: recording.encoding,
             pipelines: recording.pipelines,
             transform: recording.transform,
             output_size: recording.output_size,
@@ -1730,7 +1706,7 @@ impl VulkanFrame<'_> {
         let framebuffer = match create_framebuffer(
             self.renderer.device.device_handle(),
             context.pipelines.render_pass,
-            context.encoding.view(&context.target),
+            context.target.render_view(),
             context.size,
         ) {
             Ok(framebuffer) => framebuffer,
@@ -1747,7 +1723,6 @@ impl VulkanFrame<'_> {
             framebuffer,
             storage,
             target: context.target.clone(),
-            encoding: context.encoding,
             pipelines: context.pipelines,
             transform: context.transform,
             output_size: context.output_size,
@@ -1884,30 +1859,6 @@ fn to_vk_rect(rect: Rectangle<i32, Physical>) -> vk::Rect2D {
             width: rect.size.w as u32,
             height: rect.size.h as u32,
         },
-    }
-}
-
-/// Cancels the `_SRGB` attachment's encode-on-store for an API-supplied colour.
-///
-/// Against a linear-blending target each colour channel is linearized, so the
-/// hardware's encode lands on exactly the byte the caller named — a pure round-trip
-/// that holds whatever colour space or premultiplication the caller meant, which is
-/// what keeps [`Frame::clear`] writing the same bytes it always did. For the solid
-/// pipeline it additionally puts the channels in linear light before the shader
-/// multiplies by alpha, so that premultiplication happens in linear too.
-///
-/// Against a gamma-blending target (formats with no `_SRGB` sibling) the channels
-/// pass through untouched. Alpha is a coverage term and is never transformed.
-fn encode_color_for_target(color: Color32F, linear_blending: bool) -> [f32; 4] {
-    if linear_blending {
-        [
-            srgb_channel_to_linear(color.r()),
-            srgb_channel_to_linear(color.g()),
-            srgb_channel_to_linear(color.b()),
-            color.a(),
-        ]
-    } else {
-        [color.r(), color.g(), color.b(), color.a()]
     }
 }
 
@@ -2162,6 +2113,7 @@ fn combine_image_transform(src_transform: Transform, output_transform: Transform
 mod tests {
     include!("frame/window_group_tests.rs");
     include!("frame/owner_group_tests.rs");
+    include!("frame/blend_space_tests.rs");
     use super::{
         combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
         AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,

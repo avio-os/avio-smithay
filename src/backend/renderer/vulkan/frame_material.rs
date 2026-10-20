@@ -123,8 +123,7 @@ impl VulkanFrame<'_> {
                     offset,
                 )
                 .with_extents(Size::from((source_area.size.w, source_area.size.h)), extent)
-                .with_source_origin((source_area.loc.x, source_area.loc.y).into())
-                .with_encoded_srgb(),
+                .with_source_origin((source_area.loc.x, source_area.loc.y).into()),
             );
         } else {
             let capture_size = capture_image.size();
