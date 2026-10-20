@@ -35,6 +35,7 @@ impl GlesTexture {
             is_external: false,
             y_inverted: false,
             size,
+            retirement: renderer.origin.as_ref().map(GlesDeviceOrigin::retirement_slot),
             egl_images: None,
             destruction_callback_sender: renderer.gles_cleanup().sender.clone(),
         }))
@@ -64,64 +65,93 @@ impl GlesTexture {
 
 #[derive(Debug, Default)]
 pub(super) struct TextureSync {
-    read_sync: Mutex<Option<ffi::types::GLsync>>,
-    write_sync: Mutex<Option<ffi::types::GLsync>>,
+    pub(super) read_sync: Mutex<Option<ffi::types::GLsync>>,
+    pub(super) write_sync: Mutex<Option<ffi::types::GLsync>>,
 }
 
-unsafe fn wait_for_syncpoint(sync: &mut Option<ffi::types::GLsync>, gl: &Gles2) {
+unsafe fn wait_for_syncpoint(sync: &mut Option<ffi::types::GLsync>, gl: &Gles2) -> Result<(), GlesError> {
     if let Some(sync_obj) = *sync {
         match gl.ClientWaitSync(sync_obj, 0, 0) {
             ffi::ALREADY_SIGNALED | ffi::CONDITION_SATISFIED => {
                 let _ = sync.take();
                 gl.DeleteSync(sync_obj);
             }
-            _ => {
+            ffi::TIMEOUT_EXPIRED => {
                 gl.WaitSync(sync_obj, 0, ffi::TIMEOUT_IGNORED);
+                let code = gl.GetError();
+                if code != ffi::NO_ERROR {
+                    return Err(GlesError::GlSync {
+                        operation: "texture server wait",
+                        code,
+                    });
+                }
+            }
+            _ => {
+                return Err(GlesError::GlSync {
+                    operation: "texture readiness query",
+                    code: gl.GetError(),
+                })
             }
         };
     }
+    Ok(())
 }
 
 impl TextureSync {
-    pub(super) fn wait_for_upload(&self, gl: &Gles2) {
-        unsafe {
-            wait_for_syncpoint(&mut self.write_sync.lock().unwrap(), gl);
-        }
+    pub(super) fn wait_for_upload(&self, gl: &Gles2) -> Result<(), GlesError> {
+        unsafe { wait_for_syncpoint(&mut self.write_sync.lock().unwrap(), gl) }
     }
 
-    pub(super) fn update_read(&self, gl: &Gles2) {
+    pub(super) fn update_read(&self, gl: &Gles2) -> Result<(), GlesError> {
         let mut read_sync = self.read_sync.lock().unwrap();
-        if let Some(old) = read_sync.take() {
-            unsafe {
-                gl.WaitSync(old, 0, ffi::TIMEOUT_IGNORED);
-                gl.DeleteSync(old);
-            };
-        }
-        *read_sync = Some(unsafe { gl.FenceSync(ffi::SYNC_GPU_COMMANDS_COMPLETE, 0) });
+        replace_syncpoint(&mut read_sync, gl)
     }
 
-    pub(super) fn wait_for_all(&mut self, gl: &Gles2) {
+    pub(super) fn wait_for_all(&mut self, gl: &Gles2) -> Result<(), GlesError> {
         unsafe {
-            wait_for_syncpoint(self.read_sync.get_mut().unwrap(), gl);
-            wait_for_syncpoint(self.write_sync.get_mut().unwrap(), gl);
+            wait_for_syncpoint(self.read_sync.get_mut().unwrap(), gl)?;
+            wait_for_syncpoint(self.write_sync.get_mut().unwrap(), gl)
         }
     }
 
-    pub(super) fn update_write(&mut self, gl: &Gles2) {
-        let write_sync = self.write_sync.get_mut().unwrap();
-        if let Some(old) = write_sync.take() {
-            unsafe {
-                gl.WaitSync(old, 0, ffi::TIMEOUT_IGNORED);
-                gl.DeleteSync(old);
-            };
-        }
-
-        *write_sync = Some(unsafe { gl.FenceSync(ffi::SYNC_GPU_COMMANDS_COMPLETE, 0) });
+    pub(super) fn update_write(&mut self, gl: &Gles2) -> Result<(), GlesError> {
+        replace_syncpoint(self.write_sync.get_mut().unwrap(), gl)
     }
+}
+
+fn replace_syncpoint(sync: &mut Option<ffi::types::GLsync>, gl: &Gles2) -> Result<(), GlesError> {
+    // Retain the old dependency until both its wait and the replacement fence
+    // succeeded. A null fence must never become an apparently valid receipt.
+    unsafe {
+        if let Some(old) = *sync {
+            gl.WaitSync(old, 0, ffi::TIMEOUT_IGNORED);
+            let code = gl.GetError();
+            if code != ffi::NO_ERROR {
+                return Err(GlesError::GlSync {
+                    operation: "texture dependency wait",
+                    code,
+                });
+            }
+        }
+        let next = gl.FenceSync(ffi::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if next.is_null() {
+            return Err(GlesError::GlSync {
+                operation: "texture completion fence",
+                code: gl.GetError(),
+            });
+        }
+        if let Some(old) = sync.replace(next) {
+            gl.DeleteSync(old);
+        }
+        // Shared-context consumers must be able to make forward progress.
+        gl.Flush();
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
 pub(super) struct GlesTextureInternal {
+    pub(super) retirement: Option<GlesRetirementSlot<()>>,
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
     pub(super) format: Option<ffi::types::GLenum>,
@@ -151,6 +181,7 @@ impl Drop for GlesTextureInternal {
                 .destruction_callback_sender
                 .send(CleanupResource::Sync(sync as *const _));
         }
+        drop(sync);
         if let Some(images) = self.egl_images.take() {
             for image in images {
                 let _ = self
@@ -158,6 +189,8 @@ impl Drop for GlesTextureInternal {
                     .send(CleanupResource::EGLImage(image));
             }
         }
+        // Publish only after every shared cleanup command is queued.
+        drop(self.retirement.take());
     }
 }
 

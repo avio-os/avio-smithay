@@ -76,6 +76,9 @@ pub(crate) mod storage_heap_probe;
 #[cfg(all(test, feature = "renderer_vulkan"))]
 pub(crate) use vulkan::storage_heap_probe;
 
+#[cfg(any(feature = "renderer_vulkan", feature = "renderer_gl"))]
+mod retirement;
+
 pub mod sync;
 use sync::SyncPoint;
 

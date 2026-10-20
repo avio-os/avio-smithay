@@ -126,6 +126,19 @@ impl SyncPoint {
         self.single_fence().and_then(|f| f.export())
     }
 
+    /// Visit every retained fence without cloning or releasing its owner.
+    ///
+    /// A renderer can enqueue one native GPU dependency for each constituent
+    /// of a compound point. Success means every dependency was accepted, not
+    /// that any fence has completed. An empty (explicitly signaled) point
+    /// invokes no callbacks.
+    pub fn try_for_each_fence<E>(&self, mut visit: impl FnMut(&dyn Fence) -> Result<(), E>) -> Result<(), E> {
+        for fence in self.fences.iter().flatten() {
+            visit(fence.fence.as_ref())?;
+        }
+        Ok(())
+    }
+
     fn single_fence(&self) -> Option<&Arc<dyn Fence>> {
         self.fences[1].is_none().then_some(())?;
         self.fences[0].as_ref().map(|f| &f.fence)

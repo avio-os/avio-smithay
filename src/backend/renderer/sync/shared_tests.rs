@@ -136,3 +136,30 @@ fn empty_join_preserves_single_fence_get_and_ready_semantics() {
     drop(point);
     assert_eq!(owner.native_refs_on_final_return.load(Ordering::Acquire), 0);
 }
+
+#[test]
+fn native_dependency_visitation_preserves_compound_owners_on_error() {
+    let (first, a) = owned(false);
+    let (second, b) = owned(false);
+    let pair = first.try_join(second).unwrap();
+    let mut visits = 0;
+    let result = pair.try_for_each_fence(|_| {
+        visits += 1;
+        if visits == 2 {
+            Err("second import failed")
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(result, Err("second import failed"));
+    assert_eq!(visits, 2);
+    assert_eq!(a.readers.load(Ordering::Acquire), 1);
+    assert_eq!(b.readers.load(Ordering::Acquire), 1);
+    assert!(!pair.is_reached());
+    drop(pair);
+    assert_eq!(a.native_refs_on_final_return.load(Ordering::Acquire), 0);
+    assert_eq!(b.native_refs_on_final_return.load(Ordering::Acquire), 0);
+    SyncPoint::signaled()
+        .try_for_each_fence(|_| -> Result<(), ()> { panic!("signaled point has no dependency") })
+        .unwrap();
+}
