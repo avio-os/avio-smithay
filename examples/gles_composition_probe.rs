@@ -16,9 +16,9 @@ use smithay::{
             TextureRenderEffect, TextureRenderEffectKind,
         },
     },
-    utils::{Physical, Rectangle, Transform},
+    utils::{Buffer, Physical, Rectangle, Transform},
 };
-use std::{error::Error, fs::OpenOptions, os::fd::OwnedFd};
+use std::{error::Error, fs::OpenOptions, io::Write, os::fd::OwnedFd};
 
 #[derive(Debug)]
 struct NotNative;
@@ -230,6 +230,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     drop(target);
     drop(terminal_target);
     verify_encoded_dma_transfer_and_transforms(&mut renderer, &mut allocator)?;
+    verify_inverted_source_crops(&mut renderer)?;
     let source_target = renderer.bind_prepared_texture(&output)?;
     let mut prefix_target = renderer.bind_prepared_texture(&prefix)?;
     renderer
@@ -615,6 +616,141 @@ fn verify_encoded_dma_transfer_and_transforms(
         }
     }
     println!("SMITHAY_GLES_TRANSFORMED_DAMAGE=PASS");
+    Ok(())
+}
+
+// Exercise the actual shared fragment shader, not a CPU copy of its formula.
+// Both inputs describe the same logical image; only physical row order and its
+// declared storage flag differ. A nonzero asymmetric crop catches a local-UV
+// flip that full-image comparisons cannot distinguish from whole-image origin.
+fn verify_inverted_source_crops(renderer: &mut GlesRenderer) -> Result<(), Box<dyn Error>> {
+    const WIDTH: i32 = 44;
+    const HEIGHT: i32 = 28;
+    const OUTPUT_WIDTH: i32 = 48;
+    const OUTPUT_HEIGHT: i32 = 40;
+    let color = |x: i32, y: i32| [16 + x as u8 * 5, 20 + y as u8 * 7, 96, 255];
+    let pixels: Vec<u8> = (0..HEIGHT)
+        .flat_map(|y| (0..WIDTH).flat_map(move |x| color(x, y)))
+        .collect();
+    let inverted_pixels: Vec<u8> = pixels
+        .chunks_exact(WIDTH as usize * 4)
+        .rev()
+        .flatten()
+        .copied()
+        .collect();
+    let normal = renderer.import_memory(&pixels, Fourcc::Abgr8888, (WIDTH, HEIGHT).into(), false)?;
+    let inverted =
+        renderer.import_memory(&inverted_pixels, Fourcc::Abgr8888, (WIDTH, HEIGHT).into(), true)?;
+    assert!(!normal.is_y_inverted());
+    assert!(inverted.is_y_inverted());
+    let size = (OUTPUT_WIDTH, OUTPUT_HEIGHT).into();
+    let full = Rectangle::<i32, Physical>::from_size(size);
+    let scratch =
+        renderer.create_composition_buffer(Fourcc::Abgr8888, (OUTPUT_WIDTH, OUTPUT_HEIGHT).into())?;
+    let terminal = renderer.import_memory(
+        &[0u8, 255, 0, 255].repeat((OUTPUT_WIDTH * OUTPUT_HEIGHT) as usize),
+        Fourcc::Abgr8888,
+        (OUTPUT_WIDTH, OUTPUT_HEIGHT).into(),
+        false,
+    )?;
+    renderer.prepare_framebuffer_textures(&[&scratch, &terminal])?;
+    let mut scratch_target = renderer.bind_prepared_texture(&scratch)?;
+    let mut terminal_target = renderer.bind_prepared_texture(&terminal)?;
+    let cropped = Rectangle::<i32, Buffer>::new((5, 3).into(), (11, 7).into());
+    let cases = std::iter::once((
+        Rectangle::from_size((WIDTH, HEIGHT).into()),
+        Transform::Normal,
+        false,
+    ))
+    .chain(
+        [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ]
+        .into_iter()
+        .flat_map(|transform| [(cropped, transform, false), (cropped, transform, true)]),
+    );
+    for (src, transform, clipped) in cases {
+        let extent = transform.transform_size(src.size);
+        let dst = Rectangle::<i32, Physical>::new((2, 3).into(), (extent.w, extent.h).into());
+        let damage = [Rectangle::from_size(dst.size)];
+        let mut reference: Option<Vec<u8>> = None;
+        for source in [&normal, &inverted] {
+            let mut frame = renderer.render(&mut scratch_target, size, Transform::Normal)?;
+            frame.clear(Color32F::new(0.0, 1.0, 0.0, 1.0), &[full])?;
+            if clipped {
+                frame.render_texture_from_to_with_rounded_clip(
+                    source,
+                    src.to_f64(),
+                    dst,
+                    &damage,
+                    &[],
+                    transform,
+                    1.0,
+                    RoundedClip {
+                        rect: dst.to_f64(),
+                        radius: 2.0,
+                        exponent: 2.0,
+                        aa_width: 0.5,
+                        corner_mask: RoundedClip::ALL_CORNERS,
+                    },
+                )?;
+            } else {
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    source,
+                    src.to_f64(),
+                    dst,
+                    &damage,
+                    &[],
+                    transform,
+                    1.0,
+                )?;
+            }
+            let completion = frame.finish_into(&mut terminal_target, &[full])?;
+            assert!(completion.is_exportable(), "crop render lacks native completion");
+            completion.wait()?;
+            let mapping = renderer.copy_framebuffer(
+                &terminal_target,
+                Rectangle::from_size((OUTPUT_WIDTH, OUTPUT_HEIGHT).into()),
+                Fourcc::Abgr8888,
+            )?;
+            let actual = renderer.map_texture(&mapping)?.to_vec();
+            drop(mapping);
+            for y in 0..OUTPUT_HEIGHT {
+                for x in 0..OUTPUT_WIDTH {
+                    let pixel = &actual[((y * OUTPUT_WIDTH + x) * 4) as usize..][..4];
+                    if !dst.contains((x, y)) {
+                        assert_pixel(pixel, [0, 255, 0, 255], "crop escaped destination");
+                    } else if transform == Transform::Normal && !clipped {
+                        assert_pixel(
+                            pixel,
+                            color(x - dst.loc.x + src.loc.x, y - dst.loc.y + src.loc.y),
+                            "logical source crop",
+                        );
+                    }
+                }
+            }
+            if let Some(reference) = &reference {
+                assert!(
+                    actual.iter().zip(reference).all(|(a, b)| a.abs_diff(*b) <= 2),
+                    "storage orientation changed logical crop: {src:?} {transform:?} clipped={clipped}"
+                );
+            } else {
+                reference = Some(actual);
+            }
+        }
+    }
+    writeln!(
+        std::io::stdout(),
+        "SMITHAY_GLES_Y_INVERTED_SOURCE_CROP=PASS cases=17"
+    )?;
     Ok(())
 }
 
