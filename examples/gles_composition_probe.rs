@@ -66,320 +66,335 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut allocator =
         ExplicitGbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let display = unsafe { EGLDisplay::new(gbm)? };
-    let origin = GlesDeviceOrigin::new(&display)?;
-    let helper_origin = origin.clone();
-    let bank = std::thread::spawn(move || {
-        let mut helper = helper_origin.create_renderer().map_err(|e| e.to_string())?;
-        helper.prepare_composition_programs().map_err(|e| e.to_string())
-    })
-    .join()
-    .expect("helper panicked")
-    .map_err(std::io::Error::other)?;
-    let mut renderer = origin.create_renderer()?;
-    renderer.adopt_composition_programs(bank.clone())?;
-    renderer.prepare_damage_scratch(4, 16)?;
-    renderer.reserve_composition_framebuffers(8)?;
-    println!("SMITHAY_GLES_PROGRAMS=PASS");
-    let output = renderer.create_composition_buffer(Fourcc::Abgr8888, (32, 32).into())?;
-    let prefix = renderer.create_composition_buffer(Fourcc::Abgr8888, (32, 32).into())?;
-    let half = renderer.create_composition_buffer(Fourcc::Abgr8888, (16, 16).into())?;
-    let atlas = renderer.create_composition_buffer(Fourcc::Abgr8888, (64, 64).into())?;
-    renderer.prepare_composition_textures(&[&output, &prefix, &half, &atlas])?;
-    let white = renderer.import_memory(&[128; 4 * 32 * 32], Fourcc::Abgr8888, (32, 32).into(), false)?;
-    let opaque = renderer.import_memory(&[255; 4 * 32 * 32], Fourcc::Abgr8888, (32, 32).into(), false)?;
-    let display_handle = **display.get_display_handle();
-    let context_handle = renderer.egl_context().get_context_handle();
-    let external_name = renderer.with_context(|gl| unsafe {
-        let image = egl::CreateImageKHR(
-            display_handle,
-            context_handle,
-            egl::GL_TEXTURE_2D,
-            opaque.tex_id() as usize as *mut _,
-            [egl::GL_TEXTURE_LEVEL as i32, 0, egl::NONE as i32].as_ptr(),
+    let (origin, terminal_join) = GlesDeviceOrigin::new_with_terminal_join(&display)?;
+    // All resources and helper publications end before the last productive
+    // endpoint closes. A panic retains the existing quarantine discipline;
+    // the external probe deadline supervises a terminal join that cannot close.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), Box<dyn Error>> {
+        let helper_origin = origin.clone();
+        let bank = std::thread::spawn(move || {
+            let mut helper = helper_origin.create_renderer().map_err(|e| e.to_string())?;
+            helper.prepare_composition_programs().map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("helper panicked")
+        .map_err(std::io::Error::other)?;
+        let mut renderer = origin.create_renderer()?;
+        renderer.adopt_composition_programs(bank.clone())?;
+        renderer.prepare_damage_scratch(4, 16)?;
+        renderer.reserve_composition_framebuffers(8)?;
+        println!("SMITHAY_GLES_PROGRAMS=PASS");
+        let output = renderer.create_composition_buffer(Fourcc::Abgr8888, (32, 32).into())?;
+        let prefix = renderer.create_composition_buffer(Fourcc::Abgr8888, (32, 32).into())?;
+        let half = renderer.create_composition_buffer(Fourcc::Abgr8888, (16, 16).into())?;
+        let atlas = renderer.create_composition_buffer(Fourcc::Abgr8888, (64, 64).into())?;
+        renderer.prepare_composition_textures(&[&output, &prefix, &half, &atlas])?;
+        let white = renderer.import_memory(&[128; 4 * 32 * 32], Fourcc::Abgr8888, (32, 32).into(), false)?;
+        let opaque = renderer.import_memory(&[255; 4 * 32 * 32], Fourcc::Abgr8888, (32, 32).into(), false)?;
+        let display_handle = **display.get_display_handle();
+        let context_handle = renderer.egl_context().get_context_handle();
+        let external_name = renderer.with_context(|gl| unsafe {
+            let image = egl::CreateImageKHR(
+                display_handle,
+                context_handle,
+                egl::GL_TEXTURE_2D,
+                opaque.tex_id() as usize as *mut _,
+                [egl::GL_TEXTURE_LEVEL as i32, 0, egl::NONE as i32].as_ptr(),
+            );
+            assert_ne!(image, egl::NO_IMAGE_KHR, "external source EGL image creation");
+            let mut name = 0;
+            gl.GenTextures(1, &mut name);
+            gl.BindTexture(gl::TEXTURE_EXTERNAL_OES, name);
+            gl.EGLImageTargetTexture2DOES(gl::TEXTURE_EXTERNAL_OES, image);
+            gl.BindTexture(gl::TEXTURE_EXTERNAL_OES, 0);
+            assert_eq!(gl.GetError(), gl::NO_ERROR, "external source image attachment");
+            assert_ne!(egl::DestroyImageKHR(display_handle, image), egl::FALSE);
+            name
+        })?;
+        // SAFETY: The current native context created this external texture above;
+        // opaque retains the image's allocation through the probe's final fence.
+        let external =
+            unsafe { GlesTexture::from_raw_external(&renderer, true, external_name, (32, 32).into(), false) };
+        let passes = [GlesKawasePass::new(&prefix, &half, false, 1.0).with_encoded_srgb()];
+        renderer.prepare_kawase_passes(&passes)?;
+        let rect = Rectangle::<i32, Physical>::from_size((32, 32).into());
+        let clip = RoundedClip {
+            rect: rect.to_f64(),
+            radius: 10.0,
+            exponent: 2.0,
+            aa_width: 0.5,
+            corner_mask: RoundedClip::ALL_CORNERS,
+        };
+        assert!(
+            output.is_externally_idle(),
+            "weak native inventory retained a strong texture reader"
         );
-        assert_ne!(image, egl::NO_IMAGE_KHR, "external source EGL image creation");
-        let mut name = 0;
-        gl.GenTextures(1, &mut name);
-        gl.BindTexture(gl::TEXTURE_EXTERNAL_OES, name);
-        gl.EGLImageTargetTexture2DOES(gl::TEXTURE_EXTERNAL_OES, image);
-        gl.BindTexture(gl::TEXTURE_EXTERNAL_OES, 0);
-        assert_eq!(gl.GetError(), gl::NO_ERROR, "external source image attachment");
-        assert_ne!(egl::DestroyImageKHR(display_handle, image), egl::FALSE);
-        name
-    })?;
-    // SAFETY: The current native context created this external texture above;
-    // opaque retains the image's allocation through the probe's final fence.
-    let external =
-        unsafe { GlesTexture::from_raw_external(&renderer, true, external_name, (32, 32).into(), false) };
-    let passes = [GlesKawasePass::new(&prefix, &half, false, 1.0).with_encoded_srgb()];
-    renderer.prepare_kawase_passes(&passes)?;
-    let rect = Rectangle::<i32, Physical>::from_size((32, 32).into());
-    let clip = RoundedClip {
-        rect: rect.to_f64(),
-        radius: 10.0,
-        exponent: 2.0,
-        aa_width: 0.5,
-        corner_mask: RoundedClip::ALL_CORNERS,
-    };
-    assert!(
-        output.is_externally_idle(),
-        "weak native inventory retained a strong texture reader"
-    );
-    let terminal = renderer.import_memory(
-        &[0u8, 255, 0, 255].repeat(32 * 32),
-        Fourcc::Abgr8888,
-        (32, 32).into(),
-        false,
-    )?;
-    renderer.prepare_framebuffer_textures(&[&terminal])?;
-    let mut terminal_target = renderer.bind_prepared_texture(&terminal)?;
-    let mut target = renderer.bind_prepared_texture(&output)?;
-    let snapshot = renderer.submission_snapshot();
-    let mut frame = renderer.render(&mut target, (32, 32).into(), Transform::Normal)?;
-    frame.clear(Color32F::BLACK, &[rect])?;
-    Frame::render_texture_from_to(
-        &mut frame,
-        &white,
-        Rectangle::from_size((32.0, 32.0).into()),
-        rect,
-        &[rect],
-        &[],
-        Transform::Normal,
-        1.0,
-    )?;
-    let patch = Rectangle::new((8, 8).into(), (8, 8).into());
-    let completion = frame.finish_into(&mut terminal_target, &[patch])?;
-    assert!(completion.is_exportable());
-    assert!(renderer.completion_since(snapshot).is_some());
-    // This standalone cold validation program may wait/read back evidence.
-    completion.wait()?;
-    let mapping =
-        renderer.copy_framebuffer(&target, Rectangle::from_size((32, 32).into()), Fourcc::Abgr8888)?;
-    let pixels = renderer.map_texture(&mapping)?;
-    assert!(
-        (186..=190).contains(&pixels[0]),
-        "linear-light blend channel={}",
-        pixels[0]
-    );
-    println!("SMITHAY_GLES_LINEAR_BLEND=PASS channel={}", pixels[0]);
-    let mapping = renderer.copy_framebuffer(
-        &terminal_target,
-        Rectangle::from_size((32, 32).into()),
-        Fourcc::Abgr8888,
-    )?;
-    let terminal_pixels = renderer.map_texture(&mapping)?;
-    assert_eq!(
-        &terminal_pixels[..4],
-        &[0, 255, 0, 255],
-        "terminal resolve overwrote pixels outside damage"
-    );
-    assert!(
-        (186..=190).contains(&terminal_pixels[(8 * 32 + 8) * 4]),
-        "terminal resolve did not encode linear composition"
-    );
-    println!("SMITHAY_GLES_TERMINAL_ENCODING_DAMAGE=PASS");
-    let mut frame = renderer.render(&mut target, (32, 32).into(), Transform::Normal)?;
-    frame.clear(Color32F::BLACK, &[rect])?;
-    frame.render_texture_from_to_with_rounded_clip(
-        &external,
-        Rectangle::from_size((32.0, 32.0).into()),
-        rect,
-        &[rect],
-        &[],
-        Transform::Normal,
-        1.0,
-        clip,
-    )?;
-    frame.capture_and_filter_framebuffer(rect, &prefix, &passes)?;
-    frame.render_kawase_with_rounded_clip(
-        &half,
-        Rectangle::from_size((16.0, 16.0).into()),
-        rect,
-        &[rect],
-        Transform::Normal,
-        1.0,
-        clip,
-        GlesKawaseOutput::new((16, 16).into(), 1.0),
-    )?;
-    frame.render_owner_clipped_group(&atlas, rect, rect, clip, &[rect], |frame| {
-        assert!(frame.canonical_coverage_lane().is_some());
-        frame.render_texture_from_to_with_rounded_clip_and_effect(
-            &opaque,
+        let terminal = renderer.import_memory(
+            &[0u8, 255, 0, 255].repeat(32 * 32),
+            Fourcc::Abgr8888,
+            (32, 32).into(),
+            false,
+        )?;
+        renderer.prepare_framebuffer_textures(&[&terminal])?;
+        let mut terminal_target = renderer.bind_prepared_texture(&terminal)?;
+        let mut target = renderer.bind_prepared_texture(&output)?;
+        let snapshot = renderer.submission_snapshot();
+        let mut frame = renderer.render(&mut target, (32, 32).into(), Transform::Normal)?;
+        frame.clear(Color32F::BLACK, &[rect])?;
+        Frame::render_texture_from_to(
+            &mut frame,
+            &white,
             Rectangle::from_size((32.0, 32.0).into()),
             rect,
             &[rect],
             &[],
             Transform::Normal,
-            0.25,
+            1.0,
+        )?;
+        let patch = Rectangle::new((8, 8).into(), (8, 8).into());
+        let completion = frame.finish_into(&mut terminal_target, &[patch])?;
+        assert!(completion.is_exportable());
+        assert!(renderer.completion_since(snapshot).is_some());
+        // This standalone cold validation program may wait/read back evidence.
+        completion.wait()?;
+        let mapping =
+            renderer.copy_framebuffer(&target, Rectangle::from_size((32, 32).into()), Fourcc::Abgr8888)?;
+        let pixels = renderer.map_texture(&mapping)?;
+        assert!(
+            (186..=190).contains(&pixels[0]),
+            "linear-light blend channel={}",
+            pixels[0]
+        );
+        println!("SMITHAY_GLES_LINEAR_BLEND=PASS channel={}", pixels[0]);
+        let mapping = renderer.copy_framebuffer(
+            &terminal_target,
+            Rectangle::from_size((32, 32).into()),
+            Fourcc::Abgr8888,
+        )?;
+        let terminal_pixels = renderer.map_texture(&mapping)?;
+        assert_eq!(
+            &terminal_pixels[..4],
+            &[0, 255, 0, 255],
+            "terminal resolve overwrote pixels outside damage"
+        );
+        assert!(
+            (186..=190).contains(&terminal_pixels[(8 * 32 + 8) * 4]),
+            "terminal resolve did not encode linear composition"
+        );
+        println!("SMITHAY_GLES_TERMINAL_ENCODING_DAMAGE=PASS");
+        let mut frame = renderer.render(&mut target, (32, 32).into(), Transform::Normal)?;
+        frame.clear(Color32F::BLACK, &[rect])?;
+        frame.render_texture_from_to_with_rounded_clip(
+            &external,
+            Rectangle::from_size((32.0, 32.0).into()),
+            rect,
+            &[rect],
+            &[],
+            Transform::Normal,
+            1.0,
             clip,
-            TextureRenderEffect {
-                kind: TextureRenderEffectKind::Fullscreen,
-                progress: 0.5,
-                anchor: [0.5, 0.5],
-                params: [0.0, 0.1, 0.0, 0.0],
-            },
-        )
-    })?;
-    frame.finish()?.wait()?;
-    let mapping =
-        renderer.copy_framebuffer(&target, Rectangle::from_size((32, 32).into()), Fourcc::Abgr8888)?;
-    let pixels = renderer.map_texture(&mapping)?;
-    assert!(pixels[0] < 8, "corner escaped clip: {}", pixels[0]);
-    assert!(pixels[(16 * 32 + 16) * 4] > 240, "center lost content");
-    println!("SMITHAY_GLES_EFFECTS_OWNER_KAWASE_EXTERNAL=PASS");
-    drop(target);
-    drop(terminal_target);
-    verify_encoded_dma_transfer_and_transforms(&mut renderer, &mut allocator)?;
-    verify_inverted_source_crops(&mut renderer)?;
-    let source_target = renderer.bind_prepared_texture(&output)?;
-    let mut prefix_target = renderer.bind_prepared_texture(&prefix)?;
-    renderer
-        .blit(
-            &source_target,
-            &mut prefix_target,
+        )?;
+        frame.capture_and_filter_framebuffer(rect, &prefix, &passes)?;
+        frame.render_kawase_with_rounded_clip(
+            &half,
+            Rectangle::from_size((16.0, 16.0).into()),
             rect,
+            &[rect],
+            Transform::Normal,
+            1.0,
+            clip,
+            GlesKawaseOutput::new((16, 16).into(), 1.0),
+        )?;
+        frame.render_owner_clipped_group(&atlas, rect, rect, clip, &[rect], |frame| {
+            assert!(frame.canonical_coverage_lane().is_some());
+            frame.render_texture_from_to_with_rounded_clip_and_effect(
+                &opaque,
+                Rectangle::from_size((32.0, 32.0).into()),
+                rect,
+                &[rect],
+                &[],
+                Transform::Normal,
+                0.25,
+                clip,
+                TextureRenderEffect {
+                    kind: TextureRenderEffectKind::Fullscreen,
+                    progress: 0.5,
+                    anchor: [0.5, 0.5],
+                    params: [0.0, 0.1, 0.0, 0.0],
+                },
+            )
+        })?;
+        frame.finish()?.wait()?;
+        let mapping =
+            renderer.copy_framebuffer(&target, Rectangle::from_size((32, 32).into()), Fourcc::Abgr8888)?;
+        let pixels = renderer.map_texture(&mapping)?;
+        assert!(pixels[0] < 8, "corner escaped clip: {}", pixels[0]);
+        assert!(pixels[(16 * 32 + 16) * 4] > 240, "center lost content");
+        println!("SMITHAY_GLES_EFFECTS_OWNER_KAWASE_EXTERNAL=PASS");
+        drop(target);
+        drop(terminal_target);
+        verify_encoded_dma_transfer_and_transforms(&mut renderer, &mut allocator)?;
+        verify_inverted_source_crops(&mut renderer)?;
+        let source_target = renderer.bind_prepared_texture(&output)?;
+        let mut prefix_target = renderer.bind_prepared_texture(&prefix)?;
+        renderer
+            .blit(
+                &source_target,
+                &mut prefix_target,
+                rect,
+                rect,
+                TextureFilter::Nearest,
+            )?
+            .wait()?;
+        let mapping = renderer.copy_framebuffer(
+            &prefix_target,
+            Rectangle::from_size((32, 32).into()),
+            Fourcc::Abgr8888,
+        )?;
+        let pixels = renderer.map_texture(&mapping)?;
+        assert!(
+            pixels[0] < 8 && pixels[(16 * 32 + 16) * 4] > 240,
+            "blit lost prior readback's source attachment"
+        );
+        drop(source_target);
+        drop(prefix_target);
+        println!("SMITHAY_GLES_BLIT_AFTER_READBACK=PASS");
+        let excessive = (0..5)
+            .map(|_| renderer.create_composition_buffer(Fourcc::Abgr8888, (4, 4).into()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let references: Vec<_> = excessive.iter().collect();
+        assert!(renderer.can_prepare_framebuffer_textures(&references).is_err());
+        assert!(renderer.check_completion_health().is_ok());
+        println!("SMITHAY_GLES_BOUNDED_INVENTORY=PASS");
+        let mut second = origin.create_renderer()?;
+        second.adopt_composition_programs(bank)?;
+        second.reserve_composition_framebuffers(3)?;
+        let mut second_texture = second.create_composition_buffer(Fourcc::Abgr8888, (32, 32).into())?;
+        second.prepare_composition_textures(&[&second_texture])?;
+        let mut second_target = second.bind(&mut second_texture)?;
+        second.cleanup_texture_cache()?;
+        assert!(renderer
+            .render(&mut second_target, (32, 32).into(), Transform::Normal)
+            .is_err());
+        let mut frame = second.render(&mut second_target, (32, 32).into(), Transform::Normal)?;
+        frame.clear(Color32F::BLACK, &[rect])?;
+        frame.finish()?.wait()?;
+        drop(second_target);
+        println!("SMITHAY_GLES_SHARED_PROGRAMS_CONTEXT_FBO=PASS");
+        let fp16 = second.create_composition_buffer(Fourcc::Abgr16161616f, (32, 32).into())?;
+        second.prepare_composition_textures(&[&fp16])?;
+        let mut fp16_target = second.bind_prepared_texture(&fp16)?;
+        let mut frame = second.render(&mut fp16_target, (32, 32).into(), Transform::Normal)?;
+        frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &[rect])?;
+        Frame::render_texture_from_to(
+            &mut frame,
+            &white,
+            Rectangle::from_size((32.0, 32.0).into()),
             rect,
-            TextureFilter::Nearest,
-        )?
-        .wait()?;
-    let mapping = renderer.copy_framebuffer(
-        &prefix_target,
-        Rectangle::from_size((32, 32).into()),
-        Fourcc::Abgr8888,
-    )?;
-    let pixels = renderer.map_texture(&mapping)?;
-    assert!(
-        pixels[0] < 8 && pixels[(16 * 32 + 16) * 4] > 240,
-        "blit lost prior readback's source attachment"
-    );
-    drop(source_target);
-    drop(prefix_target);
-    println!("SMITHAY_GLES_BLIT_AFTER_READBACK=PASS");
-    let excessive = (0..5)
-        .map(|_| renderer.create_composition_buffer(Fourcc::Abgr8888, (4, 4).into()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let references: Vec<_> = excessive.iter().collect();
-    assert!(renderer.can_prepare_framebuffer_textures(&references).is_err());
-    assert!(renderer.check_completion_health().is_ok());
-    println!("SMITHAY_GLES_BOUNDED_INVENTORY=PASS");
-    let mut second = origin.create_renderer()?;
-    second.adopt_composition_programs(bank)?;
-    second.reserve_composition_framebuffers(3)?;
-    let mut second_texture = second.create_composition_buffer(Fourcc::Abgr8888, (32, 32).into())?;
-    second.prepare_composition_textures(&[&second_texture])?;
-    let mut second_target = second.bind(&mut second_texture)?;
-    second.cleanup_texture_cache()?;
-    assert!(renderer
-        .render(&mut second_target, (32, 32).into(), Transform::Normal)
-        .is_err());
-    let mut frame = second.render(&mut second_target, (32, 32).into(), Transform::Normal)?;
-    frame.clear(Color32F::BLACK, &[rect])?;
-    frame.finish()?.wait()?;
-    drop(second_target);
-    println!("SMITHAY_GLES_SHARED_PROGRAMS_CONTEXT_FBO=PASS");
-    let fp16 = second.create_composition_buffer(Fourcc::Abgr16161616f, (32, 32).into())?;
-    second.prepare_composition_textures(&[&fp16])?;
-    let mut fp16_target = second.bind_prepared_texture(&fp16)?;
-    let mut frame = second.render(&mut fp16_target, (32, 32).into(), Transform::Normal)?;
-    frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &[rect])?;
-    Frame::render_texture_from_to(
-        &mut frame,
-        &white,
-        Rectangle::from_size((32.0, 32.0).into()),
-        rect,
-        &[rect],
-        &[],
-        Transform::Normal,
-        1.0,
-    )?;
-    frame.finish()?.wait()?;
-    // ES requires RGBA/FLOAT readback for floating color attachments. Keep
-    // this cold probe independent of optional HALF_FLOAT readback extensions.
-    let mut pixels = vec![0.0f32; 32 * 32 * 4];
-    second.with_context(|gl| unsafe {
-        gl.ReadBuffer(gl::COLOR_ATTACHMENT0);
-        gl.ReadPixels(0, 0, 32, 32, gl::RGBA, gl::FLOAT, pixels.as_mut_ptr().cast());
-        assert_eq!(gl.GetError(), gl::NO_ERROR, "floating attachment readback");
-    })?;
-    let channel = pixels[0];
-    assert!(
-        (channel - 128.0 / 255.0).abs() < 0.002,
-        "float encoded-blend policy {channel}",
-    );
-    assert!((pixels[3] - 128.0 / 255.0).abs() < 0.002);
-    let fp16_terminal =
-        second.import_memory(&[0u8; 32 * 32 * 4], Fourcc::Abgr8888, (32, 32).into(), false)?;
-    second.prepare_framebuffer_textures(&[&fp16_terminal])?;
-    let mut fp16_destination = second.bind_prepared_texture(&fp16_terminal)?;
-    let frame = second.render(&mut fp16_target, (32, 32).into(), Transform::Normal)?;
-    frame.finish_into(&mut fp16_destination, &[rect])?.wait()?;
-    let mapping = second.copy_framebuffer(
-        &fp16_destination,
-        Rectangle::from_size((32, 32).into()),
-        Fourcc::Abgr8888,
-    )?;
-    let pixels = second.map_texture(&mapping)?;
-    assert_pixel(&pixels[..4], [128; 4], "floating electrical-alpha terminal");
-    drop(mapping);
-    let mut linear_target = second.bind_prepared_texture(&second_texture)?;
-    let mut frame = second.render(&mut linear_target, (32, 32).into(), Transform::Normal)?;
-    frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &[rect])?;
-    Frame::render_texture_from_to(
-        &mut frame,
-        &white,
-        Rectangle::from_size((32.0, 32.0).into()),
-        rect,
-        &[rect],
-        &[],
-        Transform::Normal,
-        1.0,
-    )?;
-    frame.finish()?.wait()?;
-    second
-        .blit(
-            &linear_target,
-            &mut fp16_target,
+            &[rect],
+            &[],
+            Transform::Normal,
+            1.0,
+        )?;
+        frame.finish()?.wait()?;
+        // ES requires RGBA/FLOAT readback for floating color attachments. Keep
+        // this cold probe independent of optional HALF_FLOAT readback extensions.
+        let mut pixels = vec![0.0f32; 32 * 32 * 4];
+        second.with_context(|gl| unsafe {
+            gl.ReadBuffer(gl::COLOR_ATTACHMENT0);
+            gl.ReadPixels(0, 0, 32, 32, gl::RGBA, gl::FLOAT, pixels.as_mut_ptr().cast());
+            assert_eq!(gl.GetError(), gl::NO_ERROR, "floating attachment readback");
+        })?;
+        let channel = pixels[0];
+        assert!(
+            (channel - 128.0 / 255.0).abs() < 0.002,
+            "float encoded-blend policy {channel}",
+        );
+        assert!((pixels[3] - 128.0 / 255.0).abs() < 0.002);
+        let fp16_terminal =
+            second.import_memory(&[0u8; 32 * 32 * 4], Fourcc::Abgr8888, (32, 32).into(), false)?;
+        second.prepare_framebuffer_textures(&[&fp16_terminal])?;
+        let mut fp16_destination = second.bind_prepared_texture(&fp16_terminal)?;
+        let frame = second.render(&mut fp16_target, (32, 32).into(), Transform::Normal)?;
+        frame.finish_into(&mut fp16_destination, &[rect])?.wait()?;
+        let mapping = second.copy_framebuffer(
+            &fp16_destination,
+            Rectangle::from_size((32, 32).into()),
+            Fourcc::Abgr8888,
+        )?;
+        let pixels = second.map_texture(&mapping)?;
+        assert_pixel(&pixels[..4], [128; 4], "floating electrical-alpha terminal");
+        drop(mapping);
+        let mut linear_target = second.bind_prepared_texture(&second_texture)?;
+        let mut frame = second.render(&mut linear_target, (32, 32).into(), Transform::Normal)?;
+        frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &[rect])?;
+        Frame::render_texture_from_to(
+            &mut frame,
+            &white,
+            Rectangle::from_size((32.0, 32.0).into()),
             rect,
-            rect,
-            TextureFilter::Nearest,
-        )?
-        .wait()?;
-    let frame = second.render(&mut fp16_target, (32, 32).into(), Transform::Normal)?;
-    frame.finish_into(&mut fp16_destination, &[rect])?.wait()?;
-    let mapping = second.copy_framebuffer(
-        &fp16_destination,
-        Rectangle::from_size((32, 32).into()),
-        Fourcc::Abgr8888,
-    )?;
-    let pixels = second.map_texture(&mapping)?;
-    assert_pixel(&pixels[..4], [128; 4], "linear 8888 to electrical F16 transfer");
-    drop(mapping);
-    drop(linear_target);
-    drop(fp16_destination);
-    drop(fp16_target);
-    println!("SMITHAY_GLES_FLOAT_COMPOSITION=PASS");
-    let mut exhausted = origin.create_renderer()?;
-    exhausted.reserve_native_completions(1)?;
-    let before = exhausted.submission_snapshot();
-    let held = exhausted.publish_shared_work()?;
-    assert!(held.is_exportable());
-    let after = exhausted.submission_snapshot();
-    assert!(exhausted.publish_shared_work().is_err());
-    assert!(exhausted.check_completion_health().is_err());
-    assert!(exhausted.completion_since(before).is_some());
-    assert!(exhausted.completion_since(after).is_none());
-    // Releasing a reader never rehabilitates an epoch that already emitted
-    // commands without an observable native completion.
-    held.wait()?;
-    drop(held);
-    assert!(exhausted.publish_shared_work().is_err());
-    println!("SMITHAY_GLES_COMPLETION_EXHAUSTION=PASS");
-    let wait = renderer.wait(&SyncPoint::from(NotNative));
-    assert!(wait.is_err());
-    assert!(renderer.check_completion_health().is_err());
-    println!("SMITHAY_GLES_NATIVE_REFUSAL=PASS");
-    println!("SMITHAY_GLES_PROBE=PASS");
-    Ok(())
+            &[rect],
+            &[],
+            Transform::Normal,
+            1.0,
+        )?;
+        frame.finish()?.wait()?;
+        second
+            .blit(
+                &linear_target,
+                &mut fp16_target,
+                rect,
+                rect,
+                TextureFilter::Nearest,
+            )?
+            .wait()?;
+        let frame = second.render(&mut fp16_target, (32, 32).into(), Transform::Normal)?;
+        frame.finish_into(&mut fp16_destination, &[rect])?.wait()?;
+        let mapping = second.copy_framebuffer(
+            &fp16_destination,
+            Rectangle::from_size((32, 32).into()),
+            Fourcc::Abgr8888,
+        )?;
+        let pixels = second.map_texture(&mapping)?;
+        assert_pixel(&pixels[..4], [128; 4], "linear 8888 to electrical F16 transfer");
+        drop(mapping);
+        drop(linear_target);
+        drop(fp16_destination);
+        drop(fp16_target);
+        println!("SMITHAY_GLES_FLOAT_COMPOSITION=PASS");
+        let mut exhausted = origin.create_renderer()?;
+        exhausted.reserve_native_completions(1)?;
+        let before = exhausted.submission_snapshot();
+        let held = exhausted.publish_shared_work()?;
+        assert!(held.is_exportable());
+        let after = exhausted.submission_snapshot();
+        assert!(exhausted.publish_shared_work().is_err());
+        assert!(exhausted.check_completion_health().is_err());
+        assert!(exhausted.completion_since(before).is_some());
+        assert!(exhausted.completion_since(after).is_none());
+        // Releasing a reader never rehabilitates an epoch that already emitted
+        // commands without an observable native completion.
+        held.wait()?;
+        drop(held);
+        assert!(exhausted.publish_shared_work().is_err());
+        println!("SMITHAY_GLES_COMPLETION_EXHAUSTION=PASS");
+        let wait = renderer.wait(&SyncPoint::from(NotNative));
+        assert!(wait.is_err());
+        assert!(renderer.check_completion_health().is_err());
+        println!("SMITHAY_GLES_NATIVE_REFUSAL=PASS");
+        println!("SMITHAY_GLES_PROBE=PASS");
+        Ok(())
+    }));
+    drop(origin);
+    terminal_join.join()?;
+    match outcome {
+        Ok(result) => {
+            result?;
+            writeln!(std::io::stdout(), "SMITHAY_GLES_RETIREMENT_THREAD_JOIN=PASS")?;
+            Ok(())
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 fn verify_encoded_dma_transfer_and_transforms(

@@ -54,6 +54,7 @@ unsafe impl<T: Send> Sync for Shared<T> {}
 pub(crate) struct RetirementQueue<T> {
     shared: Arc<Shared<T>>,
     executor: thread::Thread,
+    terminal_join: Option<thread::JoinHandle<()>>,
 }
 
 impl<T: Send + 'static> RetirementQueue<T> {
@@ -87,7 +88,8 @@ impl<T: Send + 'static> RetirementQueue<T> {
         });
         let executor = shared.clone();
         // There is no join in a final resource drop: it may occur on Wayland or
-        // frame/input work. Endpoint closure is the deterministic shutdown edge.
+        // frame/input work. Endpoint closure requests the final drain; a cold
+        // terminal observer may retain the actual worker termination edge.
         let worker = thread::Builder::new()
             .name("graphics-retire".into())
             .spawn(move || {
@@ -134,11 +136,19 @@ impl<T: Send + 'static> RetirementQueue<T> {
         Ok(Self {
             shared,
             executor: worker.thread().clone(),
+            terminal_join: Some(worker),
         })
     }
 }
 
 impl<T> RetirementQueue<T> {
+    /// Move the one actual worker join handle to a cold terminal owner. The
+    /// observer owns no producer endpoint and cannot delay endpoint closure.
+    /// Taking or dropping it does not close the queue or wait for the worker.
+    pub(crate) fn take_terminal_join(&mut self) -> Option<thread::JoinHandle<()>> {
+        self.terminal_join.take()
+    }
+
     pub(crate) fn worker_thread(&self) -> thread::Thread {
         self.executor.clone()
     }
@@ -204,8 +214,14 @@ mod tests {
         drop(queue);
         let executor = received.recv_timeout(Duration::from_secs(2)).unwrap().1;
         assert_ne!(executor, thread::current().id());
-        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), (1, executor));
-        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), (2, executor));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (1, executor)
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (2, executor)
+        );
     }
 
     #[test]
@@ -308,5 +324,116 @@ mod tests {
         }
         ids.sort_unstable();
         assert_eq!(ids, (1..=800).collect::<Vec<_>>());
+    }
+
+    struct GatedDrop {
+        phase: &'static str,
+        entered: mpsc::Sender<&'static str>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    impl Drop for GatedDrop {
+        fn drop(&mut self) {
+            self.entered.send(self.phase).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_join_waits_for_state_closure_captures_and_thread_locals() {
+        thread_local! {
+            static TERMINAL: std::cell::RefCell<Option<GatedDrop>> = const { std::cell::RefCell::new(None) };
+        }
+        let (events, received) = mpsc::channel();
+        let (resume_state, state_gate) = mpsc::channel();
+        let (resume_capture, capture_gate) = mpsc::channel();
+        let (resume_tls, tls_gate) = mpsc::channel();
+        let state = GatedDrop {
+            phase: "state",
+            entered: events.clone(),
+            resume: state_gate,
+        };
+        let captured = GatedDrop {
+            phase: "capture",
+            entered: events.clone(),
+            resume: capture_gate,
+        };
+        let tls = GatedDrop {
+            phase: "tls",
+            entered: events,
+            resume: tls_gate,
+        };
+        let mut queue = RetirementQueue::<()>::start_with_state(
+            move || {
+                TERMINAL.with(|slot| *slot.borrow_mut() = Some(tls));
+                // Its thread-affine state is destroyed by finish, not a marker.
+                (std::rc::Rc::new(()), state)
+            },
+            move |_, node| {
+                let _ = &captured;
+                drop(node);
+            },
+            drop,
+        )
+        .unwrap();
+        let terminal = queue.take_terminal_join().unwrap();
+        assert!(queue.take_terminal_join().is_none(), "join authority is one-shot");
+        queue.retire(RetirementNode::new(()));
+        drop(queue);
+        let (joined, complete) = mpsc::channel();
+        let observer = thread::spawn(move || {
+            terminal.join().unwrap();
+            joined.send(()).unwrap();
+        });
+        for (phase, resume) in [
+            ("state", resume_state),
+            ("capture", resume_capture),
+            ("tls", resume_tls),
+        ] {
+            assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), phase);
+            assert!(
+                matches!(complete.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "join returned during {phase} destruction"
+            );
+            resume.send(()).unwrap();
+        }
+        complete.recv_timeout(Duration::from_secs(2)).unwrap();
+        observer.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_free_terminal_observer_covers_nested_final_publications() {
+        struct Nested {
+            next: Option<Arc<RetirementQueue<Nested>>>,
+            events: mpsc::Sender<u8>,
+            generation: u8,
+        }
+        impl Drop for Nested {
+            fn drop(&mut self) {
+                self.events.send(self.generation).unwrap();
+                if let Some(next) = self.next.take() {
+                    next.retire(RetirementNode::new(Self {
+                        next: None,
+                        events: self.events.clone(),
+                        generation: 2,
+                    }));
+                    // Releasing this last endpoint on the actor closes only
+                    // after the nested node has been published.
+                }
+            }
+        }
+        let (events, received) = mpsc::channel();
+        let finished = events.clone();
+        let mut queue = RetirementQueue::start(drop, move || finished.send(0).unwrap()).unwrap();
+        let terminal = queue.take_terminal_join().unwrap();
+        let queue = Arc::new(queue);
+        queue.retire(RetirementNode::new(Nested {
+            next: Some(queue.clone()),
+            events,
+            generation: 1,
+        }));
+        drop(queue);
+        terminal.join().unwrap();
+        assert_eq!(received.try_iter().collect::<Vec<_>>(), [1, 2, 0]);
     }
 }

@@ -38,7 +38,10 @@ mod uniform;
 mod version;
 
 pub use composition::{GlesPreparedCompositionPrograms, GlesPreparedDamageScratch};
-pub use device::{GlesDeviceError, GlesDeviceOrigin, GlesOffscreenAllocator, GlesRetirementSlot};
+pub use device::{
+    GlesDeviceError, GlesDeviceJoinError, GlesDeviceOrigin, GlesDeviceRetirementJoin, GlesOffscreenAllocator,
+    GlesRetirementSlot,
+};
 pub use error::*;
 use format::*;
 pub use material::{GlesKawaseEncoding, GlesKawaseOutput, GlesKawasePass, GlesMaterialTint};

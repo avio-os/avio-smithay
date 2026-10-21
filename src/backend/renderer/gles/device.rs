@@ -41,9 +41,57 @@ pub enum GlesDeviceError {
     /// The retirement executor could not start.
     #[error("could not start GLES retirement executor: {0}")]
     Executor(#[from] std::io::Error),
+    /// The retirement executor did not terminate normally during cold setup.
+    #[error(transparent)]
+    TerminalJoin(#[from] GlesDeviceJoinError),
     /// The executor's native context could not be initialized.
     #[error("could not initialize GLES retirement context: {0}")]
     Initialization(String),
+}
+
+/// One cold terminal observer for the actual GLES retirement thread.
+///
+/// It owns only a join handle, never an origin or producer endpoint. Drop every
+/// productive origin, renderer, allocator and retirement slot before joining.
+/// Queued custody may publish nested retirement nodes before the final endpoint
+/// closes. Joining waits for all of them, native state, closure captures and
+/// thread-local destructors. It is not GPU completion or a device-health proof;
+/// quarantined owners can prevent closure indefinitely. Use a supervised cold
+/// process-terminal path, never a frame/input turn or ordinary resource Drop.
+#[derive(Debug)]
+pub struct GlesDeviceRetirementJoin {
+    worker: std::thread::JoinHandle<()>,
+}
+
+/// Failure of an explicit cold retirement-thread join.
+#[derive(Debug, thiserror::Error)]
+pub enum GlesDeviceJoinError {
+    /// Joining from the worker itself is refused without consuming authority.
+    #[error("cannot join the GLES retirement thread from itself")]
+    CurrentThread(GlesDeviceRetirementJoin),
+    /// The worker unwound instead of completing its terminal teardown.
+    #[error("GLES retirement thread panicked")]
+    WorkerPanicked,
+}
+
+impl GlesDeviceRetirementJoin {
+    /// Query the actual join handle's readiness for cold registry reaping.
+    /// This may become true before thread-local destruction ends. Only join
+    /// supplies the thread-termination receipt; neither is GPU completion.
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    /// Wait for actual thread termination after all productive owners close.
+    /// A self-worker refusal returns this exact one-shot observer to the caller.
+    pub fn join(self) -> Result<(), GlesDeviceJoinError> {
+        if self.worker.thread().id() == std::thread::current().id() {
+            return Err(GlesDeviceJoinError::CurrentThread(self));
+        }
+        self.worker
+            .join()
+            .map_err(|_| GlesDeviceJoinError::WorkerPanicked)
+    }
 }
 
 /// Sendable authority to create contexts on their actual owning threads.
@@ -117,6 +165,19 @@ impl GlesDeviceOrigin {
     /// Create the exact display's share group and initialize its retirement
     /// context. This cold constructor waits only for its own initialization.
     pub fn new(display: &EGLDisplay) -> Result<Self, GlesDeviceError> {
+        let (origin, terminal) = Self::new_with_terminal_join(display)?;
+        // Existing callers retain nonblocking final-drop behavior. A process
+        // terminal owner must instead retain and explicitly join the observer.
+        drop(terminal);
+        Ok(origin)
+    }
+
+    /// Create a cold origin with its one endpoint-free terminal join observer.
+    /// Failed retirement-context initialization closes and joins the started
+    /// worker before returning an error; no observer escapes a failed setup.
+    pub fn new_with_terminal_join(
+        display: &EGLDisplay,
+    ) -> Result<(Self, GlesDeviceRetirementJoin), GlesDeviceError> {
         let root = EGLContext::new(display).map_err(GlesError::ContextCreationError)?;
         let shared = Arc::new(Shared {
             root: Mutex::new(root),
@@ -126,7 +187,7 @@ impl GlesDeviceOrigin {
         let initialize_shared = shared.clone();
         let destroy_shared = shared.clone();
         let (initialized, ready) = mpsc::sync_channel(1);
-        let retirement = RetirementQueue::start_with_state(
+        let mut retirement = RetirementQueue::start_with_state(
             move || match renderer_for(&initialize_shared) {
                 Ok(renderer) => {
                     let _ = initialized.send(Ok(()));
@@ -156,14 +217,29 @@ impl GlesDeviceOrigin {
             },
             drop,
         )?;
-        match ready.recv() {
-            Ok(Ok(())) => Ok(Self {
+        let terminal = GlesDeviceRetirementJoin {
+            worker: retirement
+                .take_terminal_join()
+                .expect("new retirement worker has one terminal observer"),
+        };
+        let initialization_error = match ready.recv() {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = initialization_error {
+            drop(retirement);
+            drop(shared);
+            terminal.join()?;
+            return Err(GlesDeviceError::Initialization(error));
+        }
+        Ok((
+            Self {
                 shared,
                 retirement: Arc::new(retirement),
-            }),
-            Ok(Err(error)) => Err(GlesDeviceError::Initialization(error)),
-            Err(error) => Err(GlesDeviceError::Initialization(error.to_string())),
-        }
+            },
+            terminal,
+        ))
     }
 
     /// Construct the worker's strict renderer on the calling owning thread.
@@ -291,5 +367,43 @@ impl GlesOffscreenAllocator {
         size: Size<i32, Buffer>,
     ) -> Result<GlesTexture, GlesError> {
         self.create_buffer(format, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn terminal_join_refuses_self_worker_without_losing_the_handle() {
+        let (publish, receive) = mpsc::channel();
+        let (returned, observer) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let terminal = GlesDeviceRetirementJoin {
+                worker: receive.recv().unwrap(),
+            };
+            match terminal.join() {
+                Err(GlesDeviceJoinError::CurrentThread(terminal)) => returned.send(terminal).unwrap(),
+                other => panic!("self-worker join did not return its authority: {other:?}"),
+            }
+        });
+        publish.send(worker).unwrap();
+        observer
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_join_reports_worker_panic_as_failure() {
+        let terminal = GlesDeviceRetirementJoin {
+            worker: std::thread::spawn(|| panic!("worker failure")),
+        };
+        assert!(matches!(
+            terminal.join(),
+            Err(GlesDeviceJoinError::WorkerPanicked)
+        ));
     }
 }
