@@ -50,8 +50,8 @@ fn owner_group_resolves_overlapping_paint_and_opacity_once() {
                 frame
                     .render_owner_clipped_group(&atlas, full, full, clip, &[full], |frame| {
                         frame.capture_and_filter_framebuffer(full, &prefix, &[])?;
-                        frame.draw_solid(full, &[full], Color32F::new(1.0, 0.0, 0.0, 0.5))?;
-                        frame.draw_solid(full, &[full], Color32F::new(0.0, 1.0, 0.0, 0.5))?;
+                        frame.draw_solid(full, &[full], Color32F::new(0.5, 0.0, 0.0, 0.5))?;
+                        frame.draw_solid(full, &[full], Color32F::new(0.0, 0.5, 0.0, 0.5))?;
                         frame.interpolate_framebuffer_prefix(&prefix, full, &[full], opacity)
                     })
                     .expect("all ordered sample lanes");
@@ -70,27 +70,13 @@ fn owner_group_resolves_overlapping_paint_and_opacity_once() {
                         .transform_rect_in(Rectangle::new(location.into(), (1, 1).into()), &output)
                         .loc;
                     let index = ((pixel.y * 4 + pixel.x) * 4) as usize;
-                    let decode = |c: f32| {
-                        if c <= 0.04045 {
-                            c / 12.92
-                        } else {
-                            ((c + 0.055) / 1.055).powf(2.4)
-                        }
-                    };
-                    let encode = |c: f32| {
-                        if c <= 0.0031308 {
-                            c * 12.92
-                        } else {
-                            1.055 * c.powf(1.0 / 2.4) - 0.055
-                        }
-                    };
-                    let lower = [0.0, 0.0, decode(0.4 * background_alpha), background_alpha];
+                    // Encoded premultiplied values blend as stored.
+                    let lower = [0.0, 0.0, 0.4 * background_alpha, background_alpha];
                     let group = [0.25, 0.5, lower[2] * 0.25, 0.75 + background_alpha * 0.25];
                     for channel in 0..4 {
                         let weight = coverage * opacity;
                         let mixed = lower[channel] * (1.0 - weight) + group[channel] * weight;
-                        let expected =
-                            ((if channel == 3 { mixed } else { encode(mixed) }) * 255.0).round() as i32;
+                        let expected = (mixed * 255.0).round() as i32;
                         assert!((bytes[index+channel] as i32-expected).abs()<=3,
                             "{transform:?}, background={background_alpha}, opacity={opacity}, location={location:?}, channel={channel}: got {}, expected {expected}",bytes[index+channel]);
                     }

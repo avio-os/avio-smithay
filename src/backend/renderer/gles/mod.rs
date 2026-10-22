@@ -44,7 +44,7 @@ pub use device::{
 };
 pub use error::*;
 use format::*;
-pub use material::{GlesKawaseEncoding, GlesKawaseOutput, GlesKawasePass, GlesMaterialTint};
+pub use material::{GlesKawaseOutput, GlesKawasePass, GlesMaterialTint};
 pub use native_fences::GlesSubmissionSnapshot;
 pub use shaders::*;
 pub use texture::*;

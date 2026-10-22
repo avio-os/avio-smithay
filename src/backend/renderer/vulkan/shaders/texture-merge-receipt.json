@@ -1,0 +1,10 @@
+{
+  "source_sha256": "13e4458f501829b6895a422dc68f0f2aa21c57a1361b5343062c0cfc921785b4",
+  "binary_sha256": "3580b9d281df1f781866478b7ac08b9f3d84f03234ad5ca1dd0d870dc1a9b029",
+  "compiler": "libshaderc-2026.1-1.fc44.x86_64",
+  "target": "Vulkan 1.0",
+  "optimization": "zero",
+  "entry_point": "main",
+  "spirv_validation": 0,
+  "runtime_acceptance": "pending"
+}

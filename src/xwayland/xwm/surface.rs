@@ -59,6 +59,9 @@ pub struct X11Surface {
     xwm: Option<XwmId>,
     client_scale: Option<Arc<AtomicF64>>,
     window: X11Window,
+    /// Root of the screen this window's WM manages, which carries
+    /// `_NET_ACTIVE_WINDOW`.
+    root: Option<X11Window>,
     pub(super) conn: Weak<RustConnection>,
     pub(super) atoms: super::Atoms,
     pub(crate) state: Arc<Mutex<SharedSurfaceState>>,
@@ -219,6 +222,7 @@ impl X11Surface {
             xwm: xwm.map(|wm| wm.id),
             client_scale: xwm.map(|wm| wm.client_scale.clone()),
             window,
+            root: xwm.map(|wm| wm.screen.root),
             conn,
             atoms,
             state: Arc::new(Mutex::new(SharedSurfaceState {
@@ -1158,7 +1162,18 @@ impl IsAlive for X11Surface {
 
 #[cfg(test)]
 mod tests {
-    use super::{wm_protocol_from_atom, WMProtocol};
+    use super::{net_active_window_after, wm_protocol_from_atom, KeyboardFocusEdge, WMProtocol};
+
+    #[test]
+    fn net_active_window_names_the_focused_window_and_clears_on_leave() {
+        let window = 0x0060_0003;
+        assert_eq!(net_active_window_after(KeyboardFocusEdge::Enter, window), window);
+        assert_eq!(
+            net_active_window_after(KeyboardFocusEdge::Leave, window),
+            x11rb::NONE
+        );
+        assert_eq!(x11rb::NONE, 0);
+    }
 
     #[test]
     fn wm_protocol_classification_includes_ping() {
@@ -1182,8 +1197,51 @@ mod tests {
     }
 }
 
+/// Which side of a keyboard focus change a surface is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardFocusEdge {
+    Enter,
+    Leave,
+}
+
+/// The `_NET_ACTIVE_WINDOW` value after `window` gains or loses keyboard focus.
+///
+/// EWMH: the property names the active client window, or `None` when no
+/// window is active. It is written by the WM when it moves focus, so it names
+/// exactly the window keyboard focus entered; a leave clears it, and a
+/// following enter (focus moving between X11 windows) names the new window.
+fn net_active_window_after(edge: KeyboardFocusEdge, window: X11Window) -> X11Window {
+    match edge {
+        KeyboardFocusEdge::Enter => window,
+        KeyboardFocusEdge::Leave => x11rb::NONE,
+    }
+}
+
+impl X11Surface {
+    fn publish_net_active_window(&self, edge: KeyboardFocusEdge) {
+        let (Some(root), Some(conn)) = (self.root, self.conn.upgrade()) else {
+            return;
+        };
+        let value = net_active_window_after(edge, self.window);
+        if let Err(err) = conn.change_property32(
+            PropMode::REPLACE,
+            root,
+            self.atoms._NET_ACTIVE_WINDOW,
+            AtomEnum::WINDOW,
+            &[value],
+        ) {
+            warn!(
+                "Unable to update _NET_ACTIVE_WINDOW for X11Surface ({:?}): {}",
+                self.window, err
+            );
+        }
+        let _ = conn.flush();
+    }
+}
+
 impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
     fn enter(&self, seat: &Seat<D>, data: &mut D, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
+        self.publish_net_active_window(KeyboardFocusEdge::Enter);
         let (set_input_focus, send_take_focus) = match self.input_model() {
             WmInputModel::None => return,
             WmInputModel::Passive => (true, false),
@@ -1231,6 +1289,7 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
     }
 
     fn leave(&self, seat: &Seat<D>, data: &mut D, serial: Serial) {
+        self.publish_net_active_window(KeyboardFocusEdge::Leave);
         if self.input_model() == WmInputModel::None {
             return;
         } else if let Some(conn) = self.conn.upgrade() {

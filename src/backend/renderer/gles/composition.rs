@@ -90,9 +90,8 @@ struct FrameUniforms {
     target_size: [f32; 2],
     storage_is_srgb: u32,
     sample_nearest: u32,
-    encode_terminal: u32,
-    target_is_srgb: u32,
     source_size: [f32; 2],
+    padding: [u32; 2],
 }
 
 impl std::ops::Deref for CompositionState {
@@ -118,18 +117,8 @@ fn shader_source(source: &str, kawase: bool, external: bool) -> String {
     let sampling = include_str!("shaders/encoded_sampling.glsl");
     let insert = source.find("layout(std140)").expect("common shader constants");
     source.insert_str(insert, sampling);
-    if kawase {
-        // The shared shader already defines this transfer function.
-        let start = source.rfind("vec3 linear_to_srgb(vec3 c) {").unwrap();
-        let end = source[start..].find("\n}\n").unwrap() + start + 3;
-        source.replace_range(start..end, "");
-        source = source.replace(
-            "out_color = sum;",
-            "if (constants.encoded_srgb != 0u && frame.target_is_srgb != 0u) { sum.rgb = srgb_to_linear(sum.rgb); }\n    out_color = sum;",
-        );
-    } else {
-        source = source.replace("if (material_kind == 5) {", "if (material_kind == 8) {\n        encoded = vec4(constants.effect.yzw * constants.effect_params.x, constants.effect_params.x);\n    } else if (material_kind == 5) {");
-        source = source.replace("* coverage * effect_coverage;", "* coverage * effect_coverage;\n    if (frame.encode_terminal != 0u) { out_color.rgb = out_color.a > 0.0 ? linear_to_srgb(out_color.rgb / out_color.a) * out_color.a : vec3(0.0); }");
+    if !kawase {
+        source = source.replace("if (material_kind == 5) {", "if (material_kind == 8) {\n        sampled = vec4(constants.effect.yzw, constants.effect_params.x);\n    } else if (material_kind == 5) {");
     }
     if external {
         source = source
@@ -250,8 +239,6 @@ impl CompositionState {
         target_size: Size<i32, Physical>,
         storage_is_srgb: bool,
         nearest: bool,
-        terminal: bool,
-        target_is_srgb: bool,
         source_size: Size<i32, BufferCoord>,
     ) {
         let data = FrameUniforms {
@@ -259,9 +246,8 @@ impl CompositionState {
             target_size: [target_size.w as f32, target_size.h as f32],
             storage_is_srgb: storage_is_srgb as u32,
             sample_nearest: nearest as u32,
-            encode_terminal: terminal as u32,
-            target_is_srgb: target_is_srgb as u32,
             source_size: [source_size.w as f32, source_size.h as f32],
+            padding: [0; 2],
         };
         gl.BindBuffer(ffi::UNIFORM_BUFFER, self.frame_buffer);
         gl.BufferSubData(
@@ -287,9 +273,8 @@ impl CompositionState {
 
 impl GlesRenderer {
     /// Copy prepared framebuffer textures with explicit compositor encoding.
-    /// Imported electrical pixels are decoded before writing an sRGB
-    /// composition attachment; composition pixels are encoded for a terminal
-    /// destination. The destination rectangle is replaced, including alpha.
+    /// Source and destination store encoded premultiplied values. The
+    /// destination rectangle is replaced, including alpha, without a transfer.
     pub fn blit_composition_texture(
         &mut self,
         source: &GlesTarget<'_>,
@@ -324,22 +309,16 @@ impl GlesRenderer {
         {
             return Err(GlesError::Composition("invalid color transfer extent or alias"));
         }
-        // Encoded blending attachments (F16/10-bit) also store electrical
-        // premultiplication. Their composition role does not make their
-        // channels interchangeable with sRGB storage of linear premultiplication.
-        let terminal = target.0.encoding == GlesTextureEncoding::ElectricalPremultiplied;
-        let constants = TexturePushConstants::default()
-            .with_src_rect(
-                [
-                    src.loc.x as f32 / texture.width() as f32,
-                    src.loc.y as f32 / texture.height() as f32,
-                ],
-                [
-                    src.size.w as f32 / texture.width() as f32,
-                    src.size.h as f32 / texture.height() as f32,
-                ],
-            )
-            .with_source_encoding(texture.0.encoding, terminal || target.0.storage_is_srgb);
+        let constants = TexturePushConstants::default().with_src_rect(
+            [
+                src.loc.x as f32 / texture.width() as f32,
+                src.loc.y as f32 / texture.height() as f32,
+            ],
+            [
+                src.size.w as f32 / texture.width() as f32,
+                src.size.h as f32 / texture.height() as f32,
+            ],
+        );
         self.native_fences.observe(sync_lock.wait_for_upload(&self.gl))?;
         self.composition_draw(
             texture,
@@ -347,7 +326,6 @@ impl GlesRenderer {
             analytic_clip_rect_push_constant(dst.to_f64()),
             &constants,
             filter == TextureFilter::Nearest,
-            terminal,
             true,
             true,
             None,
@@ -489,7 +467,7 @@ impl GlesRenderer {
         Ok(())
     }
 
-    /// Prepare programs for linear-light compositing. This may compile shaders
+    /// Prepare programs for encoded-premultiplied compositing. This may compile shaders
     /// and must run before opening a frame, on the context's owning thread.
     pub fn prepare_composition(&mut self) -> Result<(), GlesError> {
         self.check_completion_health()?;
@@ -507,9 +485,8 @@ impl GlesRenderer {
     }
 
     /// Create a compositor attachment with explicit storage and encoding.
-    /// Eight-bit storage decodes the destination for blending and sRGB-encodes
-    /// stores. Formats without an sRGB sibling preserve the Vulkan compositor's
-    /// encoded blending policy. Client imports retain their separate role.
+    /// All formats use UNORM/float attachment storage, matching the shared
+    /// encoded blend space. Client imports retain their separate role.
     pub fn create_composition_buffer(
         &mut self,
         format: Fourcc,
@@ -521,7 +498,7 @@ impl GlesRenderer {
         }
         let (storage, metadata, storage_is_srgb) = match format {
             Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
-                (ffi::SRGB8_ALPHA8, ffi::RGBA8, true)
+                (ffi::RGBA8, ffi::RGBA8, false)
             }
             Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => (ffi::RGBA16F, ffi::RGBA16F, false),
             Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 => (ffi::RGB10_A2, ffi::RGB10_A2, false),
@@ -551,11 +528,7 @@ impl GlesRenderer {
         let mut texture =
             unsafe { GlesTexture::from_raw(self, Some(metadata), !has_alpha(format), name, size) };
         let inner = Arc::get_mut(&mut texture.0).expect("new native texture");
-        inner.encoding = if storage_is_srgb {
-            GlesTextureEncoding::LinearPremultiplied
-        } else {
-            GlesTextureEncoding::ElectricalPremultiplied
-        };
+        inner.encoding = GlesTextureEncoding::ElectricalPremultiplied;
         inner.storage_is_srgb = storage_is_srgb;
         inner.is_composition = true;
         Ok(texture)
@@ -815,7 +788,7 @@ impl GlesRenderer {
         ))
     }
 
-    /// Encode a completed linear-light composition into an imported scanout
+    /// Copy a completed encoded composition into an imported scanout
     /// attachment, preserving pixels outside the exact damage rectangles.
     pub fn resolve_composition(
         &mut self,
@@ -826,7 +799,7 @@ impl GlesRenderer {
         self.resolve_composition_internal(source, destination, damage.iter().copied(), false)
     }
 
-    /// Encode composition damage expressed in transformed output coordinates.
+    /// Resolve composition damage expressed in transformed output coordinates.
     ///
     /// `output_size` is the extent before `transform` maps each damage rectangle
     /// into destination storage coordinates. Mapping is streamed directly into
@@ -876,13 +849,12 @@ impl GlesRenderer {
                 "terminal source and destination extent differ",
             ));
         }
-        let constants = TexturePushConstants::default().with_source_encoding(source.0.encoding, true);
+        let constants = TexturePushConstants::default();
         self.composition_draw(
             source,
             size,
             [0.0, 0.0, size.w as f32, size.h as f32],
             &constants,
-            true,
             true,
             true,
             source_in_frame,
@@ -903,7 +875,6 @@ impl GlesRenderer {
         destination: [f32; 4],
         constants: &TexturePushConstants,
         nearest: bool,
-        terminal: bool,
         replace: bool,
         source_in_frame: bool,
         prefix_weight: Option<f32>,
@@ -959,8 +930,6 @@ impl GlesRenderer {
                 target_size,
                 texture.0.storage_is_srgb,
                 nearest,
-                terminal,
-                false,
                 texture.size(),
             );
             gl.ActiveTexture(ffi::TEXTURE0);
@@ -1082,7 +1051,7 @@ impl GlesFrame<'_, '_> {
         prefix_weight: Option<f32>,
     ) -> Result<(), GlesError> {
         self.renderer.check_completion_health()?;
-        let target = self.composition_source()?;
+        self.composition_source()?;
         if damage.is_empty() || src.size.is_empty() || dst.size.is_empty() {
             return Ok(());
         }
@@ -1132,7 +1101,6 @@ impl GlesFrame<'_, '_> {
                 src.size.h as f32 / capacity.h as f32,
             ],
         )
-        .with_source_encoding(texture.0.encoding, target.0.storage_is_srgb)
         .with_effect(effect);
         if let Some(clip) =
             clip.map(|c| self.shift_clip(transform_analytic_clip(self.transform, self.size, c)))
@@ -1174,19 +1142,11 @@ impl GlesFrame<'_, '_> {
             constants = match operation {
                 MaterialOperation::Copy => constants,
                 MaterialOperation::Kawase(output) => constants.with_kawase_output(output, capacity),
-                MaterialOperation::Tint(tint) => constants.with_material_tone(tint).with_source_encoding(
-                    GlesTextureEncoding::ElectricalPremultiplied,
-                    target.0.storage_is_srgb,
-                ),
+                MaterialOperation::Tint(tint) => constants.with_material_tone(tint),
                 MaterialOperation::OwnerResolve(extent) => constants.with_owner_resolve(extent, capacity),
                 MaterialOperation::Solid(color) => {
                     constants.effect = [8.0, color.r(), color.g(), color.b()];
                     constants.effect_params = [color.a(), 0.0, 0.0, 0.0];
-                    constants.source_encoding = if target.0.storage_is_srgb {
-                        SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED
-                    } else {
-                        SOURCE_ENCODING_PASSTHROUGH
-                    };
                     constants
                 }
             };
@@ -1213,7 +1173,6 @@ impl GlesFrame<'_, '_> {
             analytic_clip_rect_push_constant(native),
             &constants,
             nearest,
-            false,
             false,
             false,
             prefix_weight,
@@ -1295,38 +1254,18 @@ pub(super) enum MaterialOperation {
 
 include!("composition_material.rs");
 
-fn srgb_channel_to_linear(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 impl GlesFrame<'_, '_> {
     pub(super) fn clear_composition(
         &mut self,
         color: Color32F,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
-        let target = self.composition_source()?;
+        self.composition_source()?;
         self.bind_composition_target()?;
         unsafe {
             let gl = &self.renderer.gl;
             gl.Enable(ffi::SCISSOR_TEST);
-            let channel = |value| {
-                if target.0.storage_is_srgb {
-                    srgb_channel_to_linear(value)
-                } else {
-                    value
-                }
-            };
-            gl.ClearColor(
-                channel(color.r()),
-                channel(color.g()),
-                channel(color.b()),
-                color.a(),
-            );
+            gl.ClearColor(color.r(), color.g(), color.b(), color.a());
             for rect in damage.iter().filter_map(|r| self.native_region(*r)) {
                 gl.Scissor(rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
                 gl.Clear(ffi::COLOR_BUFFER_BIT);

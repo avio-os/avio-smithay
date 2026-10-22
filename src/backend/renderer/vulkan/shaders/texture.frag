@@ -13,55 +13,21 @@ layout(push_constant) uniform TexturePushConstants {
     vec4 clip_params;
     vec4 effect;
     vec4 effect_params;
-    uint source_encoding;
     float clip_scale;
+    float outer_radius;
     vec2 outer_origin;
     vec2 outer_size;
-    float outer_radius;
 } constants;
 
-// Must match the SOURCE_ENCODING_* constants in pipeline.rs.
-const uint SOURCE_ELECTRICAL_PREMULTIPLIED = 0u;
-const uint SOURCE_LINEAR_PREMULTIPLIED = 1u;
-const uint SOURCE_PASSTHROUGH = 2u;
 const uint BOTTOM_EDGE_CLIP_FLAG = 0x80000000u;
 const uint CLIP_TRANSFORM_SHIFT = 8u;
 
-vec3 srgb_to_linear(vec3 c) {
-    bvec3 lo = lessThanEqual(c, vec3(0.04045));
-    vec3 linear_lo = c / 12.92;
-    vec3 linear_hi = pow((c + 0.055) / 1.055, vec3(2.4));
-    return mix(linear_hi, linear_lo, vec3(lo));
-}
-
-// Convert a sampled texel into the premultiplied-LINEAR value the blend expects.
-//
-// The compositor blends in linear light: the colour attachment is viewed as _SRGB, so
-// the hardware decodes the destination and re-encodes the result on store. Only the
-// source side is left, and it has two shapes:
-//
-//   ELECTRICAL_PREMULTIPLIED - client and shell buffers, premultiplied in gamma space
-//     (`encode(colour) * alpha`). Decoding that product directly is wrong: it yields
-//     roughly `linear(colour) * alpha^2.4`, which visibly darkens translucent glass.
-//     Unpremultiply first, decode, then premultiply again in linear.
-//   LINEAR_PREMULTIPLIED - our own offscreens, already premultiplied in linear and
-//     merely sRGB-encoded for 8-bit precision. A plain decode is exact here, and
-//     unpremultiplying would corrupt it.
-//
-// Both collapse to a plain decode when alpha is 1, which is the opaque fast path.
-vec4 to_linear_premultiplied(vec4 texel) {
-    if (constants.source_encoding == SOURCE_PASSTHROUGH) {
-        return texel;
-    }
-    if (constants.source_encoding == SOURCE_LINEAR_PREMULTIPLIED) {
-        return vec4(srgb_to_linear(texel.rgb), texel.a);
-    }
-    if (texel.a <= 0.0) {
-        return vec4(0.0);
-    }
-    vec3 straight = min(texel.rgb / texel.a, vec3(1.0));
-    return vec4(srgb_to_linear(straight) * texel.a, texel.a);
-}
+// The renderer blends in encoded sRGB (VulkanRenderer::BLEND_SPACE): every
+// attachment is viewed through its UNORM storage format, and every sampled
+// texel - a client or shell buffer premultiplied in electrical values, or one of
+// the compositor's own offscreens filled the same way - already is the
+// encoded premultiplied value SourceOver expects. No texel is converted here,
+// so an opaque 1:1 composite stores exactly its source bytes.
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
@@ -140,7 +106,11 @@ float rounded_clip_alpha(vec2 frag_pos) {
 
     vec2 delta = abs(clip_pos - center);
     float dist = pow(pow(delta.x, exponent) + pow(delta.y, exponent), 1.0 / exponent) - radius;
-    return 1.0 - smoothstep(-aa_width, aa_width, dist);
+    // Plain encoded coverage: a linear ramp aa_width physical pixels wide in
+    // total, centred on the edge (RoundedClip::aa_width). At 1.0 this is the
+    // area a pixel straddling a straight edge covers, so a corner meets its
+    // straight sides without a seam and crosses 0.5 exactly on the curve.
+    return clamp(0.5 - dist / aa_width, 0.0, 1.0);
 }
 
 float cubic_component(float p0, float p1, float p2, float p3, float t) {
@@ -308,7 +278,6 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
     float foot_left = plateau_left - side_run;
     float cosine = cos(angle_radians);
     float sine = sin(angle_radians);
-    bool outside_height = point.y < plateau_top || point.y > baseline;
 
     float left = bottom_edge_left_boundary(
         point.y,
@@ -328,11 +297,17 @@ float bottom_edge_clip_alpha(vec2 frag_pos) {
         min(point.x - left, right - point.x),
         min(point.y - plateau_top, baseline - point.y)
     );
-    // Fragment-dependent early returns before fwidth leave quad derivatives
-    // undefined. Every lane computes the field and its footprint first;
-    // visibility still masks the same authored rectangle and height afterward.
-    float aa_width = max(fwidth(signed_inside) * 0.75, 0.5 * geometry_scale);
-    float coverage = smoothstep(-aa_width, aa_width, signed_inside);
+    // Fragment-dependent early returns before the derivatives leave quad
+    // derivatives undefined. Every lane computes the field and its footprint
+    // first; visibility still masks the authored rectangle afterward. The
+    // field is a horizontal distance on the slanted sides, so its screen-space
+    // gradient converts it to device pixels along the edge normal: the ramp is
+    // 1 device px in total, centred on the edge, at every geometry scale.
+    float ramp = max(length(vec2(dFdx(signed_inside), dFdy(signed_inside))), 1.0);
+    float coverage = clamp(0.5 + signed_inside / ramp, 0.0, 1.0);
+    // The plateau top ramps on both sides of the authored height; nothing of
+    // the pull reaches more than half a ramp above it.
+    bool outside_height = point.y < plateau_top - 0.5 * ramp || point.y > baseline;
     return outside_rect || outside_height ? 0.0 : coverage;
 }
 
@@ -414,7 +389,7 @@ vec2 apply_texture_effect(vec2 uv, out float coverage) {
 }
 
 // Same final Kawase upsample and CSS transform as the former full-size
-// intermediate, applied before the source's single colour-space conversion.
+// intermediate, on the stored encoded-sRGB values like every other texel.
 vec4 material_tap(vec2 uv) {
     vec2 half_texel = vec2(0.5) / vec2(textureSize(texture_sampler, 0));
     return texture(texture_sampler, clamp(uv, half_texel, constants.effect_params.yz - half_texel));
@@ -450,7 +425,8 @@ vec4 material_upsample(vec2 uv) {
 }
 
 // One premultiplied paint packet, with no silhouette upload. Compose all
-// authored electrical-sRGB lights before conversion and clip quantization.
+// authored electrical-sRGB lights before clip quantization; the result blends
+// over the filtered backdrop exactly like CSS `background: rgba()`.
 vec4 material_tone(vec2 frag_pos) {
     vec4 result = vec4(constants.effect.yzw * constants.effect_params.x,
                        constants.effect_params.x);
@@ -517,19 +493,19 @@ void main() {
     }
 
     int material_kind = int(constants.effect.x + 0.5);
-    vec4 encoded;
+    vec4 sampled;
     if (material_kind == 5) {
-        encoded = material_tone(gl_FragCoord.xy);
-    } else {
-        encoded = (material_kind == 4 || material_kind == 6) ? material_upsample(uv) : texture(texture_sampler, uv);
-    }
-    vec4 sampled = to_linear_premultiplied(encoded);
-    if (material_kind == 7) {
+        sampled = material_tone(gl_FragCoord.xy);
+    } else if (material_kind == 4 || material_kind == 6) {
+        sampled = material_upsample(uv);
+    } else if (material_kind == 7) {
         vec2 stride = constants.effect.yz;
-        sampled = (to_linear_premultiplied(texture(texture_sampler, uv)) +
-                   to_linear_premultiplied(texture(texture_sampler, uv + vec2(stride.x, 0.0))) +
-                   to_linear_premultiplied(texture(texture_sampler, uv + vec2(0.0, stride.y))) +
-                   to_linear_premultiplied(texture(texture_sampler, uv + stride))) * 0.25;
+        sampled = (texture(texture_sampler, uv) +
+                   texture(texture_sampler, uv + vec2(stride.x, 0.0)) +
+                   texture(texture_sampler, uv + vec2(0.0, stride.y)) +
+                   texture(texture_sampler, uv + stride)) * 0.25;
+    } else {
+        sampled = texture(texture_sampler, uv);
     }
     float coverage = joint_owner_coverage(gl_FragCoord.xy);
     if ((constants.rounded_clip_flags & 0x40000000u) != 0u) {

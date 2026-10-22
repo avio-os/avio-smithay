@@ -4,9 +4,7 @@
 
 use super::DeviceHandle;
 use crate::backend::allocator::{Format, Fourcc, Modifier};
-use crate::backend::renderer::vulkan::{
-    allocation::VulkanAllocationReason, format::ColorEncoding, image::VulkanImage,
-};
+use crate::backend::renderer::vulkan::{allocation::VulkanAllocationReason, image::VulkanImage};
 use ash::{vk, vk::Handle};
 use std::{
     collections::HashMap,
@@ -397,7 +395,6 @@ pub(in super::super) fn image(device: Arc<DeviceHandle>, id: u64) -> Arc<VulkanI
             },
             vk::Format::B8G8R8A8_UNORM,
             vk::FormatFeatureFlags::SAMPLED_IMAGE,
-            ColorEncoding::LinearPremultiplied,
             vk::ImageUsageFlags::SAMPLED,
             false,
             vk::ImageLayout::UNDEFINED,

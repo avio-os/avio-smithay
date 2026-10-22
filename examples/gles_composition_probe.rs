@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // opaque retains the image's allocation through the probe's final fence.
         let external =
             unsafe { GlesTexture::from_raw_external(&renderer, true, external_name, (32, 32).into(), false) };
-        let passes = [GlesKawasePass::new(&prefix, &half, false, 1.0).with_encoded_srgb()];
+        let passes = [GlesKawasePass::new(&prefix, &half, false, 1.0)];
         renderer.prepare_kawase_passes(&passes)?;
         let rect = Rectangle::<i32, Physical>::from_size((32, 32).into());
         let clip = RoundedClip {
@@ -160,12 +160,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mapping =
             renderer.copy_framebuffer(&target, Rectangle::from_size((32, 32).into()), Fourcc::Abgr8888)?;
         let pixels = renderer.map_texture(&mapping)?;
-        assert!(
-            (186..=190).contains(&pixels[0]),
-            "linear-light blend channel={}",
-            pixels[0]
-        );
-        println!("SMITHAY_GLES_LINEAR_BLEND=PASS channel={}", pixels[0]);
+        assert_eq!(&pixels[..4], &[128, 128, 128, 255], "encoded SourceOver");
+        println!("SMITHAY_GLES_ENCODED_BLEND=PASS channel={}", pixels[0]);
         let mapping = renderer.copy_framebuffer(
             &terminal_target,
             Rectangle::from_size((32, 32).into()),
@@ -177,9 +173,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             &[0, 255, 0, 255],
             "terminal resolve overwrote pixels outside damage"
         );
-        assert!(
-            (186..=190).contains(&terminal_pixels[(8 * 32 + 8) * 4]),
-            "terminal resolve did not encode linear composition"
+        assert_eq!(
+            &terminal_pixels[(8 * 32 + 8) * 4..(8 * 32 + 8) * 4 + 4],
+            &[128, 128, 128, 255],
+            "terminal resolve changed encoded composition"
         );
         println!("SMITHAY_GLES_TERMINAL_ENCODING_DAMAGE=PASS");
         let mut frame = renderer.render(&mut target, (32, 32).into(), Transform::Normal)?;
@@ -512,12 +509,12 @@ fn verify_encoded_dma_transfer_and_transforms(
         &mut frame,
         left,
         &[Rectangle::from_size(left.size)],
-        Color32F::new(1.0, 0.0, 0.0, 0.5),
+        Color32F::new(0.5, 0.0, 0.0, 0.5),
     )?;
     frame.draw_solid(
         right,
         &[Rectangle::from_size(right.size)],
-        Color32F::new(1.0, 0.0, 0.0, 0.5),
+        Color32F::new(0.5, 0.0, 0.0, 0.5),
     )?;
     frame.finish_into(&mut destination, &[overlay])?.wait()?;
     let mapping = renderer.copy_framebuffer(
@@ -530,28 +527,13 @@ fn verify_encoded_dma_transfer_and_transforms(
         for x in 0..WIDTH {
             let mut expected = pattern(x, y);
             if overlay.contains((x, y)) {
-                let alpha = expected[3] as f64 / 255.0;
-                let output_alpha = 0.5 + alpha * 0.5;
+                // SourceOver applies to stored encoded premultiplied values.
+                // The source is red at alpha .5, already premultiplied above.
                 for channel in 0..3 {
-                    let encoded = if alpha > 0.0 {
-                        expected[channel] as f64 / 255.0 / alpha
-                    } else {
-                        0.0
-                    };
-                    let linear = if encoded <= 0.04045 {
-                        encoded / 12.92
-                    } else {
-                        ((encoded + 0.055) / 1.055).powf(2.4)
-                    };
-                    let mixed = (linear * alpha * 0.5 + if channel == 0 { 0.5 } else { 0.0 }) / output_alpha;
-                    let encoded = if mixed <= 0.0031308 {
-                        mixed * 12.92
-                    } else {
-                        1.055 * mixed.powf(1.0 / 2.4) - 0.055
-                    };
-                    expected[channel] = (encoded * output_alpha * 255.0).round() as u8;
+                    let source = if channel == 0 { 0.5 } else { 0.0 };
+                    expected[channel] = (source * 255.0 + f64::from(expected[channel]) * 0.5).round() as u8;
                 }
-                expected[3] = (output_alpha * 255.0).round() as u8;
+                expected[3] = (127.5 + f64::from(expected[3]) * 0.5).round() as u8;
             }
             assert_pixel(
                 &pixels[((y * WIDTH + x) * 4) as usize..][..4],

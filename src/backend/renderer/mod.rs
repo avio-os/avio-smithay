@@ -331,7 +331,10 @@ pub struct RoundedClip {
     pub radius: f32,
     /// Superellipse exponent. `2.0` is circular; larger values square the shoulders.
     pub exponent: f32,
-    /// Antialiasing ramp width in physical pixels.
+    /// Total width, in physical pixels, of the linear coverage ramp centred on
+    /// the curve: coverage is `clamp(0.5 - distance / aa_width, 0, 1)`. `1.0`
+    /// is the 1-device-pixel analytic ramp; coverage reaches zero `aa_width / 2`
+    /// outside the curve.
     pub aa_width: f32,
     /// Bitmask selecting which corners are rounded.
     pub corner_mask: u32,
@@ -369,7 +372,8 @@ pub struct BottomEdgeClip {
     pub edge_height: f32,
     /// Extra inset on each side of the content plateau.
     pub plateau_inset: f32,
-    /// Physical pixels per authored logical pixel.
+    /// Physical pixels per authored logical pixel. It scales the authored
+    /// curve, never the antialiasing: the edge always ramps over 1 device pixel.
     pub geometry_scale: f32,
 }
 

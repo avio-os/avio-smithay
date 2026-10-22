@@ -31,8 +31,9 @@ but makes every future diff unreviewable against the committed history.
 
 ## Colour space
 
-`texture.frag` is the single authority that converts sampled texels into
-premultiplied linear light; `kawase.frag` decodes its taps for the same reason.
-Colour attachments are viewed as `_SRGB`, so the hardware performs the
-destination decode and the encode on store — shaders must not encode as well.
-See `docs/rendering-plan.md` in the Avio repo for the full contract.
+The renderer blends in encoded sRGB (`VulkanRenderer::BLEND_SPACE`). Colour
+attachments are viewed through their UNORM storage format, and every sampled
+texel is already the encoded premultiplied value SourceOver expects, so neither
+`texture.frag` nor `kawase.frag` converts colour: the blur and its CSS filters
+work on stored values, as CSS `backdrop-filter` does. See
+`docs/rendering-plan.md` in the Avio repo for the full contract.

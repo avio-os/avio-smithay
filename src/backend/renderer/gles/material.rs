@@ -19,9 +19,8 @@ impl GlesKawaseColorTransform {
 /// One dual-Kawase pyramid step: renders `source` into `destination` with the
 /// down- or upsample kernel.
 ///
-/// The pass records its working space. Linear-light passes choose hardware or
-/// shader encoding from the destination format; encoded-sRGB passes use UNORM
-/// views so the sampled and stored channel values remain encoded.
+/// Like the shared Vulkan equations, every pass filters and applies CSS
+/// transforms directly to encoded premultiplied channel values.
 #[derive(Debug, Clone)]
 pub struct GlesKawasePass {
     pub(crate) source: GlesTexture,
@@ -29,21 +28,9 @@ pub struct GlesKawasePass {
     pub(crate) upsample: bool,
     pub(crate) offset: f32,
     pub(crate) transform: GlesKawaseColorTransform,
-    pub(crate) encoding: GlesKawaseEncoding,
     pub(crate) source_origin: Point<i32, BufferCoord>,
     pub(crate) source_extent: Size<i32, BufferCoord>,
     pub(crate) destination_extent: Size<i32, BufferCoord>,
-}
-
-/// Colour-space convention used by a Kawase pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GlesKawaseEncoding {
-    /// Decode sRGB, filter in linear light, then encode for storage.
-    #[default]
-    LinearLight,
-    /// Filter and apply the colour transform directly to gamma-encoded sRGB
-    /// values. This intentionally matches CSS backdrop-filter semantics.
-    EncodedSrgb,
 }
 
 impl GlesKawasePass {
@@ -55,7 +42,6 @@ impl GlesKawasePass {
             upsample,
             offset,
             transform: GlesKawaseColorTransform::IDENTITY,
-            encoding: GlesKawaseEncoding::LinearLight,
             source_origin: (0, 0).into(),
             source_extent: source.size(),
             destination_extent: destination.size(),
@@ -106,12 +92,6 @@ impl GlesKawasePass {
     /// `1.0` is the identity.
     pub fn with_brightness(mut self, brightness: f32) -> Self {
         self.transform.brightness = brightness.clamp(0.0, 4.0);
-        self
-    }
-
-    /// Select CSS-compatible filtering over encoded sRGB channel values.
-    pub fn with_encoded_srgb(mut self) -> Self {
-        self.encoding = GlesKawaseEncoding::EncodedSrgb;
         self
     }
 }

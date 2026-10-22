@@ -11,12 +11,7 @@ use crate::{
     utils::{Buffer as BufferCoord, Size},
 };
 
-use super::{
-    allocation::AllocationGuard,
-    device::DeviceHandle,
-    format::{render_view_format, ColorEncoding},
-    retirement::RetirementNode,
-};
+use super::{allocation::AllocationGuard, device::DeviceHandle, retirement::RetirementNode, VulkanRenderer};
 
 /// Immutable origin of a Vulkan image resource.
 ///
@@ -38,9 +33,9 @@ impl VulkanImageOrigin {
 
 /// One Vulkan image together with the immutable facts that govern every use.
 ///
-/// Storage provenance, color encoding, layout, and external queue custody live
-/// on the resource itself. Callers select an operation; they do not guess how
-/// the image was allocated or whether a FOREIGN transfer is legal.
+/// Storage provenance, layout, and external queue custody live on the resource
+/// itself. Callers select an operation; they do not guess how the image was
+/// allocated or whether a FOREIGN transfer is legal.
 pub(crate) struct VulkanImage {
     resource_id: u64,
     incarnation: std::num::NonZeroU64,
@@ -52,7 +47,6 @@ pub(crate) struct VulkanImage {
     format: Format,
     vk_format: vk::Format,
     format_features: vk::FormatFeatureFlags,
-    color_encoding: ColorEncoding,
     usage: vk::ImageUsageFlags,
     y_inverted: bool,
     origin: VulkanImageOrigin,
@@ -93,7 +87,6 @@ impl VulkanImage {
         format: Format,
         vk_format: vk::Format,
         format_features: vk::FormatFeatureFlags,
-        color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
@@ -110,7 +103,6 @@ impl VulkanImage {
             format,
             vk_format,
             format_features,
-            color_encoding,
             usage,
             y_inverted,
             VulkanImageOrigin::RendererLocal,
@@ -131,7 +123,6 @@ impl VulkanImage {
         format: Format,
         vk_format: vk::Format,
         format_features: vk::FormatFeatureFlags,
-        color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
         initial_layout: vk::ImageLayout,
@@ -148,7 +139,6 @@ impl VulkanImage {
             format,
             vk_format,
             format_features,
-            color_encoding,
             usage,
             y_inverted,
             VulkanImageOrigin::ExternalDmabuf,
@@ -169,7 +159,6 @@ impl VulkanImage {
         format: Format,
         vk_format: vk::Format,
         format_features: vk::FormatFeatureFlags,
-        color_encoding: ColorEncoding,
         usage: vk::ImageUsageFlags,
         y_inverted: bool,
         origin: VulkanImageOrigin,
@@ -203,7 +192,6 @@ impl VulkanImage {
             format,
             vk_format,
             format_features,
-            color_encoding,
             usage,
             y_inverted,
             origin,
@@ -229,20 +217,14 @@ impl VulkanImage {
         self.sampled_view
     }
 
-    /// Format of the colour attachment view — the `_SRGB` sibling of the
-    /// storage format wherever one exists.
-    pub(crate) fn render_format(&self) -> vk::Format {
-        render_view_format(self.vk_format)
+    /// Format of the colour-attachment view, derived from the renderer's one
+    /// blend space. Render passes and pipelines targeting this image key on it.
+    pub(crate) fn attachment_format(&self) -> vk::Format {
+        VulkanRenderer::BLEND_SPACE.attachment_format(self.vk_format)
     }
 
-    pub(crate) fn color_encoding(&self) -> ColorEncoding {
-        self.color_encoding
-    }
-
-    pub(crate) fn blends_in_linear_light(&self) -> bool {
-        self.render_format() != self.vk_format
-    }
-
+    /// Colour-attachment view: [`Self::attachment_format`] with identity
+    /// swizzles, unlike the sampled view of an opaque DRM format.
     pub(crate) fn render_view(&self) -> vk::ImageView {
         self.render_view
     }

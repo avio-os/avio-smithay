@@ -6,8 +6,6 @@ layout(std140) uniform FrameUniforms {
     vec2 target_size;
     uint storage_is_srgb;
     uint sample_nearest;
-    uint encode_terminal;
-    uint target_is_srgb;
     vec2 source_size;
 } frame;
 

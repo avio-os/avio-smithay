@@ -88,7 +88,7 @@ fn state(authority: &Arc<PipelineCreationAuthority>, capacity: usize) -> Pipelin
         per_format: IndexMap::with_capacity(capacity),
     }
 }
-const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 #[test]
 fn prepared_pipeline_adoption_uses_exact_native_handles_without_heap_or_driver_calls() {
     let _serial = SERIAL.lock().unwrap();
@@ -129,7 +129,7 @@ fn prepared_pipeline_wrong_identity_keeps_both_owner_and_bank_unchanged() {
     for (expected, generation, format) in [
         (&other_context, 7, FORMAT),
         (&context, 8, FORMAT),
-        (&context, 7, vk::Format::B8G8R8A8_SRGB),
+        (&context, 7, vk::Format::B8G8R8A8_UNORM),
     ] {
         let (result, heap) = super::super::super::storage_heap_probe::measure(|| {
             owner.adopt_prepared_for_context(&mut bank, expected, generation, format)
@@ -154,7 +154,7 @@ fn full_prepared_cache_refuses_without_evicting_or_destroying_native_readers() {
     let context = context();
     let mut owner = state(&authority, 1);
     owner.per_format.insert(FORMAT, set(200));
-    let other = vk::Format::B8G8R8A8_SRGB;
+    let other = vk::Format::B8G8R8A8_UNORM;
     let mut bank = prepared(&authority, &context, other);
     let (result, heap) = super::super::super::storage_heap_probe::measure(|| {
         owner.adopt_prepared_for_context(&mut bank, &context, 7, other)

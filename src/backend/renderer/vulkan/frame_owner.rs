@@ -98,12 +98,11 @@ impl VulkanFrame<'_> {
             .ok_or(VulkanRendererError::TemporaryFailure(
                 "owner lane atlas is not image backed",
             ))?;
-        let (command_buffer, parent, encoding, pipelines, framebuffer, transform, output_size, frame_size) = {
+        let (command_buffer, parent, pipelines, framebuffer, transform, output_size, frame_size) = {
             let recording = self.recording()?;
             (
                 recording.command_buffer,
                 recording.target.clone(),
-                recording.encoding,
                 recording.pipelines,
                 recording.framebuffer,
                 recording.transform,
@@ -151,7 +150,7 @@ impl VulkanFrame<'_> {
         let lane_framebuffer = create_framebuffer(
             self.renderer.device.device_handle(),
             pipelines.render_pass,
-            encoding.view(&image),
+            image.render_view(),
             atlas_size,
         )?;
         self.recording_mut()?.effect_framebuffers.push(lane_framebuffer);

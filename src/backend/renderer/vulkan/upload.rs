@@ -27,7 +27,7 @@ use crate::{
 use super::{
     allocation::VulkanAllocationReason,
     device::{DeviceHandle, DeviceState, ImageUpload},
-    format::{optimal_tiling_features, texture_view_components, ColorEncoding},
+    format::{optimal_tiling_features, texture_view_components},
     image::VulkanImage,
     staging::{ReservationWriter, StagingReservation},
     VulkanRenderer, VulkanRendererError, VulkanTexture,
@@ -1198,7 +1198,7 @@ fn create_upload_image(
     let render_view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
-        .format(vk_format)
+        .format(VulkanRenderer::BLEND_SPACE.attachment_format(vk_format))
         .subresource_range(
             vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1237,10 +1237,6 @@ fn create_upload_image(
         },
         vk_format,
         format_features,
-        // shm buffers and CPU-rasterized chrome are premultiplied in electrical values,
-        // exactly like client DMA-BUFs. These images are SAMPLED-only, so they keep a
-        // storage-format render view: it is never usable as a colour attachment.
-        ColorEncoding::ElectricalPremultiplied,
         usage,
         y_inverted,
         vk::ImageLayout::UNDEFINED,

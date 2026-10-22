@@ -39,6 +39,20 @@
 //! - [`crate::backend::renderer::ExportMem`] performs readback through transfer buffers and returns
 //!   deterministic linear pixel data for supported formats.
 //!
+//! # Blend Space
+//!
+//! Every render pass blends in [`VulkanRenderer::BLEND_SPACE`], encoded sRGB:
+//! attachments are viewed through their own UNORM storage format on 8-bit and
+//! 2101010 targets alike, sampled texels (electrically premultiplied client
+//! buffers and the renderer's own offscreens) enter the blend unconverted, and
+//! clear and solid colours (premultiplied [`Color32F`](crate::backend::renderer::Color32F))
+//! are written as given. Authored alpha, coverage, opacity, tints and the
+//! material filter therefore keep their CSS meaning, and an opaque 1:1
+//! composite stores exactly its source bytes. Analytic clip edges are plain
+//! coverage on a linear ramp centred on the edge: [`RoundedClip::aa_width`](crate::backend::renderer::RoundedClip::aa_width)
+//! wide for rounded corners, and 1 device pixel for the bottom-edge pull at
+//! every geometry scale.
+//!
 //! # Explicit Device-Memory Census
 //!
 //! [`VulkanRenderer::diagnostics`] reports successful explicit device-memory
@@ -210,8 +224,9 @@ pub use allocation::{
 };
 pub use blit::VulkanBlitChainStep;
 pub use error::{VulkanRendererError, VulkanRendererErrorKind};
+pub use format::VulkanBlendSpace;
 pub use frame::VulkanFrame;
-pub use kawase::{VulkanKawaseEncoding, VulkanKawaseOutput, VulkanKawasePass};
+pub use kawase::{VulkanKawaseOutput, VulkanKawasePass};
 pub use offscreen::VulkanOffscreenAllocator;
 pub use target::VulkanTarget;
 pub use texture::VulkanTexture;
@@ -385,6 +400,14 @@ impl Drop for VulkanRenderer {
 }
 
 impl VulkanRenderer {
+    /// The colour space every render pass of this renderer blends in.
+    ///
+    /// Composition, the renderer's own offscreens and the material filter all
+    /// work on stored sRGB-encoded values, so authored alpha, coverage, tints
+    /// and fades keep their CSS meaning on every target format. See
+    /// [`VulkanBlendSpace`].
+    pub const BLEND_SPACE: VulkanBlendSpace = VulkanBlendSpace::EncodedSrgb;
+
     /// Provision this exact context's source-fence semaphore inventory cold.
     /// The count covers one selected frame, rather than all native slots.
     pub fn prepare_external_wait_storage(&mut self, count: usize) -> Result<(), VulkanRendererError> {
@@ -767,28 +790,6 @@ impl VulkanRenderer {
             .bind_render_target(&self.device, &self.formats, dmabuf)
     }
 
-    /// Bind immutable-image copy storage without the compositing pass's sRGB
-    /// conversion. An unscaled source drawn with alpha one over transparent
-    /// black retains its encoded premultiplied channels, including alpha.
-    ///
-    /// The destination must have an alpha channel: opaque DRM formats use a
-    /// sampled-view component swizzle, which is not a legal attachment view.
-    /// This is a resource-copy target, not a different display blend policy.
-    pub fn bind_dmabuf_storage_copy_target(
-        &mut self,
-        dmabuf: &Dmabuf,
-    ) -> Result<VulkanTarget, VulkanRendererError> {
-        use crate::backend::allocator::Buffer;
-        if !crate::backend::allocator::format::has_alpha(dmabuf.format().code) {
-            return Err(VulkanRendererError::InvalidDmabuf(
-                "storage-copy target requires identity alpha components",
-            ));
-        }
-        let mut target = self.bind_dmabuf_target(dmabuf)?;
-        target.encoding = target::VulkanTargetEncoding::PreserveStorage;
-        Ok(target)
-    }
-
     /// Whether every advertised framebuffer-effect/capture modifier for this
     /// format supports combined sampled and target usage. Mixed sets use copy capture.
     pub fn framebuffer_sampling_supported(&self, format: crate::backend::allocator::Fourcc) -> bool {
@@ -799,15 +800,14 @@ impl VulkanRenderer {
     ///
     /// Call on the renderer owner's cold resource turn before display or
     /// sealed-capture rendering. This records no commands and prepares only
-    /// this format's actual linear-blend attachment view, not other formats.
+    /// this format's attachment view in [`Self::BLEND_SPACE`], which display,
+    /// capture and material passes on that format share.
     pub fn prepare_framebuffer_format(
         &mut self,
         format: crate::backend::allocator::Fourcc,
     ) -> Result<(), VulkanRendererError> {
-        let storage = crate::backend::allocator::vulkan::format::get_vk_format(format)
-            .ok_or(VulkanRendererError::UnsupportedMemoryFormat(format))?;
         self.pipelines
-            .pipelines_for_format(format::render_view_format(storage))
+            .pipelines_for_format(PreparedAttachmentFormat::Framebuffer(format).native()?)
             .map(|_| ())
     }
 

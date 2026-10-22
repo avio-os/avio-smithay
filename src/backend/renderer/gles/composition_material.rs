@@ -4,9 +4,7 @@ struct KawaseConstants {
     halfpixel: [f32; 2],
     offset: f32,
     mode: u32,
-    encode_output: u32,
     saturation: f32,
-    encoded_srgb: u32,
     contrast: f32,
     brightness: f32,
     pad: u32,
@@ -14,7 +12,6 @@ struct KawaseConstants {
     source_uv_min: [f32; 2],
     source_uv_max: [f32; 2],
     source_uv_offset: [f32; 2],
-    std140_padding: [u32; 2],
 }
 
 impl GlesRenderer {
@@ -72,9 +69,7 @@ impl GlesRenderer {
             ],
             offset: pass.offset,
             mode: pass.upsample as u32,
-            encode_output: (!pass.destination.0.storage_is_srgb) as u32,
             saturation: pass.transform.saturation,
-            encoded_srgb: (pass.encoding == GlesKawaseEncoding::EncodedSrgb) as u32,
             contrast: pass.transform.contrast,
             brightness: pass.transform.brightness,
             pad: 0,
@@ -94,7 +89,6 @@ impl GlesRenderer {
                 pass.source_origin.x as f32 / source_size.w as f32,
                 pass.source_origin.y as f32 / source_size.h as f32,
             ],
-            std140_padding: [0; 2],
         };
         unsafe {
             let gl = &self.gl;
@@ -120,8 +114,6 @@ impl GlesRenderer {
                 (destination_size.w, destination_size.h).into(),
                 pass.source.0.storage_is_srgb,
                 false,
-                false,
-                pass.destination.0.storage_is_srgb,
                 source_size,
             );
             gl.ActiveTexture(ffi::TEXTURE0);
@@ -251,8 +243,7 @@ impl GlesFrame<'_, '_> {
         let current = self.composition_source()?;
         let first = GlesKawasePass::new(&current, first_level, false, offset)
             .with_extents((source.size.w, source.size.h).into(), first_extent)
-            .with_source_origin((source.loc.x, source.loc.y).into())
-            .with_encoded_srgb();
+            .with_source_origin((source.loc.x, source.loc.y).into());
         let result = (|| {
             self.renderer.execute_kawase(&first, true)?;
             for pass in passes {
@@ -529,5 +520,49 @@ impl GlesFrame<'_, '_> {
             Some(MaterialOperation::Tint(tint)),
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod encoded_uniform_contract_tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn frame_uniform_members_match_between_vertex_and_fragment_stages() {
+        fn members(source: &str) -> Vec<&str> {
+            source
+                .split_once("uniform FrameUniforms {")
+                .unwrap()
+                .1
+                .split_once("} frame;")
+                .unwrap()
+                .0
+                .split_whitespace()
+                .collect()
+        }
+        assert_eq!(
+            members(include_str!("shaders/composition.vert")),
+            members(include_str!("shaders/encoded_sampling.glsl"))
+        );
+    }
+
+    #[test]
+    fn texture_uniforms_match_the_shared_std140_shader_block() {
+        assert_eq!(offset_of!(TexturePushConstants, clip_scale), 96);
+        assert_eq!(offset_of!(TexturePushConstants, outer_radius), 100);
+        assert_eq!(offset_of!(TexturePushConstants, outer_origin), 104);
+        assert_eq!(offset_of!(TexturePushConstants, outer_size), 112);
+        assert_eq!(size_of::<TexturePushConstants>(), 128);
+    }
+
+    #[test]
+    fn kawase_uniforms_match_the_shared_std140_shader_block() {
+        assert_eq!(offset_of!(KawaseConstants, saturation), 16);
+        assert_eq!(offset_of!(KawaseConstants, contrast), 20);
+        assert_eq!(offset_of!(KawaseConstants, brightness), 24);
+        assert_eq!(offset_of!(KawaseConstants, source_uv_scale), 32);
+        assert_eq!(offset_of!(KawaseConstants, source_uv_offset), 56);
+        assert_eq!(size_of::<KawaseConstants>(), 64);
     }
 }

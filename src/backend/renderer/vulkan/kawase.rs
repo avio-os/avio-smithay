@@ -4,9 +4,10 @@
 //! step is a fullscreen fragment pass sampling 5 (down) or 8 (up) bilinear
 //! taps at half-pixel offsets (KWin's formulation), composing a
 //! gaussian-like kernel from the same pixels the blit chain already touched
-//! — equivalent bandwidth, marginal extra ALU. Passes explicitly select
-//! linear-light filtering or CSS-compatible encoded-sRGB filtering; storage
-//! stays sRGB-encoded in either case.
+//! — equivalent bandwidth, marginal extra ALU. Every pass filters the stored
+//! encoded-sRGB values in the renderer's blend space
+//! ([`VulkanRenderer::BLEND_SPACE`]), which is what CSS `backdrop-filter`
+//! specifies; nothing is decoded or re-encoded.
 
 use std::sync::Arc;
 
@@ -33,9 +34,9 @@ use super::{
 /// One dual-Kawase pyramid step: renders `source` into `destination` with the
 /// down- or upsample kernel.
 ///
-/// The pass records its working space. Linear-light passes choose hardware or
-/// shader encoding from the destination format; encoded-sRGB passes use UNORM
-/// views so the sampled and stored channel values remain encoded.
+/// The pass samples and stores encoded-sRGB values through the images' own
+/// UNORM views, so its working space is the renderer's blend space and a
+/// colour transform on the final pass means exactly the CSS filter it names.
 #[derive(Debug, Clone)]
 pub struct VulkanKawasePass {
     pub(super) source: VulkanTexture,
@@ -43,30 +44,9 @@ pub struct VulkanKawasePass {
     pub(super) upsample: bool,
     pub(super) offset: f32,
     pub(super) transform: KawaseColorTransform,
-    pub(super) encoding: VulkanKawaseEncoding,
     pub(super) source_origin: Point<i32, BufferCoord>,
     pub(super) source_extent: Size<i32, BufferCoord>,
     pub(super) destination_extent: Size<i32, BufferCoord>,
-}
-
-/// Colour-space convention used by a Kawase pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VulkanKawaseEncoding {
-    /// Decode sRGB, filter in linear light, then encode for storage.
-    #[default]
-    LinearLight,
-    /// Filter and apply the colour transform directly to gamma-encoded sRGB
-    /// values. This intentionally matches CSS backdrop-filter semantics.
-    EncodedSrgb,
-}
-
-impl VulkanKawaseEncoding {
-    fn destination_format(self, storage: vk::Format, render: vk::Format) -> vk::Format {
-        match self {
-            Self::LinearLight => render,
-            Self::EncodedSrgb => storage,
-        }
-    }
 }
 
 impl VulkanKawasePass {
@@ -78,7 +58,6 @@ impl VulkanKawasePass {
             upsample,
             offset,
             transform: KawaseColorTransform::IDENTITY,
-            encoding: VulkanKawaseEncoding::LinearLight,
             source_origin: (0, 0).into(),
             source_extent: source.size(),
             destination_extent: destination.size(),
@@ -129,12 +108,6 @@ impl VulkanKawasePass {
     /// `1.0` is the identity.
     pub fn with_brightness(mut self, brightness: f32) -> Self {
         self.transform.brightness = brightness.clamp(0.0, 4.0);
-        self
-    }
-
-    /// Select CSS-compatible filtering over encoded sRGB channel values.
-    pub fn with_encoded_srgb(mut self) -> Self {
-        self.encoding = VulkanKawaseEncoding::EncodedSrgb;
         self
     }
 }
@@ -212,24 +185,20 @@ impl VulkanRenderer {
     /// only looks up these banks and fails if preparation was omitted.
     pub fn prepare_kawase_passes(&mut self, passes: &[VulkanKawasePass]) -> Result<(), VulkanRendererError> {
         for pass in passes {
-            self.prepare_kawase_destination(&pass.destination, pass.encoding)?;
+            self.prepare_kawase_destination(&pass.destination)?;
         }
         Ok(())
     }
 
-    /// Prepare the encoded-sRGB attachment of a direct first downsample.
+    /// Prepare the attachment of a direct first downsample.
     ///
     /// Its source is the future active framebuffer, so the cold inventory
     /// names only the immutable destination. No lower scene is captured here.
     pub fn prepare_kawase_capture(&mut self, destination: &VulkanTexture) -> Result<(), VulkanRendererError> {
-        self.prepare_kawase_destination(destination, VulkanKawaseEncoding::EncodedSrgb)
+        self.prepare_kawase_destination(destination)
     }
 
-    fn prepare_kawase_destination(
-        &mut self,
-        destination: &VulkanTexture,
-        encoding: VulkanKawaseEncoding,
-    ) -> Result<(), VulkanRendererError> {
+    fn prepare_kawase_destination(&mut self, destination: &VulkanTexture) -> Result<(), VulkanRendererError> {
         let image = destination
             .image_resource()
             .ok_or(VulkanRendererError::NotImplemented(
@@ -240,8 +209,9 @@ impl VulkanRenderer {
                 "Kawase destination image does not support color-attachment usage",
             ));
         }
-        let format = encoding.destination_format(image.vk_format(), image.render_format());
-        self.pipelines.pipelines_for_format(format).map(|_| ())
+        self.pipelines
+            .pipelines_for_format(image.attachment_format())
+            .map(|_| ())
     }
 
     pub(super) fn resolve_kawase_passes(
@@ -315,16 +285,10 @@ impl VulkanRenderer {
                 ));
             }
 
-            let encoded_srgb = pass.encoding == VulkanKawaseEncoding::EncodedSrgb;
-            let destination_format = pass
-                .encoding
-                .destination_format(destination.vk_format(), destination.render_format());
-            let destination_view = if encoded_srgb {
-                destination.view()
-            } else {
-                destination.render_view()
-            };
-            let pipelines = self.pipelines.prepared_pipelines_for_format(destination_format)?;
+            let destination_view = destination.render_view();
+            let pipelines = self
+                .pipelines
+                .prepared_pipelines_for_format(destination.attachment_format())?;
             let descriptor_set = self.descriptors.texture_descriptor_set(
                 source.view(),
                 source.incarnation(),
@@ -334,9 +298,7 @@ impl VulkanRenderer {
                 kawase_halfpixel(pass.source_extent, pass.destination_extent),
                 pass.offset,
                 pass.upsample,
-                destination.blends_in_linear_light(),
                 pass.transform,
-                encoded_srgb,
             )
             .with_source_region(pass.source_origin, pass.source_extent, source.size());
             resolved.push(ResolvedKawasePass {
@@ -580,49 +542,28 @@ mod tests {
         utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
     };
 
-    use super::{VulkanKawaseEncoding, VulkanRenderer};
+    use super::VulkanRenderer;
 
-    #[test]
-    fn kawase_preparation_uses_actual_encoded_or_render_attachment_format() {
-        for (storage, render) in [
-            (ash::vk::Format::R8G8B8A8_UNORM, ash::vk::Format::R8G8B8A8_SRGB),
-            (ash::vk::Format::B8G8R8A8_UNORM, ash::vk::Format::B8G8R8A8_SRGB),
-            (
-                ash::vk::Format::R16G16B16A16_SFLOAT,
-                ash::vk::Format::R16G16B16A16_SFLOAT,
-            ),
-        ] {
-            assert_eq!(
-                VulkanKawaseEncoding::EncodedSrgb.destination_format(storage, render),
-                storage
-            );
-            assert_eq!(
-                VulkanKawaseEncoding::LinearLight.destination_format(storage, render),
-                render
-            );
-        }
-    }
-
-    /// The reviewed first-glass trigger: the output clear warmed only SRGB,
-    /// while the real first downsample and filter destinations use UNORM.
+    /// First glass may use only an attachment bank prepared on a cold turn.
+    /// The output's own bank serves every pass of its storage format, so the
+    /// refusal is exercised with filter images of a second storage format.
     #[test]
     #[ignore = "requires native Vulkan; run explicitly for cold/first-glass evidence"]
     fn first_glass_requires_exact_cold_bank_and_preserves_active_frame_on_refusal() {
         let physical =
             crate::backend::renderer::vulkan::test_support::physical_device().expect("native Vulkan device");
         let mut renderer = VulkanRenderer::new(&physical).expect("native Vulkan renderer");
-        let format = first_working_offscreen_format(&mut renderer).expect("offscreen format");
-        let mut output = renderer.create_buffer(format, (16, 16).into()).unwrap();
-        let capture = renderer.create_buffer(format, (8, 8).into()).unwrap();
-        let filtered = renderer.create_buffer(format, (4, 4).into()).unwrap();
+        let mut output = renderer.create_buffer(Fourcc::Abgr8888, (16, 16).into()).unwrap();
+        let capture = renderer.create_buffer(Fourcc::Argb8888, (8, 8).into()).unwrap();
+        let filtered = renderer.create_buffer(Fourcc::Argb8888, (4, 4).into()).unwrap();
         let destination = capture.image_resource().unwrap();
+        let filter_format = destination.attachment_format();
         assert_ne!(
-            destination.vk_format(),
-            destination.render_format(),
-            "fixture needs the native SRGB sibling"
+            output.image_resource().unwrap().attachment_format(),
+            filter_format,
+            "fixture needs a filter bank distinct from the output bank"
         );
-        let encoded_format = destination.vk_format();
-        let passes = [VulkanKawasePass::new(&capture, &filtered, false, 1.5).with_encoded_srgb()];
+        let passes = [VulkanKawasePass::new(&capture, &filtered, false, 1.5)];
         let size: Size<i32, Physical> = (16, 16).into();
         let area = Rectangle::from_size(size);
         {
@@ -641,13 +582,13 @@ mod tests {
         }
         assert!(renderer
             .pipelines
-            .prepared_pipelines_for_format(encoded_format)
+            .prepared_pipelines_for_format(filter_format)
             .is_err());
         renderer.prepare_kawase_capture(&capture).unwrap();
         renderer.prepare_kawase_passes(&passes).unwrap();
         let prepared = renderer
             .pipelines
-            .prepared_pipelines_for_format(encoded_format)
+            .prepared_pipelines_for_format(filter_format)
             .unwrap();
         for _ in 0..2 {
             let mut target = renderer.bind(&mut output).unwrap();
@@ -660,7 +601,7 @@ mod tests {
             drop(target);
             let reused = renderer
                 .pipelines
-                .prepared_pipelines_for_format(encoded_format)
+                .prepared_pipelines_for_format(filter_format)
                 .unwrap();
             assert_eq!(reused.render_pass, prepared.render_pass);
             assert_eq!(reused.kawase_pipeline, prepared.kawase_pipeline);
@@ -737,7 +678,7 @@ mod tests {
             .expect("readback");
         let data = renderer.map_texture(&mapping).expect("map");
         // Sample the center pixel; a solid mid-gray must survive the round
-        // trip within +-2/255 regardless of linearization.
+        // trip within +-2/255.
         let center = ((8 * 16 + 8) * 4) as usize;
         let pixel = &data[center..center + 4];
         for channel in 0..3 {
@@ -806,8 +747,8 @@ mod tests {
     }
 
     /// Renders one solid colour through a two-pass chain whose final pass
-    /// carries `transform`, in the encoded-sRGB working space, and returns the
-    /// centre pixel's stored bytes.
+    /// carries `transform`, in the renderer's encoded-sRGB blend space, and
+    /// returns the centre pixel's stored bytes.
     fn filtered_solid_center_pixel(
         renderer: &mut VulkanRenderer,
         format: Fourcc,
@@ -836,8 +777,8 @@ mod tests {
 
         renderer
             .kawase_texture_chain(&[
-                VulkanKawasePass::new(&full, &half, false, 1.5).with_encoded_srgb(),
-                transform(VulkanKawasePass::new(&half, &full, true, 1.5).with_encoded_srgb()),
+                VulkanKawasePass::new(&full, &half, false, 1.5),
+                transform(VulkanKawasePass::new(&half, &full, true, 1.5)),
             ])
             .expect("filtering kawase chain")
             .wait()

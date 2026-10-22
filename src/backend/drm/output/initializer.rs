@@ -94,6 +94,7 @@ where
     pub(super) renderer_formats: Vec<DrmFormat>,
     pub(super) cursor_size: Size<u32, Buffer>,
     pub(super) native_black_enabled: bool,
+    pub(super) output_layer_enabled: bool,
     pub(super) reservation: OutputReservation,
 }
 
@@ -173,7 +174,7 @@ where
                     surface,
                     planes.clone(),
                     self.allocator.clone(),
-                    Some(self.allocator.clone()),
+                    self.output_layer_enabled.then(|| self.allocator.clone()),
                     self.exporter.clone(),
                     self.color_formats.iter().copied(),
                     self.renderer_formats
@@ -189,7 +190,7 @@ where
                     surface,
                     planes.clone(),
                     self.allocator.clone(),
-                    Some(self.allocator.clone()),
+                    self.output_layer_enabled.then(|| self.allocator.clone()),
                     self.exporter.clone(),
                     self.color_formats.iter().copied(),
                     self.renderer_formats.iter().copied(),

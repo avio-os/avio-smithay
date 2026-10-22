@@ -46,37 +46,18 @@ pub(crate) struct TexturePushConstants {
     pub(crate) clip_params: [f32; 4],
     pub(crate) effect: [f32; 4],
     pub(crate) effect_params: [f32; 4],
-    /// How the sampled texels relate to linear light, and therefore which conversion
-    /// the shader applies before the blend. See [`GlesTextureEncoding`].
-    pub(crate) source_encoding: u32,
     /// Physical pixels per authored logical pixel for parametric clips.
     pub(crate) clip_scale: f32,
+    pub(crate) outer_radius: f32,
     // vec2 spelling in GLSL avoids vec4 alignment padding past the minimum
     // 128-byte Vulkan push-constant allowance.
     pub(crate) outer_origin: [f32; 2],
     pub(crate) outer_size: [f32; 2],
-    pub(crate) outer_radius: f32,
-    _std140_padding: f32,
+    _std140_padding: [u32; 2],
 }
 
 const BOTTOM_EDGE_CLIP_FLAG: u32 = 1 << 31;
 const CLIP_TRANSFORM_SHIFT: u32 = 8;
-
-/// Shader-side spelling of [`GlesTextureEncoding`]. Kept next to the push-constant struct so
-/// the two stay in step; `texture.frag` reads the same numbering.
-pub(crate) const SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED: u32 = 0;
-pub(crate) const SOURCE_ENCODING_LINEAR_PREMULTIPLIED: u32 = 1;
-/// The target blends in gamma space (no `_SRGB` sibling), so no conversion happens.
-pub(crate) const SOURCE_ENCODING_PASSTHROUGH: u32 = 2;
-
-impl From<GlesTextureEncoding> for u32 {
-    fn from(encoding: GlesTextureEncoding) -> Self {
-        match encoding {
-            GlesTextureEncoding::ElectricalPremultiplied => SOURCE_ENCODING_ELECTRICAL_PREMULTIPLIED,
-            GlesTextureEncoding::LinearPremultiplied => SOURCE_ENCODING_LINEAR_PREMULTIPLIED,
-        }
-    }
-}
 
 impl Default for TexturePushConstants {
     fn default() -> Self {
@@ -91,12 +72,11 @@ impl Default for TexturePushConstants {
             clip_params: [0.0, 2.0, 0.5, 0.0],
             effect: [TextureRenderEffectKind::None as u32 as f32, 0.0, 0.5, 0.5],
             effect_params: [0.0, 0.0, 0.0, 0.0],
-            source_encoding: SOURCE_ENCODING_PASSTHROUGH,
             clip_scale: 1.0,
             outer_origin: [0.0; 2],
             outer_size: [0.0; 2],
             outer_radius: -1.0,
-            _std140_padding: 0.0,
+            _std140_padding: [0; 2],
         }
     }
 }
@@ -109,23 +89,6 @@ impl TexturePushConstants {
             y_inverted: u32::from(y_inverted),
             ..Self::default()
         }
-    }
-
-    /// Declares how the sampled texels relate to linear light.
-    ///
-    /// `linear_blending` is a property of the bound target: when it is false the pass
-    /// blends in gamma space and texels must reach the blend exactly as stored.
-    pub(crate) fn with_source_encoding(
-        mut self,
-        encoding: GlesTextureEncoding,
-        linear_blending: bool,
-    ) -> Self {
-        self.source_encoding = if linear_blending {
-            encoding.into()
-        } else {
-            SOURCE_ENCODING_PASSTHROUGH
-        };
-        self
     }
 
     pub(crate) fn with_src_rect(mut self, offset: [f32; 2], scale: [f32; 2]) -> Self {
