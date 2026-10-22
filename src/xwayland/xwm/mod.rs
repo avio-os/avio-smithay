@@ -1944,24 +1944,10 @@ where
                 }
             }
         }
-        Event::FocusIn(n) => {
-            conn.change_property32(
-                PropMode::REPLACE,
-                xwm.screen.root,
-                xwm.atoms._NET_ACTIVE_WINDOW,
-                AtomEnum::WINDOW,
-                &[n.event],
-            )?;
-        }
-        Event::FocusOut(n) => {
-            conn.change_property32(
-                PropMode::REPLACE,
-                xwm.screen.root,
-                xwm.atoms._NET_ACTIVE_WINDOW,
-                AtomEnum::WINDOW,
-                &[n.event],
-            )?;
-        }
+        // `_NET_ACTIVE_WINDOW` is written where the WM moves focus, in the
+        // `X11Surface` keyboard enter/leave. Root FocusIn/FocusOut carry the
+        // root as their event window, never the focused client, so deriving
+        // the property from them named the root as the active window.
         Event::ClientMessage(msg) => {
             if let Some(reply) = conn.get_atom_name(msg.type_)?.reply_unchecked()? {
                 trace!(
