@@ -113,6 +113,7 @@ pub struct DrmDevice {
     pub(super) dev_id: dev_t,
     pub(crate) internal: Arc<DrmDeviceInternal>,
     has_universal_planes: bool,
+    cursor_hotspots_required: bool,
     cursor_size: Size<u32, Buffer>,
     resources: ResourceHandles,
     plane_claim_storage: PlaneClaimStorage,
@@ -183,6 +184,27 @@ impl DrmDevice {
     ///
     /// Returns an error if the file is no valid drm node or the device is not accessible.
     pub fn new(fd: DrmDeviceFd, disable_connectors: bool) -> Result<(Self, DrmDeviceNotifier), Error> {
+        Self::new_internal(fd, disable_connectors, false)
+    }
+
+    /// Create a device whose cursor-plane users supply exact image hotspots.
+    ///
+    /// Atomic virtual drivers hide their cursor planes unless this capability
+    /// is enabled. Callers promise to supply a hotspot with every cursor image,
+    /// through `DrmCompositor::render_frame_with_cursor_hotspot` or `PlaneConfig`.
+    /// Unsupported drivers retain their ordinary cursor-plane behavior.
+    pub fn new_with_cursor_hotspots(
+        fd: DrmDeviceFd,
+        disable_connectors: bool,
+    ) -> Result<(Self, DrmDeviceNotifier), Error> {
+        Self::new_internal(fd, disable_connectors, true)
+    }
+
+    fn new_internal(
+        fd: DrmDeviceFd,
+        disable_connectors: bool,
+        cursor_hotspots_requested: bool,
+    ) -> Result<(Self, DrmDeviceNotifier), Error> {
         // setup parent span for internal device types
         let span = debug_span!(
             "drm_device",
@@ -217,7 +239,9 @@ impl DrmDevice {
             })
         })?;
 
-        let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
+        let (internal, cursor_hotspots_required) =
+            DrmDevice::create_internal(fd, active, disable_connectors, cursor_hotspots_requested)?;
+        let internal = Arc::new(internal);
         if matches!(&*internal, DrmDeviceInternal::Atomic(_)) {
             internal.device_fd().prepare_mode_blob_banks(resources.crtcs())?;
         }
@@ -227,6 +251,7 @@ impl DrmDevice {
                 dev_id,
                 internal: internal.clone(),
                 has_universal_planes,
+                cursor_hotspots_required,
                 cursor_size,
                 resources,
                 plane_claim_storage: Default::default(),
@@ -244,7 +269,8 @@ impl DrmDevice {
         fd: DrmDeviceFd,
         active: Arc<AtomicBool>,
         disable_connectors: bool,
-    ) -> Result<DrmDeviceInternal, Error> {
+        cursor_hotspots_requested: bool,
+    ) -> Result<(DrmDeviceInternal, bool), Error> {
         let force_legacy = std::env::var("SMITHAY_USE_LEGACY")
             .map(|x| {
                 x == "1" || x.to_lowercase() == "true" || x.to_lowercase() == "yes" || x.to_lowercase() == "y"
@@ -255,14 +281,25 @@ impl DrmDevice {
             info!("SMITHAY_USE_LEGACY is set. Forcing LegacyDrmDevice.");
         };
 
-        Ok(
-            if !force_legacy && fd.set_client_capability(ClientCapability::Atomic, true).is_ok() {
-                DrmDeviceInternal::Atomic(AtomicDrmDevice::new(fd, active, disable_connectors)?)
-            } else {
-                info!("Falling back to LegacyDrmDevice");
-                DrmDeviceInternal::Legacy(LegacyDrmDevice::new(fd, active, disable_connectors)?)
-            },
-        )
+        if !force_legacy && fd.set_client_capability(ClientCapability::Atomic, true).is_ok() {
+            // This must precede AtomicDrmDevice's property inventory: the
+            // kernel exposes the virtual cursor plane only on this DRM fd.
+            let cursor_hotspots_required = cursor_hotspots_requested
+                && fd
+                    .set_client_capability(ClientCapability::CursorPlaneHotspot, true)
+                    .is_ok();
+            tracing::debug!(cursor_hotspots_required, "DRM cursor hotspot capability");
+            Ok((
+                DrmDeviceInternal::Atomic(AtomicDrmDevice::new(fd, active, disable_connectors)?),
+                cursor_hotspots_required,
+            ))
+        } else {
+            info!("Falling back to LegacyDrmDevice");
+            Ok((
+                DrmDeviceInternal::Legacy(LegacyDrmDevice::new(fd, active, disable_connectors)?),
+                false,
+            ))
+        }
     }
 
     /// Returns if the underlying implementation uses atomic-modesetting or not.
@@ -396,6 +433,7 @@ impl DrmDevice {
 
         Ok(DrmSurface {
             dev_id: self.dev_id,
+            cursor_hotspots_required: self.cursor_hotspots_required,
             crtc,
             planes,
             internal,

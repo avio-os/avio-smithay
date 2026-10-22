@@ -30,6 +30,7 @@ pub struct DrmSurface {
     #[allow(dead_code)]
     pub(super) dev_id: dev_t,
     pub(super) crtc: crtc::Handle,
+    pub(super) cursor_hotspots_required: bool,
     pub(super) planes: Planes,
     pub(super) internal: Arc<DrmSurfaceInternal>,
     pub(super) plane_claim_storage: PlaneClaimStorage,
@@ -71,6 +72,9 @@ pub struct PlaneConfig<'a> {
     pub fb: framebuffer::Handle,
     /// Optional fence
     pub fence: Option<BorrowedFd<'a>>,
+    /// Cursor hotspot in the attached, already transformed bitmap's pixels.
+    /// Required when the plane exposes HOTSPOT_X/Y; absent for scene planes.
+    pub cursor_hotspot: Option<crate::utils::Point<i32, Buffer>>,
 }
 
 /// VRR support state

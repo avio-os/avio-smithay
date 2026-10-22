@@ -209,6 +209,7 @@ where
                 transform: Transform::Normal,
                 alpha: 1.0,
                 format: slot.format(),
+                cursor_hotspot: None,
             },
             buffer: DrmScanoutBuffer {
                 buffer: ScanoutBuffer::Swapchain(slot),

@@ -699,6 +699,7 @@ pub(super) mod tests {
                 transform: Transform::Normal,
                 alpha: 1.0,
                 format: TestBuffer.format(),
+                cursor_hotspot: None,
             },
             buffer: DrmScanoutBuffer {
                 buffer: ScanoutBuffer::Swapchain(Arc::new(Slot::new(TestBuffer))),

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Avio virtual cursor integration
+
+`DrmDevice::new_with_cursor_hotspots` explicitly opts atomic clients into the
+kernel's virtual cursor-plane hotspot contract before plane discovery. Use
+`render_frame_with_cursor_hotspot` with `CursorPlaneHotspot` bound to the exact
+element ID/commit, or supply `PlaneConfig::cursor_hotspot` directly. The new
+optional `PlaneConfig` field is `None` for ordinary primary/overlay planes.
+Missing virtual cursor metadata retains composition; native requests never
+invent an anchor. Cursor-only movement keeps the presented image's hotspot.
+The existing `DrmDevice::new` leaves capability admission unchanged.
+
 ### Breaking changes
 
 `crate::wayland::selection::data_device::start_dnd` was removed in favor of exposing the

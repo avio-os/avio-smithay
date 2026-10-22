@@ -435,6 +435,7 @@ impl AtomicDrmSurface {
                     damage_clips: None,
                     fb: test_buffer.fb,
                     fence: None,
+                    cursor_hotspot: None,
                 }),
             };
 
@@ -493,6 +494,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                cursor_hotspot: None,
             }),
         };
 
@@ -551,6 +553,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                cursor_hotspot: None,
             }),
         };
         let mut req = AtomicRequest::build_request(
@@ -598,6 +601,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                cursor_hotspot: None,
             }),
         };
         let mut req = AtomicRequest::build_request(
@@ -650,6 +654,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                cursor_hotspot: None,
             }),
         };
         self.test_state_cold([plane], true, &current, &candidate)?;
@@ -785,6 +790,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                cursor_hotspot: None,
             }),
         };
 

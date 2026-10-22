@@ -620,6 +620,32 @@ where
         })
     }
 
+    /// Render one frame with exact virtual-cursor hotspot metadata.
+    pub fn render_frame_with_cursor_hotspot<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_mode: FrameFlags,
+        cursor_hotspot: Option<&super::compositor::CursorPlaneHotspot>,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+        self.with_compositor(|compositor| {
+            compositor.render_frame_with_cursor_hotspot(
+                renderer,
+                elements,
+                clear_color,
+                frame_mode,
+                cursor_hotspot,
+            )
+        })
+    }
+
     /// Queues the current frame for scan-out.
     ///
     /// If `render_frame` has not been called prior to this function or returned no damage

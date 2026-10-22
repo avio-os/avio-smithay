@@ -187,6 +187,8 @@ use crate::{
     wayland::{shm, single_pixel_buffer},
 };
 
+mod cursor_hotspot;
+pub use cursor_hotspot::CursorPlaneHotspot;
 mod composition;
 mod framebuffer_policy;
 pub use composition::{
@@ -536,6 +538,7 @@ struct PlaneProperties {
     pub transform: Transform,
     pub alpha: f32,
     pub format: DrmFormat,
+    pub cursor_hotspot: Option<Point<i32, Physical>>,
 }
 
 impl PlaneProperties {
@@ -546,6 +549,7 @@ impl PlaneProperties {
             && self.transform == other.transform
             && self.alpha == other.alpha
             && self.format == other.format
+            && self.cursor_hotspot == other.cursor_hotspot
     }
 }
 
@@ -969,6 +973,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                 config: state.config.as_mut().map(|config| super::PlaneConfig {
                     src: config.properties.src,
                     dst: config.properties.dst,
+                    cursor_hotspot: config
+                        .properties
+                        .cursor_hotspot
+                        .map(|point| (point.x, point.y).into()),
                     alpha: config.properties.alpha,
                     transform: config.properties.transform,
                     damage_clips: config.damage_clips.as_ref().map(|d| d.blob()),
@@ -2044,6 +2052,7 @@ where
                     transform: Transform::Normal,
                     alpha: 1.0,
                     format: buffer.format(),
+                    cursor_hotspot: None,
                 },
                 buffer: DrmScanoutBuffer {
                     buffer: ScanoutBuffer::Swapchain(Arc::new(buffer)),
@@ -2273,14 +2282,34 @@ where
     ///
     /// - `elements` for this frame in front-to-back order
     /// - `frame_flags` specifies techniques allowed to realize the frame
-    #[instrument(level = "trace", parent = &self.span, skip_all)]
-    #[profiling::function]
     pub fn render_frame<'a, R, E>(
         &mut self,
         renderer: &mut R,
         elements: &'a [E],
         clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+    {
+        self.render_frame_with_cursor_hotspot(renderer, elements, clear_color, frame_flags, None)
+    }
+
+    /// Render one frame with the hotspot of its exact cursor bitmap.
+    ///
+    /// Required for virtual cursor planes enabled by `DrmDevice::new_with_cursor_hotspots`.
+    /// Cursor-only moves retain this metadata from their presented frame.
+    #[instrument(name = "render_frame", level = "trace", parent = &self.span, skip_all)]
+    #[profiling::function]
+    pub fn render_frame_with_cursor_hotspot<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
         mut frame_flags: FrameFlags,
+        cursor_hotspot: Option<&CursorPlaneHotspot>,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
@@ -2694,6 +2723,7 @@ where
                     output_geometry,
                     try_assign_primary_plane,
                     frame_flags,
+                    cursor_hotspot,
                 ) {
                     Ok(direct_scan_out_plane) => {
                         match direct_scan_out_plane.type_ {
@@ -4371,6 +4401,7 @@ where
         output_geometry: Rectangle<i32, Physical>,
         try_assign_primary_plane: bool,
         frame_flags: FrameFlags,
+        cursor_hotspot: Option<&CursorPlaneHotspot>,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer + Bind<Dmabuf>,
@@ -4432,6 +4463,7 @@ where
             output_transform,
             output_geometry,
             frame_flags,
+            cursor_hotspot,
         ) {
             trace!("assigned element {:?} to cursor {:?}", element.id(), plane.handle);
             return Ok(plane);
@@ -4689,6 +4721,7 @@ where
                     transform: Transform::Normal,
                     alpha: 1.0,
                     format: slot.format(),
+                    cursor_hotspot: None,
                 },
                 buffer: DrmScanoutBuffer {
                     buffer: ScanoutBuffer::Swapchain(Arc::new(slot)),
@@ -4752,6 +4785,7 @@ where
         output_transform: Transform,
         output_geometry: Rectangle<i32, Physical>,
         frame_flags: FrameFlags,
+        cursor_hotspot: Option<&CursorPlaneHotspot>,
     ) -> Option<PlaneAssignment>
     where
         R: Renderer,
@@ -4853,6 +4887,19 @@ where
             self.cursor_size
         };
 
+        let cursor_hotspot = cursor_hotspot.and_then(|hotspot| {
+            hotspot.for_bitmap(
+                element.id(),
+                element.current_commit(),
+                output_transform,
+                cursor_plane_size,
+            )
+        });
+        if self.surface.cursor_hotspots_required && cursor_hotspot.is_none() {
+            trace!("virtual cursor plane requires exact image hotspot metadata");
+            return None;
+        }
+
         // this calculates the location of the cursor plane taking the simulated transform
         // into consideration
         let cursor_plane_location = output_transform
@@ -4900,10 +4947,10 @@ where
         let reposition = previous_state
             .plane_state(plane_info.handle)
             .and_then(|state| {
-                state
-                    .config
-                    .as_ref()
-                    .map(|config| config.properties.dst.loc != cursor_plane_location)
+                state.config.as_ref().map(|config| {
+                    config.properties.dst.loc != cursor_plane_location
+                        || config.properties.cursor_hotspot != cursor_hotspot
+                })
             })
             .unwrap_or(true);
 
@@ -4930,6 +4977,7 @@ where
             plane_state.needs_test = false;
             let config = plane_state.config.as_mut().unwrap();
             config.properties.dst.loc = cursor_plane_location;
+            config.properties.cursor_hotspot = cursor_hotspot;
             frame_state.set_state(plane_info.handle, plane_state);
             return Some(plane_info.into());
         }
@@ -5110,6 +5158,7 @@ where
                 alpha: 1.0,
                 transform: Transform::Normal,
                 format: framebuffer.format(),
+                cursor_hotspot,
             },
             buffer: DrmScanoutBuffer {
                 buffer: ScanoutBuffer::Cursor(Arc::new(cursor_buffer)),
@@ -5306,6 +5355,7 @@ where
             alpha,
             transform,
             format: fb.format(),
+            cursor_hotspot: None,
         };
         let buffer: DrmScanoutBuffer<
             <A as Allocator>::Buffer,
