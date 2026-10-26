@@ -78,6 +78,61 @@ impl TextInputHandle {
         });
     }
 
+    pub(crate) fn route_client_instances(
+        &self,
+        target: &Self,
+        declared: &Self,
+        client: &wayland_server::Client,
+        provider: InputMethodHandle,
+    ) {
+        let moved = {
+            let mut inner = self.inner.lock().unwrap();
+            let mut moved = Vec::new();
+            let focus = inner.focus.clone();
+            let mut index = 0;
+            while index < inner.instances.len() {
+                let instance = &inner.instances[index];
+                let owned = instance.instance.client().as_ref() == Some(client)
+                    && instance
+                        .instance
+                        .data::<TextInputUserData>()
+                        .is_some_and(|data| Arc::ptr_eq(&data.declared.inner, &declared.inner));
+                if owned {
+                    let mut instance = inner.instances.remove(index);
+                    if inner.active_text_input_id.as_ref() == Some(&instance.instance.id()) {
+                        inner.active_text_input_id = None;
+                    }
+                    if let Some(surface) = focus.as_ref().filter(|s| s.client().as_ref() == Some(client)) {
+                        instance.instance.leave(surface);
+                    }
+                    instance.pending_state = Default::default();
+                    let data = instance.instance.data::<TextInputUserData>().unwrap();
+                    *data.endpoint.lock().unwrap() = TextInputEndpoint {
+                        handle: target.clone(),
+                        input_method_handle: provider.clone(),
+                    };
+                    data.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    moved.push(instance);
+                } else {
+                    index += 1;
+                }
+            }
+            moved
+        };
+        target.inner.lock().unwrap().instances.extend(moved);
+    }
+
+    pub(super) fn enter_instance(&self, instance: &ZwpTextInputV3) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(surface) = inner
+            .focus
+            .as_ref()
+            .filter(|surface| surface.is_alive() && instance.id().same_client_as(&surface.id()))
+        {
+            instance.enter(surface);
+        }
+    }
+
     fn increment_serial(&self, text_input: &ZwpTextInputV3) {
         if let Some(instance) = self
             .inner
@@ -87,7 +142,7 @@ impl TextInputHandle {
             .iter_mut()
             .find(|instance| instance.instance == *text_input)
         {
-            instance.serial += 1
+            instance.serial = instance.serial.wrapping_add(1)
         }
     }
 
@@ -122,8 +177,12 @@ impl TextInputHandle {
     /// surface.
     pub fn leave(&self) {
         let mut inner = self.inner.lock().unwrap();
-        // Leaving clears the active text input.
+        // Leaving clears active and pending widget state, but Commit serials
+        // belong to each protocol object's lifetime and must continue.
         inner.active_text_input_id = None;
+        for instance in &mut inner.instances {
+            instance.pending_state = Default::default();
+        }
         // NOTE: we implement it in a symmetrical way with `enter`.
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.leave(focus);
@@ -199,8 +258,36 @@ impl TextInputHandle {
 /// User data of ZwpTextInputV3 object
 #[derive(Debug)]
 pub struct TextInputUserData {
+    pub(super) endpoint: Mutex<TextInputEndpoint>,
+    pub(super) declared: TextInputHandle,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct TextInputEndpoint {
     pub(super) handle: TextInputHandle,
-    pub(crate) input_method_handle: InputMethodHandle,
+    pub(super) input_method_handle: InputMethodHandle,
+}
+
+impl TextInputUserData {
+    pub(super) fn new(
+        handle: TextInputHandle,
+        input_method_handle: InputMethodHandle,
+        declared: TextInputHandle,
+    ) -> Self {
+        Self {
+            endpoint: Mutex::new(TextInputEndpoint {
+                handle,
+                input_method_handle,
+            }),
+            declared,
+            generation: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+    /// Changes whenever this exact protocol object moves to a different seat endpoint.
+    pub fn routing_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl<D> Dispatch<ZwpTextInputV3, TextInputUserData, D> for TextInputManagerState
@@ -218,6 +305,8 @@ where
         _dhandle: &wayland_server::DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
+        let endpoint = data.endpoint.lock().unwrap().clone();
+        let data = &endpoint;
         // Always increment serial to not desync with clients.
         if matches!(request, zwp_text_input_v3::Request::Commit) {
             data.handle.increment_serial(resource);
@@ -342,10 +431,16 @@ where
     }
 
     fn destroyed(state: &mut D, _client: ClientId, text_input: &ZwpTextInputV3, data: &TextInputUserData) {
+        let endpoint = data.endpoint.lock().unwrap().clone();
+        let data = &endpoint;
         let destroyed_id = text_input.id();
         let deactivate_im = {
             let mut inner = data.handle.inner.lock().unwrap();
             inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
+            let destroyed_active = inner.active_text_input_id.as_ref() == Some(&destroyed_id);
+            if destroyed_active {
+                inner.active_text_input_id = None;
+            }
             let destroyed_focused = inner
                 .focus
                 .as_ref()
@@ -354,11 +449,12 @@ where
 
             // Deactivate IM when we either lost focus entirely or destroyed text-input for the
             // currently focused client.
-            destroyed_focused
-                && !inner
-                    .instances
-                    .iter()
-                    .any(|inst| inst.instance.id().same_client_as(&destroyed_id))
+            destroyed_active
+                || (destroyed_focused
+                    && !inner
+                        .instances
+                        .iter()
+                        .any(|inst| inst.instance.id().same_client_as(&destroyed_id)))
         };
 
         if deactivate_im {

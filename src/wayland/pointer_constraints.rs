@@ -242,7 +242,7 @@ impl PointerConstraintsState {
 #[derive(Debug)]
 pub struct PointerConstraintUserData<D: SeatHandler> {
     surface: WlSurface,
-    pointer: Option<PointerHandle<D>>,
+    pointer: std::sync::Arc<crate::wayland::seat::pointer_endpoint::PointerEndpoint<D>>,
 }
 
 struct PointerConstraintData<D: SeatHandler + 'static> {
@@ -387,7 +387,9 @@ where
                         pointer: pointer.clone(),
                     },
                 );
-                if let Some(pointer) = pointer {
+                pointer.track_constraint(&surface);
+                let current_pointer = pointer.lock().unwrap().clone();
+                if let Some(pointer) = current_pointer {
                     add_constraint(
                         pointer_constraints,
                         &surface,
@@ -421,7 +423,9 @@ where
                         pointer: pointer.clone(),
                     },
                 );
-                if let Some(pointer) = pointer {
+                pointer.track_constraint(&surface);
+                let current_pointer = pointer.lock().unwrap().clone();
+                if let Some(pointer) = current_pointer {
                     add_constraint(
                         pointer_constraints,
                         &surface,
@@ -477,7 +481,8 @@ where
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let pointer = data.pointer.lock().unwrap().clone();
+        let Some(pointer) = &pointer else {
             return;
         };
 
@@ -502,7 +507,8 @@ where
         _resource: &ZwpConfinedPointerV1,
         data: &PointerConstraintUserData<D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let pointer = data.pointer.lock().unwrap().clone();
+        let Some(pointer) = &pointer else {
             return;
         };
 
@@ -525,7 +531,8 @@ where
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let pointer = data.pointer.lock().unwrap().clone();
+        let Some(pointer) = &pointer else {
             return;
         };
 
@@ -555,7 +562,8 @@ where
         _resource: &ZwpLockedPointerV1,
         data: &PointerConstraintUserData<D>,
     ) {
-        let Some(pointer) = &data.pointer else {
+        let pointer = data.pointer.lock().unwrap().clone();
+        let Some(pointer) = &pointer else {
             return;
         };
 
@@ -601,4 +609,36 @@ macro_rules! delegate_pointer_constraints {
             );
         };
     };
+}
+
+// Resource custody changes only after focus/held input has retired. A stale
+// surface registration must not move a successor constraint owned by another
+// wl_pointer endpoint, even if both endpoints currently use the same seat.
+pub(crate) fn route_pointer_constraint<D: SeatHandler + 'static>(
+    surface: &WlSurface,
+    from: &PointerHandle<D>,
+    to: &PointerHandle<D>,
+    endpoint: &std::sync::Arc<crate::wayland::seat::pointer_endpoint::PointerEndpoint<D>>,
+) {
+    let owned = |constraint: &PointerConstraint| {
+        let data = match constraint {
+            PointerConstraint::Locked(locked) => locked.handle.data::<PointerConstraintUserData<D>>(),
+            PointerConstraint::Confined(confined) => confined.handle.data::<PointerConstraintUserData<D>>(),
+        };
+        data.is_some_and(|data| std::sync::Arc::ptr_eq(&data.pointer, endpoint))
+    };
+    with_pointer_constraint(surface, from, |constraint| {
+        if let Some(constraint) = constraint.filter(|constraint| owned(constraint.entry.get())) {
+            constraint.deactivate();
+        }
+    });
+    with_constraint_data::<D, _, _>(surface, |data| {
+        if let Some(data) = data {
+            if data.constraints.get(from).is_some_and(owned) {
+                if let Some(constraint) = data.constraints.remove(from) {
+                    data.constraints.insert(to.clone(), constraint);
+                }
+            }
+        }
+    });
 }

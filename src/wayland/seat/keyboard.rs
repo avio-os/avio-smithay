@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fmt};
+use std::{cell::RefCell, fmt, sync::Mutex};
 
 use tracing::{instrument, trace, warn};
 use wayland_server::{
@@ -99,13 +99,14 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// May return `None` for a valid `WlKeyboard` that was created without
     /// the keyboard capability.
     pub fn from_resource(seat: &WlKeyboard) -> Option<Self> {
-        seat.data::<KeyboardUserData<D>>()?.handle.clone()
+        seat.data::<KeyboardUserData<D>>()?.handle.lock().unwrap().clone()
     }
 }
 
 /// User data for keyboard
 pub struct KeyboardUserData<D: SeatHandler> {
-    pub(crate) handle: Option<KeyboardHandle<D>>,
+    pub(crate) handle: Mutex<Option<KeyboardHandle<D>>>,
+    pub(crate) declared_seat: WeakSeat<D>,
 }
 
 impl<D: SeatHandler> fmt::Debug for KeyboardUserData<D> {
@@ -133,7 +134,7 @@ where
     }
 
     fn destroyed(_state: &mut D, _client_id: ClientId, keyboard: &WlKeyboard, data: &KeyboardUserData<D>) {
-        if let Some(ref handle) = data.handle {
+        if let Some(ref handle) = *data.handle.lock().unwrap() {
             handle
                 .arc
                 .known_kbds

@@ -112,9 +112,10 @@ use wayland_server::{backend::GlobalId, Dispatch, DisplayHandle};
 
 use crate::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::input::SeatHandler;
-use crate::input::WeakSeat;
 use crate::utils::Serial;
+use crate::wayland::seat::pointer_endpoint::PointerEndpoint;
 use crate::wayland::seat::{pointer::allow_setting_cursor, WaylandFocus};
+use std::sync::Arc;
 
 use super::seat::PointerUserData;
 use super::tablet_manager::{TabletSeatHandler, TabletToolUserData};
@@ -171,7 +172,7 @@ where
     D: 'static,
 {
     fn request(
-        state: &mut D,
+        _state: &mut D,
         _client: &wayland_server::Client,
         _resource: &CursorShapeManager,
         request: <CursorShapeManager as wayland_server::Resource>::Request,
@@ -185,26 +186,12 @@ where
                 pointer,
             } => {
                 let pointer_data = pointer.data::<PointerUserData<D>>();
-                let handle = match pointer_data.and_then(|data| data.handle.as_ref()) {
-                    Some(handle) => handle,
-                    None => return,
-                };
-
-                let Some(seat) = state
-                    .seat_state()
-                    .seats
-                    .iter()
-                    .find(|seat| seat.get_pointer().map(|h| &h == handle).unwrap_or(false))
-                    .cloned()
-                else {
+                let Some(endpoint) = pointer_data.map(|data| data.handle.clone()) else {
                     return;
                 };
-
                 data_init.init(
                     cursor_shape_device,
-                    CursorShapeDeviceUserData(CursorShapeDeviceUserDataInner::Pointer {
-                        seat: seat.downgrade(),
-                    }),
+                    CursorShapeDeviceUserData(CursorShapeDeviceUserDataInner::Pointer { endpoint }),
                 );
             }
             ManagerRequest::GetTabletToolV2 {
@@ -231,7 +218,7 @@ pub struct CursorShapeDeviceUserData<D: SeatHandler>(CursorShapeDeviceUserDataIn
 #[derive(Debug, Clone)]
 pub(crate) enum CursorShapeDeviceUserDataInner<D: SeatHandler> {
     /// The device was created for the pointer.
-    Pointer { seat: WeakSeat<D> },
+    Pointer { endpoint: Arc<PointerEndpoint<D>> },
     /// The device was created for the tablet tool.
     Tablet(Weak<ZwpTabletToolV2>),
 }
@@ -259,17 +246,19 @@ where
                 shape: WEnum::Value(shape),
             } => {
                 match &data.0 {
-                    CursorShapeDeviceUserDataInner::Pointer { seat } => {
-                        let Some(seat) = seat.upgrade() else {
+                    CursorShapeDeviceUserDataInner::Pointer { endpoint } => {
+                        let Some(handle) = endpoint.lock().unwrap().clone() else {
                             return;
                         };
-
-                        let Some(handle) = seat.get_pointer() else {
-                            // When the pointer capability is removed from the wl_seat,
-                            // the wp_cursor_shape_device_v1 object becomes inert.
+                        let Some(seat) = state
+                            .seat_state()
+                            .seats
+                            .iter()
+                            .find(|seat| seat.get_pointer().as_ref() == Some(&handle))
+                            .cloned()
+                        else {
                             return;
                         };
-
                         if !allow_setting_cursor(&handle, Serial(serial), &resource.id()) {
                             return;
                         }

@@ -46,7 +46,7 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     /// May return `None` for a valid `WlPointer` that was created without
     /// the keyboard capability.
     pub fn from_resource(seat: &WlPointer) -> Option<Self> {
-        seat.data::<PointerUserData<D>>()?.handle.clone()
+        seat.data::<PointerUserData<D>>()?.handle.lock().unwrap().clone()
     }
 
     /// Return all raw [`WlPointer`] instances for a particular [`Client`]
@@ -59,7 +59,7 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
 #[derive(Debug, Default)]
 pub(crate) struct WlPointerHandle {
     pub(crate) last_enter: Mutex<Option<Serial>>,
-    known_pointers: Mutex<Vec<Weak<WlPointer>>>,
+    pub(crate) known_pointers: Mutex<Vec<Weak<WlPointer>>>,
 }
 
 impl WlPointerHandle {
@@ -344,7 +344,7 @@ where
 /// User data for pointer
 #[derive(Debug)]
 pub struct PointerUserData<D: SeatHandler> {
-    pub(crate) handle: Option<PointerHandle<D>>,
+    pub(crate) handle: Arc<super::pointer_endpoint::PointerEndpoint<D>>,
     pub(crate) client_scale: Arc<AtomicF64>,
 }
 
@@ -371,12 +371,11 @@ where
                 hotspot_x,
                 hotspot_y,
             } => {
-                let handle = match &data.handle {
-                    Some(handle) => handle,
-                    None => return,
+                let Some(handle) = data.handle.lock().unwrap().clone() else {
+                    return;
                 };
 
-                if !allow_setting_cursor(handle, Serial(serial), &pointer.id()) {
+                if !allow_setting_cursor(&handle, Serial(serial), &pointer.id()) {
                     return;
                 }
 
@@ -423,7 +422,7 @@ where
                     .seat_state()
                     .seats
                     .iter()
-                    .find(|seat| seat.get_pointer().map(|h| h == *handle).unwrap_or(false))
+                    .find(|seat| seat.get_pointer().map(|h| h == handle).unwrap_or(false))
                     .cloned();
 
                 if let Some(seat) = seat {
@@ -438,7 +437,7 @@ where
     }
 
     fn destroyed(_state: &mut D, _: ClientId, pointer: &WlPointer, data: &PointerUserData<D>) {
-        if let Some(ref handle) = data.handle {
+        if let Some(ref handle) = *data.handle.lock().unwrap() {
             handle
                 .wl_pointer
                 .known_pointers

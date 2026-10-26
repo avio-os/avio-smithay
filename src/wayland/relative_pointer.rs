@@ -98,10 +98,7 @@ use wayland_server::{
 };
 
 use crate::{
-    input::{
-        pointer::{PointerHandle, RelativeMotionEvent},
-        SeatHandler,
-    },
+    input::{pointer::RelativeMotionEvent, SeatHandler},
     wayland::seat::PointerUserData,
 };
 
@@ -113,6 +110,26 @@ pub(crate) struct WpRelativePointerHandle {
 }
 
 impl WpRelativePointerHandle {
+    pub(crate) fn route_endpoint<D: SeatHandler + 'static>(
+        &self,
+        target: &Self,
+        endpoint: &Arc<crate::wayland::seat::pointer_endpoint::PointerEndpoint<D>>,
+    ) {
+        let mut moved = Vec::new();
+        self.known_relative_pointers.lock().unwrap().retain(|resource| {
+            if Arc::ptr_eq(
+                &resource.data::<RelativePointerUserData<D>>().unwrap().handle,
+                endpoint,
+            ) {
+                moved.push(resource.clone());
+                false
+            } else {
+                true
+            }
+        });
+        target.known_relative_pointers.lock().unwrap().extend(moved);
+    }
+
     fn new_relative_pointer(&self, pointer: ZwpRelativePointerV1) {
         self.known_relative_pointers.lock().unwrap().push(pointer);
     }
@@ -157,7 +174,7 @@ impl WpRelativePointerHandle {
 /// User data of ZwpRelativePointerV1 object
 #[derive(Debug)]
 pub struct RelativePointerUserData<D: SeatHandler> {
-    handle: Option<PointerHandle<D>>,
+    handle: Arc<crate::wayland::seat::pointer_endpoint::PointerEndpoint<D>>,
     client_scale: Arc<AtomicF64>,
 }
 
@@ -212,7 +229,7 @@ where
                     client_scale: data.client_scale.clone(),
                 };
                 let pointer = data_init.init(id, user_data);
-                if let Some(handle) = &data.handle {
+                if let Some(handle) = &*data.handle.lock().unwrap() {
                     handle.wp_relative.new_relative_pointer(pointer);
                 }
             }
@@ -268,7 +285,7 @@ where
         object: &ZwpRelativePointerV1,
         data: &RelativePointerUserData<D>,
     ) {
-        if let Some(ref handle) = data.handle {
+        if let Some(handle) = &*data.handle.lock().unwrap() {
             handle
                 .wp_relative
                 .known_relative_pointers

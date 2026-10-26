@@ -116,7 +116,6 @@ use crate::{
         pointer::{
             GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent,
-            PointerHandle,
         },
         SeatHandler,
     },
@@ -134,6 +133,52 @@ pub(crate) struct WpPointerGesturePointerHandle {
 }
 
 impl WpPointerGesturePointerHandle {
+    pub(crate) fn route_endpoint<D: SeatHandler + 'static>(
+        &self,
+        target: &Self,
+        endpoint: &Arc<crate::wayland::seat::pointer_endpoint::PointerEndpoint<D>>,
+    ) {
+        let mut moved = Vec::new();
+        self.known_swipe_gestures.lock().unwrap().retain(|resource| {
+            if Arc::ptr_eq(
+                &resource.data::<PointerGestureUserData<D>>().unwrap().handle,
+                endpoint,
+            ) {
+                moved.push(resource.clone());
+                false
+            } else {
+                true
+            }
+        });
+        target.known_swipe_gestures.lock().unwrap().extend(moved);
+        let mut moved = Vec::new();
+        self.known_pinch_gestures.lock().unwrap().retain(|resource| {
+            if Arc::ptr_eq(
+                &resource.data::<PointerGestureUserData<D>>().unwrap().handle,
+                endpoint,
+            ) {
+                moved.push(resource.clone());
+                false
+            } else {
+                true
+            }
+        });
+        target.known_pinch_gestures.lock().unwrap().extend(moved);
+        let mut moved = Vec::new();
+        self.known_hold_gestures.lock().unwrap().retain(|resource| {
+            if Arc::ptr_eq(
+                &resource.data::<PointerGestureUserData<D>>().unwrap().handle,
+                endpoint,
+            ) {
+                moved.push(resource.clone());
+                false
+            } else {
+                true
+            }
+        });
+        target.known_hold_gestures.lock().unwrap().extend(moved);
+    }
+
     fn new_swipe_gesture(&self, gesture: ZwpPointerGestureSwipeV1) {
         self.known_swipe_gestures.lock().unwrap().push(gesture);
     }
@@ -363,7 +408,7 @@ impl WpPointerGesturePointerHandle {
 /// User data of ZwpPointerGesture*V1 objects
 #[derive(Debug)]
 pub struct PointerGestureUserData<D: SeatHandler> {
-    handle: Option<PointerHandle<D>>,
+    handle: Arc<crate::wayland::seat::pointer_endpoint::PointerEndpoint<D>>,
     /// This gesture is in the middle between its begin() and end() on this surface.
     pub(crate) in_progress_on: Mutex<Option<WlSurface>>,
     client_scale: Arc<AtomicF64>,
@@ -425,7 +470,7 @@ where
                     client_scale: data.client_scale.clone(),
                 };
                 let gesture = data_init.init(id, user_data);
-                if let Some(handle) = &data.handle {
+                if let Some(handle) = &*data.handle.lock().unwrap() {
                     handle.wp_pointer_gestures.new_swipe_gesture(gesture);
                 }
             }
@@ -437,7 +482,7 @@ where
                     client_scale: data.client_scale.clone(),
                 };
                 let gesture = data_init.init(id, user_data);
-                if let Some(handle) = &data.handle {
+                if let Some(handle) = &*data.handle.lock().unwrap() {
                     handle.wp_pointer_gestures.new_pinch_gesture(gesture);
                 }
             }
@@ -449,7 +494,7 @@ where
                     client_scale: data.client_scale.clone(),
                 };
                 let gesture = data_init.init(id, user_data);
-                if let Some(handle) = &data.handle {
+                if let Some(handle) = &*data.handle.lock().unwrap() {
                     handle.wp_pointer_gestures.new_hold_gesture(gesture);
                 }
             }
@@ -502,7 +547,7 @@ where
         object: &ZwpPointerGestureSwipeV1,
         data: &PointerGestureUserData<D>,
     ) {
-        if let Some(ref handle) = data.handle {
+        if let Some(handle) = &*data.handle.lock().unwrap() {
             handle
                 .wp_pointer_gestures
                 .known_swipe_gestures
@@ -540,7 +585,7 @@ where
         object: &ZwpPointerGesturePinchV1,
         data: &PointerGestureUserData<D>,
     ) {
-        if let Some(ref handle) = data.handle {
+        if let Some(handle) = &*data.handle.lock().unwrap() {
             handle
                 .wp_pointer_gestures
                 .known_pinch_gestures
@@ -578,7 +623,7 @@ where
         object: &ZwpPointerGestureHoldV1,
         data: &PointerGestureUserData<D>,
     ) {
-        if let Some(ref handle) = data.handle {
+        if let Some(handle) = &*data.handle.lock().unwrap() {
             handle
                 .wp_pointer_gestures
                 .known_hold_gestures

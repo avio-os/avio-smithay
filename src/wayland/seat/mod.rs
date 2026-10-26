@@ -66,9 +66,12 @@
 //! This module further defines the `"cursor_image"` role, that is assigned to surfaces used by clients
 //! to change the cursor icon.
 
+mod client_route;
 pub(crate) mod keyboard;
 pub(crate) mod pointer;
+pub(crate) mod pointer_endpoint;
 mod touch;
+pub use client_route::ClientInputRouteLease;
 
 use std::{borrow::Cow, fmt, sync::Arc};
 
@@ -317,13 +320,23 @@ where
     ) {
         match request {
             wl_seat::Request::GetPointer { id } => {
-                let inner = data.arc.inner.lock().unwrap();
+                let declared = Seat {
+                    arc: data.arc.clone(),
+                };
+                let effective = declared
+                    .input_route_for_client(client)
+                    .unwrap_or_else(|| declared.clone());
+                let inner = effective.arc.inner.lock().unwrap();
 
                 let client_scale = state.client_compositor_state(client).clone_client_scale();
                 let pointer = data_init.init(
                     id,
                     PointerUserData {
-                        handle: inner.pointer.clone(),
+                        handle: pointer_endpoint::PointerEndpoint::new(
+                            &declared,
+                            client,
+                            inner.pointer.clone(),
+                        ),
                         client_scale,
                     },
                 );
@@ -336,12 +349,19 @@ where
                 }
             }
             wl_seat::Request::GetKeyboard { id } => {
-                let inner = data.arc.inner.lock().unwrap();
+                let declared = Seat {
+                    arc: data.arc.clone(),
+                };
+                let effective = declared
+                    .input_route_for_client(client)
+                    .unwrap_or_else(|| declared.clone());
+                let inner = effective.arc.inner.lock().unwrap();
 
                 let keyboard = data_init.init(
                     id,
                     KeyboardUserData {
-                        handle: inner.keyboard.clone(),
+                        handle: std::sync::Mutex::new(inner.keyboard.clone()),
+                        declared_seat: declared.downgrade(),
                     },
                 );
 

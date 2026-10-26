@@ -120,6 +120,7 @@ pub struct LazyXWayland {
     client_scale: LazyXWaylandClientScale,
     dh: DisplayHandle,
     envs: Vec<(OsString, OsString)>,
+    executable: OsString,
     listeners: Vec<TransientSource<Generic<UnixStream>>>,
     server: TransientSource<OptionalXWayland>,
     sender: Sender<Completion>,
@@ -159,6 +160,7 @@ impl LazyXWayland {
             client_scale: LazyXWaylandClientScale(Arc::new(AtomicF64::new(1.0))),
             dh: dh.clone(),
             envs: envs.into_iter().collect(),
+            executable: "Xwayland".into(),
             listeners: Vec::new(),
             server: TransientSource::default(),
             sender,
@@ -172,6 +174,13 @@ impl LazyXWayland {
         };
         instance.arm()?;
         Ok(instance)
+    }
+
+    /// Select the compositor-owned executable before installing this event source.
+    /// The same immutable path is used for every server episode.
+    pub fn with_executable(mut self, executable: impl Into<OsString>) -> Self {
+        self.executable = executable.into();
+        self
     }
 
     /// Display number to publish to X11 clients before their first connection.
@@ -214,6 +223,7 @@ impl LazyXWayland {
             self.generation,
         );
         let client_scale = self.client_scale.0.clone();
+        let executable = self.executable.clone();
         std::thread::Builder::new()
             .name("xwayland-start".into())
             .spawn(move || {
@@ -232,6 +242,7 @@ impl LazyXWayland {
                         });
                     },
                     client_scale,
+                    &executable,
                 );
                 let _ = sender.send(Completion::Spawned(generation, result));
             })?;

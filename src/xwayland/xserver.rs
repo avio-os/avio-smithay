@@ -197,6 +197,7 @@ impl XWayland {
             stderr,
             user_data,
             CompositorClientState::default().clone_client_scale(),
+            OsStr::new("Xwayland"),
         )
     }
 
@@ -208,6 +209,7 @@ impl XWayland {
         stderr: impl Into<std::process::Stdio>,
         user_data: F,
         client_scale: Arc<atomic_float::AtomicF64>,
+        executable: &OsStr,
     ) -> std::io::Result<(Self, Client)>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -224,7 +226,7 @@ impl XWayland {
         let (displayfd_recv, displayfd_send) =
             rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC)?;
 
-        let mut command = Command::new("Xwayland");
+        let mut command = Command::new(executable);
 
         command
             .stdout(stdout)
