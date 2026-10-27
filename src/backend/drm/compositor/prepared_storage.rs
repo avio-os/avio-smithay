@@ -1,4 +1,15 @@
 //! Cold factory products and exact retirement of DRM CPU workspace.
+//!
+//! A displaced storage is owned by its leases alone: the state maps, selection
+//! receipts and native frame snapshots that still name its banks. The frame on
+//! glass is one of them, and it returns its lease only when a later frame
+//! flips. Retirement therefore must never gate anything that later frame needs:
+//! no adoption and no preparation waits for a [`RetiredDrmFrameStorage`]. Its
+//! owner keeps it only so the last return frees it off the render thread.
+//! (Before 2026-10-27 Avio's cold owner held every frame preparation behind an
+//! unreclaimed retired storage. A frame that adopted new storage and then
+//! missed KMS left the next preparation waiting on a flip only it could make,
+//! and the output froze until a power cycle cleared its pipeline.)
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -119,19 +130,14 @@ impl<B: Buffer, F: Framebuffer> PreparedDrmFrameStorage<B, F> {
         self.states.as_ref().map_or(0, StateMapBank::receipt_capacity)
     }
 
-    /// Arm displaced storage on its untagged owner, dropping the old current
-    /// duplicate there. Check `is_reclaimable` immediately after this call;
-    /// subsequent exact last-reader returns signal the registered cold owner.
-    pub fn arm_retirement(&mut self) {
+    pub(super) fn arm_retirement(&mut self) {
         self.old_current = None;
         if let Some(armed) = &self.retirement_armed {
             armed.store(true, Ordering::Release);
         }
     }
 
-    /// Every storage lease has actually returned. Active products and parked
-    /// current snapshots are never reclaimable even when GPU work has ended.
-    pub fn is_reclaimable(&self) -> bool {
+    pub(super) fn is_reclaimable(&self) -> bool {
         self.old_current.is_none()
             && self
                 .retirement_armed
@@ -144,6 +150,32 @@ impl<B: Buffer, F: Framebuffer> PreparedDrmFrameStorage<B, F> {
                 .is_none_or(DrmFrameStorage::is_reclaimable)
             && self.primary_damage.storage_receipts_reclaimable()
             && self.layer_damage.storage_receipts_reclaimable()
+    }
+}
+
+/// Storage an adoption displaced. It can be armed, polled and dropped, and
+/// nothing else: it is never adopted again and gates no adoption or
+/// preparation (see the module documentation).
+pub struct RetiredDrmFrameStorage<B: Buffer, F: Framebuffer>(PreparedDrmFrameStorage<B, F>);
+
+impl<B: Buffer, F: Framebuffer> std::fmt::Debug for RetiredDrmFrameStorage<B, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RetiredDrmFrameStorage").field(&self.0).finish()
+    }
+}
+
+impl<B: Buffer, F: Framebuffer> RetiredDrmFrameStorage<B, F> {
+    /// Arm on the owner thread, dropping the parked current duplicate there.
+    /// Idempotent. Check [`Self::is_reclaimable`] after it; later last-lease
+    /// returns signal the owner's registered retirement wake.
+    pub fn arm(&mut self) {
+        self.0.arm_retirement();
+    }
+
+    /// Every lease into this storage has returned; dropping it frees nothing
+    /// a reader still names.
+    pub fn is_reclaimable(&self) -> bool {
+        self.0.is_reclaimable()
     }
 }
 
@@ -175,14 +207,15 @@ where
 {
     /// Adopt an already allocated cold product without reallocating workspace.
     /// All rejection checks precede changing current/native/cache state. The
-    /// returned displaced product must be retained by its cold owner until its
-    /// exact reader leases return; do not discard it on the render thread.
+    /// returned displaced storage must be retained by its cold owner until its
+    /// exact reader leases return; do not discard it on the render thread, and
+    /// never make later preparation wait for it.
     #[allow(clippy::result_large_err)]
     pub fn adopt_frame_storage(
         &mut self,
         mut prepared: PreparedDrmFrameStorage<A::Buffer, F::Framebuffer>,
     ) -> Result<
-        PreparedDrmFrameStorage<A::Buffer, F::Framebuffer>,
+        RetiredDrmFrameStorage<A::Buffer, F::Framebuffer>,
         FrameStorageAdoptionError<A::Buffer, F::Framebuffer>,
     > {
         let roster = self.frame_storage_plane_capacity();
@@ -273,6 +306,6 @@ where
         std::mem::swap(&mut self.storage_retirement_armed, &mut prepared.retirement_armed);
         prepared.old_current = Some(std::mem::replace(&mut self.current_frame, current));
         self.reset_pending = true;
-        Ok(prepared)
+        Ok(RetiredDrmFrameStorage(prepared))
     }
 }

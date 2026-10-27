@@ -193,7 +193,7 @@ mod elements;
 mod native_cache;
 mod prepared_storage;
 mod storage;
-pub use prepared_storage::{FrameStorageAdoptionError, PreparedDrmFrameStorage};
+pub use prepared_storage::{FrameStorageAdoptionError, PreparedDrmFrameStorage, RetiredDrmFrameStorage};
 #[cfg(test)]
 mod storage_tests;
 use storage::DrmFrameStorage;
@@ -2142,7 +2142,7 @@ where
         let mut displaced = self
             .adopt_frame_storage(prepared)
             .map_err(|rejected| rejected.error)?;
-        displaced.arm_retirement();
+        displaced.arm();
         debug_assert!(
             displaced.is_reclaimable(),
             "startup storage has no submitted or Main readers"
