@@ -90,6 +90,9 @@ pub enum Error {
     /// The owning atomic request/state workspace is temporarily borrowed.
     #[error("atomic DRM request workspace is busy")]
     AtomicRequestBusy,
+    /// A strict submission cannot forward its pending producer completion.
+    #[error("pending plane completion has no native KMS input fence")]
+    NativeFenceUnavailable,
     /// An input is outside the cold-admitted native request roster or capacity.
     #[error("atomic DRM workspace `{resource}` needs {required} entries, admitted {capacity}")]
     AtomicRequestCapacity {

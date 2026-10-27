@@ -145,7 +145,9 @@ use wayland_server::{protocol::wl_buffer::WlBuffer, Resource};
 
 use super::{
     error::AccessError,
-    exporter::{gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer},
+    exporter::{
+        gbm::GbmFramebufferExporter, gbm::NodeFilter, ExportBuffer, ExportFramebuffer, FramebufferPolicy,
+    },
     surface::VrrSupport,
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
 };
@@ -185,7 +187,10 @@ use crate::{
     wayland::{shm, single_pixel_buffer},
 };
 
+mod cursor_hotspot;
+pub use cursor_hotspot::CursorPlaneHotspot;
 mod composition;
+mod framebuffer_policy;
 pub use composition::{
     CompositionAllocator, CompositionBufferCounts, PreparedCompositionBuffers, RetiredCompositionBuffers,
 };
@@ -533,6 +538,7 @@ struct PlaneProperties {
     pub transform: Transform,
     pub alpha: f32,
     pub format: DrmFormat,
+    pub cursor_hotspot: Option<Point<i32, Physical>>,
 }
 
 impl PlaneProperties {
@@ -543,6 +549,7 @@ impl PlaneProperties {
             && self.transform == other.transform
             && self.alpha == other.alpha
             && self.format == other.format
+            && self.cursor_hotspot == other.cursor_hotspot
     }
 }
 
@@ -837,9 +844,17 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
+        strict_fencing: bool,
         event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        if strict_fencing {
+            for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
+                if let Some((sync, fence)) = state.config.as_mut().and_then(|config| config.sync.as_mut()) {
+                    framebuffer_policy::admit_fence(sync, fence, supports_fencing)?;
+                }
+            }
+        }
         surface.commit(
             self.build_planes(
                 surface,
@@ -857,9 +872,17 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
+        strict_fencing: bool,
         event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        if strict_fencing {
+            for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
+                if let Some((sync, fence)) = state.config.as_mut().and_then(|config| config.sync.as_mut()) {
+                    framebuffer_policy::admit_fence(sync, fence, supports_fencing)?;
+                }
+            }
+        }
         surface.page_flip(
             self.build_planes(
                 surface,
@@ -950,6 +973,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                 config: state.config.as_mut().map(|config| super::PlaneConfig {
                     src: config.properties.src,
                     dst: config.properties.dst,
+                    cursor_hotspot: config
+                        .properties
+                        .cursor_hotspot
+                        .map(|point| (point.x, point.y).into()),
                     alpha: config.properties.alpha,
                     transform: config.properties.transform,
                     damage_clips: config.damage_clips.as_ref().map(|d| d.blob()),
@@ -1403,6 +1430,7 @@ where
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
     supports_fencing: bool,
+    strict_fencing: bool,
     reset_pending: bool,
     /// Last frame's primary disposition (Some(true) = swapchain composite,
     /// Some(false) = element scanout); drives the rare seam-change witness.
@@ -1524,7 +1552,7 @@ where
     #[instrument(skip_all)]
     pub fn new_with_output_layer_allocator(
         output_mode_source: impl Into<OutputModeSource> + Debug,
-        surface: DrmSurface,
+        surface: impl Into<Arc<DrmSurface>>,
         planes: Option<Planes>,
         mut allocator: A,
         mut output_layer_allocator: Option<A>,
@@ -1534,6 +1562,7 @@ where
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
     ) -> FrameResult<Self, A, F> {
+        let surface = surface.into();
         let span = info_span!(
             parent: None,
             "drm_compositor",
@@ -1545,7 +1574,6 @@ where
         let renderer_formats = renderer_formats.into_iter().collect::<Vec<_>>();
 
         let mut error = None;
-        let surface = Arc::new(surface);
         let mut planes = match planes {
             Some(planes) => planes,
             None => surface.planes().clone(),
@@ -1580,19 +1608,27 @@ where
 
         let cursor_size = Size::from((cursor_size.w as i32, cursor_size.h as i32));
         let damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
-        let supports_fencing = !surface.is_legacy()
-            && surface
+        let strict_fencing = framebuffer_exporter.framebuffer_policy() != FramebufferPolicy::Legacy;
+        // Atomic IN_FENCE_FD accepts sync_file descriptors independently of
+        // the optional DRM syncobj timeline API.
+        let timeline_or_strict = strict_fencing
+            || surface
                 .get_driver_capability(DriverCapability::SyncObj)
-                .map(|val| val != 0)
-                .map_err(|err| {
+                .map(|value| value != 0)
+                .map_err(|source| {
                     FrameError::DrmError(DrmError::Access(AccessError {
                         errmsg: "Failed to query driver capability",
                         dev: surface.dev_path(),
-                        source: err,
+                        source,
                     }))
-                })?
+                })?;
+        let supports_fencing = !surface.is_legacy()
+            && timeline_or_strict
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
+        if strict_fencing && !supports_fencing {
+            return Err(FrameError::DrmError(DrmError::NativeFenceUnavailable));
+        }
 
         for format in color_formats {
             debug!("Testing color format: {}", format);
@@ -1694,6 +1730,7 @@ where
                         previous_element_states: IndexMap::new(),
 
                         supports_fencing,
+                        strict_fencing,
                         primary_was_composited: None,
                         composition_prepared_only: false,
                         native_black_enabled: false,
@@ -1790,19 +1827,27 @@ where
         let cursor_size = Size::from((cursor_size.w as i32, cursor_size.h as i32));
         let damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         let output_layer_damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
-        let supports_fencing = !surface.is_legacy()
-            && surface
+        let strict_fencing = framebuffer_exporter.framebuffer_policy() != FramebufferPolicy::Legacy;
+        // Atomic IN_FENCE_FD accepts sync_file descriptors independently of
+        // the optional DRM syncobj timeline API.
+        let timeline_or_strict = strict_fencing
+            || surface
                 .get_driver_capability(DriverCapability::SyncObj)
-                .map(|val| val != 0)
-                .map_err(|err| {
+                .map(|value| value != 0)
+                .map_err(|source| {
                     FrameError::DrmError(DrmError::Access(AccessError {
                         errmsg: "Failed to query driver capability",
                         dev: surface.dev_path(),
-                        source: err,
+                        source,
                     }))
-                })?
+                })?;
+        let supports_fencing = !surface.is_legacy()
+            && timeline_or_strict
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
+        if strict_fencing && !supports_fencing {
+            return Err(FrameError::DrmError(DrmError::NativeFenceUnavailable));
+        }
 
         let (swapchain, is_opaque) = Self::test_format(
             &surface,
@@ -1871,6 +1916,7 @@ where
             previous_element_states: IndexMap::new(),
 
             supports_fencing,
+            strict_fencing,
             primary_was_composited: None,
             composition_prepared_only: false,
             native_black_enabled: false,
@@ -1909,15 +1955,32 @@ where
             return Err((allocator, FrameError::NoSupportedPlaneFormat));
         }
 
-        let plane_modifiers = plane_formats
+        let requested = modifiers
             .iter()
-            .map(|fmt| fmt.modifier)
-            .collect::<IndexSet<_>>();
-
-        let swapchain_modifiers = plane_modifiers
-            .intersection(&modifiers)
-            .copied()
+            .map(|modifier| DrmFormat {
+                code,
+                modifier: *modifier,
+            })
             .collect::<Vec<_>>();
+        let swapchain_modifiers = if framebuffer_exporter.framebuffer_policy() == FramebufferPolicy::Legacy {
+            plane_formats
+                .iter()
+                .map(|format| format.modifier)
+                .collect::<IndexSet<_>>()
+                .intersection(&modifiers)
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            framebuffer_policy::select_formats(
+                code,
+                &plane_formats,
+                &requested,
+                framebuffer_exporter.framebuffer_policy(),
+            )
+            .into_iter()
+            .map(|format| format.modifier)
+            .collect::<Vec<_>>()
+        };
 
         if swapchain_modifiers.is_empty() {
             return Err((allocator, FrameError::NoSupportedPlaneFormat));
@@ -1989,6 +2052,7 @@ where
                     transform: Transform::Normal,
                     alpha: 1.0,
                     format: buffer.format(),
+                    cursor_hotspot: None,
                 },
                 buffer: DrmScanoutBuffer {
                     buffer: ScanoutBuffer::Swapchain(Arc::new(buffer)),
@@ -2059,7 +2123,12 @@ where
             return Err((allocator, FrameError::NoSupportedRendererFormat));
         }
 
-        let formats = select_compositor_formats(code, &plane_formats, &renderer_formats);
+        let formats = framebuffer_policy::select_formats(
+            code,
+            &plane_formats,
+            &renderer_formats,
+            framebuffer_exporter.framebuffer_policy(),
+        );
 
         debug!("Testing Formats: {:?}", formats);
 
@@ -2213,14 +2282,34 @@ where
     ///
     /// - `elements` for this frame in front-to-back order
     /// - `frame_flags` specifies techniques allowed to realize the frame
-    #[instrument(level = "trace", parent = &self.span, skip_all)]
-    #[profiling::function]
     pub fn render_frame<'a, R, E>(
         &mut self,
         renderer: &mut R,
         elements: &'a [E],
         clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+    {
+        self.render_frame_with_cursor_hotspot(renderer, elements, clear_color, frame_flags, None)
+    }
+
+    /// Render one frame with the hotspot of its exact cursor bitmap.
+    ///
+    /// Required for virtual cursor planes enabled by `DrmDevice::new_with_cursor_hotspots`.
+    /// Cursor-only moves retain this metadata from their presented frame.
+    #[instrument(name = "render_frame", level = "trace", parent = &self.span, skip_all)]
+    #[profiling::function]
+    pub fn render_frame_with_cursor_hotspot<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
         mut frame_flags: FrameFlags,
+        cursor_hotspot: Option<&CursorPlaneHotspot>,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
@@ -2639,6 +2728,7 @@ where
                     output_geometry,
                     try_assign_primary_plane,
                     frame_flags,
+                    cursor_hotspot,
                 ) {
                     Ok(direct_scan_out_plane) => {
                         match direct_scan_out_plane.type_ {
@@ -3638,9 +3728,13 @@ where
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
 
-        let flip = prepared_frame
-            .frame
-            .commit(&self.surface, self.supports_fencing, false, false);
+        let flip = prepared_frame.frame.commit(
+            &self.surface,
+            self.supports_fencing,
+            false,
+            self.strict_fencing,
+            false,
+        );
 
         if flip.is_ok() {
             self.queued_frame = None;
@@ -3675,13 +3769,21 @@ where
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
         let flip = if self.surface.commit_pending() {
-            prepared_frame
-                .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+            prepared_frame.frame.commit(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                self.strict_fencing,
+                true,
+            )
         } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+            prepared_frame.frame.page_flip(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                self.strict_fencing,
+                true,
+            )
         };
 
         self.handle_flip(prepared_frame, Some(user_data), flip)
@@ -4304,6 +4406,7 @@ where
         output_geometry: Rectangle<i32, Physical>,
         try_assign_primary_plane: bool,
         frame_flags: FrameFlags,
+        cursor_hotspot: Option<&CursorPlaneHotspot>,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer + Bind<Dmabuf>,
@@ -4365,6 +4468,7 @@ where
             output_transform,
             output_geometry,
             frame_flags,
+            cursor_hotspot,
         ) {
             trace!("assigned element {:?} to cursor {:?}", element.id(), plane.handle);
             return Ok(plane);
@@ -4622,6 +4726,7 @@ where
                     transform: Transform::Normal,
                     alpha: 1.0,
                     format: slot.format(),
+                    cursor_hotspot: None,
                 },
                 buffer: DrmScanoutBuffer {
                     buffer: ScanoutBuffer::Swapchain(Arc::new(slot)),
@@ -4685,6 +4790,7 @@ where
         output_transform: Transform,
         output_geometry: Rectangle<i32, Physical>,
         frame_flags: FrameFlags,
+        cursor_hotspot: Option<&CursorPlaneHotspot>,
     ) -> Option<PlaneAssignment>
     where
         R: Renderer,
@@ -4786,6 +4892,19 @@ where
             self.cursor_size
         };
 
+        let cursor_hotspot = cursor_hotspot.and_then(|hotspot| {
+            hotspot.for_bitmap(
+                element.id(),
+                element.current_commit(),
+                output_transform,
+                cursor_plane_size,
+            )
+        });
+        if self.surface.cursor_hotspots_required && cursor_hotspot.is_none() {
+            trace!("virtual cursor plane requires exact image hotspot metadata");
+            return None;
+        }
+
         // this calculates the location of the cursor plane taking the simulated transform
         // into consideration
         let cursor_plane_location = output_transform
@@ -4833,10 +4952,10 @@ where
         let reposition = previous_state
             .plane_state(plane_info.handle)
             .and_then(|state| {
-                state
-                    .config
-                    .as_ref()
-                    .map(|config| config.properties.dst.loc != cursor_plane_location)
+                state.config.as_ref().map(|config| {
+                    config.properties.dst.loc != cursor_plane_location
+                        || config.properties.cursor_hotspot != cursor_hotspot
+                })
             })
             .unwrap_or(true);
 
@@ -4863,6 +4982,7 @@ where
             plane_state.needs_test = false;
             let config = plane_state.config.as_mut().unwrap();
             config.properties.dst.loc = cursor_plane_location;
+            config.properties.cursor_hotspot = cursor_hotspot;
             frame_state.set_state(plane_info.handle, plane_state);
             return Some(plane_info.into());
         }
@@ -5043,6 +5163,7 @@ where
                 alpha: 1.0,
                 transform: Transform::Normal,
                 format: framebuffer.format(),
+                cursor_hotspot,
             },
             buffer: DrmScanoutBuffer {
                 buffer: ScanoutBuffer::Cursor(Arc::new(cursor_buffer)),
@@ -5239,6 +5360,7 @@ where
             alpha,
             transform,
             format: fb.format(),
+            cursor_hotspot: None,
         };
         let buffer: DrmScanoutBuffer<
             <A as Allocator>::Buffer,

@@ -1,7 +1,7 @@
 //! Device-wide synchronization helpers
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     marker::PhantomData,
     os::fd::{AsFd, OwnedFd},
@@ -32,6 +32,9 @@ use super::{
     DrmDevice, DrmError, Planes,
 };
 
+mod initializer;
+pub use initializer::{DrmOutputInitializer, DrmOutputPrepareError};
+
 type CompositorList<A, F, U, G> = Arc<RwLock<HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>>>>;
 
 /// Provides synchronization between a [`DrmDevice`] and derived [`DrmOutput`]s.
@@ -55,6 +58,7 @@ where
     exporter: F,
     gbm: Option<GbmDevice<G>>,
     compositor: CompositorList<A, F, U, G>,
+    pending_initializers: Arc<Mutex<HashSet<crtc::Handle>>>,
     color_formats: Vec<DrmFourcc>,
     renderer_formats: Vec<DrmFormat>,
     native_black_enabled: bool,
@@ -75,6 +79,7 @@ where
     gbm: &'a mut Option<GbmDevice<G>>,
     compositor: RwLockWriteGuard<'a, HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>>>,
     compositor_arc: CompositorList<A, F, U, G>,
+    pending_initializers: Arc<Mutex<HashSet<crtc::Handle>>>,
     color_formats: &'a [DrmFourcc],
     renderer_formats: &'a [DrmFormat],
     native_black_enabled: bool,
@@ -260,6 +265,7 @@ where
             exporter,
             gbm,
             compositor: Default::default(),
+            pending_initializers: Default::default(),
             color_formats: color_formats.into_iter().collect(),
             renderer_formats: renderer_formats.into_iter().collect(),
             native_black_enabled: false,
@@ -272,6 +278,24 @@ where
     pub fn enable_native_black(mut self) -> Self {
         self.native_black_enabled = true;
         self
+    }
+
+    /// Prepare an output without creating or using a renderer.
+    ///
+    /// The returned initializer owns the DRM surface and reserves its CRTC until
+    /// initialization completes or the initializer is dropped. No manager lock
+    /// is retained, so it may be moved to the thread that owns the renderer.
+    /// See [`DrmOutputInitializer::initialize`] for the GPU initialization phase.
+    pub fn prepare_output(
+        &mut self,
+        crtc: crtc::Handle,
+        mode: control::Mode,
+        connectors: &[connector::Handle],
+        output_mode_source: impl Into<OutputModeSource> + fmt::Debug,
+        planes: Option<Planes>,
+    ) -> Result<DrmOutputInitializer<A, F, U, G>, DrmOutputPrepareError> {
+        self.lock()
+            .prepare_output(crtc, mode, connectors, output_mode_source, planes)
     }
 
     /// Give subsequently initialized outputs an above-primary output-layer
@@ -296,6 +320,7 @@ where
             gbm: &mut self.gbm,
             compositor: self.compositor.write().unwrap(),
             compositor_arc: self.compositor.clone(),
+            pending_initializers: self.pending_initializers.clone(),
             color_formats: &self.color_formats,
             renderer_formats: &self.renderer_formats,
             native_black_enabled: self.native_black_enabled,
@@ -318,6 +343,40 @@ where
     G: AsFd + std::clone::Clone + 'static,
     U: 'static,
 {
+    /// Prepare the DRM surface and reserve its CRTC without using a renderer.
+    ///
+    /// Drop this manager guard before moving the returned initializer to the
+    /// renderer's thread and calling [`DrmOutputInitializer::initialize`].
+    pub fn prepare_output(
+        &mut self,
+        crtc: crtc::Handle,
+        mode: control::Mode,
+        connectors: &[connector::Handle],
+        output_mode_source: impl Into<OutputModeSource> + fmt::Debug,
+        planes: Option<Planes>,
+    ) -> Result<DrmOutputInitializer<A, F, U, G>, DrmOutputPrepareError> {
+        if self.compositor.contains_key(&crtc) {
+            return Err(DrmOutputPrepareError::DuplicateCrtc(crtc));
+        }
+        let reservation = initializer::OutputReservation::new(self.pending_initializers.clone(), crtc)?;
+        let surface = self.device.create_surface(crtc, mode, connectors)?;
+        Ok(DrmOutputInitializer {
+            surface: Arc::new(surface),
+            output_mode_source: output_mode_source.into(),
+            planes,
+            allocator: self.allocator.clone(),
+            exporter: self.exporter.clone(),
+            gbm: self.gbm.clone(),
+            compositor: self.compositor_arc.clone(),
+            color_formats: self.color_formats.to_vec(),
+            renderer_formats: self.renderer_formats.to_vec(),
+            cursor_size: self.device.cursor_size(),
+            native_black_enabled: self.native_black_enabled,
+            output_layer_enabled: self.output_layer_enabled,
+            reservation,
+        })
+    }
+
     /// Create a new [`DrmOutput`] for the provided crtc of the underlying device.
     ///
     /// The [`OutputModeSource`] can be created from an [`Output`](crate::output::Output), which will automatically track
@@ -353,187 +412,15 @@ where
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
-        let output_mode_source = output_mode_source.into();
-
-        if self.compositor.contains_key(&crtc) {
-            return Err(DrmOutputManagerError::DuplicateCrtc(crtc));
-        }
-
-        let mut create_compositor =
-            |implicit_modifiers: bool| -> FrameResult<DrmCompositor<A, F, U, G>, A, F> {
-                let surface = self.device.create_surface(crtc, mode, connectors)?;
-
-                if implicit_modifiers {
-                    DrmCompositor::<A, F, U, G>::new_with_output_layer_allocator(
-                        output_mode_source.clone(),
-                        surface,
-                        planes.clone(),
-                        self.allocator.clone(),
-                        self.output_layer_enabled.then(|| self.allocator.clone()),
-                        self.exporter.clone(),
-                        self.color_formats.iter().copied(),
-                        self.renderer_formats
-                            .iter()
-                            .filter(|f| f.modifier == DrmModifier::Invalid)
-                            .copied(),
-                        self.device.cursor_size(),
-                        self.gbm.clone(),
-                    )
-                } else {
-                    DrmCompositor::<A, F, U, G>::new_with_output_layer_allocator(
-                        output_mode_source.clone(),
-                        surface,
-                        planes.clone(),
-                        self.allocator.clone(),
-                        self.output_layer_enabled.then(|| self.allocator.clone()),
-                        self.exporter.clone(),
-                        self.color_formats.iter().copied(),
-                        self.renderer_formats.iter().copied(),
-                        self.device.cursor_size(),
-                        self.gbm.clone(),
-                    )
+        let initializer = self
+            .prepare_output(crtc, mode, connectors, output_mode_source, planes)
+            .map_err(|error| match error {
+                DrmOutputPrepareError::DuplicateCrtc(crtc) => DrmOutputManagerError::DuplicateCrtc(crtc),
+                DrmOutputPrepareError::Drm(error) => {
+                    DrmOutputManagerError::Frame(FrameError::DrmError(error))
                 }
-                .map(|mut compositor| {
-                    if self.native_black_enabled {
-                        compositor.enable_native_black();
-                    }
-                    compositor
-                })
-            };
-
-        let compositor = create_compositor(false);
-
-        // Okay, so this can fail for various reasons...
-        //
-        //  Enabling an additional CRTC might fail because the bandwidth
-        //  requirement is higher then supported with the current configuration.
-        //
-        // * Bandwidth limitation caused by overlay plane usage:
-        //   Each overlay plane requires some certain bandwidth and we only
-        //   test that during plane assignment implicitly through an atomic test.
-        //   When trying to enable an additional CRTC we might hit some limit and the
-        //   only way to resolve this might be to disable all overlay planes and
-        //   retry enabling the CRTC.
-        //
-        // * Bandwidth limitation caused by the primary plane format:
-        //   Different formats (might) require a higher memory bandwidth than others.
-        //   This also applies to the same fourcc with different modifiers. For example
-        //   the Intel CCS Formats use an additional plane to transport meta-data.
-        //   So if we fail to enable an additional CRTC we might be able to resolve
-        //   the issue by using a different format. Again the only way to know is by
-        //   trying out what works.
-        //
-        // So for now we try to disable overlay planes first. If that doesn't work,
-        // we set the modifiers to `Invalid` (for now) to give the driver the opportunity
-        // to re-allocate in the background. (TODO: Do this ourselves).
-
-        match compositor {
-            Ok(compositor) => {
-                self.compositor.insert(crtc, Mutex::new(compositor));
-            }
-            Err(err) => {
-                tracing::warn!(
-                    ?crtc,
-                    ?err,
-                    "failed to initialize crtc, trying to lower bandwidth"
-                );
-
-                for compositor in self.compositor.values_mut() {
-                    let compositor = compositor.get_mut().unwrap();
-                    if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
-                        if !matches!(err, DrmOutputManagerError::Frame(FrameError::EmptyFrame)) {
-                            return Err(err);
-                        }
-                    }
-                }
-
-                let compositor = create_compositor(false);
-
-                match compositor {
-                    Ok(compositor) => {
-                        self.compositor.insert(crtc, Mutex::new(compositor));
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?crtc,
-                            ?err,
-                            "failed to initialize crtc, trying implicit modifiers"
-                        );
-
-                        for compositor in self.compositor.values_mut() {
-                            let compositor = compositor.get_mut().unwrap();
-
-                            let current_format = compositor.format();
-                            if let Err(err) = compositor.set_format(
-                                self.allocator.clone(),
-                                current_format,
-                                [DrmModifier::Invalid],
-                            ) {
-                                tracing::warn!(?err, "failed to set new format");
-                                continue;
-                            }
-
-                            render_elements.submit_composited_frame(&mut *compositor, renderer)?;
-                        }
-
-                        let compositor = create_compositor(true);
-
-                        match compositor {
-                            Ok(compositor) => {
-                                self.compositor.insert(crtc, Mutex::new(compositor));
-                            }
-                            Err(err) => {
-                                // try to reset formats
-                                for compositor in self.compositor.values_mut() {
-                                    let compositor = compositor.get_mut().unwrap();
-
-                                    let current_format = compositor.format();
-                                    if let Err(err) = compositor.set_format(
-                                        self.allocator.clone(),
-                                        current_format,
-                                        self.renderer_formats
-                                            .iter()
-                                            .filter(|f| f.code == current_format)
-                                            .map(|f| f.modifier),
-                                    ) {
-                                        tracing::warn!(?err, "failed to reset format");
-                                        continue;
-                                    }
-
-                                    render_elements.submit_composited_frame(&mut *compositor, renderer)?;
-                                }
-
-                                return Err(DrmOutputManagerError::Frame(err));
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        // We need to render the new output once to lock in the primary plane as used with the new format, so we don't hit the bandwidth issue,
-        // when downstream potentially uses `FrameFlags::DEFAULT` immediately after this.
-
-        let compositor = self.compositor.get_mut(&crtc).unwrap();
-        let compositor = compositor.get_mut().unwrap();
-        if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
-            self.compositor.remove(&crtc);
-            return Err(err);
-        }
-
-        if self.native_black_enabled {
-            if let Err(error) = compositor.configure_native_black(renderer) {
-                self.compositor.remove(&crtc);
-                return Err(DrmOutputManagerError::RenderFrame(error));
-            }
-        }
-
-        Ok(DrmOutput {
-            compositor: self.compositor_arc.clone(),
-            crtc,
-            allocator: self.allocator.clone(),
-            renderer_formats: Vec::from(self.renderer_formats),
-        })
+            })?;
+        initializer.initialize_locked(&mut self.compositor, renderer, render_elements)
     }
 
     /// Grants exclusive access to all underlying [`DrmCompositor`]s.
@@ -744,6 +631,32 @@ where
     {
         self.with_compositor(|compositor| {
             compositor.render_frame(renderer, elements, clear_color, frame_mode)
+        })
+    }
+
+    /// Render one frame with exact virtual-cursor hotspot metadata.
+    pub fn render_frame_with_cursor_hotspot<'a, R, E>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_mode: FrameFlags,
+        cursor_hotspot: Option<&super::compositor::CursorPlaneHotspot>,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer + Bind<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::Error: Send + Sync + 'static,
+    {
+        self.with_compositor(|compositor| {
+            compositor.render_frame_with_cursor_hotspot(
+                renderer,
+                elements,
+                clear_color,
+                frame_mode,
+                cursor_hotspot,
+            )
         })
     }
 

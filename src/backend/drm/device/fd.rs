@@ -13,6 +13,9 @@ struct InternalDrmDeviceFd {
     privileged: bool,
     // One creating-file authority; quarantined native slots survive surface recreation.
     mode_blobs: std::sync::Mutex<Option<super::super::surface::mode_blob::ModeFileBanks>>,
+    // PRIME returns one handle per GEM object and file, not per import call.
+    // Keep import -> AddFB2 -> unique-handle close under one file-owned lease.
+    prime_transaction: std::sync::Mutex<()>,
 }
 
 impl PartialEq for InternalDrmDeviceFd {
@@ -72,6 +75,7 @@ impl DrmDeviceFd {
             fd,
             privileged: false,
             mode_blobs: std::sync::Mutex::new(None),
+            prime_transaction: std::sync::Mutex::new(()),
         };
 
         // We want to modeset, so we better be the master, if we run via a tty session.
@@ -84,6 +88,15 @@ impl DrmDeviceFd {
         }
 
         DrmDeviceFd(Arc::new(dev))
+    }
+
+    /// Nonblocking custody for raw PRIME handle transactions on this file.
+    /// All cloned raw exporters share this guard; allocations must use their
+    /// separately opened render file rather than alias these temporary handles.
+    pub(in crate::backend::drm) fn try_prime_transaction(
+        &self,
+    ) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, ()>> {
+        self.0.prime_transaction.try_lock()
     }
 
     pub(super) fn prepare_mode_blob_banks(

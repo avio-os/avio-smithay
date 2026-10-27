@@ -153,3 +153,7 @@ harness = false
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+[[example]]
+name = "gles_composition_probe"
+required-features = ["renderer_gl", "backend_gbm", "backend_drm"]

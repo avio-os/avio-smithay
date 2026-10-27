@@ -7,6 +7,15 @@ use wayland_server::protocol::wl_shm;
 /// Error returned during rendering using GL ES
 #[derive(thiserror::Error, Debug)]
 pub enum GlesError {
+    /// A composition packet exceeds its admitted format, storage or geometry.
+    #[error("GLES composition refused: {0}")]
+    Composition(&'static str),
+    /// An EGL context could not be created on its owning thread.
+    #[error("Failed to create EGL context")]
+    ContextCreationError(#[source] crate::backend::egl::Error),
+    /// A context-local framebuffer was used by another renderer.
+    #[error("Framebuffer belongs to another GLES context")]
+    FramebufferContextMismatch,
     /// A shader could not be compiled
     #[error("Failed to compile Shader")]
     ShaderCompileError,
@@ -86,6 +95,30 @@ pub enum GlesError {
     /// Blocking for a synchronization primitive failed
     #[error("Blocking for a synchronization primitive got interrupted")]
     SyncInterrupted,
+    /// The required native fence operation failed.
+    ///
+    /// Submitted work must remain quarantined; this error is not a completion
+    /// receipt and the strict renderer refuses further submissions.
+    #[error("Required native fence operation failed")]
+    NativeFence(#[source] crate::backend::egl::Error),
+    /// Native resource deletion failed. The share group must be quarantined.
+    #[error("Native EGL resource cleanup failed")]
+    NativeCleanup(#[source] crate::backend::egl::EGLError),
+    /// A retained dependency could not produce a native fence descriptor.
+    #[error("Required dependency has no exportable native fence")]
+    NativeFenceUnavailable,
+    /// A GL synchronization command failed.
+    #[error("GL synchronization failed during {operation} (GL error {code:#x})")]
+    GlSync {
+        /// Operation whose completion could not be established.
+        operation: &'static str,
+        /// Raw GL error, or zero when the driver returned a null fence without
+        /// a GL error.
+        code: u32,
+    },
+    /// An earlier submission or abandoned frame has no observable completion.
+    #[error("Renderer completion is unobservable; quarantine this renderer epoch")]
+    UnobservableCompletion,
 }
 
 impl From<GlesError> for SwapBuffersError {
@@ -93,14 +126,22 @@ impl From<GlesError> for SwapBuffersError {
     #[inline]
     fn from(err: GlesError) -> SwapBuffersError {
         match err {
-            x @ GlesError::ShaderCompileError
+            x @ GlesError::ContextCreationError(_)
+            | x @ GlesError::ShaderCompileError
             | x @ GlesError::ProgramLinkError
             | x @ GlesError::GLFunctionLoaderError
             | x @ GlesError::GLExtensionNotSupported(_)
             | x @ GlesError::EGLExtensionNotSupported(_)
-            | x @ GlesError::GLVersionNotSupported(_) => SwapBuffersError::ContextLost(Box::new(x)),
+            | x @ GlesError::GLVersionNotSupported(_)
+            | x @ GlesError::NativeFence(_)
+            | x @ GlesError::NativeCleanup(_)
+            | x @ GlesError::NativeFenceUnavailable
+            | x @ GlesError::GlSync { .. }
+            | x @ GlesError::UnobservableCompletion => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
-            x @ GlesError::FramebufferBindingError
+            x @ GlesError::Composition(_)
+            | x @ GlesError::FramebufferContextMismatch
+            | x @ GlesError::FramebufferBindingError
             | x @ GlesError::BindBufferEGLError(_)
             | x @ GlesError::UnknownPixelFormat
             | x @ GlesError::UnsupportedPixelFormat(_)
@@ -122,14 +163,22 @@ impl From<GlesError> for SwapBuffersError {
     #[inline]
     fn from(err: GlesError) -> SwapBuffersError {
         match err {
-            x @ GlesError::ShaderCompileError
+            x @ GlesError::ContextCreationError(_)
+            | x @ GlesError::ShaderCompileError
             | x @ GlesError::ProgramLinkError
             | x @ GlesError::GLFunctionLoaderError
             | x @ GlesError::GLExtensionNotSupported(_)
             | x @ GlesError::EGLExtensionNotSupported(_)
-            | x @ GlesError::GLVersionNotSupported(_) => SwapBuffersError::ContextLost(Box::new(x)),
+            | x @ GlesError::GLVersionNotSupported(_)
+            | x @ GlesError::NativeFence(_)
+            | x @ GlesError::NativeCleanup(_)
+            | x @ GlesError::NativeFenceUnavailable
+            | x @ GlesError::GlSync { .. }
+            | x @ GlesError::UnobservableCompletion => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
-            x @ GlesError::FramebufferBindingError
+            x @ GlesError::Composition(_)
+            | x @ GlesError::FramebufferContextMismatch
+            | x @ GlesError::FramebufferBindingError
             | x @ GlesError::MappingError
             | x @ GlesError::UnknownPixelFormat
             | x @ GlesError::UnsupportedPixelFormat(_)
@@ -143,5 +192,70 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::BindBufferEGLError(_)
             | x @ GlesError::SyncInterrupted => SwapBuffersError::TemporaryFailure(Box::new(x)),
         }
+    }
+}
+
+impl GlesError {
+    /// True only for an actual EGL/GL context-loss report.
+    ///
+    /// An unobservable fence does not establish device loss or authorize
+    /// reclaiming submitted resources.
+    pub fn is_device_lost(&self) -> bool {
+        if matches!(self, Self::GlSync { code: 0x0507, .. }) {
+            return true;
+        }
+        let mut source = std::error::Error::source(self);
+        while let Some(error) = source {
+            if matches!(
+                error.downcast_ref::<crate::backend::egl::EGLError>(),
+                Some(crate::backend::egl::EGLError::ContextLost)
+            ) {
+                return true;
+            }
+            source = error.source();
+        }
+        false
+    }
+
+    /// Whether native work may lack an observable completion edge.
+    pub fn is_completion_unobservable(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeFence(_)
+                | Self::NativeCleanup(_)
+                | Self::NativeFenceUnavailable
+                | Self::GlSync { .. }
+                | Self::UnobservableCompletion
+        )
+    }
+}
+
+impl crate::backend::renderer::damage::MaybeDeviceLost for GlesError {
+    fn is_device_lost(&self) -> bool {
+        self.is_device_lost()
+    }
+
+    fn is_completion_unobservable(&self) -> bool {
+        self.is_completion_unobservable()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::egl::{EGLError, Error};
+
+    #[test]
+    fn lost_completion_is_not_device_loss_or_reclamation_evidence() {
+        for error in [
+            GlesError::UnobservableCompletion,
+            GlesError::NativeFenceUnavailable,
+            GlesError::NativeFence(Error::CreationFailed(EGLError::BadAlloc)),
+        ] {
+            assert!(error.is_completion_unobservable());
+            assert!(!error.is_device_lost());
+        }
+        assert!(GlesError::NativeFence(Error::CreationFailed(EGLError::ContextLost)).is_device_lost());
+        assert!(GlesError::ContextActivationError(EGLError::ContextLost.into()).is_device_lost());
     }
 }

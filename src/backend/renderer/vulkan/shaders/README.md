@@ -7,11 +7,11 @@ or `.vert` has no effect until its `.spv` is regenerated and committed with it.
 ## Regenerating
 
 Compile with **shaderc**, targeting **Vulkan 1.0**, entry point `main`, at
-**optimization level zero**. With the same shaderc release those settings
-reproduce the committed artifacts byte-for-byte, so a regeneration that only
-reformats the source should produce no diff in the `.spv`. Another release
-changes only the generator word and debug-only `OpSourceExtension`
-instructions:
+**optimization level zero**, and record the exact compiler version. Byte-for-byte
+reproduction also requires matching compiler provenance. A different frontend
+can change generator metadata and source annotations without changing shader
+instructions; validate and compare same-source disassembly before attributing
+such a difference to the shader edit:
 
 ```rust
 let mut options = shaderc::CompileOptions::new().unwrap();

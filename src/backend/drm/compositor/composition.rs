@@ -154,6 +154,7 @@ where
                 transform: Transform::Normal,
                 alpha: 1.0,
                 format: primary_plane_buffer.format(),
+                cursor_hotspot: None,
             },
             buffer: DrmScanoutBuffer {
                 buffer: ScanoutBuffer::Swapchain(Arc::new(primary_plane_buffer)),

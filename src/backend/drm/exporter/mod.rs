@@ -16,6 +16,18 @@ use crate::backend::{
 
 use super::{DrmDeviceFd, Framebuffer};
 
+/// Allocation-layout and submission contract of a framebuffer exporter.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum FramebufferPolicy {
+    /// Preserve legacy implicit-layout negotiation and submission behavior.
+    #[default]
+    Legacy,
+    /// Require an explicit modifier and native KMS input fences.
+    ExplicitModifiers,
+    /// Require actual single-plane linear storage and native KMS input fences.
+    ExplicitLinear,
+}
+
 #[cfg(feature = "backend_drm")]
 pub mod dumb;
 #[cfg(feature = "backend_gbm")]
@@ -59,6 +71,11 @@ where
     /// Type of the error
     type Error: std::error::Error;
 
+    /// Immutable layout and synchronization contract selected at device setup.
+    fn framebuffer_policy(&self) -> FramebufferPolicy {
+        FramebufferPolicy::Legacy
+    }
+
     /// Add a framebuffer for the specified buffer
     fn add_framebuffer(
         &self,
@@ -78,6 +95,10 @@ where
 {
     type Framebuffer = <F as ExportFramebuffer<B>>::Framebuffer;
     type Error = <F as ExportFramebuffer<B>>::Error;
+
+    fn framebuffer_policy(&self) -> FramebufferPolicy {
+        self.lock().unwrap().framebuffer_policy()
+    }
 
     #[inline]
     fn add_framebuffer(
@@ -104,6 +125,10 @@ where
 {
     type Framebuffer = <F as ExportFramebuffer<B>>::Framebuffer;
     type Error = <F as ExportFramebuffer<B>>::Error;
+
+    fn framebuffer_policy(&self) -> FramebufferPolicy {
+        self.borrow().framebuffer_policy()
+    }
 
     #[inline]
     fn add_framebuffer(

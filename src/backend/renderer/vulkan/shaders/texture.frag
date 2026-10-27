@@ -484,11 +484,13 @@ void main() {
     vec2 uv = apply_texture_effect(in_uv, effect_coverage);
     uv = apply_transform(uv, constants.transform);
 
+    // Source rectangles are logical image coordinates. Storage inversion is
+    // relative to the whole texture, not the cropped rectangle: relocate the
+    // crop before reversing its rows. GLES lowers this same sampling equation.
+    uv = constants.src_offset + (uv * constants.src_scale);
     if (constants.y_inverted != 0u) {
         uv.y = 1.0 - uv.y;
     }
-
-    uv = constants.src_offset + (uv * constants.src_scale);
 
     int material_kind = int(constants.effect.x + 0.5);
     vec4 sampled;

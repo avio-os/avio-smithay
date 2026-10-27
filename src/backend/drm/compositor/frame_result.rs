@@ -470,6 +470,9 @@ where
                 .map_err(BlitFrameResultError::Rendering)?;
 
             frame
+                .set_output_damage(&clear_damage)
+                .map_err(BlitFrameResultError::Rendering)?;
+            frame
                 .clear(Color32F::BLACK, &clear_damage)
                 .map_err(BlitFrameResultError::Rendering)?;
 
@@ -515,6 +518,9 @@ where
                 .render(framebuffer, size, transform)
                 .map_err(BlitFrameResultError::Rendering)?;
 
+            frame
+                .set_output_damage(&damage)
+                .map_err(BlitFrameResultError::Rendering)?;
             for element in elements_to_render.iter().rev() {
                 let src = element.src();
                 let dst = element.geometry(scale);

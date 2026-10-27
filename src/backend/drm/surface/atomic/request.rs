@@ -35,6 +35,8 @@ const PLANE_PROPERTIES: &[&str] = &[
     "alpha",
     "FB_DAMAGE_CLIPS",
     "IN_FENCE_FD",
+    "HOTSPOT_X",
+    "HOTSPOT_Y",
 ];
 fn object_roster<H: ResourceHandle>(
     handle: H,
@@ -276,6 +278,23 @@ impl<'a> AtomicRequest<'a> {
                 property::Value::CRTC(Some(crtc)),
             )?;
 
+            // A virtual cursor is not a generic overlay. Missing image
+            // metadata must fail closed, never silently advertise hotspot 0.
+            match (
+                self.mapping.plane_prop_handle(handle, "HOTSPOT_X"),
+                self.mapping.plane_prop_handle(handle, "HOTSPOT_Y"),
+            ) {
+                (Ok(x), Ok(y)) => {
+                    let hotspot = config
+                        .cursor_hotspot
+                        .ok_or(Error::UnsupportedPlaneConfiguration(handle))?;
+                    self.add_property(handle, x, property::Value::SignedRange(hotspot.x as i64))?;
+                    self.add_property(handle, y, property::Value::SignedRange(hotspot.y as i64))?;
+                }
+                (Ok(_), Err(error)) | (Err(error), Ok(_)) => return Err(error),
+                (Err(_), Err(_)) => {}
+            }
+
             // Set the fb for the plane
             self.add_property(
                 handle,
@@ -459,6 +478,11 @@ impl<'a> AtomicRequest<'a> {
         if let Ok(prop) = self.mapping.plane_prop_handle(plane, "IN_FENCE_FD") {
             self.add_property(plane, prop, property::Value::SignedRange(-1))?;
         }
+        for name in ["HOTSPOT_X", "HOTSPOT_Y"] {
+            if let Ok(prop) = self.mapping.plane_prop_handle(plane, name) {
+                self.add_property(plane, prop, property::Value::SignedRange(0))?;
+            }
+        }
         Ok(())
     }
 
@@ -506,3 +530,7 @@ impl<'a> AtomicRequest<'a> {
         Ok(request)
     }
 }
+
+#[cfg(test)]
+#[path = "cursor_hotspot_tests.rs"]
+mod cursor_hotspot_tests;

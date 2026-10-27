@@ -179,3 +179,78 @@ impl EGLFence {
         Ok(status == ffi::egl::CONDITION_SATISFIED as ffi::EGLint)
     }
 }
+
+/// Unique context-local native fence, without allocating a shared Rust owner.
+/// Strict immediate renderers export or enqueue it before this scope ends.
+#[derive(Debug)]
+pub(crate) struct OwnedEGLFence(InnerEGLFence);
+
+impl OwnedEGLFence {
+    pub(crate) fn create_native(display: &EGLDisplay) -> Result<Self, Error> {
+        if !display.extensions.has_native_fences {
+            return Err(Error::EglExtensionNotSupported(&[
+                "EGL_ANDROID_native_fence_sync",
+            ]));
+        }
+        let display_handle = display.get_display_handle();
+        let handle = wrap_egl_call_ptr(|| unsafe {
+            ffi::egl::CreateSync(
+                **display_handle,
+                ffi::egl::SYNC_NATIVE_FENCE_ANDROID,
+                std::ptr::null(),
+            )
+        })
+        .map_err(Error::CreationFailed)?;
+        Ok(Self(InnerEGLFence {
+            display_handle,
+            handle,
+            native: true,
+        }))
+    }
+
+    pub(crate) fn import_native(display: &EGLDisplay, native: OwnedFd) -> Result<Self, Error> {
+        use std::os::fd::AsRawFd;
+        if !display.extensions.has_native_fences {
+            return Err(Error::EglExtensionNotSupported(&[
+                "EGL_ANDROID_native_fence_sync",
+            ]));
+        }
+        let display_handle = display.get_display_handle();
+        let attributes = [
+            ffi::egl::SYNC_NATIVE_FENCE_FD_ANDROID as ffi::egl::types::EGLAttrib,
+            native.as_raw_fd() as ffi::egl::types::EGLAttrib,
+            ffi::egl::NONE as ffi::egl::types::EGLAttrib,
+        ];
+        let handle = wrap_egl_call_ptr(|| unsafe {
+            ffi::egl::CreateSync(
+                **display_handle,
+                ffi::egl::SYNC_NATIVE_FENCE_ANDROID,
+                attributes.as_ptr(),
+            )
+        })
+        .map_err(Error::CreationFailed)?;
+        // Ownership transfers to EGL only after successful creation.
+        let _ = native.into_raw_fd();
+        Ok(Self(InnerEGLFence {
+            display_handle,
+            handle,
+            native: true,
+        }))
+    }
+
+    pub(crate) fn export(&self) -> Result<OwnedFd, Error> {
+        let fd = wrap_egl_call(
+            || unsafe { ffi::egl::DupNativeFenceFDANDROID(**self.0.display_handle, self.0.handle) },
+            ffi::egl::NO_NATIVE_FENCE_FD_ANDROID,
+        )
+        .map_err(Error::CreationFailed)?;
+        // SAFETY: A successful duplication returns one newly owned native fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    pub(crate) fn wait(&self) -> Result<(), Error> {
+        wrap_egl_call_bool(|| unsafe { ffi::egl::WaitSync(**self.0.display_handle, self.0.handle, 0) })
+            .map(|_| ())
+            .map_err(Error::CreationFailed)
+    }
+}

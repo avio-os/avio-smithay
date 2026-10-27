@@ -285,3 +285,16 @@ where
         todo!()
     }
 }
+
+// Element packets own textures, never the renderer used to draw them. A
+// context-affine renderer must not make otherwise shareable packets affine.
+render_elements! {
+    SharedTexturePacket<R> where R::TextureId: Clone + 'static;
+    Texture=super::texture::TextureRenderElement<R::TextureId>,
+}
+
+#[test]
+fn texture_packet_does_not_own_its_context_affine_renderer() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SharedTexturePacket<GlesRenderer>>();
+}

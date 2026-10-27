@@ -1,0 +1,507 @@
+//! Device-owned, event-driven destruction. A resource reserves its queue node
+//! when it is created; final drop only publishes that node and unparks the
+//! executor. No driver operation, allocation, mutex, or completion wait runs there.
+
+use std::{
+    marker::PhantomData,
+    ptr,
+    sync::{
+        atomic::{AtomicBool, AtomicPtr, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread,
+    time::Duration,
+};
+
+/// Completion of native device retirement, without retaining the device.
+///
+/// Only a cold shutdown owner or test harness may wait. Release every renderer,
+/// origin and resource first; dropping those owners remains nonblocking.
+#[derive(Clone, Debug)]
+pub struct RetirementCompletion {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RetirementCompletion {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn complete(&self) {
+        let (complete, changed) = &*self.state;
+        *complete.lock().unwrap() = true;
+        changed.notify_all();
+    }
+
+    /// Wait for the native retirement executor to finish, bounded by `timeout`.
+    /// False leaves custody unchanged; it never authorizes destroying resources
+    /// or unloading a driver. Never call this on an input or frame path.
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let (complete, changed) = &*self.state;
+        *changed
+            .wait_timeout_while(complete.lock().unwrap(), timeout, |done| !*done)
+            .unwrap()
+            .0
+    }
+}
+
+pub(crate) struct RetirementNode<T> {
+    value: T,
+    next: AtomicPtr<Self>,
+}
+
+impl<T> RetirementNode<T> {
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(crate) fn into_value(self: Box<Self>) -> T {
+        self.value
+    }
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    pub(crate) fn new(value: T) -> Box<Self> {
+        Box::new(Self {
+            value,
+            next: AtomicPtr::new(ptr::null_mut()),
+        })
+    }
+}
+
+struct Shared<T> {
+    head: AtomicPtr<RetirementNode<T>>,
+    closed: AtomicBool,
+    _owns: PhantomData<Box<RetirementNode<T>>>,
+}
+
+// SAFETY: Producers touch only atomics and their own unpublished node. One
+// consumer detaches the stack with acquire ordering before reading any T.
+// Sharing this ownership-transfer container requires Send, not Sync, from T.
+unsafe impl<T: Send> Sync for Shared<T> {}
+
+/// One producer endpoint, shared through the device handle rather than cloned.
+/// The executor owns no endpoint: closing the final device handle therefore
+/// drains all queued children and then destroys the device, without an Arc cycle.
+pub(crate) struct RetirementQueue<T> {
+    shared: Arc<Shared<T>>,
+    executor: thread::Thread,
+    terminal_join: Option<thread::JoinHandle<()>>,
+    completion: RetirementCompletion,
+}
+
+impl<T: Send + 'static> RetirementQueue<T> {
+    pub(crate) fn start(
+        mut destroy: impl FnMut(T) + Send + 'static,
+        finish: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::start_with_nodes(move |node| destroy(node.into_value()), finish)
+    }
+
+    /// A native owner may return this exact cold-allocated node to its fixed
+    /// bank after disposal, avoiding a release-path allocation or replacement.
+    pub(crate) fn start_with_nodes(
+        mut destroy: impl FnMut(Box<RetirementNode<T>>) + Send + 'static,
+        finish: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::start_with_state(|| (), move |_, node| destroy(node), move |_| finish())
+    }
+
+    /// Construct context-affine native state on the executor itself. The state
+    /// never crosses a thread boundary and therefore need not implement Send.
+    pub(crate) fn start_with_state<S: 'static>(
+        initialize: impl FnOnce() -> S + Send + 'static,
+        mut destroy: impl FnMut(&mut S, Box<RetirementNode<T>>) + Send + 'static,
+        finish: impl FnOnce(S) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let shared = Arc::new(Shared {
+            head: AtomicPtr::new(ptr::null_mut()),
+            closed: AtomicBool::new(false),
+            _owns: PhantomData,
+        });
+        let executor = shared.clone();
+        let completion = RetirementCompletion::new();
+        let finished = completion.clone();
+        // There is no join in a final resource drop: it may occur on Wayland or
+        // frame/input work. Endpoint closure requests the final drain; a cold
+        // terminal observer may retain the actual worker termination edge.
+        let worker = thread::Builder::new()
+            .name("graphics-retire".into())
+            .spawn(move || {
+                let mut state = initialize();
+                loop {
+                    // Read closure before detaching: observing closed proves
+                    // every producer already published its last node. Reading
+                    // it after an empty detach could miss a concurrent final
+                    // publication and prematurely destroy the logical device.
+                    let closed = executor.closed.load(Ordering::Acquire);
+                    let mut batch = executor.head.swap(ptr::null_mut(), Ordering::Acquire);
+                    if batch.is_null() {
+                        if closed {
+                            break;
+                        }
+                        // Unpark carries a permit. A publication between the
+                        // detach and park cannot lose its idle wake.
+                        thread::park();
+                        continue;
+                    }
+                    // Reverse the detached producer stack once. FIFO native
+                    // disposal makes a cold drain marker an exact edge for
+                    // everything published before that marker.
+                    let mut fifo = ptr::null_mut();
+                    while !batch.is_null() {
+                        // SAFETY: Detach grants exclusive list ownership.
+                        let next = unsafe { (*batch).next.load(Ordering::Relaxed) };
+                        unsafe { (*batch).next.store(fifo, Ordering::Relaxed) };
+                        fifo = batch;
+                        batch = next;
+                    }
+                    batch = fifo;
+                    while !batch.is_null() {
+                        // SAFETY: Atomic detach transferred exclusive ownership
+                        // of the entire list. Each node was Box::into_raw once,
+                        // and each is reconstructed exactly once here.
+                        let node = unsafe { Box::from_raw(batch) };
+                        batch = node.next.swap(ptr::null_mut(), Ordering::Relaxed);
+                        destroy(&mut state, node);
+                    }
+                }
+                finish(state);
+                finished.complete();
+            })?;
+        Ok(Self {
+            shared,
+            executor: worker.thread().clone(),
+            terminal_join: Some(worker),
+            completion,
+        })
+    }
+}
+
+impl<T> RetirementQueue<T> {
+    /// Move the one actual worker join handle to a cold terminal owner. The
+    /// observer owns no producer endpoint and cannot delay endpoint closure.
+    /// Taking or dropping it does not close the queue or wait for the worker.
+    pub(crate) fn take_terminal_join(&mut self) -> Option<thread::JoinHandle<()>> {
+        self.terminal_join.take()
+    }
+
+    pub(crate) fn completion(&self) -> RetirementCompletion {
+        self.completion.clone()
+    }
+
+    pub(crate) fn worker_thread(&self) -> thread::Thread {
+        self.executor.clone()
+    }
+
+    pub(crate) fn retire(&self, node: Box<RetirementNode<T>>) {
+        let node = Box::into_raw(node);
+        let mut head = self.shared.head.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: This producer still exclusively owns the unpublished
+            // node. A failed CAS publishes nothing and permits updating its
+            // link; a successful release-CAS transfers ownership permanently.
+            unsafe {
+                (*node).next.store(head, Ordering::Relaxed);
+            }
+            match self
+                .shared
+                .head
+                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(current) => head = current,
+            }
+        }
+        // Closing requires exclusive endpoint drop; a borrowed endpoint cannot
+        // race it. Enqueue cannot fail or use an inline driver-free fallback.
+        self.executor.unpark();
+    }
+}
+
+impl<T> Drop for RetirementQueue<T> {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.executor.unpark();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn context_affine_state_is_constructed_and_destroyed_on_the_executor() {
+        let (events, received) = mpsc::channel();
+        let initialized = events.clone();
+        let retired = events.clone();
+        let queue = RetirementQueue::start_with_state(
+            move || {
+                let owner = thread::current().id();
+                initialized.send((0, owner)).unwrap();
+                // Rc is deliberately !Send. Only its constructor crosses.
+                std::rc::Rc::new(owner)
+            },
+            move |owner, node| {
+                assert_eq!(**owner, thread::current().id());
+                retired.send((node.into_value(), **owner)).unwrap();
+            },
+            move |owner| events.send((2, *owner)).unwrap(),
+        )
+        .unwrap();
+        queue.retire(RetirementNode::new(1));
+        drop(queue);
+        let executor = received.recv_timeout(Duration::from_secs(2)).unwrap().1;
+        assert_ne!(executor, thread::current().id());
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (1, executor)
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (2, executor)
+        );
+    }
+
+    #[test]
+    fn idle_executor_retires_on_its_thread_before_device_shutdown() {
+        let (events, received) = mpsc::channel();
+        let retired = events.clone();
+        let queue = RetirementQueue::start(
+            move |id| retired.send((id, thread::current().id())).unwrap(),
+            move || events.send((0, thread::current().id())).unwrap(),
+        )
+        .unwrap();
+        let caller = thread::current().id();
+        queue.retire(RetirementNode::new(1));
+        // No endpoint closure, frame, import, poll or timeout initiates this.
+        let (id, executor) = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(id, 1);
+        assert_ne!(executor, caller);
+        queue.retire(RetirementNode::new(2));
+        queue.retire(RetirementNode::new(3));
+        drop(queue);
+        let mut ids = Vec::new();
+        loop {
+            let (id, thread) = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(thread, executor);
+            if id == 0 {
+                break;
+            }
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, [2, 3]);
+    }
+
+    #[test]
+    fn blocked_driver_does_not_block_enqueue_or_endpoint_drop() {
+        let (entered, started) = mpsc::channel();
+        let (resume, stalled) = mpsc::channel();
+        let (events, received) = mpsc::channel();
+        let retired = events.clone();
+        let queue = RetirementQueue::start(
+            move |id| {
+                if id == 1 {
+                    entered.send(()).unwrap();
+                    stalled.recv().unwrap();
+                }
+                retired.send(id).unwrap();
+            },
+            move || events.send(0).unwrap(),
+        )
+        .unwrap();
+        queue.retire(RetirementNode::new(1));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Returning before resume proves no driver wait is under the lock.
+        let (enqueued, accepted) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            queue.retire(RetirementNode::new(2));
+            drop(queue);
+            enqueued.send(()).unwrap();
+        });
+        accepted.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(received.try_recv().is_err());
+        resume.send(()).unwrap();
+        producer.join().unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_producers_transfer_every_preallocated_node_before_shutdown() {
+        let (events, received) = mpsc::channel();
+        let retired = events.clone();
+        let queue = Arc::new(
+            RetirementQueue::start(
+                move |id| retired.send(id).unwrap(),
+                move || events.send(0).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut producers = Vec::new();
+        for producer in 0..8 {
+            let queue = queue.clone();
+            producers.push(thread::spawn(move || {
+                for index in 0..100 {
+                    queue.retire(RetirementNode::new(producer * 100 + index + 1));
+                }
+            }));
+        }
+        drop(queue);
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        let mut ids = Vec::new();
+        loop {
+            let id = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            if id == 0 {
+                break;
+            }
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=800).collect::<Vec<_>>());
+    }
+
+    struct GatedDrop {
+        phase: &'static str,
+        entered: mpsc::Sender<&'static str>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    impl Drop for GatedDrop {
+        fn drop(&mut self) {
+            self.entered.send(self.phase).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_join_waits_for_state_closure_captures_and_thread_locals() {
+        thread_local! {
+            static TERMINAL: std::cell::RefCell<Option<GatedDrop>> = const { std::cell::RefCell::new(None) };
+        }
+        let (events, received) = mpsc::channel();
+        let (resume_state, state_gate) = mpsc::channel();
+        let (resume_capture, capture_gate) = mpsc::channel();
+        let (resume_tls, tls_gate) = mpsc::channel();
+        let state = GatedDrop {
+            phase: "state",
+            entered: events.clone(),
+            resume: state_gate,
+        };
+        let captured = GatedDrop {
+            phase: "capture",
+            entered: events.clone(),
+            resume: capture_gate,
+        };
+        let tls = GatedDrop {
+            phase: "tls",
+            entered: events,
+            resume: tls_gate,
+        };
+        let mut queue = RetirementQueue::<()>::start_with_state(
+            move || {
+                TERMINAL.with(|slot| *slot.borrow_mut() = Some(tls));
+                // Its thread-affine state is destroyed by finish, not a marker.
+                (std::rc::Rc::new(()), state)
+            },
+            move |_, node| {
+                let _ = &captured;
+                drop(node);
+            },
+            drop,
+        )
+        .unwrap();
+        let terminal = queue.take_terminal_join().unwrap();
+        assert!(queue.take_terminal_join().is_none(), "join authority is one-shot");
+        queue.retire(RetirementNode::new(()));
+        drop(queue);
+        let (joined, complete) = mpsc::channel();
+        let observer = thread::spawn(move || {
+            terminal.join().unwrap();
+            joined.send(()).unwrap();
+        });
+        for (phase, resume) in [
+            ("state", resume_state),
+            ("capture", resume_capture),
+            ("tls", resume_tls),
+        ] {
+            assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), phase);
+            assert!(
+                matches!(complete.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "join returned during {phase} destruction"
+            );
+            resume.send(()).unwrap();
+        }
+        complete.recv_timeout(Duration::from_secs(2)).unwrap();
+        observer.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_free_terminal_observer_covers_nested_final_publications() {
+        struct Nested {
+            next: Option<Arc<RetirementQueue<Nested>>>,
+            events: mpsc::Sender<u8>,
+            generation: u8,
+        }
+        impl Drop for Nested {
+            fn drop(&mut self) {
+                self.events.send(self.generation).unwrap();
+                if let Some(next) = self.next.take() {
+                    next.retire(RetirementNode::new(Self {
+                        next: None,
+                        events: self.events.clone(),
+                        generation: 2,
+                    }));
+                    // Releasing this last endpoint on the actor closes only
+                    // after the nested node has been published.
+                }
+            }
+        }
+        let (events, received) = mpsc::channel();
+        let finished = events.clone();
+        let mut queue = RetirementQueue::start(drop, move || finished.send(0).unwrap()).unwrap();
+        let terminal = queue.take_terminal_join().unwrap();
+        let queue = Arc::new(queue);
+        queue.retire(RetirementNode::new(Nested {
+            next: Some(queue.clone()),
+            events,
+            generation: 1,
+        }));
+        drop(queue);
+        terminal.join().unwrap();
+        assert_eq!(received.try_iter().collect::<Vec<_>>(), [1, 2, 0]);
+    }
+
+    #[test]
+    fn completion_waits_for_native_finish_without_retaining_endpoint() {
+        let (entered, started) = mpsc::channel();
+        let (resume, stalled) = mpsc::channel();
+        let queue = RetirementQueue::start(
+            |_: ()| {},
+            move || {
+                entered.send(()).unwrap();
+                stalled.recv().unwrap();
+            },
+        )
+        .unwrap();
+        let completion = queue.completion();
+        let second = completion.clone();
+        assert!(!completion.wait_timeout(Duration::ZERO));
+        drop(queue);
+        // Reaching finish proves the receipts did not keep the endpoint alive.
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!completion.wait_timeout(Duration::ZERO));
+        resume.send(()).unwrap();
+        assert!(completion.wait_timeout(Duration::from_secs(2)));
+        assert!(second.wait_timeout(Duration::ZERO));
+    }
+}

@@ -860,7 +860,7 @@ macro_rules! render_elements_internal {
                 $body($field)
             ),*,
             #[doc(hidden)]
-            _GenericCatcher((std::marker::PhantomData<$renderer>, std::convert::Infallible)),
+            _GenericCatcher((std::marker::PhantomData<fn() -> $renderer>, std::convert::Infallible)),
         }
     };
     (@enum $(#[$attr:meta])* $vis:vis $name:ident<$renderer:ident, $($custom:ident),+>; $($(#[$meta:meta])* $body:ident=$field:ty$( as <$other_renderer:ty>)?),* $(,)?) => {
@@ -880,7 +880,7 @@ macro_rules! render_elements_internal {
                 $body($field)
             ),*,
             #[doc(hidden)]
-            _GenericCatcher((std::marker::PhantomData<$renderer>, std::convert::Infallible)),
+            _GenericCatcher((std::marker::PhantomData<fn() -> $renderer>, std::convert::Infallible)),
         }
     };
     (@enum $(#[$attr:meta])* $vis:vis $name:ident<$lt:lifetime, $renderer:ident>; $($(#[$meta:meta])* $body:ident=$field:ty$( as <$other_renderer:ty>)?),* $(,)?) => {
@@ -898,7 +898,7 @@ macro_rules! render_elements_internal {
                 $body($field)
             ),*,
             #[doc(hidden)]
-            _GenericCatcher((std::marker::PhantomData<$renderer>, std::convert::Infallible)),
+            _GenericCatcher((std::marker::PhantomData<fn() -> $renderer>, std::convert::Infallible)),
         }
     };
     (@enum $(#[$attr:meta])* $vis:vis $name:ident<$lt:lifetime, $renderer:ident, $($custom:ident),+>; $($(#[$meta:meta])* $body:ident=$field:ty$( as <$other_renderer:ty>)?),* $(,)?) => {
@@ -919,7 +919,7 @@ macro_rules! render_elements_internal {
                 $body($field)
             ),*,
             #[doc(hidden)]
-            _GenericCatcher((std::marker::PhantomData<$renderer>, std::convert::Infallible)),
+            _GenericCatcher((std::marker::PhantomData<fn() -> $renderer>, std::convert::Infallible)),
         }
     };
     (@call $name:ident; $($x:ident),*) => {
