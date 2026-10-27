@@ -35,6 +35,26 @@ pub struct CompositionBufferCounts {
     pub output_layer: usize,
 }
 
+/// Whether the top full-output element may go straight onto the primary
+/// plane: it covers every pixel itself, or what shows through it is the CRTC
+/// background, which equals the clear colour composition would draw. The early
+/// selection and the per-element loop share this one rule. When the early
+/// selection required opacity alone, every non-opaque full-output root (Avio's
+/// Stage root declares no opaque region) acquired a composition target first
+/// and then went direct anyway: with prepared-only targets released between
+/// episodes, that was a failed, deferred frame about twice a second per output
+/// (2026-10-27).
+pub(super) fn primary_shows_element_correctly(
+    spans_output: bool,
+    opaque: bool,
+    clear_color: Color32F,
+) -> bool {
+    let crtc_background_matches_clear_color =
+        (clear_color.r() == 0f32 && clear_color.g() == 0f32 && clear_color.b() == 0f32)
+            || clear_color.a() == 0f32;
+    crtc_background_matches_clear_color || (spans_output && opaque)
+}
+
 // Direct ARGB scanout can be fully opaque. Its alpha-channel capability is
 // not evidence of a compositor-rendered transparent hole over an underlay.
 pub(super) fn underlay_preserves_visibility(
@@ -168,7 +188,10 @@ pub(super) fn select_primary<D, C, E>(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_primary, underlay_preserves_visibility, PrimaryPreparation};
+    use super::{
+        primary_shows_element_correctly, select_primary, underlay_preserves_visibility, PrimaryPreparation,
+    };
+    use crate::backend::renderer::Color32F;
     use std::cell::Cell;
 
     #[test]
@@ -179,6 +202,17 @@ mod tests {
         assert!(underlay_preserves_visibility(true, true, true));
         assert!(!underlay_preserves_visibility(false, true, true));
         assert!(!underlay_preserves_visibility(true, false, true));
+    }
+
+    #[test]
+    fn a_non_opaque_full_output_root_over_black_needs_no_composition_target() {
+        let black = Color32F::new(0.0, 0.0, 0.0, 1.0);
+        let grey = Color32F::new(0.5, 0.5, 0.5, 1.0);
+        // Avio's Stage root: full output, no declared opaque region.
+        assert!(primary_shows_element_correctly(true, false, black));
+        assert!(primary_shows_element_correctly(true, true, grey));
+        assert!(!primary_shows_element_correctly(true, false, grey));
+        assert!(!primary_shows_element_correctly(false, true, grey));
     }
 
     #[test]

@@ -2518,11 +2518,16 @@ where
         let mut output_layer_plane: Option<plane::Handle> = None;
         let output_elements_len = output_elements.len();
         let selection_result: Result<(), RenderFrameErrorType<A, F, R>> = (|| {
-            // A full-output opaque primary candidate lets us test every auxiliary
-            // plane against real producer storage. No scratch target is needed.
+            // A full-output primary candidate that shows correctly on the plane
+            // lets us test every auxiliary plane against real producer storage.
+            // No scratch target is needed. Underlays beneath a direct producer
+            // buffer are refused separately (`primary_can_holepunch`).
             let direct_primary = output_elements.last().and_then(|(element, geometry, _, opaque)| {
                 let element = &elements[*element];
-                if *opaque && geometry.contains_rect(output_geometry) {
+                let spans_output = geometry.contains_rect(output_geometry);
+                if spans_output
+                    && composition::primary_shows_element_correctly(spans_output, *opaque, clear_color)
+                {
                     self.try_assign_primary_plane(
                         renderer,
                         element,
@@ -2600,9 +2605,6 @@ where
                 // on the primary plane.
                 let try_assign_primary_plane = if remaining_elements == 1 && primary_plane_elements.is_empty()
                 {
-                    let crtc_background_matches_clear_color =
-                        (clear_color.r() == 0f32 && clear_color.g() == 0f32 && clear_color.b() == 0f32)
-                            || clear_color.a() == 0f32;
                     let element_spans_complete_output = element_geometry.contains_rect(output_geometry);
                     let overlaps_with_underlay = self
                         .planes
@@ -2613,8 +2615,11 @@ where
                         })
                         .any(|p| next_frame_state.overlaps(p.handle, element_geometry));
                     !overlaps_with_underlay
-                        && (crtc_background_matches_clear_color
-                            || (element_spans_complete_output && element_is_opaque))
+                        && composition::primary_shows_element_correctly(
+                            element_spans_complete_output,
+                            element_is_opaque,
+                            clear_color,
+                        )
                 } else {
                     false
                 };
