@@ -199,6 +199,7 @@ mod readback;
 mod retirement_slot;
 pub use retirement_slot::VulkanRetirementSlot;
 mod retirement;
+pub use retirement::VulkanRetirementCompletion;
 mod staging;
 pub use staging::VulkanUploadStorage;
 mod bank_return;

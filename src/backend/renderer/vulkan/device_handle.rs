@@ -288,6 +288,10 @@ impl DeviceHandle {
             .map_err(queue_error)
     }
 
+    pub(super) fn retirement_completion(&self) -> super::VulkanRetirementCompletion {
+        self.retirement.completion()
+    }
+
     pub(super) fn retire_commands(&self, commands: Box<RetirementNode<super::device::RetiredCommands>>) {
         self.command_retirement.retire(commands);
     }

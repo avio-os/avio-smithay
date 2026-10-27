@@ -7,10 +7,45 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicPtr, Ordering},
-        Arc,
+        Arc, Condvar, Mutex,
     },
     thread,
+    time::Duration,
 };
+
+/// Completion of native device retirement, without retaining the device.
+///
+/// Only a cold shutdown owner or test harness may wait. Release every renderer,
+/// origin and resource first; dropping those owners remains nonblocking.
+#[derive(Clone, Debug)]
+pub struct VulkanRetirementCompletion {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl VulkanRetirementCompletion {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn complete(&self) {
+        let (complete, changed) = &*self.state;
+        *complete.lock().unwrap() = true;
+        changed.notify_all();
+    }
+
+    /// Wait for the native retirement executor to finish, bounded by `timeout`.
+    /// False leaves custody unchanged; it never authorizes destroying resources
+    /// or unloading a driver. Never call this on an input or frame path.
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let (complete, changed) = &*self.state;
+        *changed
+            .wait_timeout_while(complete.lock().unwrap(), timeout, |done| !*done)
+            .unwrap()
+            .0
+    }
+}
 
 pub(super) struct RetirementNode<T> {
     value: T,
@@ -62,6 +97,7 @@ unsafe impl<T: Send> Sync for Shared<T> {}
 pub(super) struct RetirementQueue<T> {
     shared: Arc<Shared<T>>,
     executor: thread::Thread,
+    completion: VulkanRetirementCompletion,
 }
 
 impl<T: Send + 'static> RetirementQueue<T> {
@@ -84,6 +120,8 @@ impl<T: Send + 'static> RetirementQueue<T> {
             _owns: PhantomData,
         });
         let executor = shared.clone();
+        let completion = VulkanRetirementCompletion::new();
+        let finished = completion.clone();
         // There is no join in a final resource drop: it may occur on Wayland or
         // frame/input work. Endpoint closure is the deterministic shutdown edge.
         let worker = thread::Builder::new()
@@ -127,15 +165,21 @@ impl<T: Send + 'static> RetirementQueue<T> {
                     }
                 }
                 finish();
+                finished.complete();
             })?;
         Ok(Self {
             shared,
             executor: worker.thread().clone(),
+            completion,
         })
     }
 }
 
 impl<T> RetirementQueue<T> {
+    pub(super) fn completion(&self) -> VulkanRetirementCompletion {
+        self.completion.clone()
+    }
+
     pub(super) fn worker_thread(&self) -> thread::Thread {
         self.executor.clone()
     }
@@ -278,5 +322,29 @@ mod tests {
         }
         ids.sort_unstable();
         assert_eq!(ids, (1..=800).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn completion_waits_for_native_finish_without_retaining_endpoint() {
+        let (entered, started) = mpsc::channel();
+        let (resume, stalled) = mpsc::channel();
+        let queue = RetirementQueue::start(
+            |_: ()| {},
+            move || {
+                entered.send(()).unwrap();
+                stalled.recv().unwrap();
+            },
+        )
+        .unwrap();
+        let completion = queue.completion();
+        let second = completion.clone();
+        assert!(!completion.wait_timeout(Duration::ZERO));
+        drop(queue);
+        // Reaching finish proves the receipts did not keep the endpoint alive.
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!completion.wait_timeout(Duration::ZERO));
+        resume.send(()).unwrap();
+        assert!(completion.wait_timeout(Duration::from_secs(2)));
+        assert!(second.wait_timeout(Duration::ZERO));
     }
 }

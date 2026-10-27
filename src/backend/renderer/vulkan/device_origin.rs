@@ -65,6 +65,13 @@ impl VulkanDeviceOrigin {
         super::VulkanRetirementSlot::new(self.device.clone())
     }
 
+    /// Observe final native device retirement without keeping the device alive.
+    /// After releasing all origins, renderers and resources, a cold shutdown
+    /// owner can wait on this receipt before allowing process/driver teardown.
+    pub fn retirement_completion(&self) -> super::VulkanRetirementCompletion {
+        self.device.retirement_completion()
+    }
+
     /// Whether two contexts originate from exactly the same logical device.
     pub fn same_device(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.device, &other.device)
