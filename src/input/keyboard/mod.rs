@@ -1058,6 +1058,18 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         });
     }
 
+    /// Whether a physical press was forwarded to a client and is still held.
+    /// Intercepted compositor shortcuts are not client input ownership.
+    pub fn has_forwarded_pressed_keys(&self) -> bool {
+        !self
+            .arc
+            .internal
+            .lock()
+            .unwrap()
+            .forwarded_pressed_keys
+            .is_empty()
+    }
+
     /// Return the key codes of the currently pressed keys.
     pub fn pressed_keys(&self) -> HashSet<Keycode> {
         let guard = self.arc.internal.lock().unwrap();

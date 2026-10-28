@@ -1,9 +1,11 @@
 //! Reversible protocol-resource custody for clients which bind only one wl_seat.
 use super::{KeyboardUserData, WaylandFocus};
 use crate::input::{Seat, SeatHandler, WeakSeat};
+use crate::utils::Serial;
 use crate::wayland::{input_method::InputMethodSeat, text_input::TextInputSeat};
 use std::sync::{Arc, Mutex};
 use wayland_server::{backend::ClientId, Client, Resource};
+mod passive_focus;
 
 struct Entry<D: SeatHandler> {
     client: ClientId,
@@ -36,6 +38,20 @@ pub struct ClientInputRouteLease<D: SeatHandler + 'static> {
 }
 
 impl<D: SeatHandler + 'static> ClientInputRouteLease<D> {
+    /// Restore the client's physical protocol focus after its logical holds
+    /// have been retired. Call outside either physical seat handle's lock.
+    /// The physical focus and pressed-key authority are unchanged.
+    pub fn release(self, data: &mut D, serial: Serial, time: u32)
+    where
+        D::KeyboardFocus: WaylandFocus,
+        D::PointerFocus: WaylandFocus,
+    {
+        let source = self.source.clone();
+        let client = self.client.clone();
+        drop(self);
+        passive_focus::resume(&source, data, &client, serial, time);
+    }
+
     /// The exact connection whose declared first-seat resources are routed.
     pub fn client(&self) -> &Client {
         &self.client
@@ -69,6 +85,38 @@ impl<D: SeatHandler + 'static> Seat<D> {
         D::KeyboardFocus: WaylandFocus,
         D::PointerFocus: WaylandFocus,
     {
+        self.route_client_input_inner(client, target, None)
+    }
+
+    /// Lease an idle client's input resources even when it has passive physical
+    /// focus. The compositor must suppress passive physical protocol delivery
+    /// while routed and release the lease before actual human content input.
+    /// Held keys/grabs remain exclusive. No physical focus is moved.
+    pub fn route_client_input_with_passive_focus(
+        &self,
+        data: &mut D,
+        client: &Client,
+        target: &Self,
+        serial: Serial,
+        time: u32,
+    ) -> Result<ClientInputRouteLease<D>, &'static str>
+    where
+        D::KeyboardFocus: WaylandFocus,
+        D::PointerFocus: WaylandFocus,
+    {
+        self.route_client_input_inner(client, target, Some((data, serial, time)))
+    }
+
+    fn route_client_input_inner(
+        &self,
+        client: &Client,
+        target: &Self,
+        passive: Option<(&mut D, Serial, u32)>,
+    ) -> Result<ClientInputRouteLease<D>, &'static str>
+    where
+        D::KeyboardFocus: WaylandFocus,
+        D::PointerFocus: WaylandFocus,
+    {
         if self == target || target.input_route_for_client(client).is_some() {
             return Err("invalid or chained input route");
         }
@@ -82,25 +130,32 @@ impl<D: SeatHandler + 'static> Seat<D> {
         let matches = |surface: Option<wayland_server::protocol::wl_surface::WlSurface>| {
             surface.is_some_and(|s| s.client().as_ref() == Some(client))
         };
-        if matches(
+        let keyboard_focused = matches(
             keyboard
                 .current_focus()
                 .and_then(|f| f.wl_surface().map(|s| s.into_owned())),
-        ) || matches(
+        );
+        let pointer_focused = matches(
             pointer
                 .current_focus()
                 .and_then(|f| f.wl_surface().map(|s| s.into_owned())),
-        ) || matches(
-            keyboard
-                .grab_start_data()
-                .and_then(|g| g.focus)
-                .and_then(|f| f.wl_surface().map(|s| s.into_owned())),
-        ) || matches(
-            pointer
-                .grab_start_data()
-                .and_then(|g| g.focus)
-                .and_then(|(f, _)| f.wl_surface().map(|s| s.into_owned())),
-        ) {
+        );
+        let held_keys = keyboard.has_forwarded_pressed_keys();
+        if (keyboard_focused && (passive.is_none() || held_keys))
+            || (pointer_focused && passive.is_none())
+            || matches(
+                keyboard
+                    .grab_start_data()
+                    .and_then(|g| g.focus)
+                    .and_then(|f| f.wl_surface().map(|s| s.into_owned())),
+            )
+            || matches(
+                pointer
+                    .grab_start_data()
+                    .and_then(|g| g.focus)
+                    .and_then(|(f, _)| f.wl_surface().map(|s| s.into_owned())),
+            )
+        {
             return Err("physical input owns client");
         }
         if super::pointer_endpoint::client_has_endpoint(target, client)
@@ -128,6 +183,11 @@ impl<D: SeatHandler + 'static> Seat<D> {
                 target: target.downgrade(),
                 identity: identity.clone(),
             });
+        }
+        // Validate and reserve first; suspension cannot fail. Resources have
+        // not moved yet, so these leave events reach their original endpoint.
+        if let Some((data, serial, time)) = passive {
+            passive_focus::suspend(self, data, client, serial, time);
         }
         move_keyboards(self, target, self, client);
         move_pointers(self, target, self, client);
