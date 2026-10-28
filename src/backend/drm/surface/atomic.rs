@@ -34,7 +34,9 @@ use super::{
     PlaneConfig, PlaneState, VrrSupport,
 };
 mod request;
-use request::{AtomicRequest, AtomicRequestStorage};
+use request::AtomicRequest;
+mod workspace;
+use workspace::AtomicRequestWorkspace;
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -217,7 +219,7 @@ pub struct AtomicDrmSurface {
     crtc: crtc::Handle,
     plane: plane::Handle,
     used_planes: Mutex<HashSet<plane::Handle>>,
-    request_storage: Mutex<AtomicRequestStorage>,
+    request_storage: Mutex<AtomicRequestWorkspace>,
     mode_blobs: ModeBlobBank,
     prop_mapping: Arc<RwLock<PropMapping>>,
     state: RwLock<State>,
@@ -246,7 +248,7 @@ impl AtomicDrmSurface {
         );
 
         let mut state = State::current_state(&*fd, crtc, &mut prop_mapping.write().unwrap())?;
-        let request_storage = AtomicRequestStorage::for_surface(&prop_mapping.read().unwrap(), crtc, planes);
+        let request_storage = AtomicRequestWorkspace::new(&prop_mapping.read().unwrap(), crtc, planes);
         state.connectors.reserve(
             request_storage
                 .connector_capacity()
@@ -390,7 +392,7 @@ impl AtomicDrmSurface {
         let connector_capacity = {
             let mapping = self.prop_mapping.read().unwrap();
             let mut storage = self.request_storage.lock().unwrap();
-            storage.admit_connectors_cold(&mapping);
+            storage.refresh_connectors(&mapping);
             storage.connector_capacity()
         };
         // Release map/storage before taking state: native commit takes state first.
@@ -851,15 +853,11 @@ impl AtomicDrmSurface {
         current: &State,
         pending: &State,
     ) -> Result<(), Error> {
-        let mapping = self
-            .prop_mapping
-            .try_read()
-            .map_err(|_| Error::AtomicRequestBusy)?;
         let mut storage = self
             .request_storage
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mut req = AtomicRequest::prepared(&mapping, &mut storage);
+        let mut req = storage.request();
         self.test_state_request(&mut req, planes, allow_modeset, current, pending)
     }
 
@@ -925,10 +923,6 @@ impl AtomicDrmSurface {
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
         let pending = self.pending.try_read().map_err(|_| Error::AtomicRequestBusy)?;
-        let mapping = self
-            .prop_mapping
-            .try_read()
-            .map_err(|_| Error::AtomicRequestBusy)?;
         let mut storage = self
             .request_storage
             .try_lock()
@@ -945,7 +939,7 @@ impl AtomicDrmSurface {
             });
         }
         debug!(current = ?*current, pending = ?*pending, "Preparing Commit");
-        let mut req = AtomicRequest::prepared(&mapping, &mut storage);
+        let mut req = storage.request();
         req.fill_request(
             self.crtc,
             pending.mode_id(),
@@ -1013,10 +1007,6 @@ impl AtomicDrmSurface {
             .used_planes
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mapping = self
-            .prop_mapping
-            .try_read()
-            .map_err(|_| Error::AtomicRequestBusy)?;
         let state = self.state.try_read().map_err(|_| Error::AtomicRequestBusy)?;
         let mut storage = self
             .request_storage
@@ -1026,7 +1016,7 @@ impl AtomicDrmSurface {
             .last_out_fence
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mut req = AtomicRequest::prepared(&mapping, &mut storage);
+        let mut req = storage.request();
         req.fill_request(self.crtc, None, state.vrr, [], [], planes)?;
         let mut out_fence_fd = -1;
         let requested_out_fence = req.set_crtc_out_fence_ptr(self.crtc, &mut out_fence_fd)?;
@@ -1071,15 +1061,11 @@ impl AtomicDrmSurface {
             .used_planes
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mapping = self
-            .prop_mapping
-            .try_read()
-            .map_err(|_| Error::AtomicRequestBusy)?;
         let mut storage = self
             .request_storage
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mut req = AtomicRequest::prepared(&mapping, &mut storage);
+        let mut req = storage.request();
         req.reset_plane(plane)?;
         let result = req
             .commit(&*self.fd, AtomicCommitFlags::empty())
@@ -1107,15 +1093,11 @@ impl AtomicDrmSurface {
             .used_planes
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mapping = self
-            .prop_mapping
-            .try_read()
-            .map_err(|_| Error::AtomicRequestBusy)?;
         let mut storage = self
             .request_storage
             .try_lock()
             .map_err(|_| Error::AtomicRequestBusy)?;
-        let mut req = AtomicRequest::prepared(&mapping, &mut storage);
+        let mut req = storage.request();
         for plane in used_planes.iter() {
             req.reset_plane(*plane)?;
         }
@@ -1151,7 +1133,12 @@ impl AtomicDrmSurface {
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
-        let capacity = self.request_storage.lock().unwrap().connector_capacity();
+        let capacity = {
+            let mapping = self.prop_mapping.read().unwrap();
+            let mut workspace = self.request_storage.lock().unwrap();
+            workspace.refresh_connectors(&mapping);
+            workspace.connector_capacity()
+        };
         state
             .connectors
             .reserve(capacity.saturating_sub(state.connectors.len()));

@@ -3756,8 +3756,18 @@ where
     /// to reset it's internal state.
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
         self.surface.reset_state()?;
-        self.reset_pending = true;
+        self.require_next_commit();
         Ok(())
+    }
+
+    /// Require a fresh full physical submission even when every plane is unchanged.
+    ///
+    /// This is output-local presentation intent. Unlike `reset_state`, it does
+    /// not read KMS state or refresh device-wide property discovery. It remains
+    /// pending across failed preparation/submission and is consumed by successful
+    /// submission through the ordinary frame lane, never by a TEST_ONLY result.
+    pub fn require_next_commit(&mut self) {
+        self.reset_pending = true;
     }
 
     #[profiling::function]
@@ -6245,6 +6255,25 @@ pub enum FrameError<
     #[error(transparent)]
     NativeBlack(#[from] NativeBlackError),
 }
+
+impl<A, B, F> FrameError<A, B, F>
+where
+    A: std::error::Error + Send + Sync + 'static,
+    B: std::error::Error + Send + Sync + 'static,
+    F: std::error::Error + Send + Sync + 'static,
+{
+    /// Whether an error returned by `queue_frame` reached the physical ioctl.
+    /// Local admission failures and a refused TEST_ONLY are not submissions.
+    /// This classification is for queue errors, not errors from rendering or
+    /// configuring a surface, where Access may describe a different operation.
+    pub fn queue_submission_attempted(&self) -> bool {
+        matches!(self, Self::DrmError(DrmError::Access(_)))
+    }
+}
+
+#[cfg(test)]
+#[path = "queue_failure_tests.rs"]
+mod queue_failure_tests;
 
 /// Error returned from [`DrmCompositor::render_frame`]
 #[derive(thiserror::Error)]
