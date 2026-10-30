@@ -5,7 +5,7 @@ use crate::input::{
     pointer::{MotionEvent, PointerTarget},
 };
 
-pub(super) fn suspend<D: SeatHandler + 'static>(
+pub(super) fn suspend<D: SelectionHandler + 'static>(
     seat: &Seat<D>,
     data: &mut D,
     client: &Client,
@@ -15,6 +15,7 @@ pub(super) fn suspend<D: SeatHandler + 'static>(
     D::KeyboardFocus: WaylandFocus,
     D::PointerFocus: WaylandFocus,
 {
+    crate::wayland::selection::routed_focus::suspend(seat, client);
     if let Some(surface) = seat
         .get_keyboard()
         .and_then(|k| k.current_focus())
@@ -36,7 +37,7 @@ pub(super) fn suspend<D: SeatHandler + 'static>(
     }
 }
 
-pub(super) fn resume<D: SeatHandler + 'static>(
+pub(super) fn resume<D: SelectionHandler + 'static>(
     seat: &Seat<D>,
     data: &mut D,
     client: &Client,
@@ -66,6 +67,13 @@ pub(super) fn resume<D: SeatHandler + 'static>(
             // takeover press or a consumed compositor shortcut.
             super::super::keyboard::enter_internal(&surface, seat, data, keys.into_iter(), serial);
             KeyboardTarget::modifiers(&surface, seat, data, mods, serial);
+            if let Some(handle) = surface.handle().upgrade() {
+                crate::wayland::selection::routed_focus::resume(
+                    &wayland_server::DisplayHandle::from(handle),
+                    seat,
+                    client,
+                );
+            }
         }
     }
     if let Some(pointer) = seat.get_pointer() {

@@ -351,6 +351,8 @@ pub enum Error {
 }
 
 pub(crate) struct KbdRc<D: SeatHandler> {
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) owner: super::WeakSeat<D>,
     pub(crate) internal: Mutex<KbdInternal<D>>,
     #[cfg(feature = "wayland_frontend")]
     pub(crate) keymap: Mutex<KeymapFile>,
@@ -665,7 +667,12 @@ impl<D: SeatHandler> ::std::cmp::PartialEq for KeyboardHandle<D> {
 
 impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// Create a keyboard handler from a set of RMLVO rules
-    pub(crate) fn new(xkb_config: XkbConfig<'_>, repeat_delay: i32, repeat_rate: i32) -> Result<Self, Error> {
+    pub(crate) fn new(
+        _owner: super::WeakSeat<D>,
+        xkb_config: XkbConfig<'_>,
+        repeat_delay: i32,
+        repeat_rate: i32,
+    ) -> Result<Self, Error> {
         let span = info_span!("input_keyboard");
         let _guard = span.enter();
 
@@ -688,6 +695,8 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         drop(_guard);
         Ok(Self {
             arc: Arc::new(KbdRc {
+                #[cfg(feature = "wayland_frontend")]
+                owner: _owner,
                 #[cfg(feature = "wayland_frontend")]
                 keymap: Mutex::new(keymap_file),
                 internal: Mutex::new(internal),

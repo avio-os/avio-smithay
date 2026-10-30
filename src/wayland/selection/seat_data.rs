@@ -54,6 +54,31 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         }
     }
 
+    /// Withdraw only this client's ordinary selection offers. Preserve sources
+    /// and data-control observers: borrowing input is not a selection change.
+    pub(crate) fn suspend_client(&mut self, client: &Client) {
+        if self.clipboard_selection_focus.as_ref() == Some(client) {
+            self.clipboard_selection_focus = None;
+            for device in &self.known_devices {
+                if let SelectionDevice::DataDevice(device) = device {
+                    if device.client().as_ref() == Some(client) {
+                        device.selection(None);
+                    }
+                }
+            }
+        }
+        if self.primary_selection_focus.as_ref() == Some(client) {
+            self.primary_selection_focus = None;
+            for device in &self.known_devices {
+                if let SelectionDevice::Primary(device) = device {
+                    if device.client().as_ref() == Some(client) {
+                        device.selection(None);
+                    }
+                }
+            }
+        }
+    }
+
     /// Set the clipboard selection to the `new_selection`, providing `None` will clear the
     /// selection.
     pub fn set_clipboard_selection<D>(

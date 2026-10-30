@@ -572,7 +572,8 @@ impl<D: SeatHandler + 'static> Seat<D> {
         repeat_rate: i32,
     ) -> Result<KeyboardHandle<D>, KeyboardError> {
         let mut inner = self.arc.inner.lock().unwrap();
-        let keyboard = self::keyboard::KeyboardHandle::new(xkb_config, repeat_delay, repeat_rate)?;
+        let keyboard =
+            self::keyboard::KeyboardHandle::new(self.downgrade(), xkb_config, repeat_delay, repeat_rate)?;
         if inner.keyboard.is_some() {
             // there is already a keyboard, remove it and notify the clients
             // of the change

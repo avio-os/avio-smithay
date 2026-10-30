@@ -2,6 +2,7 @@
 use super::{KeyboardUserData, WaylandFocus};
 use crate::input::{Seat, SeatHandler, WeakSeat};
 use crate::utils::Serial;
+use crate::wayland::selection::SelectionHandler;
 use crate::wayland::{input_method::InputMethodSeat, text_input::TextInputSeat};
 use std::sync::{Arc, Mutex};
 use wayland_server::{backend::ClientId, Client, Resource};
@@ -43,6 +44,7 @@ impl<D: SeatHandler + 'static> ClientInputRouteLease<D> {
     /// The physical focus and pressed-key authority are unchanged.
     pub fn release(self, data: &mut D, serial: Serial, time: u32)
     where
+        D: SelectionHandler,
         D::KeyboardFocus: WaylandFocus,
         D::PointerFocus: WaylandFocus,
     {
@@ -85,7 +87,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
         D::KeyboardFocus: WaylandFocus,
         D::PointerFocus: WaylandFocus,
     {
-        self.route_client_input_inner(client, target, None)
+        self.route_client_input_inner(client, target, false, || {})
     }
 
     /// Lease an idle client's input resources even when it has passive physical
@@ -103,15 +105,19 @@ impl<D: SeatHandler + 'static> Seat<D> {
     where
         D::KeyboardFocus: WaylandFocus,
         D::PointerFocus: WaylandFocus,
+        D: SelectionHandler,
     {
-        self.route_client_input_inner(client, target, Some((data, serial, time)))
+        self.route_client_input_inner(client, target, true, || {
+            passive_focus::suspend(self, data, client, serial, time);
+        })
     }
 
     fn route_client_input_inner(
         &self,
         client: &Client,
         target: &Self,
-        passive: Option<(&mut D, Serial, u32)>,
+        passive: bool,
+        suspend: impl FnOnce(),
     ) -> Result<ClientInputRouteLease<D>, &'static str>
     where
         D::KeyboardFocus: WaylandFocus,
@@ -141,8 +147,8 @@ impl<D: SeatHandler + 'static> Seat<D> {
                 .and_then(|f| f.wl_surface().map(|s| s.into_owned())),
         );
         let held_keys = keyboard.has_forwarded_pressed_keys();
-        if (keyboard_focused && (passive.is_none() || held_keys))
-            || (pointer_focused && passive.is_none())
+        if (keyboard_focused && (!passive || held_keys))
+            || (pointer_focused && !passive)
             || matches(
                 keyboard
                     .grab_start_data()
@@ -186,9 +192,7 @@ impl<D: SeatHandler + 'static> Seat<D> {
         }
         // Validate and reserve first; suspension cannot fail. Resources have
         // not moved yet, so these leave events reach their original endpoint.
-        if let Some((data, serial, time)) = passive {
-            passive_focus::suspend(self, data, client, serial, time);
-        }
+        suspend();
         move_keyboards(self, target, self, client);
         move_pointers(self, target, self, client);
         self.text_input().route_client_instances(

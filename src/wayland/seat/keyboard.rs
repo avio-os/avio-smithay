@@ -32,14 +32,17 @@ where
 {
     /// Check if client of given resource currently has keyboard focus
     pub fn client_of_object_has_focus(&self, id: &ObjectId) -> bool {
-        self.arc
-            .internal
-            .lock()
-            .unwrap()
-            .focus
-            .as_ref()
-            .map(|f| f.0.same_client_as(id))
-            .unwrap_or(false)
+        let focus = self.current_focus();
+        let Some(focus) = focus.filter(|f| f.same_client_as(id)) else {
+            return false;
+        };
+        // Physical focus can remain on a client whose protocol resources are
+        // borrowed by a logical seat. That is not physical selection authority.
+        let client = focus.wl_surface().and_then(|s| s.client());
+        match (self.arc.owner.upgrade(), client) {
+            (Some(seat), Some(client)) => seat.input_route_for_client(&client).is_none(),
+            _ => false,
+        }
     }
 
     /// Return all raw [`WlKeyboard`] instances for a particular [`Client`]
