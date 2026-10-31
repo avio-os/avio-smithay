@@ -618,12 +618,21 @@ impl X11Surface {
     ///
     /// Allows the client to reflect this state in their UI.
     pub fn set_activated(&self, activated: bool) -> Result<(), ConnectionError> {
+        self.set_activated_tracked(activated).map(|_| ())
+    }
+
+    /// Set activation and return the exact X request sequence, if state changed.
+    ///
+    /// This is a queued request identifier, not acknowledgement of server or
+    /// client progress. A compositor with native server receipts may correlate
+    /// the low 32 bits with the server's request sequence on this WM connection.
+    /// No request or receipt is invented for an unchanged state.
+    pub fn set_activated_tracked(&self, activated: bool) -> Result<Option<u64>, ConnectionError> {
         if activated {
-            self.change_net_state(&[self.atoms._NET_WM_STATE_FOCUSED], &[])?;
+            self.change_net_state(&[self.atoms._NET_WM_STATE_FOCUSED], &[])
         } else {
-            self.change_net_state(&[], &[self.atoms._NET_WM_STATE_FOCUSED])?;
+            self.change_net_state(&[], &[self.atoms._NET_WM_STATE_FOCUSED])
         }
-        Ok(())
     }
 
     /// Returns the reported window type of the underlying X11 window if set.
@@ -651,7 +660,7 @@ impl X11Surface {
             })
     }
 
-    fn change_net_state(&self, added: &[Atom], removed: &[Atom]) -> Result<(), ConnectionError> {
+    fn change_net_state(&self, added: &[Atom], removed: &[Atom]) -> Result<Option<u64>, ConnectionError> {
         let mut state = self.state.lock().unwrap();
 
         let mut changed = false;
@@ -672,16 +681,17 @@ impl X11Surface {
                 let _ = conn.flush();
             });
 
-            conn.change_property32(
+            let request = conn.change_property32(
                 PropMode::REPLACE,
                 self.window,
                 self.atoms._NET_WM_STATE,
                 AtomEnum::ATOM,
                 &new_props,
             )?;
+            return Ok(Some(request.sequence_number()));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Input handling model requested by the underlying X11 window.
