@@ -1,5 +1,7 @@
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+use calloop::ping::Ping;
 
 use tracing::debug;
 use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
@@ -19,9 +21,20 @@ pub(crate) struct TextInput {
     instances: Vec<Instance>,
     focus: Option<WlSurface>,
     active_text_input_id: Option<ObjectId>,
+    in_process_wakeup: Option<(Weak<()>, Ping)>,
 }
 
 impl TextInput {
+    fn notify_state_change(&mut self) {
+        if let Some((owner, ping)) = &self.in_process_wakeup {
+            if owner.strong_count() > 0 {
+                ping.ping();
+            } else {
+                self.in_process_wakeup = None;
+            }
+        }
+    }
+
     fn with_focused_client_all_text_inputs<F>(&mut self, mut f: F)
     where
         F: FnMut(&ZwpTextInputV3, &WlSurface, u32),
@@ -69,6 +82,21 @@ pub struct TextInputHandle {
 }
 
 impl TextInputHandle {
+    pub(crate) fn set_in_process_wakeup(&self, owner: &Arc<()>, wake: Option<Ping>) {
+        let mut inner = self.inner.lock().unwrap();
+        match wake {
+            Some(ping) => inner.in_process_wakeup = Some((Arc::downgrade(owner), ping)),
+            None if inner
+                .in_process_wakeup
+                .as_ref()
+                .is_some_and(|(identity, _)| Weak::ptr_eq(identity, &Arc::downgrade(owner))) =>
+            {
+                inner.in_process_wakeup = None
+            }
+            None => {}
+        }
+    }
+
     pub(super) fn add_instance(&self, instance: &ZwpTextInputV3) {
         let mut inner = self.inner.lock().unwrap();
         inner.instances.push(Instance {
@@ -117,9 +145,16 @@ impl TextInputHandle {
                     index += 1;
                 }
             }
+            if !moved.is_empty() {
+                inner.notify_state_change();
+            }
             moved
         };
-        target.inner.lock().unwrap().instances.extend(moved);
+        if !moved.is_empty() {
+            let mut inner = target.inner.lock().unwrap();
+            inner.instances.extend(moved);
+            inner.notify_state_change();
+        }
     }
 
     pub(super) fn enter_instance(&self, instance: &ZwpTextInputV3) {
@@ -170,7 +205,11 @@ impl TextInputHandle {
     ///
     /// This doesn't send any 'enter' or 'leave' events.
     pub fn set_focus(&self, surface: Option<WlSurface>) {
-        self.inner.lock().unwrap().focus = surface;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.focus != surface {
+            inner.focus = surface;
+            inner.notify_state_change();
+        }
     }
 
     /// Send `leave` on the text-input instance for the currently focused
@@ -179,7 +218,9 @@ impl TextInputHandle {
         let mut inner = self.inner.lock().unwrap();
         // Leaving clears active and pending widget state, but Commit serials
         // belong to each protocol object's lifetime and must continue.
-        inner.active_text_input_id = None;
+        if inner.active_text_input_id.take().is_some() {
+            inner.notify_state_change();
+        }
         for instance in &mut inner.instances {
             instance.pending_state = Default::default();
         }
@@ -374,12 +415,14 @@ where
                 match new_state.enable {
                     Some(true) => {
                         *active_text_input_id = Some(resource.id());
+                        guard.notify_state_change();
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         data.input_method_handle.activate_input_method(state, &focus);
                     }
                     Some(false) => {
                         *active_text_input_id = None;
+                        guard.notify_state_change();
                         // Drop the guard before calling to other subsystem.
                         drop(guard);
                         data.input_method_handle.deactivate_input_method(state);
@@ -391,6 +434,7 @@ where
                             return;
                         }
 
+                        guard.notify_state_change();
                         // Drop the guard before calling to other subsystems later on.
                         drop(guard);
                     }
@@ -437,6 +481,7 @@ where
         let deactivate_im = {
             let mut inner = data.handle.inner.lock().unwrap();
             inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
+            inner.notify_state_change();
             let destroyed_active = inner.active_text_input_id.as_ref() == Some(&destroyed_id);
             if destroyed_active {
                 inner.active_text_input_id = None;

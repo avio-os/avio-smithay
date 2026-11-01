@@ -1,6 +1,7 @@
 //! Exclusive ownership for a compositor's built-in text-input provider.
 use super::{input_method_handle::InputMethodProvider, InputMethodHandle};
 use crate::wayland::text_input::TextInputHandle;
+use calloop::ping::Ping;
 use std::sync::Arc;
 
 /// An exclusive seat input-method lease held by the compositor itself.
@@ -35,6 +36,15 @@ impl InProcessTextInput {
         })
     }
 
+    /// Wake the compositor loop when this seat's committed text-input state,
+    /// focus, resources or routing changes. Notifications are coalesced hints:
+    /// revalidate the exact focus, active object and lease before any effect.
+    /// No compositor callback runs inside a protocol or provider lock.
+    /// Replacing the wake or dropping this lease retires the previous sender.
+    pub fn set_state_change_wakeup(&self, wake: Option<Ping>) {
+        self.text_input.set_in_process_wakeup(&self.identity, wake);
+    }
+
     /// The standard text-input handle associated with the leased seat.
     pub fn text_input(&self) -> &TextInputHandle {
         &self.text_input
@@ -46,6 +56,7 @@ impl Drop for InProcessTextInput {
         let mut inner = self.input_method.inner.lock().unwrap();
         if matches!(&inner.provider, Some(InputMethodProvider::InProcess(identity)) if Arc::ptr_eq(identity, &self.identity))
         {
+            self.set_state_change_wakeup(None);
             inner.provider = None;
             self.text_input.leave();
         }
