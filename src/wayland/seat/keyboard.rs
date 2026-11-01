@@ -40,7 +40,7 @@ where
         // borrowed by a logical seat. That is not physical selection authority.
         let client = focus.wl_surface().and_then(|s| s.client());
         match (self.arc.owner.upgrade(), client) {
-            (Some(seat), Some(client)) => seat.input_route_for_client(&client).is_none(),
+            (Some(seat), Some(client)) => seat.keyboard_input_route_for_client(&client).is_none(),
             _ => false,
         }
     }

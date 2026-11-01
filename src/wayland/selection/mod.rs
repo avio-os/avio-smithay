@@ -22,8 +22,8 @@ pub mod wlr_data_control;
 
 mod device;
 mod offer;
-mod seat_data;
 pub(crate) mod routed_focus;
+mod seat_data;
 mod source;
 
 pub use source::SelectionSource;

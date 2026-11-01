@@ -11,20 +11,13 @@ pub(super) fn suspend<D: SelectionHandler + 'static>(
     client: &Client,
     serial: Serial,
     time: u32,
+    keyboard: bool,
 ) where
     D::KeyboardFocus: WaylandFocus,
     D::PointerFocus: WaylandFocus,
 {
-    crate::wayland::selection::routed_focus::suspend(seat, client);
-    if let Some(surface) = seat
-        .get_keyboard()
-        .and_then(|k| k.current_focus())
-        .and_then(|f| f.wl_surface().map(|s| s.into_owned()))
-        .filter(|s| s.client().as_ref() == Some(client))
-    {
-        // Call the underlying protocol target: the compositor may already
-        // suppress passive delivery because the route has been reserved.
-        KeyboardTarget::leave(&surface, seat, data, serial);
+    if keyboard {
+        suspend_keyboard(seat, data, client, serial);
     }
     if let Some(surface) = seat
         .get_pointer()
@@ -43,6 +36,60 @@ pub(super) fn resume<D: SelectionHandler + 'static>(
     client: &Client,
     serial: Serial,
     time: u32,
+    keyboard: bool,
+) where
+    D::KeyboardFocus: WaylandFocus,
+    D::PointerFocus: WaylandFocus,
+{
+    if keyboard {
+        resume_keyboard(seat, data, client, serial);
+    }
+    if let Some(pointer) = seat.get_pointer() {
+        let focus = pointer.inner.lock().unwrap().focus.clone();
+        if let Some((focus, origin)) =
+            focus.filter(|(focus, _)| focus.wl_surface().and_then(|s| s.client()).as_ref() == Some(client))
+        {
+            focus.enter(
+                seat,
+                data,
+                &MotionEvent {
+                    location: pointer.current_location() - origin,
+                    serial,
+                    time,
+                },
+            );
+            focus.frame(seat, data);
+        }
+    }
+}
+
+pub(super) fn suspend_keyboard<D: SelectionHandler + 'static>(
+    seat: &Seat<D>,
+    data: &mut D,
+    client: &Client,
+    serial: Serial,
+) where
+    D::KeyboardFocus: WaylandFocus,
+    D::PointerFocus: WaylandFocus,
+{
+    crate::wayland::selection::routed_focus::suspend(seat, client);
+    if let Some(surface) = seat
+        .get_keyboard()
+        .and_then(|k| k.current_focus())
+        .and_then(|f| f.wl_surface().map(|s| s.into_owned()))
+        .filter(|s| s.client().as_ref() == Some(client))
+    {
+        // Call the underlying protocol target: the compositor may already
+        // suppress passive delivery because the route has been reserved.
+        KeyboardTarget::leave(&surface, seat, data, serial);
+    }
+}
+
+pub(super) fn resume_keyboard<D: SelectionHandler + 'static>(
+    seat: &Seat<D>,
+    data: &mut D,
+    client: &Client,
+    serial: Serial,
 ) where
     D::KeyboardFocus: WaylandFocus,
     D::PointerFocus: WaylandFocus,
@@ -74,23 +121,6 @@ pub(super) fn resume<D: SelectionHandler + 'static>(
                     client,
                 );
             }
-        }
-    }
-    if let Some(pointer) = seat.get_pointer() {
-        let focus = pointer.inner.lock().unwrap().focus.clone();
-        if let Some((focus, origin)) =
-            focus.filter(|(focus, _)| focus.wl_surface().and_then(|s| s.client()).as_ref() == Some(client))
-        {
-            focus.enter(
-                seat,
-                data,
-                &MotionEvent {
-                    location: pointer.current_location() - origin,
-                    serial,
-                    time,
-                },
-            );
-            focus.frame(seat, data);
         }
     }
 }

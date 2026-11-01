@@ -147,7 +147,7 @@ where
             zwp_text_input_manager_v3::Request::GetTextInput { id, seat } => {
                 let declared = Seat::<D>::from_resource(&seat).unwrap();
                 let seat = declared
-                    .input_route_for_client(client)
+                    .keyboard_input_route_for_client(client)
                     .unwrap_or_else(|| declared.clone());
 
                 let user_data = seat.user_data();

@@ -71,7 +71,7 @@ pub(crate) mod keyboard;
 pub(crate) mod pointer;
 pub(crate) mod pointer_endpoint;
 mod touch;
-pub use client_route::ClientInputRouteLease;
+pub use client_route::{ClientInputRouteKeyboardUpgrade, ClientInputRouteLease};
 
 use std::{borrow::Cow, fmt, sync::Arc};
 
@@ -353,7 +353,7 @@ where
                     arc: data.arc.clone(),
                 };
                 let effective = declared
-                    .input_route_for_client(client)
+                    .keyboard_input_route_for_client(client)
                     .unwrap_or_else(|| declared.clone());
                 let inner = effective.arc.inner.lock().unwrap();
 

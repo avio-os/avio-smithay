@@ -615,7 +615,7 @@ where
         .user_data()
         .get::<RefCell<SeatData<D::SelectionUserData>>>()
         .unwrap();
-    let client = client.filter(|client| seat.input_route_for_client(client).is_none());
+    let client = client.filter(|client| seat.keyboard_input_route_for_client(client).is_none());
     seat_data.borrow_mut().set_clipboard_focus::<D>(dh, client);
 }
 
