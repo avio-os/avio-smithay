@@ -248,21 +248,17 @@ impl ReadbackState {
         commit_foreign_releases(&foreign_images);
 
         let mut raw = vec![0u8; src_len];
-        // SAFETY: Memory belongs to this device and the mapped range is within allocation bounds.
-        let mapped = unsafe {
-            vk_device.map_memory(
-                readback.memory,
-                0,
-                src_len as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )
-        }?;
+        // The whole allocation is mapped so that a non-coherent invalidation
+        // of it is always aligned to `nonCoherentAtomSize`.
+        // SAFETY: Memory belongs to this device and is not mapped elsewhere.
+        let mapped =
+            unsafe { vk_device.map_memory(readback.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
 
         if !readback.coherent {
             let ranges = [vk::MappedMemoryRange::default()
                 .memory(readback.memory)
                 .offset(0)
-                .size(src_len as vk::DeviceSize)];
+                .size(vk::WHOLE_SIZE)];
             // SAFETY: The mapped range belongs to this memory allocation.
             if let Err(err) = unsafe { vk_device.invalidate_mapped_memory_ranges(&ranges) } {
                 // SAFETY: Memory is currently mapped and must be unmapped before returning.
@@ -277,7 +273,7 @@ impl ReadbackState {
             vk_device.unmap_memory(readback.memory);
         }
 
-        let converted = convert_pixels(src_format, dst_format, &raw)?;
+        let converted = convert_pixels(src_format, dst_format, raw)?;
         Ok(VulkanMapping {
             data: converted,
             size: region.size,
@@ -462,7 +458,7 @@ fn create_readback_buffer(
     let memory_requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
 
     let Some((memory_type_index, coherent)) =
-        pick_host_visible_memory_type(device, memory_requirements.memory_type_bits)
+        pick_readback_memory_type(device, memory_requirements.memory_type_bits)
     else {
         device_handle.destroy_with(|raw| unsafe { raw.destroy_buffer(buffer, None) });
         return Err(VulkanRendererError::NoCompatibleMemoryType);
@@ -508,7 +504,15 @@ fn create_readback_buffer(
     ))
 }
 
-fn pick_host_visible_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<(u32, bool)> {
+/// The memory a readback destination is allocated from.
+///
+/// The CPU reads every byte of a readback, so host-cached memory comes first.
+/// Host-visible memory without `HOST_CACHED` is typically write-combined: CPU
+/// reads of it bypass the cache and run at a few hundred MB/s, which made a
+/// 2560x1440 readback take ~45 ms on NVIDIA where a cached one takes well
+/// under a millisecond. Non-coherent cached memory is invalidated before the
+/// copy, so coherence is only a tie-breaker.
+fn pick_readback_memory_type(device: &DeviceState, memory_type_bits: u32) -> Option<(u32, bool)> {
     let memory_properties = unsafe {
         device
             .physical_device()
@@ -517,13 +521,26 @@ fn pick_host_visible_memory_type(device: &DeviceState, memory_type_bits: u32) ->
             .get_physical_device_memory_properties(device.physical_device().handle())
     };
 
-    pick_memory_type_index(
-        &memory_properties,
-        memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE,
-        vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .map(|(index, flags)| (index, flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)))
+    pick_readback_memory_type_index(&memory_properties, memory_type_bits)
+        .map(|(index, flags)| (index, flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT)))
+}
+
+fn pick_readback_memory_type_index(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    memory_type_bits: u32,
+) -> Option<(u32, vk::MemoryPropertyFlags)> {
+    use vk::MemoryPropertyFlags as Flags;
+    [
+        Flags::HOST_CACHED | Flags::HOST_COHERENT,
+        Flags::HOST_CACHED,
+        Flags::HOST_COHERENT,
+    ]
+    .into_iter()
+    .find_map(|preferred| {
+        pick_memory_type_index(properties, memory_type_bits, Flags::HOST_VISIBLE, preferred)
+            .filter(|(_, flags)| flags.contains(preferred))
+    })
+    .or_else(|| pick_memory_type_index(properties, memory_type_bits, Flags::HOST_VISIBLE, Flags::empty()))
 }
 
 pub(super) fn pick_memory_type_index(
@@ -579,7 +596,9 @@ fn is_alpha_equivalent_pair(src: Fourcc, dst: Fourcc) -> bool {
     )
 }
 
-fn convert_pixels(src: Fourcc, dst: Fourcc, pixels: &[u8]) -> Result<Vec<u8>, VulkanRendererError> {
+/// Converts read-back pixels in place: a frame is copied out of the readback
+/// buffer once, never again for its format.
+fn convert_pixels(src: Fourcc, dst: Fourcc, mut pixels: Vec<u8>) -> Result<Vec<u8>, VulkanRendererError> {
     let src_bpp = bytes_per_pixel(src)?;
     let dst_bpp = bytes_per_pixel(dst)?;
     if src_bpp != dst_bpp {
@@ -587,21 +606,20 @@ fn convert_pixels(src: Fourcc, dst: Fourcc, pixels: &[u8]) -> Result<Vec<u8>, Vu
     }
 
     if src == dst {
-        return Ok(pixels.to_vec());
+        return Ok(pixels);
     }
 
     if !is_alpha_equivalent_pair(src, dst) {
         return Err(VulkanRendererError::UnsupportedMemoryFormat(dst));
     }
 
-    let mut converted = pixels.to_vec();
     if src_bpp == 4 {
-        for pixel in converted.chunks_exact_mut(4) {
+        for pixel in pixels.chunks_exact_mut(4) {
             pixel[3] = 0xFF;
         }
     }
 
-    Ok(converted)
+    Ok(pixels)
 }
 
 #[cfg(test)]
@@ -965,5 +983,63 @@ mod tests {
             expected_red_pixel(format),
             "new stripe position should be red after composition update",
         );
+    }
+
+    fn memory_properties(types: &[ash::vk::MemoryPropertyFlags]) -> ash::vk::PhysicalDeviceMemoryProperties {
+        let mut properties = ash::vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: types.len() as u32,
+            ..Default::default()
+        };
+        for (slot, flags) in properties.memory_types.iter_mut().zip(types) {
+            slot.property_flags = *flags;
+        }
+        properties
+    }
+
+    #[test]
+    fn readback_memory_is_host_cached_when_the_device_offers_it() {
+        use ash::vk::MemoryPropertyFlags as F;
+        let visible = F::HOST_VISIBLE;
+        // NVIDIA lists uncached (write-combined) host memory before the cached
+        // type; reading a frame back from the former costs ~45 ms at 1440p.
+        let nvidia = memory_properties(&[
+            F::empty(),
+            F::DEVICE_LOCAL,
+            visible | F::HOST_COHERENT,
+            visible | F::HOST_COHERENT | F::HOST_CACHED,
+            F::DEVICE_LOCAL | visible | F::HOST_COHERENT,
+        ]);
+        assert_eq!(
+            super::pick_readback_memory_type_index(&nvidia, u32::MAX).map(|(index, _)| index),
+            Some(3)
+        );
+        // A type the buffer cannot use is never chosen.
+        assert_eq!(
+            super::pick_readback_memory_type_index(&nvidia, 0b0_0100).map(|(index, _)| index),
+            Some(2)
+        );
+        // Cached memory beats coherence: a non-coherent read is invalidated.
+        let non_coherent = memory_properties(&[visible | F::HOST_COHERENT, visible | F::HOST_CACHED]);
+        assert_eq!(
+            super::pick_readback_memory_type_index(&non_coherent, u32::MAX),
+            Some((1, visible | F::HOST_CACHED))
+        );
+        // Without either, any host-visible type still reads back.
+        let plain = memory_properties(&[F::DEVICE_LOCAL, visible]);
+        assert_eq!(
+            super::pick_readback_memory_type_index(&plain, u32::MAX).map(|(index, _)| index),
+            Some(1)
+        );
+        assert_eq!(super::pick_readback_memory_type_index(&plain, 0b01), None);
+    }
+
+    #[test]
+    fn same_format_readback_is_not_copied_again() {
+        let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let address = pixels.as_ptr();
+        let converted = super::convert_pixels(Fourcc::Argb8888, Fourcc::Argb8888, pixels).unwrap();
+        assert_eq!(converted.as_ptr(), address);
+        let opaque = super::convert_pixels(Fourcc::Argb8888, Fourcc::Xrgb8888, converted).unwrap();
+        assert_eq!(opaque, vec![1, 2, 3, 0xFF, 5, 6, 7, 0xFF]);
     }
 }
