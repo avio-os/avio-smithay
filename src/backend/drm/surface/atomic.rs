@@ -147,11 +147,9 @@ impl State {
             for (&id, &val) in ids.iter().zip(vals.iter()) {
                 if Some(&id) == active_prop {
                     active = property::ValueType::Boolean.convert_value(val).as_boolean();
-                    break;
                 }
                 if Some(&id) == vrr_prop {
                     vrr = property::ValueType::Boolean.convert_value(val).as_boolean();
-                    break;
                 }
             }
         }
@@ -826,25 +824,26 @@ impl AtomicDrmSurface {
         Ok(())
     }
 
-    /// Select adaptive sync only when it takes effect without a modeset.
+    /// Select adaptive sync only when it adds no modeset of its own.
     ///
     /// Returns whether the selection now holds. Unlike [`Self::use_vrr`] this
-    /// never falls through to a modeset test, because a selection that needs
-    /// one would turn the next ordinary frame into a blocking full commit. A
-    /// configuration that is already pending, or a refused `TEST_ONLY`, leaves
-    /// both states untouched and returns `Ok(false)`.
+    /// never lets a change on a settled surface fall through to a modeset test,
+    /// because that would turn the next ordinary frame into a blocking full
+    /// commit. A refused `TEST_ONLY` leaves both states untouched and returns
+    /// `Ok(false)`.
+    ///
+    /// With a configuration already pending, for example after [`Self::clear`],
+    /// the next commit is a full one anyway, so the selection joins it.
     ///
     /// The selection reaches the hardware with the next submitted frame; it
     /// is not proof of completed programming.
     pub fn use_vrr_seamless(&self, value: bool) -> Result<bool, Error> {
         let mut current = self.state.write().unwrap();
         let mut pending = self.pending.write().unwrap();
-        if pending.vrr == value && current.vrr == value {
+        if pending.vrr == value {
             return Ok(true);
         }
-        if *current != *pending {
-            return Ok(false);
-        }
+        let settled = *current == *pending;
         let prop_mapping = self.prop_mapping.read().unwrap();
         if value && prop_mapping.crtc_prop_handle(self.crtc, "VRR_ENABLED").is_err() {
             return Ok(false);
@@ -874,11 +873,18 @@ impl AtomicDrmSurface {
             &[],
             [&plane_config],
         )?;
-        if req.commit(&*self.fd, AtomicCommitFlags::TEST_ONLY).is_err() {
+        let flags = if settled {
+            AtomicCommitFlags::TEST_ONLY
+        } else {
+            AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY
+        };
+        if req.commit(&*self.fd, flags).is_err() {
             return Ok(false);
         }
         pending.vrr = value;
-        current.vrr = value;
+        if settled {
+            current.vrr = value;
+        }
         Ok(true)
     }
 
