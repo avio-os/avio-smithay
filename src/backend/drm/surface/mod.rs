@@ -273,6 +273,26 @@ impl DrmSurface {
         }
     }
 
+    /// Select adaptive sync only when it takes effect without a modeset, and
+    /// return whether the selection now holds. See
+    /// [`AtomicDrmSurface::use_vrr_seamless`](atomic::AtomicDrmSurface::use_vrr_seamless).
+    ///
+    /// The legacy API has no such property, so it never holds there.
+    pub fn use_vrr_seamless(&self, vrr: bool) -> Result<bool, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.use_vrr_seamless(vrr),
+            DrmSurfaceInternal::Legacy(_) => Ok(!vrr),
+        }
+    }
+
+    /// Whether [`DrmSurface::page_flip_async`] can be accepted on this device.
+    pub fn async_flip_supported(&self) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.atomic_async_flip_supported(),
+            DrmSurfaceInternal::Legacy(_) => false,
+        }
+    }
+
     /// Disables the given plane.
     ///
     /// Errors if the plane is not supported by this crtc or if the underlying
@@ -368,6 +388,27 @@ impl DrmSurface {
                 let fb = ensure_legacy_planes(self, planes)?;
                 surf.page_flip(fb, event)
             }
+        }
+    }
+
+    /// Queue one unsynchronized flip of the given framebuffers.
+    ///
+    /// The commit carries no out-fence and may tear. The kernel refuses it
+    /// unless only the primary plane's framebuffer, in-fence or damage
+    /// changes; the caller decides how to fall back. Check
+    /// [`DrmSurface::async_flip_supported`] first.
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip_async(planes, event),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::UnknownProperty {
+                handle: self.crtc.into(),
+                name: "DRM_MODE_PAGE_FLIP_ASYNC",
+            }),
         }
     }
 

@@ -25,8 +25,8 @@ use crate::{
 
 use super::{
     compositor::{
-        DrmCompositor, FrameError, FrameFlags, FrameResult, FrameSubmissionOutcome, RenderFrameError,
-        RenderFrameErrorType, RenderFrameResult,
+        DrmCompositor, FrameError, FrameFlags, FrameFlip, FrameResult, FrameSubmissionOutcome,
+        RenderFrameError, RenderFrameErrorType, RenderFrameResult, SubmittedFlip,
     },
     exporter::ExportFramebuffer,
     DrmDevice, DrmError, Planes,
@@ -678,6 +678,16 @@ where
     /// `user_data` can be used to attach some data to a specific buffer and later retrieved with [`DrmCompositor::frame_submitted`]    
     pub fn queue_frame(&mut self, user_data: U) -> FrameResult<(), A, F> {
         self.with_compositor(|compositor| compositor.queue_frame(user_data))
+    }
+
+    /// [`DrmOutput::queue_frame`], with this frame's commit timed as `flip` asks.
+    pub fn queue_frame_with_flip(&mut self, user_data: U, flip: FrameFlip) -> FrameResult<(), A, F> {
+        self.with_compositor(|compositor| compositor.queue_frame_with_flip(user_data, flip))
+    }
+
+    /// How the kernel accepted the commit now awaiting its completion event.
+    pub fn pending_frame_flip(&self) -> Option<SubmittedFlip> {
+        self.with_compositor(|compositor| compositor.pending_frame_flip())
     }
 
     /// Duplicate the pending commit's OUT_FENCE while preserving recovery's owner.

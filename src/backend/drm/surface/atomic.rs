@@ -826,6 +826,69 @@ impl AtomicDrmSurface {
         Ok(())
     }
 
+    /// Select adaptive sync only when it takes effect without a modeset.
+    ///
+    /// Returns whether the selection now holds. Unlike [`Self::use_vrr`] this
+    /// never falls through to a modeset test, because a selection that needs
+    /// one would turn the next ordinary frame into a blocking full commit. A
+    /// configuration that is already pending, or a refused `TEST_ONLY`, leaves
+    /// both states untouched and returns `Ok(false)`.
+    ///
+    /// The selection reaches the hardware with the next submitted frame; it
+    /// is not proof of completed programming.
+    pub fn use_vrr_seamless(&self, value: bool) -> Result<bool, Error> {
+        let mut current = self.state.write().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        if pending.vrr == value && current.vrr == value {
+            return Ok(true);
+        }
+        if *current != *pending {
+            return Ok(false);
+        }
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        if value && prop_mapping.crtc_prop_handle(self.crtc, "VRR_ENABLED").is_err() {
+            return Ok(false);
+        }
+        let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
+        let plane_config = PlaneState {
+            handle: self.plane,
+            config: Some(PlaneConfig {
+                src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
+                dst: Rectangle::from_size(
+                    (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
+                ),
+                transform: Transform::Normal,
+                alpha: 1.0,
+                damage_clips: None,
+                fb: test_buffer.fb,
+                fence: None,
+                cursor_hotspot: None,
+            }),
+        };
+        let mut req = AtomicRequest::build_request(
+            &prop_mapping,
+            self.crtc,
+            pending.mode_id(),
+            value,
+            &pending.connectors,
+            &[],
+            [&plane_config],
+        )?;
+        if req.commit(&*self.fd, AtomicCommitFlags::TEST_ONLY).is_err() {
+            return Ok(false);
+        }
+        pending.vrr = value;
+        current.vrr = value;
+        Ok(true)
+    }
+
+    /// Whether this device accepts `DRM_MODE_PAGE_FLIP_ASYNC` on an atomic
+    /// commit. A kernel too old to know the capability answers no.
+    pub fn atomic_async_flip_supported(&self) -> bool {
+        drm::Device::get_driver_capability(&*self.fd, drm::DriverCapability::AtomicASyncPageFlip)
+            .is_ok_and(|value| value != 0)
+    }
+
     pub fn commit_pending(&self) -> bool {
         *self.pending.read().unwrap() != *self.state.read().unwrap()
     }
@@ -999,6 +1062,27 @@ impl AtomicDrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        self.flip_planes(planes, event, FlipTiming::Vblank)
+    }
+
+    /// Queue one unsynchronized flip. The kernel refuses it with `EINVAL` when
+    /// anything but the primary plane's framebuffer, fence or damage changes.
+    #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        self.flip_planes(planes, event, FlipTiming::Immediate)
+    }
+
+    fn flip_planes<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+        timing: FlipTiming,
+    ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
@@ -1019,20 +1103,23 @@ impl AtomicDrmSurface {
         let mut req = storage.request();
         req.fill_request(self.crtc, None, state.vrr, [], [], planes)?;
         let mut out_fence_fd = -1;
-        let requested_out_fence = req.set_crtc_out_fence_ptr(self.crtc, &mut out_fence_fd)?;
-        trace!("Queueing page flip: {:?}", req);
-        let flags = if event {
-            AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
-        } else {
-            AtomicCommitFlags::NONBLOCK
+        // The kernel treats OUT_FENCE_PTR as a changed property on an async
+        // commit and refuses it, so an unsynchronized flip completes only by
+        // its page-flip event.
+        let requested_out_fence = match timing {
+            FlipTiming::Vblank => req.set_crtc_out_fence_ptr(self.crtc, &mut out_fence_fd)?,
+            FlipTiming::Immediate => false,
         };
-        let result = req.commit(&*self.fd, flags).map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Page flip commit failed",
-                dev: self.fd.dev_path(),
-                source,
-            })
-        });
+        trace!("Queueing page flip: {:?}", req);
+        let result = req
+            .commit(&*self.fd, flip_commit_flags(event, timing))
+            .map_err(|source| {
+                Error::Access(AccessError {
+                    errmsg: "Page flip commit failed",
+                    dev: self.fd.dev_path(),
+                    source,
+                })
+            });
         if result.is_ok() {
             *last_out_fence = consume_out_fence(requested_out_fence, out_fence_fd);
             for &(plane, configured) in req.plane_edits() {
@@ -1157,6 +1244,23 @@ impl AtomicDrmSurface {
     pub fn take_out_fence(&self) -> Option<OwnedFd> {
         self.last_out_fence.lock().unwrap().take()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlipTiming {
+    Vblank,
+    Immediate,
+}
+
+fn flip_commit_flags(event: bool, timing: FlipTiming) -> AtomicCommitFlags {
+    let mut flags = AtomicCommitFlags::NONBLOCK;
+    if event {
+        flags |= AtomicCommitFlags::PAGE_FLIP_EVENT;
+    }
+    if timing == FlipTiming::Immediate {
+        flags |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
+    }
+    flags
 }
 
 fn consume_out_fence(requested: bool, out_fence_fd: i32) -> Option<OwnedFd> {
@@ -1615,5 +1719,28 @@ mod planeless_black_request {
                 assert_eq!(req.value(plane.handle, name), Some(0));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod flip_timing_tests {
+    use super::{flip_commit_flags, AtomicCommitFlags, FlipTiming};
+
+    #[test]
+    fn only_an_immediate_flip_asks_the_kernel_to_skip_vblank() {
+        assert_eq!(
+            flip_commit_flags(true, FlipTiming::Vblank),
+            AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT
+        );
+        assert_eq!(
+            flip_commit_flags(true, FlipTiming::Immediate),
+            AtomicCommitFlags::NONBLOCK
+                | AtomicCommitFlags::PAGE_FLIP_EVENT
+                | AtomicCommitFlags::PAGE_FLIP_ASYNC
+        );
+        assert_eq!(
+            flip_commit_flags(false, FlipTiming::Vblank),
+            AtomicCommitFlags::NONBLOCK
+        );
     }
 }

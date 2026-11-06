@@ -895,6 +895,34 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     }
 
     #[profiling::function]
+    fn page_flip_async(
+        &mut self,
+        surface: &DrmSurface,
+        supports_fencing: bool,
+        allow_partial_update: bool,
+        strict_fencing: bool,
+        event: bool,
+    ) -> Result<(), crate::backend::drm::error::Error> {
+        debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        if strict_fencing {
+            for (_, state) in self.planes.iter_mut().filter(|(_, state)| !state.skip) {
+                if let Some((sync, fence)) = state.config.as_mut().and_then(|config| config.sync.as_mut()) {
+                    framebuffer_policy::admit_fence(sync, fence, supports_fencing)?;
+                }
+            }
+        }
+        surface.page_flip_async(
+            self.build_planes(
+                surface,
+                supports_fencing,
+                allow_partial_update,
+                PlaneSyncMode::Submit,
+            ),
+            event,
+        )
+    }
+
+    #[profiling::function]
     fn build_planes<'a>(
         &'a mut self,
         surface: &'a DrmSurface,
@@ -1245,6 +1273,8 @@ struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>
     /// fabricate an on-glass edge and release buffers still being scanned
     /// out). `None` when the commit carried no out-fence.
     flip_out_fence: Option<OwnedFd>,
+    /// How the kernel accepted this exact commit.
+    submitted_flip: SubmittedFlip,
 }
 
 /// Outcome of [`DrmCompositor::queue_cursor_position`].
@@ -1322,6 +1352,59 @@ where
 struct QueuedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     prepared_frame: PreparedFrame<A, F>,
     user_data: U,
+    flip: FrameFlip,
+}
+
+/// How a queued frame asks the kernel to time its commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameFlip {
+    /// Latch at vblank. The only timing a modeset or a mode-less commit has.
+    #[default]
+    Synchronized,
+    /// Latch as soon as possible, which may tear. Falls back to
+    /// [`FrameFlip::Synchronized`] for this one commit when the device or
+    /// the frame cannot take it; [`SubmittedFlip`] reports what happened.
+    Asynchronous,
+}
+
+/// How the kernel actually accepted one commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmittedFlip {
+    /// Asked for and got a vblank-latched flip.
+    Synchronized,
+    /// The kernel accepted an unsynchronized flip.
+    Asynchronous,
+    /// Asked for an unsynchronized flip and got a vblank-latched one.
+    AsynchronousRefused(AsyncFlipRefusal),
+}
+
+impl SubmittedFlip {
+    /// The commit latched at vblank, so its completion is vsync evidence.
+    pub fn is_synchronized(self) -> bool {
+        !matches!(self, Self::Asynchronous)
+    }
+}
+
+/// Why one commit that asked for an unsynchronized flip latched at vblank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncFlipRefusal {
+    /// The device does not offer atomic async flips.
+    Unsupported,
+    /// The frame carries a pending modeset.
+    ModesetPending,
+    /// The kernel refused this frame's plane changes with `EINVAL`.
+    KernelRefused,
+}
+
+/// Whether a failed async commit may retry the same frame at vblank. `EINVAL`
+/// is the kernel saying this frame changes more than an async flip can carry.
+/// Every other error reaches the ordinary failure path unchanged.
+fn async_flip_refusal_retries_synchronized(error: &crate::backend::drm::error::Error) -> bool {
+    matches!(
+        error,
+        crate::backend::drm::error::Error::Access(access)
+            if access.source.kind() == ErrorKind::InvalidInput
+    )
 }
 
 impl<A, F, U> std::fmt::Debug for QueuedFrame<A, F, U>
@@ -1449,6 +1532,9 @@ where
     current_frame: CompositorFrameState<A, F>,
     pending_frame: Option<PendingFrame<A, F, U>>,
     queued_frame: Option<QueuedFrame<A, F, U>>,
+    submitted_flip: SubmittedFlip,
+    /// The device's answer, asked once at the first async request.
+    async_flip_capability: Option<bool>,
     next_frame: Option<PreparedFrame<A, F>>,
     native_black_storage: Option<native_black::NativeBlackFrameStorage<A::Buffer, F::Framebuffer>>,
 
@@ -1708,6 +1794,8 @@ where
                         current_frame,
                         pending_frame: None,
                         queued_frame: None,
+                        submitted_flip: SubmittedFlip::Synchronized,
+                        async_flip_capability: None,
                         next_frame: None,
                         native_black_storage: None,
                         swapchain,
@@ -1894,6 +1982,8 @@ where
             current_frame,
             pending_frame: None,
             queued_frame: None,
+            submitted_flip: SubmittedFlip::Synchronized,
+            async_flip_capability: None,
             next_frame: None,
             native_black_storage: None,
             swapchain,
@@ -3686,6 +3776,15 @@ where
     /// `user_data` can be used to attach some data to a specific buffer and later retrieved with [`DrmCompositor::frame_submitted`]
     #[profiling::function]
     pub fn queue_frame(&mut self, user_data: U) -> FrameResult<(), A, F> {
+        self.queue_frame_with_flip(user_data, FrameFlip::Synchronized)
+    }
+
+    /// [`DrmCompositor::queue_frame`], with this frame's commit timed as `flip`
+    /// asks. This goes through the same one queue: a frame behind a pending
+    /// commit keeps its request until that commit completes. Read the outcome
+    /// with [`DrmCompositor::pending_frame_flip`].
+    #[profiling::function]
+    pub fn queue_frame_with_flip(&mut self, user_data: U, flip: FrameFlip) -> FrameResult<(), A, F> {
         if !self.surface.is_active() {
             return Err(FrameErrorType::<A, F>::DrmError(DrmError::DeviceInactive));
         }
@@ -3698,6 +3797,7 @@ where
         self.queued_frame = Some(QueuedFrame {
             prepared_frame,
             user_data,
+            flip,
         });
         if self.pending_frame.is_none() {
             self.submit().map_err(|(_user_data, error)| error)?;
@@ -3775,10 +3875,26 @@ where
         let QueuedFrame {
             mut prepared_frame,
             user_data,
+            flip: requested_flip,
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
-        let flip = if self.surface.commit_pending() {
+        let commit_pending = self.surface.commit_pending();
+        let mut submitted_flip = match requested_flip {
+            FrameFlip::Synchronized => SubmittedFlip::Synchronized,
+            FrameFlip::Asynchronous if commit_pending => {
+                SubmittedFlip::AsynchronousRefused(AsyncFlipRefusal::ModesetPending)
+            }
+            FrameFlip::Asynchronous
+                if !*self
+                    .async_flip_capability
+                    .get_or_insert_with(|| self.surface.async_flip_supported()) =>
+            {
+                SubmittedFlip::AsynchronousRefused(AsyncFlipRefusal::Unsupported)
+            }
+            FrameFlip::Asynchronous => SubmittedFlip::Asynchronous,
+        };
+        let flip = if commit_pending {
             prepared_frame.frame.commit(
                 &self.surface,
                 self.supports_fencing,
@@ -3786,6 +3902,26 @@ where
                 self.strict_fencing,
                 true,
             )
+        } else if submitted_flip == SubmittedFlip::Asynchronous {
+            match prepared_frame.frame.page_flip_async(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                self.strict_fencing,
+                true,
+            ) {
+                Err(error) if async_flip_refusal_retries_synchronized(&error) => {
+                    submitted_flip = SubmittedFlip::AsynchronousRefused(AsyncFlipRefusal::KernelRefused);
+                    prepared_frame.frame.page_flip(
+                        &self.surface,
+                        self.supports_fencing,
+                        allow_partial_update,
+                        self.strict_fencing,
+                        true,
+                    )
+                }
+                result => result,
+            }
         } else {
             prepared_frame.frame.page_flip(
                 &self.surface,
@@ -3796,6 +3932,7 @@ where
             )
         };
 
+        self.submitted_flip = submitted_flip;
         self.handle_flip(prepared_frame, Some(user_data), flip)
             .map_err(|(user_data, error)| {
                 (
@@ -3857,6 +3994,7 @@ where
                         frame: prepared_frame.frame,
                         user_data,
                         flip_out_fence,
+                        submitted_flip: self.submitted_flip,
                     });
                 } else {
                     // A blocking configuration commit has completed. Preserve
@@ -3908,6 +4046,12 @@ where
     /// with its `user_data`.
     pub fn is_frame_pipeline_idle(&self) -> bool {
         self.pending_frame.is_none() && self.queued_frame.is_none()
+    }
+
+    /// How the kernel accepted the commit now awaiting its completion event.
+    /// Read before [`DrmCompositor::frame_submitted`] retires that commit.
+    pub fn pending_frame_flip(&self) -> Option<SubmittedFlip> {
+        self.pending_frame.as_ref().map(|pending| pending.submitted_flip)
     }
 
     /// Queue a cursor-plane-only reposition of the currently presented frame.
@@ -4154,6 +4298,7 @@ where
             mut frame,
             user_data,
             flip_out_fence: _,
+            submitted_flip: _,
         }) = self.pending_frame.take()
         {
             std::mem::swap(&mut frame, &mut self.current_frame);
@@ -4325,6 +4470,18 @@ where
     /// used without a modeset on the attached connectors.
     pub fn use_vrr(&mut self, vrr: bool) -> FrameResult<(), A, F> {
         self.surface.use_vrr(vrr).map_err(FrameError::DrmError)
+    }
+
+    /// Select adaptive sync only when it takes effect without a modeset, and
+    /// return whether the selection now holds.
+    ///
+    /// This performs a `TEST_ONLY` commit, so it belongs off the frame path,
+    /// with the frame pipeline drained. The selection reaches the hardware
+    /// with the next submitted frame, so follow a change with
+    /// [`DrmCompositor::require_next_commit`] when no frame would otherwise
+    /// reach KMS.
+    pub fn use_vrr_seamless(&mut self, vrr: bool) -> FrameResult<bool, A, F> {
+        self.surface.use_vrr_seamless(vrr).map_err(FrameError::DrmError)
     }
 
     /// Set the [`DebugFlags`] to use
