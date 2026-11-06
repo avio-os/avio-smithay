@@ -29,6 +29,10 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
+use super::hdr_output::{
+    connector_can_signal_hdr, connector_color_writes, hdr_state, ConnectorColor, HdrOutputMetadata,
+    HdrOutputSelection,
+};
 use super::{
     mode_blob::{ModeBlob, ModeBlobBank},
     PlaneConfig, PlaneState, VrrSupport,
@@ -47,6 +51,8 @@ pub struct State {
     pub blob: Option<ModeBlob>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    /// `Colorspace`, `HDR_OUTPUT_METADATA` and `max bpc`, as one value.
+    color: ConnectorColor,
 }
 
 impl PartialEq for State {
@@ -56,6 +62,7 @@ impl PartialEq for State {
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.color == other.color
     }
 }
 
@@ -154,6 +161,7 @@ impl State {
             }
         }
 
+        let color = super::hdr_output::read_back_color(fd, &*prop_mapping, &current_connectors);
         Ok(State::read_back(
             current_mode,
             // If we don't know the active state we just assume off.
@@ -162,19 +170,41 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr.unwrap_or(false),
             current_connectors,
+            color,
         ))
+    }
+
+    /// A connector this surface is about to drive may have been left signalling by
+    /// an owner that crashed, while attached to no CRTC or to another one, so the
+    /// CRTC's own read back cannot see it. The next commit corrects it.
+    fn note_inherited_color<'a, A: ControlDevice>(
+        &mut self,
+        fd: &A,
+        prop_mapping: &PropMapping,
+        connectors: impl IntoIterator<Item = &'a connector::Handle>,
+    ) {
+        if self.color == ConnectorColor::Sdr {
+            self.color = super::hdr_output::read_back_color(fd, prop_mapping, connectors);
+        }
     }
 
     /// The state KMS reports for a CRTC. It owns no blob: requests only ever
     /// name the pending blob, so a state read back from KMS needs none.
     /// Creating one here leaked a blob on every `reset_state`.
-    fn read_back(mode: Mode, active: bool, vrr: bool, connectors: HashSet<connector::Handle>) -> Self {
+    fn read_back(
+        mode: Mode,
+        active: bool,
+        vrr: bool,
+        connectors: HashSet<connector::Handle>,
+        color: ConnectorColor,
+    ) -> Self {
         State {
             active,
             mode,
             blob: None,
             vrr,
             connectors,
+            color,
         }
     }
 
@@ -186,6 +216,7 @@ impl State {
             blob: Some(blob),
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            color: ConnectorColor::Sdr,
         }
     }
 
@@ -207,6 +238,7 @@ impl State {
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
+        self.color = ConnectorColor::Sdr;
     }
 }
 
@@ -246,6 +278,7 @@ impl AtomicDrmSurface {
         );
 
         let mut state = State::current_state(&*fd, crtc, &mut prop_mapping.write().unwrap())?;
+        state.note_inherited_color(&*fd, &prop_mapping.read().unwrap(), connectors);
         let request_storage = AtomicRequestWorkspace::new(&prop_mapping.read().unwrap(), crtc, planes);
         state.connectors.reserve(
             request_storage
@@ -888,6 +921,105 @@ impl AtomicDrmSurface {
         Ok(true)
     }
 
+    /// Whether KMS on this connector can signal HDR10: `HDR_OUTPUT_METADATA`, a
+    /// `Colorspace` with `BT2020_RGB`, and a `max bpc` that reaches 10. The panel
+    /// is the caller's to read from its EDID.
+    pub fn hdr_output_supported(&self, conn: connector::Handle) -> Result<bool, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        connector_can_signal_hdr(&self.fd, &self.prop_mapping.read().unwrap(), conn)
+    }
+
+    /// The HDR metadata the next commit carries, if any.
+    pub fn hdr_output_selected(&self) -> Option<HdrOutputMetadata> {
+        self.pending.read().unwrap().color.metadata()
+    }
+
+    /// Select HDR10 signalling for the next commit, or `None` to end it.
+    ///
+    /// Returns `None` when a connector cannot signal it or the kernel refuses the
+    /// `TEST_ONLY`, and both states stay as they were. Most drivers need a modeset
+    /// to enter or leave HDR, so unlike [`Self::use_vrr_seamless`] a selection may
+    /// need one; the returned value says so. Call this behind a drained pipeline:
+    /// the commit that carries it is a blocking one.
+    pub fn use_hdr_output(
+        &self,
+        metadata: Option<HdrOutputMetadata>,
+    ) -> Result<Option<HdrOutputSelection>, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        let current = self.state.read().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        if pending.color.metadata() == metadata {
+            return Ok(Some(HdrOutputSelection { seamless: true }));
+        }
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        let color = match metadata {
+            None => ConnectorColor::Sdr,
+            Some(metadata) => {
+                let already_in_hdr = current
+                    .color
+                    .restore_max_bpc()
+                    .or(pending.color.restore_max_bpc());
+                match hdr_state(
+                    &self.fd,
+                    &prop_mapping,
+                    &pending.connectors,
+                    metadata,
+                    already_in_hdr,
+                )? {
+                    Some(color) => color,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
+        let plane_config = PlaneState {
+            handle: self.plane,
+            config: Some(PlaneConfig {
+                src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
+                dst: Rectangle::from_size(
+                    (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
+                ),
+                transform: Transform::Normal,
+                alpha: 1.0,
+                damage_clips: None,
+                fb: test_buffer.fb,
+                fence: None,
+                cursor_hotspot: None,
+            }),
+        };
+        let mut req = AtomicRequest::build_request(
+            &prop_mapping,
+            self.crtc,
+            pending.mode_id(),
+            pending.vrr,
+            &pending.connectors,
+            &[],
+            [&plane_config],
+        )?;
+        req.set_connector_color(&connector_color_writes(
+            &current.color,
+            &color,
+            &pending.connectors,
+        ))?;
+        let seamless = req.commit(&*self.fd, AtomicCommitFlags::TEST_ONLY).is_ok();
+        if !seamless
+            && req
+                .commit(
+                    &*self.fd,
+                    AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+                )
+                .is_err()
+        {
+            return Ok(None);
+        }
+        pending.color = color;
+        Ok(Some(HdrOutputSelection { seamless }))
+    }
+
     /// Whether this device accepts `DRM_MODE_PAGE_FLIP_ASYNC` on an atomic
     /// commit. A kernel too old to know the capability answers no.
     pub fn atomic_async_flip_supported(&self) -> bool {
@@ -961,6 +1093,11 @@ impl AtomicDrmSurface {
             current.connectors.difference(&pending.connectors),
             planes,
         )?;
+        req.set_connector_color(&connector_color_writes(
+            &current.color,
+            &pending.color,
+            &pending.connectors,
+        ))?;
         let flags = if allow_modeset {
             AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY
         } else {
@@ -1017,6 +1154,11 @@ impl AtomicDrmSurface {
             current.connectors.difference(&pending.connectors),
             planes,
         )?;
+        req.set_connector_color(&connector_color_writes(
+            &current.color,
+            &pending.color,
+            &pending.connectors,
+        ))?;
         if let Err(err) = req.commit(
             &*self.fd,
             AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
@@ -1045,6 +1187,7 @@ impl AtomicDrmSurface {
             current.active = pending.active;
             current.mode = pending.mode;
             current.vrr = pending.vrr;
+            current.color.clone_from(&pending.color);
             current.blob.clone_from(&pending.blob);
             current.connectors.clear();
             current.connectors.extend(pending.connectors.iter().copied());
@@ -1197,6 +1340,12 @@ impl AtomicDrmSurface {
         for connector in current.connectors.iter() {
             req.reset_connector(*connector)?;
         }
+        // The next owner of this connector must not inherit HDR signalling.
+        req.set_connector_color(&connector_color_writes(
+            &current.color,
+            &ConnectorColor::Sdr,
+            &current.connectors,
+        ))?;
         req.reset_crtc(self.crtc)?;
         let result = req
             .commit(&*self.fd, AtomicCommitFlags::ALLOW_MODESET)
@@ -1230,6 +1379,12 @@ impl AtomicDrmSurface {
             let mapping = self.prop_mapping.read().unwrap();
             let mut workspace = self.request_storage.lock().unwrap();
             workspace.refresh_connectors(&mapping);
+            let pending = self.pending.read().unwrap();
+            if let Some(fd) = fd {
+                state.note_inherited_color(fd, &mapping, &pending.connectors);
+            } else {
+                state.note_inherited_color(&*self.fd, &mapping, &pending.connectors);
+            }
             workspace.connector_capacity()
         };
         state
@@ -1384,7 +1539,13 @@ mod mode_blob_ownership {
     /// The state `State::current_state` builds from KMS, through the same
     /// constructor.
     fn read_back(mode: Mode) -> State {
-        State::read_back(mode, true, false, HashSet::new())
+        State::read_back(
+            mode,
+            true,
+            false,
+            HashSet::new(),
+            super::super::hdr_output::ConnectorColor::Sdr,
+        )
     }
 
     /// `commit` after the kernel accepted the request.

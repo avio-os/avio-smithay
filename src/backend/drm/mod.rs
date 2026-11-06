@@ -99,8 +99,8 @@ use indexmap::IndexSet;
 #[cfg(feature = "backend_gbm")]
 pub use surface::gbm::{Error as GbmBufferedSurfaceError, GbmBufferedSurface};
 pub use surface::{
-    conservative_damage_clip_unions, live_mode_blobs, DrmSurface, PlaneConfig, PlaneDamageClips, PlaneState,
-    VrrSupport,
+    connector_can_signal_hdr10, conservative_damage_clip_unions, live_mode_blobs, DrmSurface,
+    HdrOutputMetadata, HdrOutputSelection, PlaneConfig, PlaneDamageClips, PlaneState, VrrSupport,
 };
 
 use drm::{

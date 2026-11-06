@@ -1,4 +1,5 @@
 //! One checked native request encoder for cold configuration and warm submission.
+use super::super::hdr_output::ConnectorColorWrite;
 use super::super::PlaneState;
 use super::{to_fixed, DrmRotation};
 use crate::backend::drm::{device::atomic::PropMapping, error::Error, Planes};
@@ -19,7 +20,7 @@ fn raw_handle<H: ResourceHandle>(handle: H) -> u32 {
     handle.get()
 }
 const CRTC_PROPERTIES: &[&str] = &["ACTIVE", "MODE_ID", "VRR_ENABLED", "OUT_FENCE_PTR"];
-const CONNECTOR_PROPERTIES: &[&str] = &["CRTC_ID"];
+const CONNECTOR_PROPERTIES: &[&str] = &["CRTC_ID", "Colorspace", "HDR_OUTPUT_METADATA", "max bpc"];
 const PLANE_PROPERTIES: &[&str] = &[
     "CRTC_ID",
     "FB_ID",
@@ -189,6 +190,33 @@ impl<'a> AtomicRequest<'a> {
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(Some(crtc)),
         )?;
+        Ok(())
+    }
+
+    /// Carry a connector color change. Empty on every ordinary commit. A connector
+    /// without a property keeps its default, which is what SDR asks of it.
+    pub(super) fn set_connector_color(&mut self, writes: &[ConnectorColorWrite]) -> Result<(), Error> {
+        for write in writes {
+            if let Ok(prop) = self.mapping.conn_prop_handle(write.connector, "Colorspace") {
+                self.add_property(
+                    write.connector,
+                    prop,
+                    property::Value::UnsignedRange(write.colorspace),
+                )?;
+            }
+            if let Ok(prop) = self
+                .mapping
+                .conn_prop_handle(write.connector, "HDR_OUTPUT_METADATA")
+            {
+                self.add_property(write.connector, prop, property::Value::Blob(write.metadata_blob))?;
+            }
+            if let (Ok(prop), Some(bpc)) = (
+                self.mapping.conn_prop_handle(write.connector, "max bpc"),
+                write.max_bpc,
+            ) {
+                self.add_property(write.connector, prop, property::Value::UnsignedRange(bpc))?;
+            }
+        }
         Ok(())
     }
 

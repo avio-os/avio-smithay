@@ -38,8 +38,10 @@ pub struct DrmSurface {
 }
 
 mod blob_actor;
+mod hdr_output;
 mod plane_damage;
 mod prepared_mode;
+pub use hdr_output::{connector_can_signal_hdr10, HdrOutputMetadata, HdrOutputSelection};
 pub(crate) use plane_damage::PlaneDamageClipBank;
 pub use plane_damage::{conservative_damage_clip_unions, PlaneDamageClips};
 pub use prepared_mode::PreparedSurfaceMode;
@@ -282,6 +284,39 @@ impl DrmSurface {
         match &*self.internal {
             DrmSurfaceInternal::Atomic(surf) => surf.use_vrr_seamless(vrr),
             DrmSurfaceInternal::Legacy(_) => Ok(!vrr),
+        }
+    }
+
+    /// Whether KMS on this connector can signal HDR10. See
+    /// [`AtomicDrmSurface::hdr_output_supported`](atomic::AtomicDrmSurface::hdr_output_supported).
+    ///
+    /// The legacy API has no such property, so it never can.
+    pub fn hdr_output_supported(&self, conn: connector::Handle) -> Result<bool, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.hdr_output_supported(conn),
+            DrmSurfaceInternal::Legacy(_) => Ok(false),
+        }
+    }
+
+    /// The HDR metadata the next commit carries, if any.
+    pub fn hdr_output_selected(&self) -> Option<HdrOutputMetadata> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.hdr_output_selected(),
+            DrmSurfaceInternal::Legacy(_) => None,
+        }
+    }
+
+    /// Select HDR10 signalling for the next commit, or `None` to end it. See
+    /// [`AtomicDrmSurface::use_hdr_output`](atomic::AtomicDrmSurface::use_hdr_output).
+    pub fn use_hdr_output(
+        &self,
+        metadata: Option<HdrOutputMetadata>,
+    ) -> Result<Option<HdrOutputSelection>, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.use_hdr_output(metadata),
+            DrmSurfaceInternal::Legacy(_) => Ok(metadata
+                .is_none()
+                .then_some(HdrOutputSelection { seamless: true })),
         }
     }
 

@@ -4484,6 +4484,30 @@ where
         self.surface.use_vrr_seamless(vrr).map_err(FrameError::DrmError)
     }
 
+    /// Whether KMS on this connector can signal HDR10.
+    pub fn hdr_output_supported(&self, conn: connector::Handle) -> FrameResult<bool, A, F> {
+        self.surface
+            .hdr_output_supported(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// The HDR metadata the next commit carries, if any.
+    pub fn hdr_output_selected(&self) -> Option<crate::backend::drm::HdrOutputMetadata> {
+        self.surface.hdr_output_selected()
+    }
+
+    /// Select HDR10 signalling for the next commit, or `None` to end it. The
+    /// caller drains the pipeline first and forces the commit that carries it
+    /// with [`Self::require_next_commit`].
+    pub fn use_hdr_output(
+        &mut self,
+        metadata: Option<crate::backend::drm::HdrOutputMetadata>,
+    ) -> FrameResult<Option<crate::backend::drm::HdrOutputSelection>, A, F> {
+        self.surface
+            .use_hdr_output(metadata)
+            .map_err(FrameError::DrmError)
+    }
+
     /// Set the [`DebugFlags`] to use
     ///
     /// Note: This will reset the primary plane swapchain if
