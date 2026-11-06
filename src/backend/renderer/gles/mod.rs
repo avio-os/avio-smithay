@@ -595,6 +595,7 @@ pub struct GlesFrame<'frame, 'buffer> {
     owner_sample_replay: Option<composition::OwnerSampleReplay>,
     resolved_sample_texture: bool,
     composition_target: Option<(u32, GlesTexture)>,
+    source_color: Option<super::SourceColor>,
 
     span: EnteredSpan,
 
@@ -2724,6 +2725,7 @@ impl Renderer for GlesRenderer {
             owner_sample_replay: None,
             resolved_sample_texture: false,
             composition_target: None,
+            source_color: None,
 
             span,
 
@@ -2835,6 +2837,10 @@ static OUTPUT_VERTS: [ffi::types::GLfloat; 8] = [
 ];
 
 impl Frame for GlesFrame<'_, '_> {
+    fn set_source_color(&mut self, color: Option<super::SourceColor>) {
+        self.source_color = color;
+    }
+
     type Error = GlesError;
     type TextureId = GlesTexture;
 
@@ -2936,6 +2942,13 @@ impl Frame for GlesFrame<'_, '_> {
                 None,
                 None,
             );
+        }
+        // The conversion lives in the composition program alone. Showing these
+        // texels without it would be wrong color with no error anywhere.
+        if self.source_color.is_some() {
+            return Err(GlesError::Composition(
+                "a color-managed draw needs the composition programs",
+            ));
         }
         self.render_texture_from_to(
             texture,

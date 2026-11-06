@@ -34,6 +34,12 @@ but makes every future diff unreviewable against the committed history.
 The renderer blends in encoded sRGB (`VulkanRenderer::BLEND_SPACE`). Colour
 attachments are viewed through their UNORM storage format, and every sampled
 texel is already the encoded premultiplied value SourceOver expects, so neither
-`texture.frag` nor `kawase.frag` converts colour: the blur and its CSS filters
-work on stored values, as CSS `backdrop-filter` does. See
+`kawase.frag` nor an ordinary `texture.frag` draw converts colour: the blur and
+its CSS filters work on stored values, as CSS `backdrop-filter` does. See
 `docs/rendering-plan.md` in the Avio repo for the full contract.
+
+The one conversion is explicit and per draw. A client that declared another
+encoding through `wp_color_management_v1` draws under `Frame::set_source_color`,
+and `source_to_encoded_srgb` hands the blend encoded sRGB. Without that call no
+transfer function runs, so every other surface keeps its exact bytes. The GLES
+route compiles this same source.

@@ -259,6 +259,10 @@ impl Renderer for GlowRenderer {
 }
 
 impl Frame for GlowFrame<'_, '_> {
+    fn set_source_color(&mut self, color: Option<super::SourceColor>) {
+        Frame::set_source_color(self.frame.as_mut().unwrap(), color);
+    }
+
     type Error = GlesError;
     type TextureId = GlesTexture;
 

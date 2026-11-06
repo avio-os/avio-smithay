@@ -17,6 +17,8 @@ layout(push_constant) uniform TexturePushConstants {
     float outer_radius;
     vec2 outer_origin;
     vec2 outer_size;
+    float source_reference;
+    float source_peak;
 } constants;
 
 const uint BOTTOM_EDGE_CLIP_FLAG = 0x80000000u;
@@ -27,7 +29,8 @@ const uint CLIP_TRANSFORM_SHIFT = 8u;
 // texel - a client or shell buffer premultiplied in electrical values, or one of
 // the compositor's own offscreens filled the same way - already is the
 // encoded premultiplied value SourceOver expects. No texel is converted here,
-// so an opaque 1:1 composite stores exactly its source bytes.
+// so an opaque 1:1 composite stores exactly its source bytes. The one exception is
+// a client that declared another encoding: see source_to_encoded_srgb.
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
@@ -444,6 +447,97 @@ vec4 material_tone(vec2 frag_pos) {
     return result;
 }
 
+const uint SOURCE_TRANSFER_SHIFT = 16u;
+const uint SOURCE_PRIMARIES_SHIFT = 20u;
+
+// Columns of each linear conversion to BT.709, both with a D65 white.
+const mat3 SOURCE_BT2020_TO_BT709 = mat3(
+    1.6604910, -0.1245505, -0.0181508,
+    -0.5876411, 1.1328999, -0.1005789,
+    -0.0728499, -0.0083494, 1.1187297
+);
+const mat3 SOURCE_P3_TO_BT709 = mat3(
+    1.2249402, -0.0420570, -0.0196376,
+    -0.2249402, 1.0420570, -0.0786361,
+    0.0, 0.0, 1.0982737
+);
+
+float source_pq_to_nits(float signal) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float power = pow(signal, 1.0 / m2);
+    return 10000.0 * pow(max(power - c1, 0.0) / (c2 - c3 * power), 1.0 / m1);
+}
+
+float source_hlg_to_scene(float signal) {
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    return signal <= 0.5 ? signal * signal / 3.0 : (exp((signal - c) / a) + b) / 12.0;
+}
+
+// Light where 1.0 is the source's reference white.
+vec3 source_to_reference_light(vec3 signal, uint transfer) {
+    if (transfer == 1u) {
+        vec3 high = pow((signal + vec3(0.055)) / 1.055, vec3(2.4));
+        return mix(high, signal / 12.92, lessThanEqual(signal, vec3(0.04045)));
+    }
+    if (transfer == 2u) {
+        return pow(signal, vec3(2.2));
+    }
+    if (transfer == 3u) {
+        return pow(signal, vec3(2.4));
+    }
+    if (transfer == 4u) {
+        return vec3(source_pq_to_nits(signal.r), source_pq_to_nits(signal.g),
+                    source_pq_to_nits(signal.b)) / constants.source_reference;
+    }
+    // The HLG OOTF for its nominal 1000 cd/m² display, gamma 1.2.
+    vec3 scene = vec3(source_hlg_to_scene(signal.r), source_hlg_to_scene(signal.g),
+                      source_hlg_to_scene(signal.b));
+    float luma = dot(scene, vec3(0.2627, 0.6780, 0.0593));
+    return scene * pow(max(luma, 0.000001), 0.2) * 1000.0 / constants.source_reference;
+}
+
+// Everything below the knee keeps its light. Above it, an extended Reinhard
+// curve meets the knee's slope and brings the source's peak to exactly white.
+vec3 source_tone_map(vec3 light) {
+    const float knee = 0.75;
+    float peak = max(light.r, max(light.g, light.b));
+    if (constants.source_peak <= 1.0 || peak <= knee) {
+        return light;
+    }
+    float over = (peak - knee) / (1.0 - knee);
+    float span = (constants.source_peak - knee) / (1.0 - knee);
+    float mapped = knee + (1.0 - knee) * over * (1.0 + over / (span * span)) / (1.0 + over);
+    return light * (mapped / peak);
+}
+
+// A surface with a wp_color_management_v1 description: decode its electrical
+// values, map them into BT.709 and the SDR range, and hand the blend the encoded
+// sRGB premultiplied value it expects. Filtering already happened on the source's
+// stored values, as it does for every other texel.
+vec4 source_to_encoded_srgb(vec4 texel, uint transfer) {
+    if (texel.a <= 0.0) {
+        return texel;
+    }
+    vec3 signal = clamp(texel.rgb / texel.a, vec3(0.0), vec3(1.0));
+    vec3 light = source_to_reference_light(signal, transfer);
+    uint primaries = (constants.rounded_clip_flags >> SOURCE_PRIMARIES_SHIFT) & 0x3u;
+    if (primaries == 1u) {
+        light = SOURCE_BT2020_TO_BT709 * light;
+    } else if (primaries == 2u) {
+        light = SOURCE_P3_TO_BT709 * light;
+    }
+    light = clamp(source_tone_map(max(light, vec3(0.0))), vec3(0.0), vec3(1.0));
+    vec3 high = 1.055 * pow(light, vec3(1.0 / 2.4)) - vec3(0.055);
+    vec3 encoded = mix(high, light * 12.92, lessThanEqual(light, vec3(0.0031308)));
+    return vec4(encoded * texel.a, texel.a);
+}
+
 bool outer_rounded_contains(vec2 point) {
     vec2 local = point - constants.outer_origin;
     vec2 extent = constants.outer_size;
@@ -506,6 +600,10 @@ void main() {
                    texture(texture_sampler, uv + stride)) * 0.25;
     } else {
         sampled = texture(texture_sampler, uv);
+        uint source_transfer = (constants.rounded_clip_flags >> SOURCE_TRANSFER_SHIFT) & 0x7u;
+        if (source_transfer != 0u) {
+            sampled = source_to_encoded_srgb(sampled, source_transfer);
+        }
     }
     float coverage = joint_owner_coverage(gl_FragCoord.xy);
     if ((constants.rounded_clip_flags & 0x40000000u) != 0u) {

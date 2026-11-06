@@ -11,7 +11,7 @@ use crate::{
         },
         renderer::{
             sync::SyncPoint, Bind, Blit, BlitFrame, BottomEdgeClip, Color32F, ContextId, Frame, ImportDma,
-            RenderTargetAccess, Renderer, RendererSuper, RoundedClip, Texture, TextureFilter,
+            RenderTargetAccess, Renderer, RendererSuper, RoundedClip, SourceColor, Texture, TextureFilter,
             TextureRenderEffect,
         },
     },
@@ -97,6 +97,7 @@ pub struct VulkanFrame<'frame> {
     owner_sample_replay: Option<OwnerSampleReplay>,
     resolved_sample_texture: bool,
     submitted_segment: bool,
+    source_color: Option<SourceColor>,
 }
 
 impl RendererSuper for VulkanRenderer {
@@ -220,6 +221,7 @@ impl Renderer for VulkanRenderer {
             outer_rounded_clip: None,
             owner_sample_replay: None,
             resolved_sample_texture: false,
+            source_color: None,
             recording: Some(FrameRecording {
                 command_buffer,
                 framebuffer,
@@ -325,6 +327,10 @@ impl ImportDma for VulkanRenderer {
 impl ImportDmaWl for VulkanRenderer {}
 
 impl Frame for VulkanFrame<'_> {
+    fn set_source_color(&mut self, color: Option<SourceColor>) {
+        self.source_color = color;
+    }
+
     type Error = VulkanRendererError;
     type TextureId = VulkanTexture;
 
@@ -1343,6 +1349,9 @@ impl VulkanFrame<'_> {
         if self.owner_sample_replay.is_some() {
             push_constants.rounded_clip_flags |= 1 << 30;
         }
+        if let Some(color) = self.source_color.filter(|_| material_operation.is_none()) {
+            push_constants = push_constants.with_source_color(color);
+        }
         let sampler = if matches!(
             material_operation,
             Some(MaterialTextureOperation::OwnerResolve(_))
@@ -2117,6 +2126,7 @@ mod tests {
     include!("frame/owner_group_tests.rs");
     include!("frame/blend_space_tests.rs");
     include!("frame/clip_coverage_tests.rs");
+    include!("frame/source_color_tests.rs");
     use super::{
         combine_image_transform, framebuffer_rect, texture_sampler_for_render, transform_analytic_clip,
         AnalyticClip, TextureSampler, TextureTransform, TransformedAnalyticClip, VulkanFrame, VulkanRenderer,

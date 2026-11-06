@@ -87,7 +87,13 @@ pub(crate) struct TexturePushConstants {
     // 128-byte Vulkan push-constant allowance.
     pub(crate) outer_origin: [f32; 2],
     pub(crate) outer_size: [f32; 2],
+    /// The source's reference white in cd/m², for a color-managed draw.
+    pub(crate) source_reference: f32,
+    /// The source's peak relative to that white, for a color-managed draw.
+    pub(crate) source_peak: f32,
 }
+
+const _: () = assert!(std::mem::size_of::<TexturePushConstants>() == 128);
 
 const BOTTOM_EDGE_CLIP_FLAG: u32 = 1 << 31;
 const CLIP_TRANSFORM_SHIFT: u32 = 8;
@@ -109,11 +115,21 @@ impl Default for TexturePushConstants {
             outer_radius: -1.0,
             outer_origin: [0.0; 2],
             outer_size: [0.0; 2],
+            source_reference: 1.0,
+            source_peak: 1.0,
         }
     }
 }
 
 impl TexturePushConstants {
+    /// Applied last: a clip replaces the flag word it shares.
+    pub(crate) fn with_source_color(mut self, color: crate::backend::renderer::SourceColor) -> Self {
+        self.rounded_clip_flags |= color.shader_flags();
+        self.source_reference = color.reference_luminance;
+        self.source_peak = color.relative_peak();
+        self
+    }
+
     pub(crate) fn new(alpha: f32, transform: TextureTransform, y_inverted: bool) -> Self {
         Self {
             alpha,
@@ -787,7 +803,7 @@ mod tests {
         assert_eq!(constants.outer_origin, [3.0, 5.0]);
         assert_eq!(constants.outer_size, [200.0, 112.0]);
         assert_eq!(constants.outer_radius, 9.0);
-        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 120);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 128);
     }
 
     #[test]
@@ -823,13 +839,15 @@ mod tests {
 
     #[test]
     fn texture_push_constant_layout_matches_the_shader_block() {
-        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 120);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 128);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, alpha), 0);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_rect), 32);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, clip_scale), 96);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, outer_radius), 100);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, outer_origin), 104);
         assert_eq!(std::mem::offset_of!(TexturePushConstants, outer_size), 112);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, source_reference), 120);
+        assert_eq!(std::mem::offset_of!(TexturePushConstants, source_peak), 124);
     }
 
     #[derive(Debug)]
@@ -1620,6 +1638,6 @@ mod tests {
         let constants = TexturePushConstants::default().with_kawase_output(output, (128, 128).into());
         assert_eq!(constants.effect, [4.0, 1.5, 0.6, 1.2]);
         assert_eq!(constants.effect_params, [0.8, 101.0 / 128.0, 77.0 / 128.0, 0.0]);
-        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 120);
+        assert_eq!(std::mem::size_of::<TexturePushConstants>(), 128);
     }
 }

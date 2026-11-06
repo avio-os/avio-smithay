@@ -1154,6 +1154,9 @@ impl GlesFrame<'_, '_> {
         if self.owner_sample_replay.is_some() {
             constants.rounded_clip_flags |= 1 << 30;
         }
+        if let Some(color) = self.source_color.filter(|_| operation.is_none()) {
+            constants = constants.with_source_color(color);
+        }
         self.bind_composition_target()?;
         let nearest = self.resolved_sample_texture
             || matches!(operation, Some(MaterialOperation::OwnerResolve(_)))

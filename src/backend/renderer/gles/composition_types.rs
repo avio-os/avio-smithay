@@ -53,7 +53,10 @@ pub(crate) struct TexturePushConstants {
     // 128-byte Vulkan push-constant allowance.
     pub(crate) outer_origin: [f32; 2],
     pub(crate) outer_size: [f32; 2],
-    _std140_padding: [u32; 2],
+    /// The source's reference white in cd/m², for a color-managed draw.
+    pub(crate) source_reference: f32,
+    /// The source's peak relative to that white, for a color-managed draw.
+    pub(crate) source_peak: f32,
 }
 
 const BOTTOM_EDGE_CLIP_FLAG: u32 = 1 << 31;
@@ -76,12 +79,21 @@ impl Default for TexturePushConstants {
             outer_origin: [0.0; 2],
             outer_size: [0.0; 2],
             outer_radius: -1.0,
-            _std140_padding: [0; 2],
+            source_reference: 1.0,
+            source_peak: 1.0,
         }
     }
 }
 
 impl TexturePushConstants {
+    /// Applied last: a clip replaces the flag word it shares.
+    pub(crate) fn with_source_color(mut self, color: crate::backend::renderer::SourceColor) -> Self {
+        self.rounded_clip_flags |= color.shader_flags();
+        self.source_reference = color.reference_luminance;
+        self.source_peak = color.relative_peak();
+        self
+    }
+
     pub(crate) fn new(alpha: f32, transform: TextureTransform, y_inverted: bool) -> Self {
         Self {
             alpha,

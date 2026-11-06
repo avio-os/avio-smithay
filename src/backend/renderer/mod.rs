@@ -39,7 +39,7 @@ pub mod pixman;
 pub mod vulkan;
 
 mod color;
-pub use color::Color32F;
+pub use color::{Color32F, SourceColor, SourcePrimaries, SourceTransfer};
 
 mod staged_cpu;
 pub use staged_cpu::MemoryUploadCpuCompletion;
@@ -609,6 +609,13 @@ pub trait Frame {
             rounded_clip,
         )
     }
+
+    /// Declare how the next texture draws' texels are encoded, until this is
+    /// called again. `None`, the default, is encoded sRGB, which blends as it is.
+    ///
+    /// A renderer that composes client content implements this. The default
+    /// ignores it, which fits the ones that never see a color-managed client.
+    fn set_source_color(&mut self, _color: Option<SourceColor>) {}
 
     /// Output transformation that is applied to this frame
     fn transformation(&self) -> Transform;
