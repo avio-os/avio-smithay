@@ -95,6 +95,9 @@ where
     pub(super) cursor_size: Size<u32, Buffer>,
     pub(super) native_black_enabled: bool,
     pub(super) output_layer_enabled: bool,
+    /// Leave the CRTC's current frame until the caller's first frame. See
+    /// [`DrmOutputInitializer::keep_current_frame`].
+    pub(super) keep_current_frame: bool,
     pub(super) reservation: OutputReservation,
 }
 
@@ -124,7 +127,26 @@ where
     G: AsFd + Clone + 'static,
     U: 'static,
 {
-    /// Initialize and render the first frame on the renderer's owning thread.
+    /// Leave whatever the CRTC shows until the caller's own first frame.
+    ///
+    /// By default initialization renders and commits `render_elements` once on the new
+    /// output, to lock its primary plane into the chosen format before other outputs commit
+    /// overlays. A display server that took over a frame it must not cover, such as a boot
+    /// splash held until the first complete frame, makes that first commit itself: the mode
+    /// set then goes to KMS together with real content in one commit. A failed CRTC still
+    /// retries other outputs with `render_elements`, as without this.
+    pub fn keep_current_frame(mut self) -> Self {
+        self.keep_current_frame = true;
+        self
+    }
+
+    /// Whether [`Self::keep_current_frame`] was asked for.
+    pub fn keeps_current_frame(&self) -> bool {
+        self.keep_current_frame
+    }
+
+    /// Initialize and, unless [`Self::keep_current_frame`] was asked for, render and commit
+    /// the first frame on the renderer's owning thread.
     ///
     /// This takes the device-wide compositor lock only for initialization,
     /// preserving bandwidth fallbacks and native-black admission. The caller
@@ -327,9 +349,11 @@ where
 
         let compositor = compositors.get_mut(&crtc).unwrap();
         let compositor = compositor.get_mut().unwrap();
-        if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
-            compositors.remove(&crtc);
-            return Err(err);
+        if !self.keep_current_frame {
+            if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
+                compositors.remove(&crtc);
+                return Err(err);
+            }
         }
 
         if self.native_black_enabled {

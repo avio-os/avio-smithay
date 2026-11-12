@@ -373,6 +373,7 @@ where
             cursor_size: self.device.cursor_size(),
             native_black_enabled: self.native_black_enabled,
             output_layer_enabled: self.output_layer_enabled,
+            keep_current_frame: false,
             reservation,
         })
     }
