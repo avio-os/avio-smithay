@@ -3758,6 +3758,13 @@ where
         Ok(frame_reference)
     }
 
+    /// Drop the frame `render_frame` prepared without queueing or committing it, as the next
+    /// `render_frame` would. Its slots go back to the swapchain unsubmitted, so they keep age
+    /// zero and the next frame redraws them in full. Nothing reaches KMS.
+    pub(crate) fn discard_prepared_frame(&mut self) {
+        self.next_frame = None;
+    }
+
     /// Queues the current frame for scan-out.
     ///
     /// If `render_frame` has not been called prior to this function or returned no damage

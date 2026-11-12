@@ -1091,15 +1091,45 @@ where
         G: AsFd + std::clone::Clone + 'static,
         U: 'static,
     {
+        self.composite_frame(compositor, renderer, initializer::FrameCompletion::Commit)
+    }
+
+    /// Render this output's elements once, then end the frame as `completion` says.
+    fn composite_frame<A, F, U, G>(
+        &self,
+        compositor: &mut DrmCompositor<A, F, U, G>,
+        renderer: &mut R,
+        completion: initializer::FrameCompletion,
+    ) -> DrmOutputManagerResult<(), A, F, R>
+    where
+        A: Allocator + std::clone::Clone + std::fmt::Debug,
+        <A as Allocator>::Buffer: AsDmabuf,
+        <A as Allocator>::Error: Send + Sync + 'static,
+        <<A as crate::backend::allocator::Allocator>::Buffer as AsDmabuf>::Error:
+            std::marker::Send + std::marker::Sync + 'static,
+        F: ExportFramebuffer<<A as Allocator>::Buffer> + std::clone::Clone,
+        <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Framebuffer:
+            std::fmt::Debug + Send + Sync + 'static,
+        <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Error:
+            std::marker::Send + std::marker::Sync + 'static,
+        G: AsFd + std::clone::Clone + 'static,
+        U: 'static,
+    {
         let (elements, clear_color) = self
             .render_elements
             .get(&compositor.crtc())
             .map(|(ref elements, ref color)| (&**elements, color))
             .unwrap_or((&[], &Color32F::BLACK));
-        compositor
-            .render_frame(renderer, elements, *clear_color, FrameFlags::empty())
-            .map_err(DrmOutputManagerError::RenderFrame)?;
-        compositor.commit_frame().map_err(DrmOutputManagerError::Frame)?;
-        Ok(())
+        completion.complete(
+            compositor,
+            |compositor| {
+                compositor
+                    .render_frame(renderer, elements, *clear_color, FrameFlags::empty())
+                    .map(|_| ())
+                    .map_err(DrmOutputManagerError::RenderFrame)
+            },
+            |compositor| compositor.commit_frame().map_err(DrmOutputManagerError::Frame),
+            DrmCompositor::discard_prepared_frame,
+        )
     }
 }

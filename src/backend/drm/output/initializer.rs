@@ -67,6 +67,38 @@ impl Drop for OutputReservation {
     }
 }
 
+/// How a composited frame that initialization renders ends.
+///
+/// Either way it is rendered once, on the caller's cold initialization turn. A renderer that
+/// prepares a target the first time it binds one does so there, which an output whose first
+/// frame is the caller's own still needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrameCompletion {
+    /// Commit the frame, with any pending mode set, to KMS.
+    Commit,
+    /// Drop the frame unqueued: the CRTC keeps showing what it showed.
+    Discard,
+}
+
+impl FrameCompletion {
+    pub(super) fn complete<C, Error>(
+        self,
+        compositor: &mut C,
+        render: impl FnOnce(&mut C) -> Result<(), Error>,
+        commit: impl FnOnce(&mut C) -> Result<(), Error>,
+        discard: impl FnOnce(&mut C),
+    ) -> Result<(), Error> {
+        render(compositor)?;
+        match self {
+            Self::Commit => commit(compositor),
+            Self::Discard => {
+                discard(compositor);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// An owning cold-start handoff for a DRM output.
 ///
 /// Preparation does not retain a manager lock or a renderer. Initialize it on
@@ -133,8 +165,13 @@ where
     /// output, to lock its primary plane into the chosen format before other outputs commit
     /// overlays. A display server that took over a frame it must not cover, such as a boot
     /// splash held until the first complete frame, makes that first commit itself: the mode
-    /// set then goes to KMS together with real content in one commit. A failed CRTC still
-    /// retries other outputs with `render_elements`, as without this.
+    /// set then goes to KMS together with real content in one commit.
+    ///
+    /// The frame is still rendered, into the swapchain slot the compositor allocated to test
+    /// its format, and then dropped unqueued. A renderer that may prepare a target only on its
+    /// cold initialization turn has that slot prepared for the caller's first frame, and the
+    /// slot keeps age zero, so that frame redraws it in full. A failed CRTC still retries other
+    /// outputs with `render_elements`, as without this.
     pub fn keep_current_frame(mut self) -> Self {
         self.keep_current_frame = true;
         self
@@ -145,8 +182,8 @@ where
         self.keep_current_frame
     }
 
-    /// Initialize and, unless [`Self::keep_current_frame`] was asked for, render and commit
-    /// the first frame on the renderer's owning thread.
+    /// Initialize and render the first frame on the renderer's owning thread, committing it
+    /// unless [`Self::keep_current_frame`] was asked for.
     ///
     /// This takes the device-wide compositor lock only for initialization,
     /// preserving bandwidth fallbacks and native-black admission. The caller
@@ -346,14 +383,19 @@ where
 
         // We need to render the new output once to lock in the primary plane as used with the new format, so we don't hit the bandwidth issue,
         // when downstream potentially uses `FrameFlags::DEFAULT` immediately after this.
+        // A kept frame is rendered as well, which prepares the caller's first target, but
+        // never committed.
 
         let compositor = compositors.get_mut(&crtc).unwrap();
         let compositor = compositor.get_mut().unwrap();
-        if !self.keep_current_frame {
-            if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
-                compositors.remove(&crtc);
-                return Err(err);
-            }
+        let completion = if self.keep_current_frame {
+            FrameCompletion::Discard
+        } else {
+            FrameCompletion::Commit
+        };
+        if let Err(err) = render_elements.composite_frame(&mut *compositor, renderer, completion) {
+            compositors.remove(&crtc);
+            return Err(err);
         }
 
         if self.native_black_enabled {
@@ -391,6 +433,53 @@ mod tests {
         assert!(pending.lock().unwrap().contains(&crtc));
         drop(retry);
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    fn completed(completion: FrameCompletion, render_fails: bool) -> (Result<(), ()>, Vec<&'static str>) {
+        let mut calls = Vec::new();
+        let result = completion.complete(
+            &mut calls,
+            |calls| {
+                calls.push("render");
+                if render_fails {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            },
+            |calls| {
+                calls.push("commit");
+                Ok(())
+            },
+            |calls| calls.push("discard"),
+        );
+        (result, calls)
+    }
+
+    #[test]
+    fn a_kept_frame_is_rendered_on_the_cold_turn_but_never_committed() {
+        // Skipping the render as well left the slot the compositor allocated unprepared, and the
+        // caller's first frame then failed to bind it (Avio WP-15, 2026-11-12).
+        assert_eq!(
+            completed(FrameCompletion::Discard, false),
+            (Ok(()), vec!["render", "discard"])
+        );
+        assert_eq!(
+            completed(FrameCompletion::Commit, false),
+            (Ok(()), vec!["render", "commit"])
+        );
+    }
+
+    #[test]
+    fn a_failed_render_ends_the_frame_with_neither_commit_nor_discard() {
+        assert_eq!(
+            completed(FrameCompletion::Discard, true),
+            (Err(()), vec!["render"])
+        );
+        assert_eq!(
+            completed(FrameCompletion::Commit, true),
+            (Err(()), vec!["render"])
+        );
     }
 
     #[test]
