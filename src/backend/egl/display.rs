@@ -956,6 +956,7 @@ fn get_dmabuf_formats(
             }
         };
 
+        let mut layouts = Vec::new();
         if num != 0 {
             let mut mods: Vec<u64> = Vec::with_capacity(num as usize);
             let mut external: Vec<ffi::egl::types::EGLBoolean> = Vec::with_capacity(num as usize);
@@ -976,26 +977,14 @@ fn get_dmabuf_formats(
                 external.set_len(num as usize);
             }
 
-            for (modifier, external_only) in mods.into_iter().zip(external.into_iter()) {
-                let format = DrmFormat {
-                    code: fourcc,
-                    modifier: Modifier::from(modifier),
-                };
-                texture_formats.insert(format);
-                if external_only == 0 {
-                    render_formats.insert(format);
-                }
-            }
+            layouts.extend(
+                mods.into_iter()
+                    .zip(external)
+                    .map(|(modifier, external_only)| (Modifier::from(modifier), external_only != 0)),
+            );
         }
 
-        texture_formats.insert(DrmFormat {
-            code: fourcc,
-            modifier: Modifier::Invalid,
-        });
-        render_formats.insert(DrmFormat {
-            code: fourcc,
-            modifier: Modifier::Invalid,
-        });
+        insert_format_layouts(fourcc, &layouts, &mut texture_formats, &mut render_formats);
     }
 
     trace!("Supported dmabuf import formats: {:?}", texture_formats);
@@ -1005,6 +994,45 @@ fn get_dmabuf_formats(
         FormatSet::from_formats(texture_formats),
         FormatSet::from_formats(render_formats),
     ))
+}
+
+/// Adds what one format can be imported and rendered as, given the explicit
+/// layouts the driver listed for it (modifier, external only).
+///
+/// The implicit layout is always offered. A driver that lists no explicit
+/// layout for a format (virgl lists none for any format; NVIDIA's proprietary
+/// driver refuses the query for some) still imports a buffer that names the
+/// linear layout, so linear is offered too, as wlroots does ("render/egl: always
+/// add LINEAR to supported modifiers", 2021). Chromium and Electron allocate
+/// such a buffer without a modifier, read back linear from GBM and send it
+/// named linear; a compositor offering only the implicit layout then has to end
+/// their connection.
+fn insert_format_layouts(
+    fourcc: Fourcc,
+    layouts: &[(Modifier, bool)],
+    texture_formats: &mut IndexSet<DrmFormat>,
+    render_formats: &mut IndexSet<DrmFormat>,
+) {
+    for &(modifier, external_only) in layouts {
+        let format = DrmFormat {
+            code: fourcc,
+            modifier,
+        };
+        texture_formats.insert(format);
+        if !external_only {
+            render_formats.insert(format);
+        }
+    }
+    let implicit = std::iter::once(Modifier::Invalid);
+    let linear = layouts.is_empty().then_some(Modifier::Linear);
+    for modifier in implicit.chain(linear) {
+        let format = DrmFormat {
+            code: fourcc,
+            modifier,
+        };
+        texture_formats.insert(format);
+        render_formats.insert(format);
+    }
 }
 
 /// Type to receive [`EGLBuffer`] for EGL-based [`WlBuffer`]s.
@@ -1273,5 +1301,59 @@ impl DamageSupport {
     /// Returns true, if any valid combination of required extensions was found.
     pub fn supported(&self) -> bool {
         self != &DamageSupport::No
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexSet;
+
+    use super::{insert_format_layouts, DrmFormat, Fourcc, Modifier};
+
+    fn layouts(layouts: &[(Modifier, bool)]) -> (IndexSet<DrmFormat>, IndexSet<DrmFormat>) {
+        let (mut texture, mut render) = (IndexSet::new(), IndexSet::new());
+        insert_format_layouts(Fourcc::Abgr8888, layouts, &mut texture, &mut render);
+        (texture, render)
+    }
+
+    fn format(modifier: Modifier) -> DrmFormat {
+        DrmFormat {
+            code: Fourcc::Abgr8888,
+            modifier,
+        }
+    }
+
+    #[test]
+    fn a_format_without_listed_layouts_offers_implicit_and_linear() {
+        let (texture, render) = layouts(&[]);
+        let expected: IndexSet<_> = [format(Modifier::Invalid), format(Modifier::Linear)].into();
+        assert_eq!(texture, expected);
+        assert_eq!(render, expected);
+    }
+
+    #[test]
+    fn listed_layouts_are_offered_as_listed_with_implicit_beside_them() {
+        let tiled = Modifier::from(0x0100_0000_0000_0001);
+        let (texture, render) = layouts(&[(tiled, false)]);
+        let expected: IndexSet<_> = [format(tiled), format(Modifier::Invalid)].into();
+        assert_eq!(texture, expected);
+        assert_eq!(render, texture);
+    }
+
+    #[test]
+    fn a_listed_set_without_linear_does_not_gain_it() {
+        let tiled = Modifier::from(0x0100_0000_0000_0001);
+        let (texture, render) = layouts(&[(tiled, false)]);
+        assert!(!texture.contains(&format(Modifier::Linear)));
+        assert!(!render.contains(&format(Modifier::Linear)));
+    }
+
+    #[test]
+    fn an_external_only_layout_is_imported_but_not_rendered() {
+        let tiled = Modifier::from(0x0100_0000_0000_0001);
+        let (texture, render) = layouts(&[(tiled, true)]);
+        assert!(texture.contains(&format(tiled)));
+        assert!(!render.contains(&format(tiled)));
+        assert!(render.contains(&format(Modifier::Invalid)));
     }
 }
